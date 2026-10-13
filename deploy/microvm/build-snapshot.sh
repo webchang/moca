@@ -124,12 +124,20 @@ INSTANCE_TYPE=""
 VMM="firecracker"
 GUEST_RAM_MB=256
 OUT=""
+# Both opt-in, both off by default (the defaults keep the build exactly as before):
+# SKIP_GIT_IDENTITY_CHECK for images that deliberately refuse agent commits (no git identity,
+# e.g. benchmark testbeds whose patch must stay a diff against an untouched baseline);
+# GUEST_HOME for a writable HOME, since init otherwise leaves the kernel's HOME=/ on a
+# read-only rootfs. See check_git_identity and assemble_rootfs.
+SKIP_GIT_IDENTITY_CHECK=0
+GUEST_HOME=""
 
 usage() {
   cat >&2 <<'USAGE'
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR]
+                  [--skip-git-identity-check] [--guest-home /tmp/DIR]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
 restore requires identical hardware and software). --instance-type is an OVERRIDE:
@@ -141,6 +149,12 @@ construction. Only pass --instance-type when you deliberately want the manifest 
 name something other than what this host reports. Writes vmstate, memfile and a
 manifest.json the worker verifies at start, then restores one VM to prove the
 artifact works.
+
+--skip-git-identity-check  do not require a usable git identity in the guest (for images
+                           that refuse agent commits on purpose; default: required, #415).
+--guest-home /tmp/DIR      export HOME=DIR to guest commands, created by init on the /tmp
+                           tmpfs (default: unset, so commands see the kernel's HOME=/ on a
+                           read-only rootfs). Must be a path under /tmp.
 USAGE
   exit 2
 }
@@ -179,6 +193,14 @@ while [ $# -gt 0 ]; do
       OUT="${2:-}"
       shift 2
       ;;
+    --skip-git-identity-check)
+      SKIP_GIT_IDENTITY_CHECK=1
+      shift
+      ;;
+    --guest-home)
+      GUEST_HOME="${2:-}"
+      shift 2
+      ;;
     -h | --help)
       usage
       ;;
@@ -201,6 +223,13 @@ case "$VMM" in
     exit 2
     ;;
 esac
+
+# /tmp is the only writable tmpfs init mounts for every run (see assemble_rootfs), so a HOME
+# anywhere else would be read-only or vanish; the pattern keeps it one plain directory path.
+if [ -n "$GUEST_HOME" ] && ! printf '%s' "$GUEST_HOME" | grep -Eq '^/tmp(/[A-Za-z0-9._-]+)+$'; then
+  echo "build-snapshot.sh: --guest-home must be a path under /tmp (e.g. /tmp/home), got '$GUEST_HOME'" >&2
+  exit 2
+fi
 
 OUT="${OUT:-$REPO_ROOT/.build/microvm-snapshots/$IMAGE}"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
@@ -560,6 +589,16 @@ fi
 
 exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace
 INIT
+  # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
+  # /tmp is already mounted; the agent inherits init's environment, and so does every command.
+  if [ -n "$GUEST_HOME" ]; then
+    sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
+export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
+    grep -qx "export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init" || {
+      echo "build-snapshot.sh: could not add HOME=$GUEST_HOME to init" >&2
+      exit 1
+    }
+  fi
   chmod 0555 "$STAGE/rootfs-tree/sbin/init"
 
   # A single ext4 image is what the VMM's block device backend wants; building it
@@ -852,6 +891,10 @@ probe_capabilities() {
 check_git_identity() {
   local uds="$1"
   local out rc
+  if [ "$SKIP_GIT_IDENTITY_CHECK" = 1 ]; then
+    log "skipping the git identity check (--skip-git-identity-check): this image refuses agent commits on purpose"
+    return 0
+  fi
   out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
     -command 'git init -q /tmp/id-check && cd /tmp/id-check && git -c user.useConfigOnly=true commit --allow-empty -m x 2>&1; rc=$?; cd / && rm -rf /tmp/id-check; exit $rc' \
     2>&1)" && rc=0 || rc=$?
