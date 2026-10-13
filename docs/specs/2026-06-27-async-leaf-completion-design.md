@@ -1,7 +1,7 @@
 # Async Leaf Completion (spec §9.1) — Design
 
 Version: 1.0 — June 27, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the KEDA ScaledJob dispatch half is deprecated with the Knative path (2026-10-11)
 Scope: The first **post-MVP scale increment** — true **background** (asynchronous) execution of
 leaf sessions, so an external orchestrator can dispatch work that runs for minutes without holding a
 blocking HTTP connection. Realizes MVP spec [§9.1 Async completion](2026-06-26-mvp-leaf-session-contract-design.md).

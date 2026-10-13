@@ -1,5 +1,12 @@
 # Demo: "The workflow you built on your laptop, running in the cluster"
 
+> **This demo runs on the deprecated Knative/KEDA path**
+> ([ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md), 2026-10-11). It still works
+> during the deprecation window — fixes only, removal no earlier than end of October 2026 — but
+> new deployments should start from the P6 runtime: see
+> [Migrating off the Knative/KEDA deployment](../migrating-from-knative.md), and
+> [`vm-multi-user-demo.md`](./vm-multi-user-demo.md) for the current walkthrough.
+
 A ~8-minute walkthrough of **workflow promotion**: you author an agent workflow in Claude Code — a
 skill, a `CLAUDE.md`, a memory file, a slash command — and run it **unchanged** in the harness by
 adding one field to a dispatch.

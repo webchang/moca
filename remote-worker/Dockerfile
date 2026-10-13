@@ -108,6 +108,7 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 # (harness/src/config-overlay.ts: `base64 -d | tar -x -z` under `flock`). tar was absent, so every
 # turn of a session started with a config bundle failed "config overlay failed (exit 127)"
 # (ADR-0038); gzip and util-linux-core were inherited from the base and are listed so they stay.
+# The workload context overlay (harness/src/context-overlay.ts) needs the same three.
 # hadolint ignore=DL3041
 RUN microdnf install -y --nodocs bash coreutils-single findutils file git python3 curl-minimal ca-certificates tar gzip util-linux-core \
     && microdnf clean all

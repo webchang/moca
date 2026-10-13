@@ -247,3 +247,14 @@ jobs:
             (cd "$mod" && go mod tidy -diff) \
               || echo "::warning file=$mod/go.mod::$mod/go.mod is not tidy -- run 'cd $mod && go mod tidy'"
           done
+
+  # Offline check of relative Markdown links and in-repo anchors (`make check-links`). No
+  # submodules and no install: the script is stdlib Python over `git ls-files`.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check Markdown links
+        run: python3 scripts/check-doc-links.py

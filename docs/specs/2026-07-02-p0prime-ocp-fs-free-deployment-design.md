@@ -1,7 +1,7 @@
 # P0′ — OpenShift Deployment of the FS-Free Harness (P1 slice) — Design
 
 Version: 1.0 — July 2, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the OCP Knative deployment is deprecated (2026-10-11); the supported OpenShift path is P6 on Kubernetes (deploy/k8s)
 Scope: **P0′** of the [two-tier FS-free harness epic](https://github.com/kagenti/serverless-harness/issues/49)
 ([P0′ issue #47](https://github.com/kagenti/serverless-harness/issues/47)) — **the P1 slice only**.
 Deploy the now-merged FS-free harness ([P1](2026-07-02-p1-fs-free-harness-design.md), #45) plus a

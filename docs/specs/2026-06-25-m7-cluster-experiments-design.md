@@ -1,13 +1,13 @@
 # M7 Design: End-to-End Cluster Experiments (E1 / E3-mobility / E4)
 
 Version: 1.0 — June 25, 2026
-Status: Design (for review)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the cluster experiments target the deprecated Knative path (2026-10-11); the drivers moved to moca-experiments
 Scope: Harden M4's deployed-harness smoke claims into three rigorous, measured end-to-end
 **cluster** experiments on the Kind + Knative deploy — E1 (scale-to-zero economics),
 E3-mobility (session reconstruction on a fresh instance), E4 (crash recovery) — driven by bash
 extending `deploy/knative/smoke.sh`.
 
-Parent plan: [Serverless Harness (Pi Track) Implementation Plan](../../../docs/research/2026-06-10-serverless-harness-pi-track-plan.md) — experiments **E1 (Task 17)**, **E3 (Task 19)**, **E4 (Task 20)**.
+Parent plan: Serverless Harness (Pi Track) Implementation Plan — experiments **E1 (Task 17)**, **E3 (Task 19)**, **E4 (Task 20)**.
 Predecessors: [M4 — Knative Serverless Wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md) (the deploy this builds on) and [M6 — Experiments E2 + E5](2026-06-24-m6-experiments-design.md) (§8.1 defined this sequel).
 
 > **Milestone numbering.** Repo milestone **M7**. M6 (E2/E5) measured _local_ behavior in-process;

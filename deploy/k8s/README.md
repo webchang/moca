@@ -1,5 +1,8 @@
 # P6 on Kubernetes (Kind and OpenShift)
 
+> **Preview, and the first target for Stable.** P6 on Kubernetes is implemented but not yet declared Stable;
+> interfaces and limits may change. What Stable requires and where this path stands: [Maturity and lifecycle](../../docs/reference/maturity-and-lifecycle.md).
+
 The P6 runtime as ordinary Kubernetes workloads: the supervisor and its forked workers, the sandbox
 relay, Redis, the MU1 control plane and `remote-worker` container sandboxes. It is milestone P6.1,
 slice 1 of epic rossoctl/moca#426 (issue rossoctl/moca#423). The design is

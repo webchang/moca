@@ -25,11 +25,13 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
   let code = `http_${res.status}`;
   let message: string | undefined;
   try {
-    const body = JSON.parse(text) as { error?: unknown; message?: unknown };
+    // `/runs` reports failures as `{status, reason}`; most other routes as `{error}`.
+    const body = JSON.parse(text) as { error?: unknown; message?: unknown; reason?: unknown };
     if (typeof body.error === 'string') code = body.error;
+    else if (typeof body.reason === 'string') code = body.reason;
     if (typeof body.message === 'string') message = body.message;
   } catch {
-    // Non-JSON error body (a proxy's HTML page, say): keep the status-derived code.
+    /* non-JSON body (e.g. a proxy's HTML page): keep http_<status>. */
   }
   const retryAfter = Number.parseInt(res.headers.get('retry-after') ?? '', 10);
   return new ApiError(

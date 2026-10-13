@@ -91,6 +91,12 @@ All commits must include DCO sign-off:
 git commit -s -m "feat: Add new feature"
 ```
 
+## Documentation
+
+Docs conventions (where things go, maturity labels, banners, link checking) are in
+[`docs/CONTRIBUTING-DOCS.md`](docs/CONTRIBUTING-DOCS.md). Run `make check-links` after changing
+Markdown.
+
 ## Code of Conduct
 
 This project follows the [Kagenti Code of Conduct](https://github.com/kagenti/kagenti/blob/main/CODE_OF_CONDUCT.md).

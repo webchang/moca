@@ -44,7 +44,7 @@ interface Props {
   /** Offered each control-plane error an overlay hits; true when it opened Login instead. */
   onCpError: (err: unknown) => boolean;
   onCreate: (req: CreateSessionRequest, values: Record<string, string>) => Promise<void>;
-  onResume: (id: string) => void;
+  onResume: (id: string, configRef?: string | null) => void;
   onDeleted: (id: string) => void;
   onInputless: (inputless: boolean) => void;
   bundle?: { digest: string; skills: number; dropped: number };

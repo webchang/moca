@@ -1,10 +1,10 @@
 # M4 Design: Knative Serverless Wrapper
 
 Version: 1.0 — June 17, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the Knative Service is the deprecated deployment (2026-10-11)
 Scope: Wrap the serverless harness as a Knative Serving service that scales to zero,
 triggered by HTTP requests carrying a user message.
-Parent plan: [Serverless Harness: Revised Plan](../../../docs/research/2026-06-10-serverless-harness-revised-plan.md) §6 M3 (Knative serverless wrapper + `user_message` trigger)
+Parent plan: Serverless Harness: Revised Plan §6 M3 (Knative serverless wrapper + `user_message` trigger)
 Predecessor: [M3 Design — Persistent Channel](2026-06-17-m3-persistent-channel-design.md)
 
 ---

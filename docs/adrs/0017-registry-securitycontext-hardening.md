@@ -1,6 +1,6 @@
 # ADR-0017: Apply the non-root least-privilege securityContext baseline to the agent-running pods
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the deployment this hardened is deprecated (2026-10-11). The hardening concern itself is not moot: the deprecated path remains in-tree and runnable until removal.
 - **Date:** 2026-06-28
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-28-registry-hardening-hygiene-design.md`](../specs/2026-06-28-registry-hardening-hygiene-design.md)

@@ -29,7 +29,10 @@ function setup() {
   transcripts.appendPrompt('aaaaaaaa-1', 'Fix the payment bug');
   const cp = fakeControlPlane({
     listSessions: async () => ({
-      sessions: [summary('aaaaaaaa-1'), summary('bbbbbbbb-2', { turns: 1 })],
+      sessions: [
+        summary('aaaaaaaa-1'),
+        summary('bbbbbbbb-2', { turns: 1, configRef: `sha256:${'b'.repeat(64)}` }),
+      ],
       nextCursor: null,
     }),
   });
@@ -130,7 +133,8 @@ describe('SessionsOverlay', () => {
     // listener is still the one already confirmed attached — no need to recheck inputReady.
     stdin.write(KEY.enter);
     await tick();
-    expect(onResume).toHaveBeenCalledWith('bbbbbbbb-2');
+    // With its bundle digest, so the status line can show it once attached.
+    expect(onResume).toHaveBeenCalledWith('bbbbbbbb-2', `sha256:${'b'.repeat(64)}`);
     expect(onResume).toHaveBeenCalledTimes(1);
   });
 

@@ -1,5 +1,11 @@
 # Deploying on generic Kubernetes
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The Knative + KEDA deployment path this page describes is deprecated: security and breakage
+> fixes only, and removal comes no earlier than **end of October 2026**, once the remaining
+> users have migrated. P6 — the process-manager runtime — is the primary way to run MOCA
+> sessions: see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 `deploy/knative/setup-k8s.sh` stands up the moca stack on a **vanilla
 Kubernetes cluster** — the sibling of `setup-kind.sh` (Kind) and `setup-ocp.sh`
 (OpenShift). It installs Knative Serving + Kourier, the agent-sandbox controller,

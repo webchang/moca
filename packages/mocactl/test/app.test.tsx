@@ -315,6 +315,59 @@ describe('App', () => {
     expect(created[1]!.configRef).toBeUndefined();
   });
 
+  it('a session started with a bundle says so in a toast and in the status line', async () => {
+    const dir = skillsDir();
+    const created: Array<{ configRef?: string }> = [];
+    const rt = testRuntime({
+      cp: fakeControlPlane({
+        listCredentials: async () => [credential('anthropic')],
+        createSession: async (req) => (
+          created.push(req),
+          { sessionId: `s-${created.length}`, token: 'st', expiresAt: 4_000_000_000 }
+        ),
+      }),
+    });
+    const { stdin, all, frame, until, ready } = mount(rt);
+    await ready();
+    await send(stdin, `/promote ${dir}`);
+    await until(() => created.length === 1);
+    const short = created[0]!.configRef!.slice('sha256:'.length, 'sha256:'.length + 8);
+    await until(() => all().includes(`session started with config bundle ${short} — 1 skill`));
+    await until(() => !frame().includes('New session'));
+    // Its own status-line field, which the toast's `config bundle …` cannot satisfy.
+    expect(frame()).toContain(`s-1 · bundle ${short} · idle`);
+    // The next session has no bundle, and nothing claims it does.
+    await tick();
+    await send(stdin, '/new');
+    await until(() => created.length === 2);
+    await until(() => !frame().includes('New session'));
+    expect(frame()).toContain('s-2 · idle');
+    expect(frame()).not.toContain(`· bundle ${short}`);
+  });
+
+  it('resuming a session that carries a bundle shows it in the status line', async () => {
+    const digest = `sha256:${'ab12cd34'.repeat(8)}`;
+    const listed = sessionList('remote-1');
+    const rt = testRuntime({
+      cp: fakeControlPlane({
+        listSessions: async (o) => {
+          const page = await listed.listSessions(o);
+          return { ...page, sessions: page.sessions.map((s) => ({ ...s, configRef: digest })) };
+        },
+      }),
+    });
+    const { stdin, frame, until, ready } = mount(rt);
+    await ready();
+    stdin.write(KEY.ctrl('x'));
+    await tick();
+    stdin.write('l');
+    await until(() => inputReady(stdin) && frame().includes('remote-1'));
+    await tick();
+    stdin.write(KEY.enter);
+    await until(() => !frame().includes('Sessions'));
+    await until(() => frame().includes('remote-1 · bundle ab12cd34 · idle'));
+  });
+
   it('/promote toasts skills, commands and the warning count with the --dry-run hint', async () => {
     const dir = skillsDir();
     mkdirSync(join(dir, '.claude/commands'), { recursive: true });

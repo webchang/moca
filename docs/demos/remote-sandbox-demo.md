@@ -1,5 +1,12 @@
 # Demo: "The sandbox that isn't in your cluster"
 
+> **This demo runs on the deprecated Knative/KEDA path**
+> ([ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md), 2026-10-11). It still works
+> during the deprecation window — fixes only, removal no earlier than end of October 2026 — but
+> new deployments should start from the P6 runtime: see
+> [Migrating off the Knative/KEDA deployment](../migrating-from-knative.md), and
+> [`vm-multi-user-demo.md`](./vm-multi-user-demo.md) for the current walkthrough.
+
 A ~10-minute walkthrough of **SandboxTransport**: the harness dispatches a leaf's tool calls to a
 sandbox running as a plain `docker run` **on your laptop** — outside the cluster, with **zero
 inbound rules**, holding no cluster credential.

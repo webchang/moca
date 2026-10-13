@@ -1,4 +1,4 @@
-.PHONY: lint fmt test test-deploy typecheck demo-remote-sandbox demo-remote-sandbox-teardown \
+.PHONY: lint fmt check-links test test-deploy typecheck demo-remote-sandbox demo-remote-sandbox-teardown \
 	demo-promoted-workflow demo-promoted-workflow-teardown demo-multiuser demo-multiuser-teardown \
 	mocactl-quickstart mocactl-quickstart-teardown
 
@@ -7,6 +7,10 @@ lint:
 
 fmt:
 	pnpm exec prettier --write .
+
+# Relative links and in-repo anchors across tracked Markdown. Offline; run in CI by the `docs` job.
+check-links:
+	python3 scripts/check-doc-links.py
 
 test:
 	pnpm -r test
@@ -40,6 +44,9 @@ test-deploy:
 typecheck:
 	pnpm -r typecheck
 
+# DEPRECATED (ADR-0041): drives the deprecated Knative/KEDA path under deploy/knative. Fixes-only
+# support; removal no earlier than end of October 2026 — see docs/migrating-from-knative.md.
+# Current-runtime demos: docs/demos/vm-multi-user-demo.md, or deploy/compose for a local trial.
 # Laptop showcase: harness on kind, remote worker as a host container dialing out.
 # See deploy/knative/README-worker.md. Add --reuse-cluster to skip setup on a warm cluster.
 demo-remote-sandbox:
@@ -48,6 +55,9 @@ demo-remote-sandbox:
 demo-remote-sandbox-teardown:
 	bash deploy/knative/demo-remote-worker.sh --teardown
 
+# DEPRECATED (ADR-0041): drives the deprecated Knative/KEDA path under deploy/knative. Fixes-only
+# support; removal no earlier than end of October 2026 — see docs/migrating-from-knative.md.
+# Current-runtime demos: docs/demos/vm-two-user-acceptance.md.
 # Promote a Claude Code workflow authored in a minimal local sandbox, then prove it ran remotely.
 # Needs a warm cluster whose image contains the promotion feature; the script gates on that.
 # See docs/demos/promoted-workflow-demo.md.
@@ -57,6 +67,9 @@ demo-promoted-workflow:
 demo-promoted-workflow-teardown:
 	bash deploy/knative/demo-promoted-workflow.sh --teardown
 
+# DEPRECATED (ADR-0041): drives the deprecated Knative/KEDA path under deploy/knative. Fixes-only
+# support; removal no earlier than end of October 2026 — see docs/migrating-from-knative.md.
+# Current-runtime demos: docs/demos/vm-two-user-acceptance.md.
 # MU1 multi-user demo: two GitHub logins, owned sessions, per-user credentials, and a credential
 # property that holds with the deployment's own key present in the environment. Needs a warm cluster,
 # a GitHub OAuth app with device flow enabled, and two GitHub accounts; it SKIPS with a message
@@ -67,6 +80,9 @@ demo-multiuser:
 demo-multiuser-teardown:
 	bash deploy/knative/demo-multiuser.sh --teardown
 
+# DEPRECATED (ADR-0041): drives the deprecated Knative/KEDA path under deploy/knative. Fixes-only
+# support; removal no earlier than end of October 2026 — see docs/migrating-from-knative.md.
+# Current-runtime demos: deploy/vm/README.md.
 # Wire a warm kind cluster for mocactl and hold the port-forwards open, so `mocactl` needs one URL
 # (packages/mocactl/QUICKSTART.md). Needs SH_GITHUB_CLIENT_ID: a GitHub OAuth app with device flow on.
 mocactl-quickstart:

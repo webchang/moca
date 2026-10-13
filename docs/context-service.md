@@ -22,8 +22,8 @@ Context Service:
    with that grant. Moca never handles the bytes.
 3. **Activate:** `POST /workloads/{id}/activate` names the uploaded revision; Context Service freezes
    it.
-4. **Run:** `/runs` with a `workloadId` arrives in a follow-up change and answers
-   `501 workload_runs_unavailable` until then.
+4. **Run:** a synchronous `POST /runs` with a `workloadId` runs the prompt on a shared sandbox with
+   the workload's frozen revision available read-only.
 5. **Delete:** `DELETE /workloads/{id}` deletes the Context, then the workload.
 
 The routes are off by default. With them off, every `/workloads` route answers
@@ -62,6 +62,43 @@ A request that loses a race with another lifecycle request, such as an activatio
 answers `409 workload_state_changed` and changes nothing. Context Service failures answer
 `502 context_service_error`.
 
+## Runs
+
+A run on a workload is a synchronous prompt run (`"kind": "prompt"`) with a `workloadId`, made with
+a session token (scope `turn:write`). The token's user must own the workload: another user's
+workload, like a missing one, is `404 workload_not_found`. A workload that is not `ready` answers
+`409 workload_not_ready`, and another kind of run `400 workload_run_requires_prompt`. A run with no
+token is `401 token_required`. Asynchronous runs on a workload, and every workload run while the
+routes are off, answer `501 workload_runs_unavailable`. The sandbox tier is the session's, chosen as
+for any other run.
+
+Delivery is lazy. Moca downloads the frozen bundle from Context Service's trusted export
+(`GET /internal/v1/namespaces/{ns}/contexts/{name}/revisions/{sha256}/bundle`) only when the
+selected sandbox lacks that revision, once per revision: concurrent runs share one download, and a
+bounded in-memory cache, keyed by user, Context and revision, serves later ones. A bundle over the
+size ceiling or with an incomplete gzip stream is refused and never cached. The harness copies the
+raw bytes over SandboxExec in 8 MiB chunks, checks their sha256 in the sandbox, extracts them
+read-only (directories `0555`, files `0444`) and publishes the revision atomically under `flock`.
+The run gets its own view at `/workspace/.moca-context/runs/<session>`, and the prompt tells the
+agent that path. Each user's copy is cached separately, so two users never share one, even for
+identical content. Only P6 sandboxes (Moca's long-running sandbox workers, reached through the
+relay) are supported: a run whose sandbox is reached another way fails without running a turn.
+
+Read-only is enforced by file permissions only: the agent runs as the same user as the files and
+could change them. Separating users is why each user's copy is its own; enforcing read-only with a
+mount or a separate user comes with per-workload sandboxes
+([#476](https://github.com/rossoctl/moca/issues/476), phase 2 workloads).
+
+**Multiple users.** Several users can create workloads and run tasks at once: names, ownership,
+Contexts and sandbox caches are per user. The sandboxes themselves are shared, though, and are not
+a security boundary between users: tasks from different users can run on the same sandbox, as the
+same Linux user, one after another. Per-user sandboxes come with #476.
+
+After the run, its view is removed and, by default, so is any revision no run still uses. Shared
+sandboxes serve several users, so a user's context should not stay on them for the next user's
+task. `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES` keeps unused revisions longer, which saves a transfer
+for repeated runs at the cost of leaving that context on the sandbox for the period.
+
 ## Names are per user
 
 Each user has their own names: two users can each own `demo`. Another user's workload is
@@ -87,6 +124,10 @@ Context's owner.
 | `MOCA_CONTEXT_MAX_STORAGE_GIB`         | Largest `workspace.size`, default `10`                              |
 | `MOCA_CONTEXT_STORAGE_CLASSES`         | Comma-separated StorageClasses a caller may name; empty allows none |
 | `MOCA_WORKLOAD_DELETED_TTL_SECONDS`    | How long `GET` still reports a deleted workload, default `86400`    |
+| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`        | Largest bundle a run downloads, default `268435456` (256 MiB)       |
+| `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`      | Moca's in-memory bundle cache, default `67108864` (64 MiB)          |
+| `MOCA_CONTEXT_EXPORT_TIMEOUT_MS`       | Timeout for one bundle download, default `300000`                   |
+| `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES`  | Minutes an unused revision stays on a sandbox, default `0`          |
 
 A missing token or an unsafe public URL answers `500 workloads_misconfigured`.
 

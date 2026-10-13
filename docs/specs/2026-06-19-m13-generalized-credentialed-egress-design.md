@@ -8,7 +8,7 @@ with per-user credentials resolved and injected **only at the egress proxy**, ne
 the harness, the sandbox, the prompt, or the log.
 Milestone number: **M13 (provisional)** — a new sibling milestone extending the parent
 roadmap's M7–M12. Adjust the number to fit the parent roadmap when slotted.
-Parent design: [Zero-Trust, Multi-Agent Extensions to the Serverless Harness](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) §2 spine, §3.2 sandbox egress, §4.1 invariants, M7–M9 credential plane
+Parent design: Zero-Trust, Multi-Agent Extensions to the Serverless Harness §2 spine, §3.2 sandbox egress, §4.1 invariants, M7–M9 credential plane
 Sibling / specializes: [M10 — MCP via Code-Mode in the Sandbox](2026-06-18-m10-mcp-code-mode-design.md) — **M10's MCP-over-HTTP path becomes one interception case of this design.**
 Builds on: M1 (Redis session backend), M2 (`K8sSandboxClient`), M3 (persistent channel), M4 (Knative wrapper), M10 (MCP code-mode + credential/identity model §5, placeholder-swap §5.3)
 
@@ -377,7 +377,7 @@ external-credential store) deployed:
 
 ## 10. References
 
-- [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2 spine, §3.2 sandbox egress, §4.1 invariants, M7–M9 credential plane.
+- Zero-Trust, Multi-Agent Extensions — §2 spine, §3.2 sandbox egress, §4.1 invariants, M7–M9 credential plane.
 - [M10 — MCP via Code-Mode in the Sandbox](2026-06-18-m10-mcp-code-mode-design.md) — the MCP path this design generalizes (§5 credential/identity model; **§5.3 placeholder-swap**, the pattern this design extends to all egress; §5.4 env-injection complement, now narrowed to signing-only; D3 audit producer; D4 budget).
 - [M2 Design — K8sSandboxClient](2026-06-17-m2-k8s-sandbox-client-design.md) — Operations redirection to the pod (the path code-mode rides).
 - [M4 Design — Knative Serverless Wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md) — `runTurn`, the budget voter this design widens.

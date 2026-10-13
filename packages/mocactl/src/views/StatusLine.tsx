@@ -8,7 +8,10 @@ export function StatusLine({ fields, width }: { fields: StatusField[]; width: nu
   return (
     <Text wrap="truncate">
       {kept.map((f, i) => (
-        <Text key={f.key} color={f.key === 'warning' ? t.warning : t.muted}>
+        <Text
+          key={f.key}
+          color={f.key === 'warning' ? t.warning : f.key === 'bundle' ? t.info : t.muted}
+        >
           {i > 0 ? ' · ' : ''}
           {f.text}
         </Text>

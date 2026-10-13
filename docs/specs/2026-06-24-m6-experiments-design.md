@@ -6,7 +6,7 @@ Scope: Turn the M5 loader (`openFromCheckpoint`) and budget voter into reproduci
 asserted experiments — **E2** (local reconstruction cost) and **E5** (budget enforcement) —
 in a new in-process TypeScript `experiments/` workspace.
 
-Parent plan: [Serverless Harness (Pi Track) Implementation Plan](../../../docs/research/2026-06-10-serverless-harness-pi-track-plan.md) — experiments **E2** (Task 18) and **E5** (Task 21).
+Parent plan: Serverless Harness (Pi Track) Implementation Plan — experiments **E2** (Task 18) and **E5** (Task 21).
 Predecessor: [M5 Design — Compaction-Checkpoint Fast Path + Budget Voter](2026-06-23-m5-compaction-checkpoint-design.md) (merged to `main`, PR #2 / `8083a27`).
 
 > **Milestone numbering.** Following the repo convention (sequential, offset from the pi-track

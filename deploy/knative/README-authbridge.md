@@ -1,5 +1,11 @@
 # AuthBridge Two-Hop Egress Control (RC1)
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The Knative + KEDA deployment path this page describes is deprecated: security and breakage
+> fixes only, and removal comes no earlier than **end of October 2026**, once the remaining
+> users have migrated. P6 — the process-manager runtime — is the primary way to run MOCA
+> sessions: see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 This demo shows **Rosso Cortex / AuthBridge** acting as the zero-trust credential
 plane on MOCA: it does both **credential injection** and
 **action control** on the harness's two HTTP egress hops, and the real credential
@@ -9,7 +15,7 @@ real value is swapped in at the proxy, _after_ an allow/deny gate.
 The path is gated behind the **`SH_AUTHBRIDGE`** feature flag (off by default). It
 runs the same way on Kind and OpenShift; only the enable/run entrypoints differ.
 
-- Design: [`../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md`](../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md) · [ADR-0025](../adrs/0025-authbridge-deployment-topology.md)
+- Design: [`docs/specs/2026-07-10-authbridge-egress-control-plane-poc-design.md`](../../docs/specs/2026-07-10-authbridge-egress-control-plane-poc-design.md) · [ADR-0025](../../docs/adrs/0025-authbridge-deployment-topology.md)
 - Base deploy guides: [`README-kind.md`](README-kind.md) · [`README-ocp.md`](README-ocp.md)
 
 ## The two hops

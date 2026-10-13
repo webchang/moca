@@ -1,7 +1,7 @@
 # Scheduled Leaf Dispatch (Archetype C trigger on-ramp) — Design
 
 Version: 1.0 — June 28, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the Kubernetes CronJob on-ramp is deprecated with the Knative path (2026-10-11)
 Scope: The **cron trigger on-ramp** for Archetype C (scheduled ingestion): a Kubernetes `CronJob`
 becomes the **start signal** that dispatches a static, config-defined list of leaf sessions onto the
 existing async path. Purely additive; the async contract, work queue, KEDA `ScaledJob`, and `runLeaf`

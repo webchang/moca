@@ -1,6 +1,6 @@
 # ADR-0002: Route Pi tool execution to a remote pod via `kubectl exec`
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the Knative/KEDA deployment path is deprecated (2026-10-11)
 - **Date:** 2026-06-17
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-17-m2-k8s-sandbox-client-design.md`](../specs/2026-06-17-m2-k8s-sandbox-client-design.md)

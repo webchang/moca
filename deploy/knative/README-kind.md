@@ -1,5 +1,11 @@
 # Deploying on Kind
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The Knative + KEDA deployment path this page describes is deprecated: security and breakage
+> fixes only, and removal comes no earlier than **end of October 2026**, once the remaining
+> users have migrated. P6 — the process-manager runtime — is the primary way to run MOCA
+> sessions: see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 `deploy/knative/setup-kind.sh` stands up the moca stack on a
 **Kind** (Kubernetes-in-Docker) cluster — Knative Serving + Kourier, KEDA,
 Redis, the sandbox pod, the `leaf-work` PVC, the LLM-credentials secret, and

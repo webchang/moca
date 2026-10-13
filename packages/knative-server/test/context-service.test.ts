@@ -1,8 +1,11 @@
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  clearContextBundleCache,
   ContextServiceError,
   createUploadGrant,
   deleteContext,
+  downloadContextBundle,
   publicBaseUrl,
 } from '../src/context-service.js';
 
@@ -97,5 +100,113 @@ describe('Context Service client', () => {
   it('treats an already-deleted Context as deleted', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 404 })));
     await expect(deleteContext('w-1', 'github:alice')).resolves.toBeUndefined();
+  });
+});
+
+describe('frozen bundle download', () => {
+  const REVISION = 'e'.repeat(64);
+  const BUNDLE = gzipSync(Buffer.from('x'.repeat(4096)));
+  const bundleResponse = (body: BodyInit | null, headers: Record<string, string> = {}) =>
+    new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/vnd.rossoctl.context', ...headers },
+    });
+
+  beforeEach(() => clearContextBundleCache());
+
+  it('downloads from the trusted export as the owner and caches it per owner', async () => {
+    const fetch = vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE)));
+    vi.stubGlobal('fetch', fetch);
+    await expect(downloadContextBundle('w-1', REVISION, 'github:alice')).resolves.toEqual(BUNDLE);
+    await expect(downloadContextBundle('w-1', REVISION, 'github:alice')).resolves.toEqual(BUNDLE);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(url).toBe(
+      `http://cs.internal/internal/v1/namespaces/moca/contexts/w-1/revisions/${REVISION}/bundle`,
+    );
+    expect(init).toMatchObject({
+      method: 'GET',
+      headers: { authorization: 'Bearer svc', 'x-context-subject': 'user:github:alice' },
+    });
+    // Another owner never shares the entry.
+    await downloadContextBundle('w-1', REVISION, 'github:bob');
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares one download between concurrent requests for the same revision', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const fetch = vi.fn(async () => {
+      await gate;
+      return bundleResponse(new Uint8Array(BUNDLE));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const loads = [1, 2, 3].map(() => downloadContextBundle('w-2', REVISION, 'github:alice'));
+    release();
+    for (const bundle of await Promise.all(loads)) expect(bundle).toEqual(BUNDLE);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a bundle whose Content-Length exceeds the ceiling', async () => {
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_BYTES', '16');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE), { 'content-length': '4096' })),
+    );
+    await expect(downloadContextBundle('w-3', REVISION, 'github:alice')).rejects.toThrow(
+      'MOCA_CONTEXT_BUNDLE_MAX_BYTES',
+    );
+  });
+
+  it('refuses a streamed bundle that grows past the ceiling with no Content-Length', async () => {
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_BYTES', String(BUNDLE.length - 1));
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(BUNDLE.subarray(0, 10)));
+        controller.enqueue(new Uint8Array(BUNDLE.subarray(10)));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => bundleResponse(stream)),
+    );
+    await expect(downloadContextBundle('w-4', REVISION, 'github:alice')).rejects.toThrow(
+      'MOCA_CONTEXT_BUNDLE_MAX_BYTES',
+    );
+  });
+
+  it('rejects a truncated gzip stream and does not cache it', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(bundleResponse(new Uint8Array(BUNDLE.subarray(0, BUNDLE.length - 8))))
+      .mockResolvedValueOnce(bundleResponse(new Uint8Array(BUNDLE)));
+    vi.stubGlobal('fetch', fetch);
+    await expect(downloadContextBundle('w-5', REVISION, 'github:alice')).rejects.toThrow(
+      'truncated or invalid bundle',
+    );
+    // The next request downloads again rather than reusing the failure.
+    await expect(downloadContextBundle('w-5', REVISION, 'github:alice')).resolves.toEqual(BUNDLE);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a reply that is not a context bundle', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { headers: { 'content-type': 'application/json' } })),
+    );
+    await expect(downloadContextBundle('w-6', REVISION, 'github:alice')).rejects.toThrow(
+      'content type',
+    );
+  });
+
+  it('evicts the least recently used bundle past MOCA_CONTEXT_BUNDLE_CACHE_BYTES', async () => {
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_CACHE_BYTES', String(BUNDLE.length * 2));
+    const fetch = vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE)));
+    vi.stubGlobal('fetch', fetch);
+    for (const name of ['a', 'b', 'a', 'c', 'a', 'b'])
+      await downloadContextBundle(`w-${name}`, REVISION, 'github:alice');
+    // a, b, (a hit), c evicts b, (a hit), b again evicts c.
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 });

@@ -86,12 +86,21 @@ describe('workloads are off unless enabled and Context Service is configured', (
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('refuses a run that names a workload even when workloads are enabled', async () => {
+  it('refuses an anonymous run that names a workload when workloads are enabled', async () => {
     vi.stubEnv('MOCA_CONTEXT_WORKLOADS_ENABLED', '1');
     vi.stubEnv('CONTEXT_SERVICE_URL', 'http://cs.example');
     const res = await json('POST', '/runs', { ...envelope, workloadId: 'demo' });
-    expect(res).toEqual({ status: 501, body: { error: 'workload_runs_unavailable' } });
+    expect(res).toMatchObject({ status: 401, body: { error: 'token_required' } });
     expect(runLeaf).not.toHaveBeenCalled();
+  });
+
+  it('strips a caller-supplied internalContext from a run', async () => {
+    runLeaf.mockResolvedValue({ status: 'responded', text: 'ok' });
+    await json('POST', '/runs', {
+      ...envelope,
+      internalContext: { revision: 'a'.repeat(64), loadBundle: 'x' },
+    });
+    expect(runLeaf.mock.calls[0]![0]).not.toHaveProperty('internalContext');
   });
 
   it('runs a request without a workload as before', async () => {

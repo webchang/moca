@@ -1,6 +1,6 @@
 # ADR-0025: AuthBridge (Rosso Cortex) deployment topology — shared LLM gateway, per-sandbox egress proxy
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the Kind/OCP deployment topology is deprecated (2026-10-11). The credential mechanism it PoC'd survives in the successor design (P4.1/MI1); only the K8s PoC deployment is deprecated.
 - **Date:** 2026-07-10
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md`](../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md)

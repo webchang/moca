@@ -1,5 +1,11 @@
 # Deploying on OpenShift
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The Knative + KEDA deployment path this page describes is deprecated: security and breakage
+> fixes only, and removal comes no earlier than **end of October 2026**, once the remaining
+> users have migrated. P6 — the process-manager runtime — is the primary way to run MOCA
+> sessions: see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 `deploy/knative/setup-ocp.sh` stands up the moca stack on
 **OpenShift 4.20+** — the OpenShift-native sibling of [`setup-kind.sh`](setup-kind.sh).
 It installs OpenShift Serverless (Knative + Kourier), Redis, the sandbox pod, the

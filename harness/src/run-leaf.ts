@@ -55,6 +55,7 @@ import type { BundleRedisLike } from '@moca/config-bundle';
 import type { resolvePromotedConfig } from './config-resolver.js';
 import type { overlayConfig } from './config-overlay.js';
 import { attachPromotedConfig, type AttachedPromotedConfig } from './promoted-config.js';
+import { overlayContext, buildContextCleanupScript, contextCacheKey } from './context-overlay.js';
 
 /**
  * Recover a verdict from a persisted `verdict` custom session entry (written by
@@ -99,6 +100,18 @@ export interface LeafEnvelope {
   sessionId: string;
   /** Pool selected by the workload-facing control plane; falls back to the process default. */
   sandboxPoolSelector?: string;
+  /**
+   * A workload's frozen context, set by the server after it checks the caller owns the workload.
+   * Process-internal (it holds a function): the HTTP route strips any caller-supplied value, and it
+   * never crosses the work queue. Prompt runs only.
+   */
+  internalContext?: {
+    revision: string;
+    /** Opaque per-owner namespace (32 hex chars) that keeps each user's sandbox cache separate. */
+    ownerScope: string;
+    /** Fetches the frozen bundle; called only when the selected sandbox lacks the revision. */
+    loadBundle: () => Promise<Buffer>;
+  };
   item: LeafItem; // inputs inline (was inputsRef)
   decision?: Decision; // resume/approve only (was decisionRef)
   model?: string;
@@ -274,6 +287,7 @@ export async function runLeaf(
     executeTurn?: typeof executeTurn;
     resolvePromotedConfig?: typeof resolvePromotedConfig;
     overlayConfig?: typeof overlayConfig;
+    overlayContext?: typeof overlayContext;
     bundleRedis?: BundleRedisLike;
   },
 ): Promise<LeafResult> {
@@ -359,6 +373,7 @@ async function runPromptLeaf(
     executeTurn?: typeof executeTurn;
     resolvePromotedConfig?: typeof resolvePromotedConfig;
     overlayConfig?: typeof overlayConfig;
+    overlayContext?: typeof overlayContext;
     bundleRedis?: BundleRedisLike;
   },
 ): Promise<LeafResult> {
@@ -421,6 +436,10 @@ async function runPromptLeaf(
 
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let attached: AttachedPromotedConfig | undefined;
+  // Set before the overlay runs: its first exec registers a ref, which cleanup must release even
+  // when the overlay fails partway.
+  let contextKey: string | undefined;
+  let contextPath: string | undefined;
   try {
     if (selected) {
       const lease = selected;
@@ -429,6 +448,40 @@ async function runPromptLeaf(
         // leaf. The lease's TTL expiring is the safe outcome -- the sandbox returns to the pool.
         void lease.heartbeat().catch(() => {});
       }, promptTimings.heartbeatMs);
+    }
+    if (env.internalContext) {
+      const { revision, ownerScope, loadBundle } = env.internalContext;
+      if (
+        !/^[a-f0-9]{64}$/.test(revision) ||
+        !/^[a-f0-9]{32}$/.test(ownerScope) ||
+        typeof loadBundle !== 'function'
+      ) {
+        return { status: 'failed', reason: 'error', message: 'invalid internal context reference' };
+      }
+      // Only a P6 relay sandbox: its SandboxExec stdin is binary-safe. The pod transports
+      // (persistent-exec's heredoc framing) are not, and are not a target for this feature.
+      if (!selected?.transport) {
+        return {
+          status: 'failed',
+          reason: 'error',
+          message: 'a workload run requires a P6 relay sandbox',
+        };
+      }
+      contextKey = contextCacheKey(ownerScope, revision);
+      try {
+        contextPath = await (deps?.overlayContext ?? overlayContext)(
+          selected.transport,
+          contextKey,
+          sid,
+          loadBundle,
+        );
+      } catch (err) {
+        return {
+          status: 'failed',
+          reason: 'error',
+          message: `context overlay failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
     }
     // Promoted config: resolve the prose half into this pod's /tmp and mirror the bundle into the
     // sandbox we hold a lease on. Both halves come from one digest, and a failure of either fails
@@ -457,7 +510,9 @@ async function runPromptLeaf(
       }
     }
     const r: TurnResult = await exec({
-      prompt: env.prompt,
+      prompt: contextPath
+        ? `${env.prompt}\n\nThe workload's frozen context is available read-only at ${contextPath}.`
+        : env.prompt,
       sessionId: env.sessionId,
       config,
       createIfAbsent: true,
@@ -480,6 +535,15 @@ async function runPromptLeaf(
   } finally {
     if (heartbeat) clearInterval(heartbeat);
     await attached?.detach();
+    if (contextKey && selected?.transport) {
+      try {
+        await selected.transport.exec(buildContextCleanupScript(contextKey, sid), {
+          timeout: 60,
+        });
+      } catch {
+        /* best effort: never mask the run's verdict */
+      }
+    }
     if (selected) await selected.release();
     if (selected?.transport) await selected.transport.close();
   }

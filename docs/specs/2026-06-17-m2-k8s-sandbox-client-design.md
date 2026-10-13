@@ -1,9 +1,9 @@
 # M2 Design: K8sSandboxClient (Operations → pod)
 
 Version: 1.0 — June 17, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the Knative/KEDA deployment path is deprecated (2026-10-11); KubectlTransport + pod-exec sandboxes are its sandbox tier
 Scope: Milestone 2 of the serverless harness — route Pi tool execution to a remote Kubernetes pod
-Parent plan: [Serverless Harness: Revised Plan](../../../docs/research/2026-06-10-serverless-harness-revised-plan.md) §4, §6 (M2), §7.3
+Parent plan: Serverless Harness: Revised Plan §4, §6 (M2), §7.3
 Predecessor: [M1 Design — Redis SessionStorageBackend](2026-06-16-m1-redis-session-backend-design.md)
 
 ---

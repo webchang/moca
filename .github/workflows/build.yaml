@@ -33,6 +33,8 @@ jobs:
           # Built the same way as the harness so OCP can pull it from GHCR instead
           # of building it in-cluster (issue #41). Scoped context — sandbox.Dockerfile
           # has no COPY, so deploy/knative keeps the build context small.
+          # DEPRECATED-path image (ADR-0041): serves deploy/knative/setup-ocp.sh only; it stays
+          # while that path does (removal no earlier than end of October 2026).
           - image: ghcr.io/rossoctl/moca-sandbox
             context: deploy/knative
             file: deploy/knative/sandbox.Dockerfile

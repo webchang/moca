@@ -1,6 +1,6 @@
 # ADR-0023: Measure sandbox sharing capacity on runc, splitting Kata isolation into P4
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the pooled-pod sandbox model it measured belongs to the deprecated Knative/KEDA path (2026-10-11)
 - **Date:** 2026-07-03
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-07-03-p3-sandbox-sharing-ratio-experiments-design.md`](../specs/2026-07-03-p3-sandbox-sharing-ratio-experiments-design.md)

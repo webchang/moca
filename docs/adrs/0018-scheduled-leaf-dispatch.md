@@ -1,6 +1,6 @@
 # ADR-0018: Native Kubernetes CronJob as the scheduled dispatch start signal
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the CronJob on-ramp half is deprecated with the Knative/KEDA path (2026-10-11)
 - **Date:** 2026-06-28
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-28-scheduled-leaf-dispatch-design.md`](../specs/2026-06-28-scheduled-leaf-dispatch-design.md)

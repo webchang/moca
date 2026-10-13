@@ -32,7 +32,7 @@ export function describeTurn(s: TurnState, nowMs: number): string {
 }
 
 export interface StatusField {
-  key: 'subject' | 'title' | 'turn' | 'usage' | 'warning';
+  key: 'subject' | 'title' | 'bundle' | 'turn' | 'usage' | 'warning';
   text: string;
 }
 

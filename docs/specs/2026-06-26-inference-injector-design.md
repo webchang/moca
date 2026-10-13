@@ -11,7 +11,7 @@ enforcement, no body inspection, no token-exchange, no placeholder-swap.
 Milestone relationship: **The M8 piece** of the re-examined credential plane — the injector the
 harness lock-down (this date's sibling) depends on. Refines parent §3.1 from a same-pod sidecar to a
 **separate shared gateway pod** (the NetworkPolicy-granularity reason, harness-lockdown H6).
-Parent design: [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2.2 the harness-holds-no-key claim, §3.1 inference broker, §4.1 log invariants, §2.3 portable-core/kagenti-binding split.
+Parent design: Zero-Trust, Multi-Agent Extensions — §2.2 the harness-holds-no-key claim, §3.1 inference broker, §4.1 log invariants, §2.3 portable-core/kagenti-binding split.
 Depends on / pairs with: [Harness Lock-Down Design](2026-06-26-harness-lockdown-design.md) — H4 (key not in harness; non-secret base URL), H5 (only the injector has public egress), H6 (separate pod), §8 (the injector is the high-value target this spec must own).
 Sibling: [M13 — Generalized Credentialed Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) — the **sandbox**'s egress plane. This injector is deliberately _not_ that: no baked CA, no placeholder-swap, no allowlist-per-host policy.
 
@@ -302,7 +302,7 @@ The injector passes when, on a Kind cluster with the locked-down harness deploym
 ## 14. References
 
 - [Harness Lock-Down Design](2026-06-26-harness-lockdown-design.md) — H4/H5/H6 and §8: the dependencies and the high-value-target charge this spec answers.
-- [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2.2 harness-holds-no-key, §3.1 inference broker (placement refined to a separate pod), §2.3 portable-core/kagenti-binding, §4.1 log invariants.
+- Zero-Trust, Multi-Agent Extensions — §2.2 harness-holds-no-key, §3.1 inference broker (placement refined to a separate pod), §2.3 portable-core/kagenti-binding, §4.1 log invariants.
 - [M13 — Generalized Credentialed Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) — the sandbox egress plane this injector is deliberately lighter than (no CA, no placeholder-swap).
 - [M5 — Compaction-Checkpoint](2026-06-23-m5-compaction-checkpoint-design.md) / [M6 — Experiments](2026-06-24-m6-experiments-design.md) — the turn-boundary budget voter that keeps inference budget in v1.
 - kagenti: Istio ambient (ztunnel mTLS, `AuthorizationPolicy` SPIFFE principals), SPIRE/SPIFFE workload identity.

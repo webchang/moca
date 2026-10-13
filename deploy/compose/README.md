@@ -1,5 +1,8 @@
 # Docker Compose trial (P6 process-manager runtime)
 
+> **Preview, trial only.** This path is a trial by design and will not be promoted to Stable. For production see
+> [`deploy/vm/`](../vm/README.md) or [`deploy/k8s/`](../k8s/README.md); labels are explained in [Maturity and lifecycle](../../docs/reference/maturity-and-lifecycle.md).
+
 A five-minute, no-root way to run the P6 runtime on a dev machine: the supervisor (with its worker
 pool), the sandbox relay, Redis and one remote-worker sandbox, under Docker Compose. Optionally, add
 the MU1 control plane that [`mocactl`](../../packages/mocactl) logs in through (see

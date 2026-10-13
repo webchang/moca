@@ -1,6 +1,6 @@
 # ADR-0034: Density off Kubernetes comes from a socket-handing-off supervisor over a fixed worker pool, not from an orchestrator replacement
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-08
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-09-08-p6-vm-process-manager-design.md`](../specs/2026-09-08-p6-vm-process-manager-design.md)

@@ -1,5 +1,12 @@
+// packages/knative-server/src/cron-dispatch.ts
+//
+// @deprecated ADR-0041 (2026-10-11): the CronJob scheduled on-ramp belongs to the deprecated
+// Knative/KEDA deployment path. It receives security and breakage fixes only; removal comes
+// no earlier than end of October 2026, once the remaining users have migrated — see
+// docs/migrating-from-knative.md. A P6 equivalent for scheduled dispatch is an owed follow-up.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { KNATIVE_DEPRECATION_NOTICE } from './deprecation.js';
 
 /** Replace every __FIRE__ in each string field with fireId; non-strings pass through. Pure, non-mutating. */
 export function applyFire(
@@ -70,6 +77,11 @@ function buildPost(): (env: Record<string, unknown>) => Promise<boolean> {
 }
 
 async function main(): Promise<void> {
+  // First statement, before the config load can throw: a CronJob pod that dies on a missing or
+  // malformed config must still have said which path is deprecated (ADR-0041). Unconditional —
+  // this entrypoint only ever runs as the deprecated path's scheduled on-ramp
+  // (deploy/knative/leaf-cron.yaml), so there is no P6 path to protect here.
+  console.warn(KNATIVE_DEPRECATION_NOTICE);
   const fireId = process.env.JOB_NAME ?? `manual-${process.pid}`;
   const configPath = process.env.CRON_CONFIG ?? '/config/schedule.json';
   const items = loadConfig(configPath);

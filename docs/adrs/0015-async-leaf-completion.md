@@ -1,6 +1,6 @@
 # ADR-0015: KEDA ScaledJob over a Redis Streams queue for background leaf execution
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the KEDA ScaledJob half is deprecated with the Knative/KEDA path (2026-10-11)
 - **Date:** 2026-06-27
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-27-async-leaf-completion-design.md`](../specs/2026-06-27-async-leaf-completion-design.md)

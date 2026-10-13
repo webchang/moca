@@ -1,3 +1,7 @@
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGunzip } from 'node:zlib';
+
 /**
  * Client for Context Service's trusted, storage-only API (rossoctl/context-service#52, upload and
  * freeze for Moca). Moca calls it with its service bearer and names the user it acts for in
@@ -97,9 +101,10 @@ function timeoutMs(): number {
 async function request(
   path: string,
   owner: string,
-  method: 'POST' | 'DELETE',
+  method: 'GET' | 'POST' | 'DELETE',
   body?: unknown,
   acceptedStatuses: readonly number[] = [],
+  timeout = timeoutMs(),
 ): Promise<Response> {
   const base = process.env.CONTEXT_SERVICE_URL?.trim().replace(/\/+$/, '');
   if (!base) throw new Error('CONTEXT_SERVICE_URL is required');
@@ -112,7 +117,7 @@ async function request(
     method,
     headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(timeoutMs()),
+    signal: AbortSignal.timeout(timeout),
   }).catch((err: unknown) => {
     throw new ContextServiceError(`Context Service is unreachable: ${String(err)}`);
   });
@@ -202,4 +207,130 @@ export async function createUploadGrant(name: string, owner: string): Promise<Up
     contentType: grant.contentType,
     maxBytes: grant.maxBytes as number,
   };
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Frozen bundles Moca has downloaded, least recently used first, within
+ * `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`. A frozen revision never changes, so an entry never goes stale.
+ * Keyed by owner, Context and revision, so one user's download never serves another user.
+ */
+const bundleCache = new Map<string, Buffer>();
+const bundleDownloads = new Map<string, Promise<Buffer>>();
+let bundleCacheBytes = 0;
+
+function cacheBundle(key: string, bundle: Buffer): void {
+  const parsed = Number.parseInt(process.env.MOCA_CONTEXT_BUNDLE_CACHE_BYTES ?? '', 10);
+  const limit = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 64 * 1024 * 1024;
+  if (bundle.length > limit || bundleCache.has(key)) return;
+  for (const [oldest, entry] of bundleCache) {
+    if (bundleCacheBytes + bundle.length <= limit) break;
+    bundleCache.delete(oldest);
+    bundleCacheBytes -= entry.length;
+  }
+  bundleCache.set(key, bundle);
+  bundleCacheBytes += bundle.length;
+}
+
+/** Empties the bundle cache. For tests. */
+export function clearContextBundleCache(): void {
+  bundleCache.clear();
+  bundleCacheBytes = 0;
+}
+
+/**
+ * Context Service streams the export after its 200 header, so an export that fails midway ends the
+ * response cleanly with a short body. Only a complete gzip stream is cached or delivered.
+ */
+async function assertCompleteGzip(bundle: Buffer): Promise<void> {
+  try {
+    await pipeline(
+      Readable.from([bundle]),
+      createGunzip(),
+      new Writable({ write: (_chunk, _encoding, done) => done() }),
+    );
+  } catch {
+    throw new ContextServiceError('Context Service returned a truncated or invalid bundle');
+  }
+}
+
+async function fetchBundle(name: string, revision: string, owner: string): Promise<Buffer> {
+  const maxBytes = positiveIntEnv('MOCA_CONTEXT_BUNDLE_MAX_BYTES', 256 * 1024 * 1024);
+  const tooLarge = () =>
+    new ContextServiceError('Context Service bundle exceeds MOCA_CONTEXT_BUNDLE_MAX_BYTES');
+  // The timeout covers the body as well as the headers.
+  const response = await request(
+    `/internal/v1${contextPath(name)}/revisions/${revision}/bundle`,
+    owner,
+    'GET',
+    undefined,
+    [],
+    positiveIntEnv('MOCA_CONTEXT_EXPORT_TIMEOUT_MS', 300_000),
+  );
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim();
+  if (contentType !== CONTEXT_BUNDLE_TYPE) {
+    await response.body?.cancel().catch(() => {});
+    throw new ContextServiceError('Context Service returned an invalid bundle content type');
+  }
+  const declared = Number.parseInt(response.headers.get('content-length') ?? '', 10);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw tooLarge();
+  }
+  if (!response.body) throw new ContextServiceError('Context Service returned no bundle body');
+  const chunks: Buffer[] = [];
+  let received = 0;
+  const reader = response.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read().catch((err: unknown) => {
+      throw new ContextServiceError(`Context Service bundle stream failed: ${String(err)}`);
+    });
+    if (done) break;
+    received += value.byteLength;
+    if (received > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge();
+    }
+    chunks.push(Buffer.from(value));
+  }
+  const bundle = Buffer.concat(chunks, received);
+  await assertCompleteGzip(bundle);
+  return bundle;
+}
+
+/**
+ * The bundle of a frozen revision, from the trusted export
+ * (`GET /internal/v1/namespaces/{ns}/contexts/{name}/revisions/{sha256}/bundle`). Served from the
+ * in-memory cache when present; concurrent requests for the same revision share one download, and
+ * a failed download is never cached.
+ */
+export async function downloadContextBundle(
+  name: string,
+  revision: string,
+  owner: string,
+): Promise<Buffer> {
+  if (!/^[a-f0-9]{64}$/.test(revision)) throw new Error('invalid context revision');
+  const key = `${owner}\0${name}\0${revision}`;
+  const cached = bundleCache.get(key);
+  if (cached) {
+    // Refresh its place in the LRU order.
+    bundleCache.delete(key);
+    bundleCache.set(key, cached);
+    return cached;
+  }
+  let download = bundleDownloads.get(key);
+  if (!download) {
+    download = fetchBundle(name, revision, owner)
+      .then((bundle) => {
+        cacheBundle(key, bundle);
+        return bundle;
+      })
+      .finally(() => bundleDownloads.delete(key));
+    bundleDownloads.set(key, download);
+  }
+  return download;
 }

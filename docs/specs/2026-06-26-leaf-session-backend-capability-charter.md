@@ -181,7 +181,7 @@ plane ahead of demand.
 - [Milestone Registry](README.md) — Phase-2 numbering this charter reprioritizes.
 - [Z1 Identity Spine](2026-06-26-identity-spine-design.md), [Z2 Harness Lock-Down](2026-06-26-harness-lockdown-design.md), [Z3 Inference Injector](2026-06-26-inference-injector-design.md), [Z5 Generalized Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) — the credential plane this charter defers (except Z3/Z5 keep-light).
 - Built base: [M1](2026-06-16-m1-redis-session-backend-design.md) / [M2](2026-06-17-m2-k8s-sandbox-client-design.md) / [M3](2026-06-17-m3-persistent-channel-design.md) / [M4](2026-06-17-m4-knative-serverless-wrapper-design.md) / [M5](2026-06-23-m5-compaction-checkpoint-design.md) / [M6](2026-06-24-m6-experiments-design.md).
-- Parent: [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — the subagent/credential agenda this charter reprioritizes against observed demand.
+- Parent: Zero-Trust, Multi-Agent Extensions — the subagent/credential agenda this charter reprioritizes against observed demand.
 
 ---
 

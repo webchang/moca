@@ -16,7 +16,8 @@ import { authenticateApiCaller, type TurnAuthDeps } from './turn-auth.js';
 /**
  * The `/workloads` lifecycle: an owner-bound logical workload backed by one Context Service Context.
  * Moca stores the record; the client uploads its bundle straight to Context Service with a one-time
- * grant; activation freezes the uploaded revision. Running on a workload is a later change.
+ * grant; activation freezes the uploaded revision. A run that names a ready workload gets that
+ * revision delivered to its sandbox (`resolveWorkloadRun`).
  *
  * Names are scoped per owner (the first half of rossoctl/moca#358, per-user PVC authorization): the
  * record key includes a hash of the owner, so two users may both own `demo`, and another user's
@@ -377,6 +378,35 @@ async function deleteWorkload(
   } catch (err) {
     sendFailure(res, 'delete', err);
   }
+}
+
+/** What a run needs from a workload, or the refusal to answer with. */
+export type WorkloadRun =
+  | { contextName: string; revision: string; ownerScope: string }
+  | { status: number; error: 'workload_not_found' | 'workload_not_ready' };
+
+/**
+ * Resolve the workload a run names. Only `owner`'s own records are read, so another user's workload
+ * is `workload_not_found`, exactly like a missing one.
+ */
+export async function resolveWorkloadRun(
+  store: WorkloadStore,
+  owner: string,
+  workloadId: unknown,
+): Promise<WorkloadRun> {
+  const record =
+    typeof workloadId === 'string' && NAME.test(workloadId)
+      ? await findWorkload(store, owner, workloadId)
+      : null;
+  if (!record || record.status === 'deleted') return { status: 404, error: 'workload_not_found' };
+  if (record.status !== 'ready' || !record.revision || !REVISION.test(record.revision)) {
+    return { status: 409, error: 'workload_not_ready' };
+  }
+  return {
+    contextName: record.contextName,
+    revision: record.revision,
+    ownerScope: ownerScope(owner),
+  };
 }
 
 type Route = 'create' | 'get' | 'delete' | 'uploads' | 'activate';

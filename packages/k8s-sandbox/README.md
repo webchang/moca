@@ -1,5 +1,10 @@
 # @moca/k8s-sandbox
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The `kubectl exec` sandbox transport (`KubectlTransport`) described here is deprecated: security and
+> breakage fixes only, removal no earlier than **end of October 2026**. Sandboxes run through the gRPC
+> relay on P6; see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 Routes Pi tool execution (read/write/edit/bash/ls/grep/find) to a remote
 Kubernetes pod via `kubectl exec`, using Pi's native `Operations` seam. Part of
 MOCA (Milestone 2). See

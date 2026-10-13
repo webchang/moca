@@ -17,6 +17,8 @@ export interface Paths {
   authFile: string;
   transcriptsDir: string;
   exportsDir: string;
+  /** `mocactl spawn` ledger; mode 0600, append-only JSONL. */
+  subagentsFile: string;
 }
 
 export function resolvePaths(env: NodeJS.ProcessEnv, home: string): Paths {
@@ -29,6 +31,7 @@ export function resolvePaths(env: NodeJS.ProcessEnv, home: string): Paths {
     authFile: join(configDir, 'auth.json'),
     transcriptsDir: join(stateDir, 'transcripts'),
     exportsDir: join(stateDir, 'exports'),
+    subagentsFile: join(stateDir, 'subagents.jsonl'),
   };
 }
 

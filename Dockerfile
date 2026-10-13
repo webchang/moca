@@ -42,6 +42,8 @@ WORKDIR /app
 
 # Stage 2: slim runtime
 FROM node:24-alpine
+# kubectl serves only the deprecated Knative path's KubectlTransport (ADR-0041); it stays while
+# that path does — removal no earlier than end of October 2026.
 RUN apk add --no-cache kubectl cairo pango libjpeg-turbo giflib librsvg pixman
 WORKDIR /app
 COPY --from=builder /app ./
@@ -60,4 +62,7 @@ ARG MOCA_VERSION=dev
 ENV MOCA_VERSION=${MOCA_VERSION}
 EXPOSE 8080
 WORKDIR /app/packages/knative-server
+# Default entrypoint: the HTTP server. Under Knative — the deprecated path (ADR-0041) — this is
+# the Service's container; the P6 supervisor forks src/worker.ts instead (deploy/vm, deploy/k8s,
+# deploy/compose).
 CMD ["node", "--import", "tsx", "src/server.ts"]

@@ -1,6 +1,6 @@
 # ADR-0009: Drive cluster experiments with bash extending smoke.sh
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the Knative/KEDA deployment path is deprecated (2026-10-11)
 - **Date:** 2026-06-25
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-25-m7-cluster-experiments-design.md`](../specs/2026-06-25-m7-cluster-experiments-design.md)

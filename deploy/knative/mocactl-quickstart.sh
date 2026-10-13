@@ -28,6 +28,13 @@
 # Ports: MOCACTL_CP_PORT (default 18080), MOCACTL_HARNESS_PORT (default 18081).
 set -euo pipefail
 
+# ADR-0041 (2026-10-11): this script deploys the deprecated Knative/KEDA path. It receives
+# security and breakage fixes only; removal comes no earlier than end of October 2026, once
+# the remaining users have migrated. P6 is the primary runtime — docs/migrating-from-knative.md.
+echo "WARNING: the Knative/KEDA deployment path is deprecated (ADR-0041, 2026-10-11)." >&2
+echo "Fixes-only support; removal no earlier than end of October 2026, once users have migrated." >&2
+echo "P6 is the primary runtime - see docs/migrating-from-knative.md in the repo." >&2
+
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$0")"
 source ./lib.sh # NS, KSVC, set_ksvc_env

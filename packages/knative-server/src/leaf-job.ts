@@ -1,4 +1,9 @@
 // packages/knative-server/src/leaf-job.ts
+//
+// @deprecated ADR-0041 (2026-10-11): the KEDA ScaledJob drainer belongs to the deprecated
+// Knative/KEDA deployment path. It receives security and breakage fixes only; removal comes
+// no earlier than end of October 2026, once the remaining users have migrated — see
+// docs/migrating-from-knative.md. The P6 runtime serves turns from a warm worker pool instead.
 import { RedisWorkQueue } from '@moca/work-queue';
 import { processOne } from '@moca/harness/leaf-job-runner';
 import { runLeaf, leafSessionId, type LeafEnvelope } from '@moca/harness/run-leaf';
@@ -7,6 +12,7 @@ import { RedisResultStore, toResultRecord, writeResult } from '@moca/harness/lea
 // turn too (MI1 §5 R2-R4).
 import { prepareServerProcess } from './server-process.js';
 import { buildConfig } from './server.js';
+import { KNATIVE_DEPRECATION_NOTICE } from './deprecation.js';
 
 const MIN_IDLE_MS = 90_000;
 const MAX_ATTEMPTS = 3;
@@ -17,6 +23,10 @@ const RESULT_TTL_SECONDS = parseInt(process.env.LEAF_RESULT_TTL_SECONDS ?? '8640
 let queue: RedisWorkQueue | undefined;
 
 async function main(): Promise<void> {
+  // First statement, before any boot refusal: a KEDA pod that dies on a bad tenancy config or a
+  // dead Redis must still have said which path is deprecated (ADR-0041). Unconditional — this
+  // entrypoint only ever runs as a KEDA ScaledJob, so there is no P6 path to protect here.
+  console.warn(KNATIVE_DEPRECATION_NOTICE);
   // Before the queue is touched: refuse an inconsistent tenancy configuration, scrub ambient
   // credentials under multi tenancy, and give the process a private agent directory.
   prepareServerProcess(process.env);

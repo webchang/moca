@@ -1,6 +1,6 @@
 # ADR-0037: P6 on Kubernetes is a substrate, not the deprecated Knative path
 
-- **Status:** Proposed <!-- Proposed → Accepted → Superseded by ADR-NNNN / Deprecated -->
+- **Status:** Accepted <!-- Proposed → Accepted → Superseded by ADR-NNNN / Deprecated -->
 - **Date:** 2026-10-02
 - **Deciders:** MOCA team
 - **Spec:** [`../specs/2026-10-02-p6-on-kubernetes-slice1-design.md`](../specs/2026-10-02-p6-on-kubernetes-slice1-design.md)

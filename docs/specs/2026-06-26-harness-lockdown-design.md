@@ -10,7 +10,7 @@ it has no model-controlled egress surface — so it is defended by making any lo
 **unrewarding and unable to phone home**, not by mediating egress it never makes.
 Milestone relationship: **Refines the harness portion of parent M7/M8.** It _lightens_ M7 (no
 egress proxy for the harness) and sets up M8 (the provider-key injector, specified separately next).
-Parent design: [Zero-Trust, Multi-Agent Extensions to the Serverless Harness](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2 spine, §2.2 load-bearing claims, §3.1 inference broker, §4.1 invariants.
+Parent design: Zero-Trust, Multi-Agent Extensions to the Serverless Harness — §2 spine, §2.2 load-bearing claims, §3.1 inference broker, §4.1 invariants.
 Builds on / consumes: M2 ([`K8sSandboxClient`](2026-06-17-m2-k8s-sandbox-client-design.md)), M3 ([persistent channel](2026-06-17-m3-persistent-channel-design.md)), M4 ([Knative wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md)).
 Sibling: [M13 — Generalized Credentialed Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) (the **sandbox**'s heavyweight egress plane). This design explicitly argues that apparatus does **not** extend to the harness.
 
@@ -339,7 +339,7 @@ The harness lock-down passes when, on a Kind cluster with the zero-trust harness
 
 ## 9. References
 
-- [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2 spine, §2.2 the harness-holds-no-key claim this design preserves structurally, §3.1 inference broker (placement refined here), §4.1 log invariants + red-team grep.
+- Zero-Trust, Multi-Agent Extensions — §2 spine, §2.2 the harness-holds-no-key claim this design preserves structurally, §3.1 inference broker (placement refined here), §4.1 log invariants + red-team grep.
 - [M2 — `K8sSandboxClient`](2026-06-17-m2-k8s-sandbox-client-design.md) — the override-based tool redirection this design makes fail-closed; `extension.ts:47` gate; `grep-tool.ts` local-`rg` special case.
 - [M3 — Persistent channel](2026-06-17-m3-persistent-channel-design.md) — the transport the redirected tools ride.
 - [M4 — Knative wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md) — `runTurn`, the scale-to-zero deployment this posture applies to.

@@ -114,6 +114,14 @@ export async function promoteDirectory(
 
 const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 
+/** A bundle digest as the status line and toasts show it: the first 8 hex of `sha256:…`. */
+export const shortDigest = (digest: string) => digest.replace(/^sha256:/, '').slice(0, 8);
+
+/** The toast for the session a pending bundle was applied to, so a later /new is not mistaken for it. */
+export function describeBundleSession(r: Pick<PromoteResult, 'digest' | 'skills'>): string {
+  return `session started with config bundle ${shortDigest(r.digest)} — ${count(r.skills.length, 'skill')}`;
+}
+
 /** The one-line TUI toast for a promotion; `dir` is the directory as the user typed it. */
 export function describePromotion(
   r: Pick<PromoteResult, 'skills' | 'prompts' | 'warnings' | 'uploaded'>,

@@ -1,5 +1,8 @@
 # P4 microVM tier on a P6 host
 
+> **Preview.** The P4 microVM tier is implemented but not yet declared Stable; see "Limits" below. Labels are
+> explained in [Maturity and lifecycle](../../docs/reference/maturity-and-lifecycle.md).
+
 The P4 Firecracker `microvm-worker`, installed on the same KVM host as a P6 deployment
 (`deploy/vm/`). It attaches to P6's relay under its **own** relay token. Every tool call of every
 session then runs in a fresh Firecracker microVM (#274), over a per-session workspace at

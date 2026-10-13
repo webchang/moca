@@ -1,7 +1,7 @@
 # P3 — Sandbox Sharing-Ratio Experiments — Design
 
 Version: 1.0 — July 3, 2026
-Status: Design (approved for implementation planning)
+Status: Superseded by [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) — the pooled-pod sandbox model it measured belongs to the deprecated Knative path (2026-10-11)
 Scope: **Phase 3 (P3)** of the [two-tier FS-free harness epic](https://github.com/kagenti/serverless-harness/issues/49)
 ([P3 issue #48](https://github.com/kagenti/serverless-harness/issues/48)). Depends on **P2** (shared sandbox
 pool + routing, [#46](https://github.com/kagenti/serverless-harness/issues/46)) and **P0′** (OCP deploy,

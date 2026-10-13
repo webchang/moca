@@ -5,7 +5,7 @@ Status: Design (approved for implementation planning)
 Scope: Make cold-start session reconstruction O(tail) instead of O(total entries) by riding
 Pi's native compaction as the checkpoint, and cap runaway token spend with a budget voter.
 
-Parent plan: [Serverless Harness (Pi Track) Implementation Plan](../../../docs/research/2026-06-10-serverless-harness-pi-track-plan.md) — **Milestone M4, Tasks 13–14** ("Compaction-checkpoint fast path").
+Parent plan: Serverless Harness (Pi Track) Implementation Plan — **Milestone M4, Tasks 13–14** ("Compaction-checkpoint fast path").
 Predecessor: [M4 Design — Knative Serverless Wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md)
 
 > **Milestone numbering.** The repo numbers milestones sequentially and offset from the

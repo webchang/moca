@@ -3,7 +3,7 @@
 Version: 1.0 — June 16, 2026
 Status: Design (approved for implementation planning)
 Scope: Milestone 1 of the serverless harness — externalize Pi session state to Redis
-Parent plan: [Serverless Harness: Revised Plan](../../../docs/research/2026-06-10-serverless-harness-revised-plan.md) §4, §6 (M1)
+Parent plan: Serverless Harness: Revised Plan §4, §6 (M1)
 Discovery basis: [`NOTES-pi-sessionmanager.md`](../../packages/session-backend/NOTES-pi-sessionmanager.md) (pinned Pi commit `406a2214`)
 
 ---
@@ -255,7 +255,7 @@ confirming the headless one-shot entry point drives the externalized store end-t
 
 ## 8. References
 
-- Parent plan: [Serverless Harness: Revised Plan](../../../docs/research/2026-06-10-serverless-harness-revised-plan.md)
+- Parent plan: Serverless Harness: Revised Plan
 - Discovery: [`NOTES-pi-sessionmanager.md`](../../packages/session-backend/NOTES-pi-sessionmanager.md)
 - Pi session-storage proposal: [earendil-works/pi#2032](https://github.com/badlogic/pi-mono/issues/2032)
 - Pi faux provider: `pi-fork/packages/ai/src/providers/faux.ts`

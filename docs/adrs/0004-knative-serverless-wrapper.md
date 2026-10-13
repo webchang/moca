@@ -1,6 +1,6 @@
 # ADR-0004: Expose the harness as a scale-to-zero Knative HTTP service
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the Knative/KEDA deployment path is deprecated (2026-10-11)
 - **Date:** 2026-06-17
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-17-m4-knative-serverless-wrapper-design.md`](../specs/2026-06-17-m4-knative-serverless-wrapper-design.md)

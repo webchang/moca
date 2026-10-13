@@ -1,5 +1,10 @@
 # M2 K8sSandboxClient — real kind smoke
 
+> **Deprecated 2026-10-11 ([ADR-0041](../../docs/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> The `kubectl exec` sandbox transport (`KubectlTransport`) described here is deprecated: security and
+> breakage fixes only, removal no earlier than **end of October 2026**. Sandboxes run through the gRPC
+> relay on P6; see [Migrating off the Knative/KEDA deployment](../../docs/migrating-from-knative.md).
+
 End-to-end proof that the `@moca/k8s-sandbox` extension routes Pi tool execution
 into a remote Kubernetes pod (not the harness head). This is the real-cluster
 half of the M2 gate. It is a **manual runbook** (cluster + model gateway

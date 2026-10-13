@@ -1,6 +1,6 @@
 # ADR-0019: Durable RWO EBS Sandbox CR, non-root under nonroot-v2, for the OCP FS-free deployment
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the OCP Knative deployment is deprecated (2026-10-11); the supported OpenShift path is P6 on Kubernetes (deploy/k8s)
 - **Date:** 2026-07-02
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-07-02-p0prime-ocp-fs-free-deployment-design.md`](../specs/2026-07-02-p0prime-ocp-fs-free-deployment-design.md)

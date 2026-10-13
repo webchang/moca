@@ -1,5 +1,12 @@
 # Demo: "The agent that isn't there"
 
+> **This demo runs on the deprecated Knative/KEDA path**
+> ([ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md), 2026-10-11). It still works
+> during the deprecation window — fixes only, removal no earlier than end of October 2026 — but
+> new deployments should start from the P6 runtime: see
+> [Migrating off the Knative/KEDA deployment](../migrating-from-knative.md), and
+> [`vm-multi-user-demo.md`](./vm-multi-user-demo.md) for the current walkthrough.
+
 A 10-minute walkthrough that shows what a **serverless** AI agent does that a
 normal always-on agent _can't_. The task — a small security review of a repo —
 is just a vehicle. The real show is in your pod-watch pane: watch the agent

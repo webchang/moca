@@ -1,6 +1,6 @@
 # ADR-0003: Reuse a long-lived in-pod bash session for fast tool ops
 
-- **Status:** Implemented
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the Knative/KEDA deployment path is deprecated (2026-10-11)
 - **Date:** 2026-06-17
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-06-17-m3-persistent-channel-design.md`](../specs/2026-06-17-m3-persistent-channel-design.md)

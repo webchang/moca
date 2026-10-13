@@ -1,0 +1,84 @@
+# Writing and maintaining MOCA docs
+
+Conventions for anything under `docs/`, the READMEs and `deploy/*/README*.md`. They exist so the
+docs survive the move from the Knative/KEDA deployment to P6/P4 without another restructure. The
+plan behind them is [`REORG-PLAN.md`](REORG-PLAN.md).
+
+## Where things go
+
+| Content                                        | Home                                                                                  |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------- |
+| How to install or run one deployment path      | Next to its scripts: `deploy/<path>/README.md`                                        |
+| Which path to pick, cross-path overview        | `docs/get-started/`                                                                   |
+| One decision and its alternatives              | An ADR in `docs/adrs/` (immutable apart from the Status line and a Revisions section) |
+| A design and its reasoning                     | A spec in `docs/specs/`, registered in `docs/specs/README.md`                         |
+| Throwaway implementation checklist             | A plan; plans are local and gitignored (`docs/plans/README.md`)                       |
+| Working notes, runbooks, measurement write-ups | `docs/notes/`                                                                         |
+
+Do not put design reasoning in a how-to or install steps in a spec. Keep concept and reference
+content free of Knative/KEDA specifics: put substrate differences in a per-path table, or in a
+clearly marked "Legacy" note, so removing the Legacy path deletes a row instead of rewriting a page.
+
+## Maturity labels and banners
+
+Every install path, guide and reference page states **Stable**, **Preview** or **Legacy** (meanings
+in the [documentation map](index.md#maturity-labels)). The label must agree with the milestone
+registry; if it does not, fix the registry in the same change.
+
+Use these banners verbatim, changing only the bracketed parts.
+
+Legacy (matches the banners already on `deploy/knative/`):
+
+```markdown
+> **Deprecated 2026-10-11 ([ADR-0041](<relative path>/adrs/0041-deprecate-knative-keda-deployment.md)).**
+> <What this page describes> is deprecated: security and breakage fixes only, and removal comes no
+> earlier than **end of October 2026**, once the remaining users have migrated. P6, the
+> process-manager runtime, is the primary way to run MOCA sessions: see [Migrating off the Knative/KEDA
+> deployment](<relative path>/migrating-from-knative.md).
+```
+
+Preview:
+
+```markdown
+> **Preview.** <What this page describes> is implemented but not yet declared Stable; interfaces
+> and limits may change. Known limits: <link to the limits section or issues>.
+```
+
+Do not state a removal date or a support commitment that [ADR-0041](adrs/0041-deprecate-knative-keda-deployment.md)
+and the migration guide do not state.
+
+## Page conventions
+
+- **Prerequisites first.** A short block listing tools, versions and credentials. Do not repeat
+  another page's prerequisites; link to it and list only what differs.
+- **Verify and uninstall.** Every install page ends with a command whose output proves it works,
+  and a teardown.
+- **Tested-on stamp.** One line, `Tested on <environment>, <date>`, only for steps you ran.
+  Mark anything you did not run as _(unverified)_ rather than leaving it out.
+- **Command blocks.** One fenced block per step, `bash` language tag, copy-pasteable, no `$` prompt,
+  secrets as obvious placeholders. Show expected output separately.
+- **Environment variables.** Name the file each one lives in. Never document a secret as an env
+  line when the deployment loads it as a credential.
+- **Cite the source.** Claims about behavior name the file, spec section or issue they come from.
+
+## Terminology
+
+Use [the glossary](glossary.md) terms as defined: `session` (durable, owned, resumable), `turn`
+(one exchange), and not `run`. The product is **MOCA**; packages are `@moca/*`. Legacy names
+(`serverless-harness`, `SH_*`, `KAGENTI_*`, `@sh/*`) appear only where a variable or path still has
+that name, never in new prose. "P6" and "P4" are milestone IDs (process manager and microVM
+sandboxes); introduce them with that gloss on first use in a page.
+
+## Links
+
+- Use relative links to files that exist in this repository. Do not link into a parent monorepo.
+- Moving a file: `git mv` it, leave a one-line stub at the old path if anything links to it, and
+  fix inbound links in the same change.
+- Run `make check-links` before pushing; CI runs the same check.
+- Do not rename `docs/migrating-from-knative.md` before the Knative path is removed. Banners and
+  the runtime notice link to it.
+
+## Status vocabulary
+
+Specs and ADRs use `Proposed`, `Accepted`, `Implemented`, `Superseded by <link>` or `Deprecated`.
+When a design is replaced, mark the old one Superseded instead of deleting it.

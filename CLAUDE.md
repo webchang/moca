@@ -2,9 +2,11 @@
 
 ## Overview
 
-Cloud-native serverless runtime for AI agent sessions. Wraps the Pi AI framework
-with Knative Serving, Redis-backed session persistence, K8s sandbox execution,
-and budget-aware compaction checkpoints.
+Cloud-native runtime for AI agent sessions. Wraps the Pi AI framework with a P6
+process-manager supervisor (warm worker pool, L4 socket hand-off), Redis-backed session
+persistence, remote sandbox execution over a gRPC relay (container and per-`Exec` microVM
+tiers), and budget-aware compaction checkpoints. The legacy Knative/KEDA deployment is
+deprecated (ADR-0041; removal no earlier than end of October 2026).
 
 ## Repository Structure
 
@@ -12,8 +14,8 @@ and budget-aware compaction checkpoints.
 moca/
 ├── harness/              # Core harness runtime (@moca/harness)
 ├── packages/
-│   ├── k8s-sandbox/      # K8s pod exec client (@moca/k8s-sandbox)
-│   ├── knative-server/   # Knative HTTP entrypoint (@moca/knative-server)
+│   ├── k8s-sandbox/      # Sandbox transports (@moca/k8s-sandbox; K8s pod-exec half deprecated, ADR-0041)
+│   ├── knative-server/   # HTTP server + P6 worker entrypoints (@moca/knative-server; name historical — P6-load-bearing)
 │   ├── session-backend/  # Redis session storage (@moca/session-backend)
 │   ├── work-queue/       # Redis Streams work queue (@moca/work-queue)
 │   ├── sandbox-relay/    # gRPC relay between control plane and remote-worker sandboxes (@moca/sandbox-relay)
@@ -24,15 +26,15 @@ moca/
 │   └── mocactl/          # MOCA terminal client for the control plane (@moca/mocactl)
 ├── remote-worker/        # Go module: container + microVM sandbox workers, vmpoolctl
 ├── deploy/
-│   ├── knative/          # Kubernetes/Knative/KEDA deployment (experiment drivers moved to
-│   │                     # rossoctl/moca-experiments, 2026-09-25)
+│   ├── knative/          # Knative/KEDA deployment (DEPRECATED — ADR-0041, removal no earlier than end of Oct 2026)
+│   ├── k8s/              # P6 on Kubernetes/OpenShift (first-class, ADR-0037)
 │   ├── vm/               # P6 single-VM systemd deployment
 │   ├── microvm/          # P4 Firecracker microVM deployment
 │   ├── compose/          # Docker Compose trial of the P6 runtime (no root, five minutes)
 │   └── claude/           # Claude Code workflow-promotion tooling (the /promote command)
 ├── scripts/              # install-mocactl.sh: the one-line mocactl installer (curl | sh)
 ├── pi-fork/              # Git submodule: Pi AI framework (must be built)
-└── Dockerfile            # Container image (node:22-alpine)
+└── Dockerfile            # Container image (node:24-alpine)
 ```
 
 ## Key Commands

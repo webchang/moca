@@ -19,6 +19,13 @@
 
 set -euo pipefail
 
+# ADR-0041 (2026-10-11): this script deploys the deprecated Knative/KEDA path. It receives
+# security and breakage fixes only; removal comes no earlier than end of October 2026, once
+# the remaining users have migrated. P6 is the primary runtime — docs/migrating-from-knative.md.
+echo "WARNING: the Knative/KEDA deployment path is deprecated (ADR-0041, 2026-10-11)." >&2
+echo "Fixes-only support; removal no earlier than end of October 2026, once users have migrated." >&2
+echo "P6 is the primary runtime - see docs/migrating-from-knative.md in the repo." >&2
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ----------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # ADR-0027: RC1 control gate as IBAC-only, and Hop-2 egress interception over plain HTTP
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0041](0041-deprecate-knative-keda-deployment.md) — the K8s PoC deployment of the RC1 control gate is deprecated (2026-10-11). The control-gate design itself survives in the successor credential plane.
 - **Date:** 2026-07-10
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md`](../specs/2026-07-10-authbridge-egress-control-plane-poc-design.md)

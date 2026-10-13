@@ -11,7 +11,7 @@ Milestone: **Z1** (Phase 2). **Reframes the parent's M7** ("egress/identity spin
 gets a SPIFFE identity but **no egress waypoint** (Z2 §2.4 — its egress is fixed-destination); the
 per-user egress plane is the sandbox's (Z5).
 Source of truth for numbering: [Milestone Registry](README.md).
-Parent design: [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2.1 principle, §2.3 portable-core/kagenti-binding, §3.2/§3.4 identities for sandbox & subagents, §4.1 log invariants (refined here, §6).
+Parent design: Zero-Trust, Multi-Agent Extensions — §2.1 principle, §2.3 portable-core/kagenti-binding, §3.2/§3.4 identities for sandbox & subagents, §4.1 log invariants (refined here, §6).
 Consumed by: [Z2 Harness Lock-Down](2026-06-26-harness-lockdown-design.md) (harness SPIFFE id for mTLS to the injector; `pods/exec`-only RBAC), [Z3 Inference Injector](2026-06-26-inference-injector-design.md) (mTLS peer authz), [Z4 MCP code-mode](2026-06-18-m10-mcp-code-mode-design.md) + [Z5 Generalized Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) (per-user `(actor SVID ⊕ subject)` resolution).
 
 > **The one-sentence thesis.** Per-user isolation in a shared namespace, under scale-to-zero,
@@ -316,7 +316,7 @@ resolver, in **one shared namespace**:
 ## 13. References
 
 - [Milestone Registry](README.md) — Phase 2 numbering; Z1 supersedes parent M7.
-- [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2.1 principle, §2.3 portable-core/kagenti-binding, §3.2/§3.4 identities, §4.1 log invariants (refined §6 here).
+- Zero-Trust, Multi-Agent Extensions — §2.1 principle, §2.3 portable-core/kagenti-binding, §3.2/§3.4 identities, §4.1 log invariants (refined §6 here).
 - [Z2 Harness Lock-Down](2026-06-26-harness-lockdown-design.md) — `pods/exec`-only RBAC (the integrity invariant's enforcement), harness SPIFFE id.
 - [Z3 Inference Injector](2026-06-26-inference-injector-design.md) — the trivial (non-per-user) implementation of §4; mTLS peer authz.
 - [Z4 MCP code-mode](2026-06-18-m10-mcp-code-mode-design.md) / [Z5 Generalized Egress](2026-06-19-m13-generalized-credentialed-egress-design.md) — the full per-user `(actor SVID ⊕ subject)` implementation; the credential store Z1 depends on.

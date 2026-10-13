@@ -17,6 +17,7 @@ import {
   type Io,
 } from './headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
+import { cmdGet, cmdSpawn, cmdSubagents, runSpawnWorker } from './subagent.js';
 import { VERSION } from './version.js';
 
 export const USAGE = `usage:
@@ -38,6 +39,10 @@ export const USAGE = `usage:
   mocactl credentials add NAME --host HOST [--host HOST ...] [--kind KIND] [--consumer CONSUMER]
       [--endpoint URL] [--json]                  the secret is read from stdin
   mocactl credentials delete NAME [--json]
+  mocactl spawn "prompt" [--config DIGEST] --kind prompt|solve
+      [--repo URL --ref REF] [--tag T] [--json]   fork a detached subagent (solve needs --repo/--ref)
+  mocactl subagents [--tag T] [--json]            list spawned subagents + current state
+  mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
 flags for every command: --control-plane-url URL
   (the control plane says where the harness is; --harness-url URL overrides that)`;
 
@@ -99,6 +104,10 @@ export async function main(
         setup: { type: 'boolean' },
         'no-animation': { type: 'boolean' },
         'dry-run': { type: 'boolean' },
+        repo: { type: 'string' },
+        ref: { type: 'string' },
+        tag: { type: 'string' },
+        out: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'V' },
       },
@@ -127,24 +136,44 @@ export async function main(
   const json = values.json === true;
   const { signal } = deps;
   if (!(command === 'credentials' && rest[0] === 'add')) {
-    const stray = CREDENTIAL_FLAGS.find((f) => values[f] !== undefined);
+    // --kind is shared with `spawn` (prompt|solve); the other three remain credentials-only.
+    const stray = CREDENTIAL_FLAGS.filter((f) => !(f === 'kind' && command === 'spawn')).find(
+      (f) => values[f] !== undefined,
+    );
     if (stray) {
       io.err(`--${stray} only applies to \`mocactl credentials add\`\n${USAGE}`);
       return 2;
     }
   }
-  if (values.config !== undefined && command !== 'run') {
-    io.err(`--config only applies to \`mocactl run\`\n${USAGE}`);
+  if (values.config !== undefined && command !== 'run' && command !== 'spawn') {
+    io.err(`--config only applies to \`mocactl run\` and \`mocactl spawn\`\n${USAGE}`);
     return 2;
   }
   if (values.all !== undefined && command !== 'logout') {
     io.err(`--all only applies to \`mocactl logout\`\n${USAGE}`);
     return 2;
   }
+  if ((values.repo !== undefined || values.ref !== undefined) && command !== 'spawn') {
+    io.err(`--repo and --ref only apply to \`mocactl spawn\`\n${USAGE}`);
+    return 2;
+  }
+  if (values.tag !== undefined && command !== 'spawn' && command !== 'subagents') {
+    io.err(`--tag only applies to \`mocactl spawn\` and \`mocactl subagents\`\n${USAGE}`);
+    return 2;
+  }
+  if (values.out !== undefined && command !== 'get') {
+    io.err(`--out only applies to \`mocactl get\`\n${USAGE}`);
+    return 2;
+  }
   // B14: refresh an expired API token once, up front, so every command's login check -- and the
   // interactive login screen -- sees the refreshed login rather than asking for a new one. `login`,
-  // `logout` and `auth` manage the login themselves.
-  if (rt.endpoints.controlPlaneUrl && !['login', 'logout', 'auth'].includes(command ?? '')) {
+  // `logout` and `auth` manage the login themselves. `__spawn-worker` is the detached child of
+  // `spawn`: it is handed its session token on stdin and does not need the user's API token or
+  // refresh flow.
+  if (
+    rt.endpoints.controlPlaneUrl &&
+    !['login', 'logout', 'auth', '__spawn-worker'].includes(command ?? '')
+  ) {
     await ensureRuntimeAuth(rt);
   }
   switch (command) {
@@ -240,6 +269,46 @@ export async function main(
         readStdin,
         stdinIsTTY: deps.stdinIsTTY === true,
       });
+    }
+    case 'spawn': {
+      const prompt = rest.join(' ').trim();
+      if (!prompt) {
+        io.err(`spawn needs a prompt\n${USAGE}`);
+        return 2;
+      }
+      const kind = values.kind;
+      if (kind !== 'prompt' && kind !== 'solve') {
+        io.err(`--kind must be prompt or solve\n${USAGE}`);
+        return 2;
+      }
+      if (values.config !== undefined && values.config.trim() === '') {
+        io.err(`--config needs a bundle digest (sha256:…); omit it to run without one\n${USAGE}`);
+        return 2;
+      }
+      return cmdSpawn(rt, io, {
+        prompt,
+        kind,
+        configRef: values.config,
+        repoUrl: values.repo,
+        ref: values.ref,
+        tag: values.tag,
+        json,
+      });
+    }
+    case 'subagents': {
+      if (rest.length > 0) return usage(io);
+      return cmdSubagents(rt, io, { tag: values.tag, json, signal });
+    }
+    case 'get': {
+      const [sid, ...extra] = rest;
+      if (sid === undefined || extra.length > 0) return usage(io);
+      return cmdGet(rt, io, { sessionId: sid, outDir: values.out, json, signal });
+    }
+    // Hidden entrypoint: the detached worker forked by `mocactl spawn` re-execs itself with this
+    // subcommand, reads its payload from stdin, and writes the result to the ledger. Not in USAGE
+    // because end users should never run it directly.
+    case '__spawn-worker': {
+      return runSpawnWorker(rt);
     }
     case undefined:
       if (!deps.startInteractive) {

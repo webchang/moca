@@ -6,8 +6,9 @@
 #
 # Scope, mirroring the control-plane document's own boundary note: only the client-facing
 # surface. The handler also serves the workload lifecycle (/workloads — off unless the operator
-# enables it, see docs/context-service.md) and the pre-/v1 wire paths (/turn, /runs, /run-leaf*) — all listed in src/routes.ts as
-# surface: 'internal' and deliberately not described here. /runs/status has no /v1 form; it is
+# enables it, see docs/context-service.md) and the pre-/v1 wire paths (/turn, /runs,
+# /run-leaf*) — all listed in src/routes.ts as surface: 'internal' and deliberately not described
+# here. /runs/status has no /v1 form; it is
 # the canonical path.
 openapi: 3.1.0
 info:
@@ -405,9 +406,11 @@ paths:
         would spend the operator's key for a user. Owned asynchronous runs are MU2's.
 
         `sandboxPoolSelector` is internal routing state and is deleted at the request boundary —
-        never settable by an external caller. A run naming a `workloadId` is refused with 501
-        workload_runs_unavailable rather than run on the default pool: delivering a workload's
-        context to the sandbox is a later change (docs/context-service.md).
+        never settable by an external caller. A synchronous prompt run naming a `workloadId` runs
+        with that workload's frozen context, which Moca copies read-only into the sandbox; the
+        session token's user must own the workload (docs/context-service.md). With workloads off,
+        or for an async run, it is refused with 501 workload_runs_unavailable rather than run on
+        the default pool.
       security:
         - sessionToken: []
       requestBody:
@@ -433,7 +436,8 @@ paths:
             names the field) · tenant_not_allowed (an authenticated caller named a tenant) ·
             session_mismatch · subject_conflict · credential_required · credential_ambiguous ·
             endpoint_unresolved (the control-plane exchange refused the caller's credential or
-            its endpoint)
+            its endpoint) · workload_run_requires_prompt (a run naming a workloadId must be a
+            prompt run)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -445,7 +449,13 @@ paths:
         '404':
           description: |
             session_not_found / credential_not_found — the control-plane exchange refused the
-            token's session or subject.
+            token's session or subject. workload_not_found — the named workload does not exist
+            or belongs to another user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: workload_not_ready — the named workload has not been activated.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -454,7 +464,7 @@ paths:
             async_runs_unavailable — async: true with a token-bearing caller. Not a capability
             this deployment grants; a token-less caller on a require-auth deployment never
             reaches it (401 token_required fires first). workload_runs_unavailable — the
-            envelope named a workloadId; runs on a workload are not available yet.
+            envelope named a workloadId, but workloads are off or the run is async.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

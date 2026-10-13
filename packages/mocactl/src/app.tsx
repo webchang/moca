@@ -14,9 +14,11 @@ import { apiTokenValid, loginExpiryMinutes } from './core/auth.js';
 import { collectBannerInfo, type BannerInfo } from './core/banner.js';
 import { describeError } from './core/messages.js';
 import {
+  describeBundleSession,
   describePromotion,
   promoteDirectory,
   PromoteError,
+  shortDigest,
   type PromoteResult,
 } from './core/promote.js';
 import { sanitizeRemote } from './core/sanitize.js';
@@ -64,6 +66,8 @@ interface Attached {
   session?: ActiveSession;
   initial: BlockState;
   initialUsage?: Usage;
+  /** The session's config bundle digest, fixed for its life; shown so it is never a guess. */
+  configRef?: string;
 }
 const DETACHED: Attached = { initial: EMPTY_BLOCKS };
 
@@ -349,17 +353,18 @@ export function App({ rt, opts, env, os, write }: AppProps) {
       const prompt = pendingRef.current;
       sendOnAttach.current = prompt;
       attach(
-        { session: s, initial: EMPTY_BLOCKS },
+        { session: s, initial: EMPTY_BLOCKS, configRef: bundle?.digest },
         prompt ? deriveTitle(prompt) : undefined,
         prompt ? [prompt] : [],
       );
       close();
+      if (bundle) notify(describeBundleSession(bundle));
     } finally {
       busy.current = false;
     }
   };
 
-  const resume = (id: string) =>
+  const resume = (id: string, configRef?: string | null) =>
     leave(() => {
       void (async () => {
         if (busy.current) return;
@@ -382,9 +387,11 @@ export function App({ rt, opts, env, os, write }: AppProps) {
             lastEventId: t?.lastEventId,
             expectOpen: t ? lastTurnState(t) === 'open-detachable' : false,
           };
-          attach({ session: s, initial, initialUsage: t?.usage }, t?.title ?? id.slice(0, 8), [
-            ...(t?.prompts ?? []),
-          ]);
+          attach(
+            { session: s, initial, initialUsage: t?.usage, configRef: configRef ?? undefined },
+            t?.title ?? id.slice(0, 8),
+            [...(t?.prompts ?? [])],
+          );
           close();
         } catch (err) {
           if (!loginIfExpired(err, { name: 'sessions' })) notify(describeError(err), 'error');
@@ -641,6 +648,9 @@ export function App({ rt, opts, env, os, write }: AppProps) {
         ? [{ key: 'subject' as const, text: rt.auth.displayName ?? rt.auth.subject }]
         : []),
       { key: 'title', text: title ?? (session ? session.sessionId.slice(0, 8) : 'no session') },
+      ...(session && attached.configRef
+        ? [{ key: 'bundle' as const, text: `bundle ${shortDigest(attached.configRef)}` }]
+        : []),
       { key: 'turn', text: describeTurn(view.turn, now) + (leader ? ' · ctrl+x …' : '') },
       ...(view.usage.total > 0 ? [{ key: 'usage' as const, text: formatUsage(view.usage) }] : []),
       ...(expiresIn ? [{ key: 'warning' as const, text: `login expires in ${expiresIn}m` }] : []),

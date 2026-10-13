@@ -23,6 +23,17 @@ describe('errorFromResponse', () => {
     expect(e.code).toBe('http_502');
     expect(e.retryAfterS).toBeUndefined();
   });
+
+  it("reads body.reason when body.error is absent so {status:'failed', reason:'saturated'} maps to code=saturated", async () => {
+    // /runs reports failures as {status:'failed', reason:'<code>'}; the client's err.code check
+    // (e.g. the worker's saturated-retry guard) needs the semantic code regardless of body shape.
+    const e = await errorFromResponse(
+      'harness',
+      json({ status: 'failed', reason: 'saturated' }, 503, { 'retry-after': '2' }),
+    );
+    expect(e.code).toBe('saturated');
+    expect(e.retryAfterS).toBe(2);
+  });
 });
 
 describe('classify', () => {

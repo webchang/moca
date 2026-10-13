@@ -6,7 +6,7 @@ Scope: How MCP tool calls are originated in the serverless harness — as **code
 runs in the sandbox**, not as harness-native tool calls and not through a standalone
 terminating gateway — and the **credential/identity model** that injects per-user,
 unattended-session credentials at egress.
-Parent design: [Zero-Trust, Multi-Agent Extensions to the Serverless Harness](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) §3.3 (MCP servers — gateway invocation), M10; §2 spine; M7–M9 credential plane
+Parent design: Zero-Trust, Multi-Agent Extensions to the Serverless Harness §3.3 (MCP servers — gateway invocation), M10; §2 spine; M7–M9 credential plane
 Builds on: M1 (Redis session backend), M2 (`K8sSandboxClient`), M3 (persistent channel), M4 (Knative wrapper)
 
 > **Supersedes §3.3 of the parent design.** The parent doc chose a dedicated MCP gateway
@@ -399,7 +399,7 @@ extension, and the M7–M9 identity plane deployed:
 
 ## 12. References
 
-- [Zero-Trust, Multi-Agent Extensions](../../../docs/research/2026-06-18-zero-trust-multiagent-harness-extension.md) — §2 spine, §3.2 sandbox egress, §3.3 (superseded here), §3.4 subagents, §4.1 invariants, M7–M9 credential plane.
+- Zero-Trust, Multi-Agent Extensions — §2 spine, §3.2 sandbox egress, §3.3 (superseded here), §3.4 subagents, §4.1 invariants, M7–M9 credential plane.
 - [M2 Design — K8sSandboxClient](2026-06-17-m2-k8s-sandbox-client-design.md) — Operations redirection to the pod (the path code-mode rides).
 - [M4 Design — Knative Serverless Wrapper](2026-06-17-m4-knative-serverless-wrapper-design.md) — `runTurn`, the budget voter this design widens.
 - Pi harness — [earendil-works/pi](https://github.com/earendil-works/pi): native Bash/Write/Read Operations; MCP client absent at pin `406a2214`.
