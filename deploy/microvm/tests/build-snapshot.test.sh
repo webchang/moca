@@ -1817,5 +1817,45 @@ check "assemble_rootfs calls install_egress_ca only when the flag is set" \
   "$(fn_body assemble_rootfs | grep -cF '[ -n "$EGRESS_CA" ] && install_egress_ca')" "1"
 rm -rf "$EGT"
 
+echo "== --skip-git-identity-check and --guest-home are opt-in and off by default"
+# Images that refuse agent commits on purpose (benchmark testbeds: the patch must stay a diff
+# against an untouched baseline) carry no git identity, and the guest's HOME is otherwise the
+# kernel's HOME=/ on a read-only rootfs. Both flags exist for that; neither may change a default
+# build.
+usage_text="$(bash "$SCRIPT" --help 2>&1)"
+check "usage names --skip-git-identity-check" \
+  "$(printf '%s' "$usage_text" | grep -c -- '--skip-git-identity-check')" "2"
+check "usage names --guest-home" \
+  "$(printf '%s' "$usage_text" | grep -c -- '--guest-home')" "2"
+check "the identity check is skipped only behind the flag" \
+  "$(printf '%s' "$gitid_body" | grep -c 'if \[ "\$SKIP_GIT_IDENTITY_CHECK" = 1 \]; then')" "1"
+check "the skip is logged, never silent" \
+  "$(printf '%s' "$gitid_body" | grep -c 'log "skipping the git identity check')" "1"
+check "by default the identity check is required" \
+  "$(grep -c '^SKIP_GIT_IDENTITY_CHECK=0$' "$SCRIPT")" "1"
+check "by default no HOME is set for the guest" "$(grep -c '^GUEST_HOME=""$' "$SCRIPT")" "1"
+check "the HOME insertion is guarded by --guest-home" \
+  "$(grep -c '^  if \[ -n "\$GUEST_HOME" \]; then$' "$SCRIPT")" "1"
+rc=0
+out="$(bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --guest-home /home/x 2>&1)" || rc=$?
+check "a --guest-home outside /tmp is refused before any build step (exit 2)" "$rc" "2"
+check "the refusal names the rule" \
+  "$(printf '%s' "$out" | grep -c 'must be a path under /tmp')" "1"
+# The insertion itself, with the same sed the script runs. GNU sed only: the script runs on the
+# KVM host (Linux), and BSD sed's `a` syntax differs.
+if sed --version >/dev/null 2>&1; then
+  t="$(mktemp)"
+  printf '#!/bin/sh\nmount -t tmpfs -o mode=1777 tmpfs /tmp\nexport PATH=/usr/bin:/bin\nexec agent\n' >"$t"
+  GUEST_HOME=/tmp/home
+  sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
+export HOME=$GUEST_HOME" "$t"
+  check "init gets mkdir + export HOME right after PATH" \
+    "$(sed -n '4,5p' "$t" | tr '\n' '|')" "mkdir -p /tmp/home|export HOME=/tmp/home|"
+  check "init still execs the agent last" "$(tail -1 "$t")" "exec agent"
+  rm -f "$t"
+else
+  echo "  skip: the init insertion check needs GNU sed (runs on the KVM host)"
+fi
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
