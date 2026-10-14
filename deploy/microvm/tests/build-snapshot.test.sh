@@ -1857,5 +1857,20 @@ else
   echo "  skip: the init insertion check needs GNU sed (runs on the KVM host)"
 fi
 
+echo "== --vcpus is opt-in, default 1, validated, and reaches both VMMs and the manifest"
+usage_text="$(bash "$SCRIPT" --help 2>&1)"
+check "usage names --vcpus" "$(printf '%s' "$usage_text" | grep -c -- '--vcpus')" "2"
+check "by default the guest has 1 vCPU" "$(grep -c '^VCPUS=1$' "$SCRIPT")" "1"
+check "firecracker's machine-config takes the count" "$(grep -c 'vcpu_count\\":\$VCPUS' "$SCRIPT")" "1"
+check "no hardcoded vcpu_count is left" "$(grep -c 'vcpu_count\\":1' "$SCRIPT")" "0"
+check "cloud-hypervisor's --cpus takes the count" "$(grep -c -- '--cpus boot=\$VCPUS' "$SCRIPT")" "1"
+check "the manifest records it" "$(grep -c '"vcpus": \$VCPUS,' "$SCRIPT")" "1"
+for bad in 0 33 two -1; do
+  rc=0
+  out="$(bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --vcpus "$bad" 2>&1)" || rc=$?
+  check "--vcpus $bad is refused before any build step (exit 2)" "$rc" "2"
+done
+check "the refusal names the rule" "$(printf '%s' "$out" | grep -c 'from 1 to 32')" "1"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

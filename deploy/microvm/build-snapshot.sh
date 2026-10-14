@@ -132,13 +132,17 @@ EGRESS_CA=""
 # read-only rootfs. See check_git_identity and assemble_rootfs.
 SKIP_GIT_IDENTITY_CHECK=0
 GUEST_HOME=""
+# VCPUS: the guest's vCPU count, recorded in the manifest. Default 1, exactly as before; a
+# benchmark comparing this tier with containers of N CPUs builds with --vcpus N so the comparison
+# measures the tier, not the CPU count. Restore takes the count from the snapshot itself.
+VCPUS=1
 
 usage() {
   cat >&2 <<'USAGE'
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR] [--egress-ca PATH]
-                  [--skip-git-identity-check] [--guest-home /tmp/DIR]
+                  [--skip-git-identity-check] [--guest-home /tmp/DIR] [--vcpus 1]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
 restore requires identical hardware and software). --instance-type is an OVERRIDE:
@@ -160,6 +164,8 @@ artifact works.
 --guest-home /tmp/DIR      export HOME=DIR to guest commands, created by init on the /tmp
                            tmpfs (default: unset, so commands see the kernel's HOME=/ on a
                            read-only rootfs). Must be a path under /tmp.
+--vcpus N                  the guest's vCPU count, 1-32 (default 1, as before), recorded in the
+                           manifest; every VM restored from the snapshot has it.
 USAGE
   exit 2
 }
@@ -208,6 +214,10 @@ while [ $# -gt 0 ]; do
       ;;
     --guest-home)
       GUEST_HOME="${2:-}"
+      shift 2
+      ;;
+    --vcpus)
+      VCPUS="${2:-}"
       shift 2
       ;;
     -h | --help)
@@ -262,6 +272,11 @@ esac
 # anywhere else would be read-only or vanish; the pattern keeps it one plain directory path.
 if [ -n "$GUEST_HOME" ] && ! printf '%s' "$GUEST_HOME" | grep -Eq '^/tmp(/[A-Za-z0-9._-]+)+$'; then
   echo "build-snapshot.sh: --guest-home must be a path under /tmp (e.g. /tmp/home), got '$GUEST_HOME'" >&2
+  exit 2
+fi
+
+if ! printf '%s' "$VCPUS" | grep -Eq '^([1-9]|[12][0-9]|3[0-2])$'; then
+  echo "build-snapshot.sh: --vcpus must be an integer from 1 to 32, got '$VCPUS'" >&2
   exit 2
 fi
 
@@ -1591,7 +1606,7 @@ boot_quiesce_snapshot_firecracker() {
   api_put "$api_sock" /vsock \
     "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
   api_put "$api_sock" /machine-config \
-    "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":1}"
+    "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":$VCPUS}"
   api_put "$api_sock" /actions '{"action_type":"InstanceStart"}'
 
   wait_for_agent "$vsock_uds" "$console_log"
@@ -1751,7 +1766,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --vsock "cid=3,socket=/vsock.sock" \
     --fs "tag=workspace,socket=/fs.sock" \
     --memory "size=${GUEST_RAM_MB}M,shared=on" \
-    --cpus boot=1 \
+    --cpus boot=$VCPUS \
     --console "file=/console.log" \
     --serial off \
     </dev/null >/dev/null 2>&1 &
@@ -1845,6 +1860,7 @@ write_manifest() {
   "instance_type": "$INSTANCE_TYPE",
   "kernel_release": "$(uname -r)",
   "guest_ram_mb": $GUEST_RAM_MB,
+  "vcpus": $VCPUS,
   "capabilities": [$caps_json],
   "built_at": "$built_at",
   "kernel_sha256": "$khash",
