@@ -562,6 +562,25 @@ assemble_rootfs() {
   cp -a "$ROOTFS/." "$STAGE/rootfs-tree/"
   mkdir -p "$STAGE/rootfs-tree/usr/local/bin" "$STAGE/rootfs-tree/sbin" \
     "$STAGE/rootfs-tree/tmp" "$STAGE/rootfs-tree/var" "$STAGE/rootfs-tree/workspace"
+  # NEVER WRITE THROUGH THE IMAGE'S SYMLINKS. The tree is an image's filesystem, and paths in it
+  # resolve on THIS host: Ubuntu-based images ship /sbin/init -> /lib/systemd/systemd (absolute), so
+  # writing "$tree/sbin/init" opened the BUILD HOST's systemd (found 2026-10-14 on a moca-microvm
+  # image: "Text file busy" stopped it only because that file was running; a host file that was not
+  # running would have been overwritten as root). So: the directories we write into must resolve
+  # inside the tree, and the files we write are unlinked first, which replaces a symlink rather than
+  # following it.
+  local tree_real d
+  tree_real="$(realpath -e "$STAGE/rootfs-tree")"
+  for d in sbin usr/local/bin; do
+    case "$(realpath -e "$STAGE/rootfs-tree/$d")/" in
+      "$tree_real"/*) ;;
+      *)
+        echo "build-snapshot.sh: the rootfs's /$d resolves outside the tree ($(realpath -e "$STAGE/rootfs-tree/$d")); refusing to write through it" >&2
+        exit 1
+        ;;
+    esac
+  done
+  rm -f "$STAGE/rootfs-tree/sbin/init" "$STAGE/rootfs-tree/usr/local/bin/agent"
   install -m 0555 "$STAGE/agent" "$STAGE/rootfs-tree/usr/local/bin/agent"
 
   # A minimal init: mount the ephemeral filesystems every run needs writable, then

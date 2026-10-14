@@ -1671,5 +1671,24 @@ for bad in 0 33 two -1; do
 done
 check "the refusal names the rule" "$(printf '%s' "$out" | grep -c 'from 1 to 32')" "1"
 
+echo "== assemble_rootfs never writes through the image's symlinks"
+# An image's /sbin/init is commonly an ABSOLUTE symlink (/lib/systemd/systemd); writing through it
+# hits the build host's file. The fix unlinks the targets first and refuses out-of-tree directories.
+asm_body="$(sed -n '/^assemble_rootfs() {/,/^}/p' "$SCRIPT")"
+check "init and agent are unlinked before they are written" \
+  "$(printf '%s' "$asm_body" | grep -c 'rm -f "$STAGE/rootfs-tree/sbin/init" "$STAGE/rootfs-tree/usr/local/bin/agent"')" "1"
+unlink_line=$(printf '%s\n' "$asm_body" | grep -n 'rm -f "$STAGE/rootfs-tree/sbin/init"' | cut -d: -f1)
+write_line=$(printf '%s\n' "$asm_body" | grep -n 'cat >"$STAGE/rootfs-tree/sbin/init"' | cut -d: -f1)
+check "the unlink comes before the write" "$([ "$unlink_line" -lt "$write_line" ] && echo yes || echo no)" "yes"
+check "sbin and usr/local/bin must resolve inside the tree" \
+  "$(printf '%s' "$asm_body" | grep -c 'refusing to write through it')" "1"
+# The mechanism itself, on a scratch tree: an absolute symlink is replaced, its target untouched.
+t="$(mktemp -d)"; mkdir -p "$t/host" "$t/tree/sbin"; printf 'HOST\n' >"$t/host/init"
+ln -s "$t/host/init" "$t/tree/sbin/init"
+rm -f "$t/tree/sbin/init"; printf 'GUEST\n' >"$t/tree/sbin/init"
+check "the host file behind the symlink is untouched" "$(cat "$t/host/init")" "HOST"
+check "the tree gets a regular file" "$([ -f "$t/tree/sbin/init" ] && [ ! -L "$t/tree/sbin/init" ] && echo yes || echo no)" "yes"
+rm -rf "$t"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
