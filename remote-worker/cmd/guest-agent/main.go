@@ -29,6 +29,11 @@ func main() {
 	)
 	flag.Parse()
 
+	// Before the snapshot is taken, so every restored VM has a working loopback. A failure is
+	// logged, not fatal: commands that never touch 127.0.0.1 still work.
+	if err := guestagent.BringUpLoopback(); err != nil {
+		log.Printf("guest-agent: %v", err)
+	}
 	if err := os.MkdirAll(*scratchDir, 0o700); err != nil {
 		log.Fatalf("guest-agent: scratch %s: %v", *scratchDir, err)
 	}
