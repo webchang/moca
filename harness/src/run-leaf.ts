@@ -107,10 +107,15 @@ export interface LeafEnvelope {
    */
   internalContext?: {
     revision: string;
-    /** Opaque per-owner namespace (32 hex chars) that keeps each user's sandbox cache separate. */
-    ownerScope: string;
+    /**
+     * Opaque, unguessable per-owner name (32 hex chars) for this user's copies in the sandbox's
+     * context cache. Not the scope of the owner's workload records in Redis.
+     */
+    cacheScope: string;
     /** Fetches the frozen bundle; called only when the selected sandbox lacks the revision. */
     loadBundle: () => Promise<Buffer>;
+    /** Give the run its own writable copy of the context, removed when the run ends. */
+    writable?: boolean;
   };
   item: LeafItem; // inputs inline (was inputsRef)
   decision?: Decision; // resume/approve only (was decisionRef)
@@ -450,11 +455,12 @@ async function runPromptLeaf(
       }, promptTimings.heartbeatMs);
     }
     if (env.internalContext) {
-      const { revision, ownerScope, loadBundle } = env.internalContext;
+      const { revision, cacheScope, loadBundle, writable } = env.internalContext;
       if (
         !/^[a-f0-9]{64}$/.test(revision) ||
-        !/^[a-f0-9]{32}$/.test(ownerScope) ||
-        typeof loadBundle !== 'function'
+        !/^[a-f0-9]{32}$/.test(cacheScope) ||
+        typeof loadBundle !== 'function' ||
+        (writable !== undefined && typeof writable !== 'boolean')
       ) {
         return { status: 'failed', reason: 'error', message: 'invalid internal context reference' };
       }
@@ -467,13 +473,14 @@ async function runPromptLeaf(
           message: 'a workload run requires a P6 relay sandbox',
         };
       }
-      contextKey = contextCacheKey(ownerScope, revision);
+      contextKey = contextCacheKey(cacheScope, revision);
       try {
         contextPath = await (deps?.overlayContext ?? overlayContext)(
           selected.transport,
           contextKey,
           sid,
           loadBundle,
+          { writable: writable === true },
         );
       } catch (err) {
         return {
@@ -511,7 +518,7 @@ async function runPromptLeaf(
     }
     const r: TurnResult = await exec({
       prompt: contextPath
-        ? `${env.prompt}\n\nThe workload's frozen context is available read-only at ${contextPath}.`
+        ? `${env.prompt}\n\n${contextNote(contextPath, env.internalContext?.writable === true)}`
         : env.prompt,
       sessionId: env.sessionId,
       config,
@@ -547,6 +554,15 @@ async function runPromptLeaf(
     if (selected) await selected.release();
     if (selected?.transport) await selected.transport.close();
   }
+}
+
+/** The line appended to a workload run's prompt that tells the agent where its context is. */
+export function contextNote(path: string, writable: boolean): string {
+  return writable
+    ? `The workload's context is copied to ${path} for this run. The copy is writable and is ` +
+        'discarded when the run ends, so return any changes you make, such as a diff or test ' +
+        'output, in your response.'
+    : `The workload's frozen context is available read-only at ${path}.`;
 }
 
 // Real solve runner: lease a sandbox, converge the per-leaf worktree, run the agent with ONLY the

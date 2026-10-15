@@ -869,8 +869,19 @@ grep -qF 'ip saddr 10.89.40.0/24 counter drop' "$NFT" ||
 if grep -E 'accept' "$NFT" | grep -vE 'ct state established,related accept|policy accept' | grep -vqF 'ip saddr'; then
   fail "an accept rule without ip saddr would admit IPv6 from the sandbox bridge: $(cat "$NFT")"
 fi
-grep -q 'hook input' "$NFT" || fail "the table must filter traffic TO the host (input), not forwarding"
-grep -q 'hook forward' "$NFT" && fail "S1 must not filter forwarded (internet) traffic; that is S5's"
+grep -q 'hook input' "$NFT" || fail "the table must filter traffic TO the host (input)"
+# The forward chain exists to block cloud instance metadata (rossoctl/moca#357): forwarded
+# traffic is the path a sandbox takes to 169.254.169.254, which on a cloud VM can hand out the
+# instance role's credentials. It must drop exactly the link-local metadata destinations and
+# nothing else -- general internet egress stays untouched until S5's moca-egress.
+grep -q 'hook forward' "$NFT" || fail "the table must filter forwarded traffic: metadata is reachable through the forward path otherwise: $(cat "$NFT")"
+grep -qF 'iifname "moca-sandbox0" ip daddr 169.254.0.0/16 counter drop' "$NFT" ||
+  fail "the forward chain must drop IPv4 link-local (169.254.0.0/16 carries 169.254.169.254) from the sandbox bridge: $(cat "$NFT")"
+grep -qF 'iifname "moca-sandbox0" ip6 daddr fd00:ec2::254 counter drop' "$NFT" ||
+  fail "the forward chain must drop the IPv6 metadata address fd00:ec2::254 from the sandbox bridge: $(cat "$NFT")"
+fwd_body="$(sed -n '/chain forward {/,/^  }$/p' "$NFT" | sed '1d;$d' | sed '/type filter hook forward/d')"
+[[ "$(grep -c . <<<"$fwd_body")" -eq 2 ]] ||
+  fail "the forward chain must contain only the two link-local drops; any other rule there would filter general egress, which is S5's moca-egress work: $(cat "$NFT")"
 grep -q 'nft -f' "$MOCK_LOG" || fail "install_sandbox_firewall must load the table now: $(cat "$MOCK_LOG")"
 grep -q 'systemctl enable moca-sandbox-firewall.service' "$MOCK_LOG" ||
   fail "the firewall unit must be enabled so the table survives a reboot: $(cat "$MOCK_LOG")"

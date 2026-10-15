@@ -44,7 +44,13 @@ resolved, and a bad digest comes back as a 200 `failed` result with reason `erro
 **`tenant`** is accepted only from unauthenticated callers: an authenticated `/runs` that sends it gets
 400 `tenant_not_allowed`.
 
-`workloadId` returns 501 `workload_runs_unavailable`, after the envelope and `configRef` checks pass.
+`workloadId` runs a synchronous prompt on that workload's frozen context (see
+[Context Service and workloads](../context-service.md#runs)). An async run that names one, and any
+run while workloads are off, returns 501 `workload_runs_unavailable`, unless the deployment requires
+a token and none was sent (401 `token_required` first). `contextWritable: true` gives that run its
+own writable copy of the context, discarded when the run ends. It must be a boolean (400
+`context_writable_invalid`), and `true` needs a `workloadId` (400
+`context_writable_requires_workload`); `false` is ignored.
 
 `sessionId` is mapped to a safe internal id: a `tenant/` prefix if any, every character outside
 `[A-Za-z0-9._-]` becomes `-`, and leading and trailing non-alphanumerics are trimmed.
@@ -113,7 +119,8 @@ To resolve it, re-POST the **same envelope** to `/v1/runs` with an inline decisi
 ## Async and scheduled dispatch
 
 `async: true` and the cron on-ramp exist only on the deprecated Knative/KEDA path. On P6, `async: true`
-with a token returns 501 `async_runs_unavailable`. See
+with a token returns 501 `async_runs_unavailable` (or `workload_runs_unavailable` when it names a
+`workloadId`). See
 [the migration guide](../migrating-from-knative.md#if-you-depend-on-async-fan-out-or-the-cronjob).
 
 ## Spec drift

@@ -19,7 +19,8 @@ All flags are accepted by one parser. An unknown flag, or a missing flag value, 
 exits 2. Some flags are always rejected (exit 2) outside their command: `--consumer`, `--host` and
 `--endpoint` outside `credentials add`; `--kind` outside `credentials add` and `spawn`; `--config`
 outside `run` and `spawn`; `--repo` and `--ref` outside `spawn`; `--tag` outside `spawn` and
-`subagents`; `--out` outside `get`; and `--all` outside `logout`. Other flags a command does not use
+`subagents`; `--out` outside `get`; `--workload` outside `spawn`; `--context` and `--name` outside
+`workloads create`; and `--all` outside `logout`. Other flags a command does not use
 are not rejected and may be ignored.
 
 ## Endpoints
@@ -73,6 +74,9 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 | `mocactl spawn "prompt" [--config DIGEST] --kind prompt\|solve [--repo URL --ref REF] [--tag T] [--json]`                         | Creates a session, writes a ledger record, forks a detached worker that holds a `POST /v1/runs`. Prints the sessionId on stdout             |
 | `mocactl subagents [--tag T] [--json]`                                                                                            | Lists spawned subagents from the ledger joined with `GET /runs/status`                                                                      |
 | `mocactl get SESSIONID [--out DIR] [--json]`                                                                                      | Fetches a terminal result from `GET /runs/status` and writes `<sid>.text` / `<sid>.verdict.json` / `<sid>.patch`                            |
+| `mocactl workloads create --context FILE [--name NAME] [--json]`                                                                  | `POST /workloads`, uploads `FILE` to the returned grant, then `POST /workloads/{id}/activate`. Prints the workload id                       |
+| `mocactl workloads get ID [--json]`                                                                                               | Reads a workload (`GET /workloads/{id}`)                                                                                                    |
+| `mocactl workloads delete ID [--json]`                                                                                            | Deletes a workload and its context (`DELETE /workloads/{id}`)                                                                               |
 
 ### `run`
 
@@ -113,7 +117,8 @@ for behavior; this section covers only CLI-reference details.
 
 - `spawn` exit 2: empty prompt, prompt over 64 KiB, bundle digest not matching `sha256:<64 lowercase
 hex>`, `--kind` other than `prompt`/`solve`, `--kind solve` without both `--repo` and `--ref`, or
-  `--repo`/`--ref` on `--kind prompt`.
+  `--repo`/`--ref` on `--kind prompt`, `--workload` without `--kind prompt`, or a workload id that
+  is not a lowercase Kubernetes name of at most 50 characters.
 - `spawn` on a sync 503 `saturated`: the worker retries up to 3 times honoring `Retry-After`,
   bounded by a 5-minute wall budget; after that the ledger row is `failed` with
   `stateDetail: 'saturated — exhausted retries'`.
@@ -121,8 +126,23 @@ hex>`, `--kind` other than `prompt`/`solve`, `--kind solve` without both `--repo
   `responded`/`done`/`solved`; `queued`/`paused`/`failed` exit 1.
 - `--json`:
   - `spawn` → `{"type":"session","sessionId","pid"}`.
-  - `subagents` → `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","submittedAt"}]}`.
+  - `subagents` → `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","workload","submittedAt"}]}`.
   - `get` → `{"sessionId","status","files":[…],"reason"?,"message"?}`.
+
+### `workloads`
+
+See "Delegate with context" in [`packages/mocactl/README.md`](../../packages/mocactl/README.md) and
+[`docs/context-service.md`](../context-service.md). The routes are on the harness and take the API
+token. There is no list command: the harness has no list route.
+
+- `create` exit 2: no `--context`, a missing, empty or non-regular file, or an invalid `--name`; all
+  before any request. Exit 1 for a refusal, including a file larger than the grant's `maxBytes` or an
+  upload URL that is neither HTTPS nor loopback HTTP; a workload created before the failure is deleted.
+- `get`/`delete` exit 2 for an invalid id, exit 1 for `404 workload_not_found` or another refusal.
+- `--json`:
+  - `create` → `{"workloadId","status","contextType","revision","files","bytes"}`.
+  - `get` → `{"workloadId","status","contextType","workspace","revision"}` (`null` when unset).
+  - `delete` → `{"workloadId","status":"deleted"}`.
 
 ### `promote` exit codes
 

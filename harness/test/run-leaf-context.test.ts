@@ -6,7 +6,7 @@ vi.mock('../src/select-sandbox.js', async (importOriginal) => {
   return { ...actual, selectPoolSandbox: (...args: unknown[]) => selectPoolSandboxMock(...args) };
 });
 
-import { runLeaf, type LeafEnvelope } from '../src/run-leaf.js';
+import { contextNote, runLeaf, type LeafEnvelope } from '../src/run-leaf.js';
 
 type ExecuteTurnDep = NonNullable<NonNullable<Parameters<typeof runLeaf>[2]>['executeTurn']>;
 
@@ -42,13 +42,18 @@ const relayLease = () => {
   };
 };
 
-const env = (loadBundle: () => Promise<Buffer>): LeafEnvelope =>
+const env = (loadBundle: () => Promise<Buffer>, writable?: unknown): LeafEnvelope =>
   ({
     sessionId: 'run-1',
     item: { item_id: 'i1', file: 'f', pattern: 'p' },
     kind: 'prompt',
     prompt: 'Inspect.',
-    internalContext: { revision: REVISION, ownerScope: SCOPE, loadBundle },
+    internalContext: {
+      revision: REVISION,
+      cacheScope: SCOPE,
+      loadBundle,
+      ...(writable !== undefined ? { writable } : {}),
+    },
   }) as LeafEnvelope;
 
 describe('frozen context on a prompt leaf', () => {
@@ -66,8 +71,11 @@ describe('frozen context on a prompt leaf', () => {
       `${SCOPE}-${REVISION}`,
       'run-1',
       loadBundle,
+      { writable: false },
     );
-    expect(executeTurn.mock.calls[0]![0].prompt).toContain('/workspace/.moca-context/runs/run-1');
+    expect(executeTurn.mock.calls[0]![0].prompt).toBe(
+      "Inspect.\n\nThe workload's frozen context is available read-only at /workspace/.moca-context/runs/run-1.",
+    );
     expect(
       transport.exec.mock.calls.some(([script]) => String(script).includes('CONTEXT_CLEANUP')),
     ).toBe(true);
@@ -100,5 +108,44 @@ describe('frozen context on a prompt leaf', () => {
     expect(
       transport.exec.mock.calls.some(([script]) => String(script).includes('CONTEXT_CLEANUP')),
     ).toBe(true);
+  });
+
+  it('asks for a writable copy and tells the agent it is discarded with the run', async () => {
+    const { lease, transport } = relayLease();
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const loadBundle = vi.fn();
+    const overlayContext = vi.fn(async () => '/workspace/.moca-context/runs/run-1');
+    const executeTurn = okTurn();
+    const r = await runLeaf(env(loadBundle, true), undefined, { executeTurn, overlayContext });
+
+    expect(r.status).toBe('responded');
+    expect(overlayContext).toHaveBeenCalledWith(
+      transport,
+      `${SCOPE}-${REVISION}`,
+      'run-1',
+      loadBundle,
+      { writable: true },
+    );
+    const prompt = executeTurn.mock.calls[0]![0].prompt;
+    expect(prompt).toBe(`Inspect.\n\n${contextNote('/workspace/.moca-context/runs/run-1', true)}`);
+    expect(prompt).toContain('writable');
+    expect(prompt).toContain('discarded when the run ends');
+    expect(prompt).toContain('diff or test output');
+    expect(prompt).not.toContain('read-only');
+    expect(
+      transport.exec.mock.calls.some(([script]) => String(script).includes('CONTEXT_CLEANUP')),
+    ).toBe(true);
+  });
+
+  it('refuses a non-boolean writable flag before touching the sandbox', async () => {
+    const { lease, transport } = relayLease();
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const executeTurn = okTurn();
+    const overlayContext = vi.fn();
+    const r = await runLeaf(env(vi.fn(), 'yes'), undefined, { executeTurn, overlayContext });
+    expect(r).toMatchObject({ status: 'failed', message: 'invalid internal context reference' });
+    expect(overlayContext).not.toHaveBeenCalled();
+    expect(executeTurn).not.toHaveBeenCalled();
+    expect(transport.exec).not.toHaveBeenCalled();
   });
 });

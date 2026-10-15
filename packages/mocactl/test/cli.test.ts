@@ -468,3 +468,102 @@ describe('spawn / subagents / get', () => {
     expect(USAGE).toContain('mocactl get');
   });
 });
+
+/* ---------------- workloads ---------------- */
+
+describe('workloads and spawn --workload', () => {
+  it('spawn routes --workload through to cmdSpawn; --workload is refused elsewhere', async () => {
+    const mod = await import('../src/subagent.js');
+    const stub = vi.fn(async (..._a: unknown[]) => 0);
+    const spy = vi.spyOn(mod, 'cmdSpawn').mockImplementation(stub);
+    onTestFinished(() => spy.mockRestore());
+    expect(
+      await main(['spawn', 'p', '--kind', 'prompt', '--workload', 'demo'], {}, io(), {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(0);
+    expect(stub.mock.calls[0][2]).toMatchObject({ kind: 'prompt', workloadId: 'demo' });
+    const o = io();
+    expect(await main(['run', 'p', '--workload', 'demo'], {}, o, { buildRuntime: fakeBuild })).toBe(
+      2,
+    );
+    expect(o.errs.join('\n')).toContain('--workload only applies to `mocactl spawn`');
+  });
+
+  it('spawn routes --writable through to cmdSpawn; --writable is refused elsewhere', async () => {
+    const mod = await import('../src/subagent.js');
+    const stub = vi.fn(async (..._a: unknown[]) => 0);
+    const spy = vi.spyOn(mod, 'cmdSpawn').mockImplementation(stub);
+    onTestFinished(() => spy.mockRestore());
+    const argv = ['spawn', 'p', '--kind', 'prompt', '--workload', 'demo', '--writable'];
+    expect(await main(argv, {}, io(), { buildRuntime: fakeBuild })).toBe(0);
+    expect(stub.mock.calls[0][2]).toMatchObject({ workloadId: 'demo', writable: true });
+    expect(
+      await main(['spawn', 'p', '--kind', 'prompt', '--workload', 'demo'], {}, io(), {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(0);
+    expect(stub.mock.calls[1][2]).toMatchObject({ writable: false });
+    const o = io();
+    expect(await main(['run', 'p', '--writable'], {}, o, { buildRuntime: fakeBuild })).toBe(2);
+    expect(o.errs.join('\n')).toContain('--writable only applies to `mocactl spawn`');
+  });
+
+  it('spawn --writable without --workload exits 2 before spawning', async () => {
+    const mod = await import('../src/subagent.js');
+    const spy = vi.spyOn(mod, 'cmdSpawn');
+    onTestFinished(() => spy.mockRestore());
+    const o = io();
+    expect(
+      await main(['spawn', 'p', '--kind', 'prompt', '--writable'], {}, o, {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(2);
+    expect(o.errs.join('\n')).toContain('--writable needs --workload ID');
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('routes workloads create, get and delete; --context and --name only on create', async () => {
+    const mod = await import('../src/workloads.js');
+    const create = vi.fn(async (..._a: unknown[]) => 0);
+    const get = vi.fn(async (..._a: unknown[]) => 0);
+    const del = vi.fn(async (..._a: unknown[]) => 0);
+    const spies = [
+      vi.spyOn(mod, 'cmdWorkloadCreate').mockImplementation(create),
+      vi.spyOn(mod, 'cmdWorkloadGet').mockImplementation(get),
+      vi.spyOn(mod, 'cmdWorkloadDelete').mockImplementation(del),
+    ];
+    onTestFinished(() => spies.forEach((s) => s.mockRestore()));
+    const run = (argv: string[], o = io()) => main(argv, {}, o, { buildRuntime: fakeBuild });
+
+    expect(
+      await run(['workloads', 'create', '--context', 'ctx.context', '--name', 'demo', '--json']),
+    ).toBe(0);
+    expect(create.mock.calls[0][2]).toMatchObject({
+      contextPath: 'ctx.context',
+      name: 'demo',
+      json: true,
+    });
+    expect(await run(['workloads', 'get', 'demo', '--json'])).toBe(0);
+    expect(get.mock.calls[0][2]).toMatchObject({ id: 'demo', json: true });
+    expect(await run(['workloads', 'delete', 'demo'])).toBe(0);
+    expect(del.mock.calls[0][2]).toMatchObject({ id: 'demo', json: false });
+
+    const noContext = io();
+    expect(await run(['workloads', 'create'], noContext)).toBe(2);
+    expect(noContext.errs.join('\n')).toContain('needs --context FILE');
+    const noList = io();
+    expect(await run(['workloads'], noList)).toBe(2);
+    expect(noList.errs.join('\n')).toContain('there is no list');
+    expect(await run(['workloads', 'list'])).toBe(2);
+    expect(await run(['workloads', 'get'])).toBe(2);
+    expect(await run(['workloads', 'delete', 'a', 'b'])).toBe(2);
+    expect(await run(['workloads', 'get', 'demo', '--context', 'x'])).toBe(2);
+    expect(await run(['sessions', '--name', 'x'])).toBe(2);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(del).toHaveBeenCalledTimes(1);
+    expect(USAGE).toContain('mocactl workloads create --context FILE');
+    expect(USAGE).toContain('--workload ID');
+  });
+});

@@ -1,5 +1,10 @@
 # Two users, one VM, two sandbox tiers: the MOCA VM demo
 
+> **Preview.** This walkthrough runs the single-VM deployment and was run by one person with two GitHub accounts on one
+> laptop. Parts predate the `mocactl` installer (use the one-line installer in [Get started](../get-started/index.md)
+> instead of a checkout alias), and it says the container worker ignores the workspace key, which is out of date (each
+> session now has its own directory, still not a boundary). Labels: [Maturity and lifecycle](../reference/maturity-and-lifecycle.md).
+
 > **The claim:** one Linux VM runs the whole stack: the P6 supervisor, relay, control plane and
 > Redis, container sandboxes, and the P4 Firecracker microVM worker. Two people, each on their own
 > laptop with their own GitHub account, log in with `mocactl`. Each one's agent researches live

@@ -3,6 +3,7 @@ import { spawn as spawnChild } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync, openSync, closeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ApiError } from './api/errors.js';
+import { validWorkloadId, WorkloadsClient } from './api/workloads.js';
 import type { ControlPlaneApi, CreateSessionRequest } from './api/types.js';
 import { describeError } from './core/messages.js';
 import { sanitizeRemote } from './core/sanitize.js';
@@ -15,6 +16,7 @@ import {
 } from './core/subagent-ledger.js';
 import type { Io } from './headless.js';
 import type { Runtime } from './runtime.js';
+import { describeWorkloadError } from './workloads.js';
 import {
   DEFAULT_UNKNOWN_GRACE_MS,
   LeafTransport,
@@ -72,6 +74,10 @@ export interface SpawnOptions {
   repoUrl?: string;
   ref?: string;
   tag?: string;
+  /** A ready workload whose context the run sees; prompt runs only (the harness refuses others). */
+  workloadId?: string;
+  /** Give the run its own writable copy of the workload's context (`--writable`). */
+  writable?: boolean;
   json: boolean;
   /** Test seams: fork + ledger injection. */
   forkFn?: (
@@ -81,6 +87,8 @@ export interface SpawnOptions {
     cwd: string,
   ) => number | Promise<number>;
   ledger?: Ledger;
+  /** Test seam for the `--workload` preflight; otherwise built from the runtime. */
+  workloads?: Pick<WorkloadsClient, 'get'>;
 }
 
 /** Create session, record it, fork a detached worker, return. Worker survives mocactl exit. */
@@ -109,6 +117,45 @@ export async function cmdSpawn(rt: Runtime, io: Io, opts: SpawnOptions): Promise
     io.err('--repo and --ref are only meaningful with --kind solve');
     return 2;
   }
+  if (opts.writable && opts.workloadId === undefined) {
+    io.err(
+      "--writable needs --workload ID: it gives the run a writable copy of a workload's context",
+    );
+    return 2;
+  }
+  if (opts.workloadId !== undefined) {
+    if (opts.kind !== 'prompt') {
+      io.err('--workload needs --kind prompt: the harness runs only prompts on a workload');
+      return 2;
+    }
+    if (!validWorkloadId(opts.workloadId)) {
+      io.err(`invalid workload id '${sanitizeRemote(opts.workloadId)}'`);
+      return 2;
+    }
+  }
+
+  // Preflight, before a session or a worker exists: a run on a workload that is missing or not
+  // ready would only fail later, in the detached worker.
+  if (opts.workloadId !== undefined) {
+    const id = sanitizeRemote(opts.workloadId);
+    try {
+      // `main` has already refreshed the API token for this command.
+      const client =
+        opts.workloads ??
+        new WorkloadsClient(rt.harness, async () => rt.auth?.apiToken, rt.fetchImpl);
+      const workload = await client.get(opts.workloadId);
+      if (workload.status !== 'ready') {
+        io.err(
+          `workload ${id} is ${sanitizeRemote(workload.status)}, not ready; ` +
+            `\`mocactl workloads get ${id}\` shows it`,
+        );
+        return 1;
+      }
+    } catch (err) {
+      io.err(describeWorkloadError(err, opts.workloadId));
+      return 1;
+    }
+  }
 
   let session: SpawnedSession;
   try {
@@ -131,6 +178,8 @@ export async function cmdSpawn(rt: Runtime, io: Io, opts: SpawnOptions): Promise
     ...(opts.tag ? { tag: opts.tag } : {}),
     envelope: envelopeForLedger(opts),
     ...(opts.configRef ? { bundle: opts.configRef } : {}),
+    ...(opts.workloadId ? { workloadId: opts.workloadId } : {}),
+    ...(opts.writable ? { writable: true } : {}),
     ...(opts.repoUrl ? { repoUrl: opts.repoUrl } : {}),
     ...(opts.ref ? { ref: opts.ref } : {}),
     submittedAt: rt.now(),
@@ -183,7 +232,14 @@ function buildEnvelope(sessionId: string, opts: SpawnOptions): LeafEnvelope {
   // `/runs` reads configRef from the body (not the session); the harness builds the solve prompt
   // itself from `problemStatement`.
   if (opts.configRef) base.configRef = opts.configRef;
-  if (opts.kind === 'prompt') return { ...base, prompt: opts.prompt };
+  if (opts.kind === 'prompt') {
+    return {
+      ...base,
+      prompt: opts.prompt,
+      ...(opts.workloadId ? { workloadId: opts.workloadId } : {}),
+      ...(opts.writable ? { contextWritable: true } : {}),
+    };
+  }
   return { ...base, problemStatement: opts.prompt, repoUrl: opts.repoUrl!, ref: opts.ref! };
 }
 
@@ -194,6 +250,8 @@ function envelopeForLedger(opts: SpawnOptions): LedgerEnvelope {
     ...(opts.repoUrl ? { repoUrl: opts.repoUrl } : {}),
     ...(opts.ref ? { ref: opts.ref } : {}),
     ...(opts.configRef ? { configRef: opts.configRef } : {}),
+    ...(opts.workloadId ? { workloadId: opts.workloadId } : {}),
+    ...(opts.writable ? { contextWritable: true } : {}),
   };
 }
 
@@ -254,6 +312,22 @@ async function defaultFork(
   }
 }
 
+/**
+ * Fetch-level errors where the request is known to have reached the server. undici's
+ * `headersTimeout` and `bodyTimeout` only fire after the request is on the wire.
+ * `UND_ERR_SOCKET` is deliberately excluded: it also fires when the server resets before
+ * reading the request. Connect-phase codes (`ECONNREFUSED`, `ENOTFOUND`,
+ * `UND_ERR_CONNECT_TIMEOUT`, TLS errors) are not here either, so they stay terminal.
+ * Verified against Node 24 with a dispatcher probe (see PR #518 for the shapes).
+ */
+const AFTER_SEND_CAUSE_CODES: ReadonlySet<string> = new Set([
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+function isAfterSendError(causeCode: string | undefined): boolean {
+  return causeCode !== undefined && AFTER_SEND_CAUSE_CODES.has(causeCode);
+}
+
 export interface SpawnWorkerDeps {
   /** Overrides stdin reading; the real binary routes `process.stdin` through main.ts. */
   readStdin?: () => Promise<string>;
@@ -265,8 +339,10 @@ export interface SpawnWorkerDeps {
 
 /**
  * Detached-worker entry: read payload from stdin, POST /v1/runs, record outcome, exit.
- * Every exit path with a sessionId writes a terminal ledger line. The malformed-stdin branch
- * has no sessionId to anchor on; the parent's row stays authoritative there.
+ * Every exit path with a sessionId writes a ledger line — terminal for server replies and
+ * connect-phase failures, non-terminal `running` for after-send disconnects so `subagents`
+ * reconciles via `/runs/status`. The malformed-stdin branch has no sessionId to anchor on;
+ * the parent's row stays authoritative there.
  */
 export async function runSpawnWorker(rt: Runtime, deps: SpawnWorkerDeps = {}): Promise<number> {
   const ledger = deps.ledger ?? openLedger(rt.paths.subagentsFile, rt.now);
@@ -316,21 +392,30 @@ export async function runSpawnWorker(rt: Runtime, deps: SpawnWorkerDeps = {}): P
       });
       return view.state === 'done' ? 0 : 1;
     } catch (err) {
-      // `errorFromResponse` folds `body.reason` into `code`, so 503 saturated arrives as
-      // ApiError(status: 503, code: 'saturated'); anything else is terminal.
+      // `errorFromResponse` folds body.reason into code, so saturated is ApiError(503, 'saturated').
       const saturated = err instanceof ApiError && err.status === 503 && err.code === 'saturated';
-      if (!saturated) {
-        ledger.updateState(payload.sessionId, 'failed', {
-          detail: err instanceof Error ? err.message : String(err),
+      if (saturated) {
+        if (attempt >= MAX_SATURATED_ATTEMPTS) break;
+        const remainingMs = MAX_RETRY_WALL_MS - (rt.now() - retryStart);
+        if (remainingMs <= 0) break;
+        const requestedMs = (err.retryAfterS ?? DEFAULT_RETRY_AFTER_S) * 1000;
+        await rt.sleep(Math.max(0, Math.min(requestedMs, remainingMs)));
+        continue;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      // Three cases: server replied (terminal), fetch died after send (reconcile — server may
+      // have the record), fetch died before send (terminal — request never left).
+      if (err instanceof ApiError && err.status > 0) {
+        ledger.updateState(payload.sessionId, 'failed', { detail: message, now: rt.now() });
+      } else if (err instanceof ApiError && err.status === 0 && isAfterSendError(err.causeCode)) {
+        ledger.updateState(payload.sessionId, 'running', {
+          detail: `client disconnected (${message}); reconciling`,
           now: rt.now(),
         });
-        return 1;
+      } else {
+        ledger.updateState(payload.sessionId, 'failed', { detail: message, now: rt.now() });
       }
-      if (attempt >= MAX_SATURATED_ATTEMPTS) break;
-      const remainingMs = MAX_RETRY_WALL_MS - (rt.now() - retryStart);
-      if (remainingMs <= 0) break;
-      const requestedMs = (err.retryAfterS ?? DEFAULT_RETRY_AFTER_S) * 1000;
-      await rt.sleep(Math.max(0, Math.min(requestedMs, remainingMs)));
+      return 1;
     }
   }
   ledger.updateState(payload.sessionId, 'failed', {
@@ -413,6 +498,9 @@ export async function cmdSubagents(rt: Runtime, io: Io, opts: SubagentsOptions):
           state: view.state,
           detail: view.detail ?? null,
           bundle: record.bundle ?? null,
+          workload: record.workloadId ?? null,
+          // Only on `spawn --writable` rows, so the shape of every other row is unchanged.
+          ...(record.writable ? { writable: true } : {}),
           submittedAt: record.submittedAt,
         })),
       }) + '\n',

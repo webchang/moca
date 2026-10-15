@@ -18,6 +18,10 @@ describe('describeError', () => {
       'cannot reach the harness: ECONNREFUSED',
     ],
     [
+      new ApiError('harness', 0, 'connection_dropped', 'fetch failed'),
+      'the harness closed the connection (a proxy idle timeout?)',
+    ],
+    [
       new ApiError('harness', 503, 'saturated', undefined, 4),
       'the harness has no capacity — retry in 4s',
     ],

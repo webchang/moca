@@ -168,8 +168,9 @@ export class OwnershipIndex {
   }
 
   /**
-   * The ONLY user-facing list path. LogStore.list() must never serve one: it is a
-   * keys('session:*') scan (spec §2.3), O(keyspace) and with no owner concept.
+   * The ONLY user-facing list path. LogStore deliberately has no listing at all (rossoctl/moca#361):
+   * a store keyed by session id has no owner concept, so the closest thing it could offer is an
+   * all-tenant keyspace scan. This method reads the owner zset instead.
    */
   async listByOwner(
     subject: string,

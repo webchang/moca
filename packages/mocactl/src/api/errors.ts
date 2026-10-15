@@ -1,15 +1,22 @@
 export type ErrorSource = 'control-plane' | 'harness';
 
 export class ApiError extends Error {
+  /**
+   * For `status === 0` network errors, the underlying error's `.code` (e.g. `ECONNREFUSED`,
+   * `UND_ERR_HEADERS_TIMEOUT`), used to tell "request never left" from "request may have landed".
+   */
+  readonly causeCode?: string;
   constructor(
     readonly source: ErrorSource,
     readonly status: number,
     readonly code: string,
     message?: string,
     readonly retryAfterS?: number,
+    causeCode?: string,
   ) {
     super(message ?? code);
     this.name = 'ApiError';
+    this.causeCode = causeCode;
   }
 }
 
@@ -43,8 +50,35 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
   );
 }
 
+// Node's fetch reports every transport failure as `TypeError: fetch failed`; the cause tells a
+// peer that was never reached (refused, DNS) from a connection that was open and then closed under
+// the request, which is what a proxy's idle timeout does.
+const CLOSED_CAUSES = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
+
 export function networkError(source: ErrorSource, err: unknown): ApiError {
-  return new ApiError(source, 0, 'network_error', err instanceof Error ? err.message : String(err));
+  const message = err instanceof Error ? err.message : String(err);
+  // undici attaches the real socket-layer error on `.cause`; its `.code` is how we tell
+  // ECONNREFUSED (never left) from UND_ERR_HEADERS_TIMEOUT (may have landed).
+  const cause = err instanceof Error ? (err as Error & { cause?: unknown }).cause : undefined;
+  const causeCode =
+    cause &&
+    typeof cause === 'object' &&
+    'code' in cause &&
+    typeof (cause as { code: unknown }).code === 'string'
+      ? (cause as { code: string }).code
+      : undefined;
+  // undici's top-level message is just "fetch failed"; fold the cause code in so the
+  // operator can tell why.
+  const detail = causeCode ? `${message} (${causeCode})` : message;
+  const closed = causeCode !== undefined && CLOSED_CAUSES.has(causeCode);
+  return new ApiError(
+    source,
+    0,
+    closed ? 'connection_dropped' : 'network_error',
+    detail,
+    undefined,
+    causeCode,
+  );
 }
 
 export const TOKEN_CODES: ReadonlySet<string> = new Set([

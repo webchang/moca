@@ -143,8 +143,8 @@ describe('listByOwner', () => {
   });
 
   it('is the ONLY user-facing list path, and returns newest first', async () => {
-    // LogStore.list() must never serve one: it is a keys('session:*') scan (spec §2.3), O(keyspace)
-    // and unowned. This method reads the owner zset instead.
+    // LogStore deliberately has no listing (rossoctl/moca#361): a store keyed by session id has no
+    // owner concept. This method reads the owner zset instead.
     const page = await index.listByOwner('github:1234');
     expect(page.sessions.map((s) => s.sessionId)).toEqual([
       'sid-5',

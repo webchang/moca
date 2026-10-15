@@ -102,7 +102,9 @@ const isTokenRejection = (err: unknown): err is ApiError =>
 const isDropped = (err: unknown): boolean =>
   err instanceof ApiError &&
   err.source === 'harness' &&
-  (err.code === 'network_error' || err.code === 'stream_truncated');
+  (err.code === 'network_error' ||
+    err.code === 'connection_dropped' ||
+    err.code === 'stream_truncated');
 
 /** A harness that cannot serve the re-attach right now (a worker drain, a gateway, Redis). */
 const isUnavailable = (err: unknown): boolean =>
@@ -471,18 +473,62 @@ export class ActiveSession {
     return 'ended';
   }
 
+  /** Set while recovering a POST that dropped before any frame: which turn counts as ours. */
+  private recovering?: { notTurnId?: string; onAccept: () => void };
+
   private attachStream(
     controller: AbortController,
     ids: Cursor,
     lastEventId?: string,
   ): AsyncGenerator<TurnFrame> {
-    return this.deps.harness.attach({
+    const stream = this.deps.harness.attach({
       sessionId: this.sessionId,
       token: this.token.token,
       lastEventId,
       signal: controller.signal,
       onEventId: (id) => (ids.last = id),
     });
+    const recovering = this.recovering;
+    if (!recovering || ids.frames > 0) return stream;
+    // Attach replays the session's LAST turn, finished or not. After a dropped POST only a turn
+    // that is still running, and not the one this client already saw, can be the dropped prompt's:
+    // anything else means the prompt never started, which is what turn_not_found says.
+    return (async function* () {
+      let first = true;
+      for await (const frame of stream) {
+        if (first) {
+          first = false;
+          if (frame.type !== 'turn' || frame.ended || frame.turnId === recovering.notTurnId)
+            throw new ApiError('harness', 404, 'turn_not_found');
+          // The turn is ours: record the prompt before its frames reach the transcript.
+          recovering.onAccept();
+        }
+        yield frame;
+      }
+    })();
+  }
+
+  /**
+   * The turn POST was cut before the harness answered (a proxy's idle timeout, say). A detachable
+   * turn keeps running without its client, so ask by session whether it started and follow it. The
+   * prompt is never sent again. When nothing is found the original error stands.
+   */
+  private async recoverDroppedStart(
+    controller: AbortController,
+    ids: Cursor,
+    original: ApiError,
+    record: () => void,
+  ): Promise<boolean> {
+    this.recovering = { notTurnId: this.lastTurnId, onAccept: record };
+    try {
+      return await this.reattach(controller, ids);
+    } catch (err) {
+      if (controller.signal.aborted || err instanceof TurnCancelledError) throw err;
+      if (ids.frames === 0) throw original;
+      throw err;
+    } finally {
+      this.recovering = undefined;
+    }
   }
 
   /**
@@ -594,6 +640,14 @@ export class ActiveSession {
           if (controller.signal.aborted || err instanceof TurnCancelledError)
             throw new TurnCancelledError();
           if (this.live && isDropped(err)) return await this.reattach(controller, ids);
+          if (
+            this.deps.detachable === true &&
+            !this.live &&
+            !streamed &&
+            err instanceof ApiError &&
+            err.code === 'connection_dropped'
+          )
+            return await this.recoverDroppedStart(controller, ids, err, record);
           // Once frames have flowed the status code is spent; never re-send a half-run turn.
           if (!(err instanceof ApiError) || err.source !== 'harness' || streamed) throw err;
           this.pending = false;
@@ -695,7 +749,7 @@ export class ActiveSession {
         ids.frames === 0 &&
         err instanceof ApiError &&
         err.source === 'harness' &&
-        (err.code === 'network_error' || err.status === 503)
+        (err.code === 'network_error' || err.code === 'connection_dropped' || err.status === 503)
       ) {
         this.emit({ kind: 'attach-none', missed: false });
         return false;

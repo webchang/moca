@@ -1,13 +1,29 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { MAX_EXEC_MESSAGE_BYTES } from '@moca/k8s-sandbox';
 import {
   buildContextAcquireScript,
   buildContextCleanupScript,
   buildContextPopulateScript,
+  buildContextWritableScript,
   CONTEXT_CHUNK_BYTES,
   contextCacheDir,
   contextCacheKey,
+  contextMaxEntries,
   contextRetainMinutes,
   contextRoot,
   overlayContext,
@@ -23,7 +39,7 @@ describe('P6 context overlay', () => {
     const alice = contextCacheKey('1'.repeat(32), digest);
     const bob = contextCacheKey('2'.repeat(32), digest);
     expect(contextCacheDir(alice)).not.toBe(contextCacheDir(bob));
-    expect(() => contextCacheKey('not-a-scope', digest)).toThrow('owner scope');
+    expect(() => contextCacheKey('not-a-scope', digest)).toThrow('cache scope');
     expect(() => contextCacheDir(digest)).toThrow('cache key');
   });
 
@@ -47,7 +63,7 @@ describe('P6 context overlay', () => {
     expect(populate).toContain(createHash('sha256').update(bundle).digest('hex'));
     expect(populate).toContain('sha256sum -c --status');
     expect(populate).toContain('tar -xzf "$ARCHIVE" --no-same-owner --no-same-permissions');
-    expect(populate).toContain('chmod 0444');
+    expect(populate).toContain('chmod -R u+rX,a-w "$STAGE"');
     expect(populate).toContain('[ -d "$CACHE" ] || mv "$STAGE" "$CACHE"');
   });
 
@@ -98,6 +114,50 @@ describe('P6 context overlay', () => {
     expect(exec.mock.calls.at(-1)![0]).toMatch(/^rm -f .*incoming\/0{32}-a{64}\.run-5\.context/);
   });
 
+  it('caps the bundle entries before extracting: 10000 by default, like Context Service', () => {
+    const populate = buildContextPopulateScript(revision, 'run-6', digest);
+    expect(populate).toContain('[ "$ENTRIES" -le 10000 ]');
+    expect(populate.indexOf('sha256sum -c')).toBeLessThan(populate.indexOf('tar -tzf'));
+    expect(populate.indexOf('tar -tzf')).toBeLessThan(populate.indexOf('tar -xzf'));
+    expect(buildContextPopulateScript(revision, 'run-6', digest, 7)).toContain('-le 7 ]');
+    expect(contextMaxEntries({ MOCA_CONTEXT_BUNDLE_MAX_ENTRIES: '25' })).toBe(25);
+    expect(contextMaxEntries({ MOCA_CONTEXT_BUNDLE_MAX_ENTRIES: 'many' })).toBe(10_000);
+    expect(() => buildContextPopulateScript(revision, 'run-6', digest, 0)).toThrow('entry limit');
+  });
+
+  it('the entry cap refuses, in a real shell, an archive with more entries than the limit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moca-context-entries-'));
+    try {
+      mkdirSync(join(dir, 'src'));
+      for (const name of ['a', 'b', 'c']) writeFileSync(join(dir, 'src', name), name);
+      const archive = join(dir, 'bundle.context');
+      // COPYFILE_DISABLE keeps macOS tar from adding AppleDouble entries.
+      execFileSync('tar', ['-czf', archive, '-C', join(dir, 'src'), 'a', 'b', 'c'], {
+        env: { ...process.env, COPYFILE_DISABLE: '1' },
+      });
+      const check = (limit: number) => {
+        const line = buildContextPopulateScript(revision, 'run-7', digest, limit)
+          .split('\n')
+          .find((l) => l.includes('tar -tzf'))!;
+        return () =>
+          execFileSync(
+            'bash',
+            ['-c', `set -euo pipefail\nARCHIVE=$1\n${line}\necho ok`, '_', archive],
+            {
+              stdio: ['ignore', 'pipe', 'pipe'],
+            },
+          ).toString();
+      };
+      expect(check(3)()).toBe('ok\n');
+      expect(check(2)).toThrow(/context bundle has +3 entries, over 2/);
+      // A corrupt archive fails the listing, so it is never extracted either.
+      writeFileSync(archive, 'not gzip');
+      expect(check(3)).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('concurrent misses each publish under the lock, and only the first copy is kept', () => {
     const one = buildContextPopulateScript(revision, 'run-a', digest);
     const two = buildContextPopulateScript(revision, 'run-b', digest);
@@ -141,7 +201,8 @@ describe('P6 context overlay', () => {
 
   it('cleanup drops only this run and sweeps unreferenced caches past retention', () => {
     const script = buildContextCleanupScript(revision, 'run-1', 0);
-    expect(script).toContain("rm -f '/workspace/.moca-context/runs/run-1'");
+    expect(script).toContain("ROOT='/workspace/.moca-context/runs/run-1'");
+    expect(script).toContain('rm -rf "$ROOT"');
     expect(script).toContain(`rm -f "/workspace/.moca-context/refs/${revision}/run-1"`);
     expect(script).toContain('ls -A "/workspace/.moca-context/refs/$REV"');
     expect(script).toContain('-mmin -0');
@@ -162,5 +223,108 @@ describe('P6 context overlay', () => {
     const release = script.indexOf(`refs/${revision}/run-1`);
     expect(lock).toBeLessThan(release);
     expect(release).toBeLessThan(script.indexOf('rm -rf "$DIR"'));
+  });
+
+  it('a writable run copies the revision after binding it, on a hit and on a miss', async () => {
+    const hit = vi.fn().mockResolvedValue(ok('hit'));
+    await overlayContext({ exec: hit } as never, revision, 'run-w', vi.fn(), { writable: true });
+    expect(hit.mock.calls.map(([script]) => script.split('\n')[1])).toEqual([
+      '# CONTEXT_ACQUIRE',
+      '# CONTEXT_WRITABLE_COPY',
+    ]);
+
+    const miss = vi.fn().mockResolvedValueOnce(ok('miss')).mockResolvedValue(ok());
+    await overlayContext({ exec: miss } as never, revision, 'run-w', async () => Buffer.from('x'), {
+      writable: true,
+    });
+    expect(miss.mock.calls.map(([script]) => script.split('\n')[1])).toEqual([
+      '# CONTEXT_ACQUIRE',
+      '# CONTEXT_UPLOAD_CHUNK',
+      '# CONTEXT_POPULATE',
+      '# CONTEXT_WRITABLE_COPY',
+    ]);
+
+    // Read-only is the default.
+    const plain = vi.fn().mockResolvedValue(ok('hit'));
+    await overlayContext({ exec: plain } as never, revision, 'run-r', vi.fn());
+    expect(plain).toHaveBeenCalledTimes(1);
+  });
+
+  it('stages the writable copy and renames it into place, so it is never partial', () => {
+    const script = buildContextWritableScript(revision, 'run-w');
+    const order = [
+      'cp -a "$CACHE" "$STAGE"',
+      'chmod -R u+w "$STAGE"\n',
+      'touch "$STAGE"',
+      'rm -rf "$ROOT"',
+      'mv "$STAGE" "$ROOT"',
+    ].map((step) => script.indexOf(step));
+    expect(order.every((at) => at >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(script).toContain("STAGE='/workspace/.moca-context/runs/.stage.run-w'");
+    expect(() => buildContextWritableScript(revision, '../run')).toThrow('invalid session id');
+  });
+
+  it('in a real shell, gives the run a writable copy, leaves the cache alone, and cleans up', () => {
+    const base = mkdtempSync(join(tmpdir(), 'moca-context-writable-'));
+    const local = (script: string) => script.replaceAll('/workspace/.moca-context', base);
+    const sh = (script: string) =>
+      execFileSync('bash', ['-c', local(script)], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const cache = join(base, 'cache', revision);
+    const root = join(base, 'runs', 'run-w');
+    try {
+      mkdirSync(join(cache, 'src'), { recursive: true });
+      mkdirSync(join(base, 'runs'));
+      // Another run still references the revision, so the cleanup sweep keeps the cache.
+      mkdirSync(join(base, 'refs', revision), { recursive: true });
+      writeFileSync(join(base, 'refs', revision, 'other'), '');
+      writeFileSync(join(cache, 'src', 'a.txt'), 'frozen');
+      writeFileSync(join(cache, 'test.sh'), '#!/bin/sh\necho tests ok\n', { mode: 0o755 });
+      // Make the cache read-only exactly as the populate script does.
+      const readOnly = buildContextPopulateScript(revision, 'run-w', digest)
+        .split('\n')
+        .find((l) => l.includes('a-w'))!;
+      execFileSync('bash', ['-c', `STAGE=$1\n${readOnly}`, '_', cache]);
+      const mode = (path: string) => statSync(path).mode & 0o777;
+      // Nothing is writable, directories stay traversable, and the script keeps its exec bit.
+      expect([cache, join(cache, 'src'), join(cache, 'src', 'a.txt')].map(mode)).toEqual([
+        0o555, 0o555, 0o444,
+      ]);
+      expect(mode(join(cache, 'test.sh'))).toBe(0o555);
+      expect(() => writeFileSync(join(cache, 'src', 'a.txt'), 'x')).toThrow();
+      symlinkSync(cache, root);
+
+      sh(buildContextWritableScript(revision, 'run-w'));
+      expect(lstatSync(root).isSymbolicLink()).toBe(false);
+      writeFileSync(join(root, 'src', 'a.txt'), 'edited');
+      writeFileSync(join(root, 'src', 'new.txt'), 'new');
+      expect(mode(join(root, 'test.sh'))).toBe(0o755);
+      expect(execFileSync('./test.sh', { cwd: root }).toString()).toBe('tests ok\n');
+      expect(readFileSync(join(cache, 'src', 'a.txt'), 'utf8')).toBe('frozen');
+      expect(mode(cache)).toBe(0o555);
+      expect(mode(join(cache, 'src', 'a.txt'))).toBe(0o444);
+
+      // The agent may leave its copy read-only; cleanup still removes it.
+      chmodSync(join(root, 'src'), 0o555);
+      sh(buildContextCleanupScript(revision, 'run-w', 0));
+      expect(() => lstatSync(root)).toThrow();
+      expect(() => lstatSync(join(base, 'runs', '.stage.run-w'))).toThrow();
+      expect(readFileSync(join(cache, 'src', 'a.txt'), 'utf8')).toBe('frozen');
+      expect(mode(cache)).toBe(0o555);
+    } finally {
+      execFileSync('chmod', ['-R', 'u+w', base]);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('cleanup never chmods through a read-only link into the cache', () => {
+    const script = buildContextCleanupScript(revision, 'run-1');
+    expect(script).toContain('[ -L "$ROOT" ] || chmod -R u+w "$ROOT"');
+  });
+
+  it('the sweep removes abandoned writable copies, never links', () => {
+    const script = buildContextAcquireScript(revision, 'run-1');
+    expect(script).toContain('for STALE in "/workspace/.moca-context"/runs/*');
+    expect(script).toContain('[ -d "$STALE" ] && [ ! -L "$STALE" ]');
   });
 });

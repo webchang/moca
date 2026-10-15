@@ -36,7 +36,9 @@ class FakeClient extends EventEmitter {
   /** The connect's outcome. Held apart from `connect` so overriding it keeps the isOpen bookkeeping. */
   attempt = vi.fn<() => Promise<void>>(async () => undefined);
   quit = vi.fn(async () => 'OK');
-  keys = vi.fn(async () => [] as string[]);
+  // The command the probe runs; list() is gone (rossoctl/moca#361) and read() exercises the same
+  // open() path.
+  xRange = vi.fn(async () => [] as unknown[]);
 }
 
 let client: FakeClient;
@@ -64,6 +66,6 @@ describe('RedisSessionBackend error listener', () => {
     const b = new RedisSessionBackend();
 
     // The listener is for unawaited EVENTS; a rejected command still reaches its caller.
-    await expect(b.list()).rejects.toThrow('connect ETIMEDOUT');
+    await expect(b.read('probe')).rejects.toThrow('connect ETIMEDOUT');
   });
 });

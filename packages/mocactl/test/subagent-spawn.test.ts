@@ -6,6 +6,7 @@ import { cmdSpawn, type SpawnOptions } from '../src/subagent.js';
 import { openLedger } from '../src/core/subagent-ledger.js';
 import type { Ledger } from '../src/core/subagent-ledger.js';
 import type { LeafEnvelope } from '../src/transport/leaf-turn.js';
+import { ApiError } from '../src/api/errors.js';
 
 /* --- test harness: minimal Runtime + Io, fake control plane --- */
 
@@ -62,10 +63,16 @@ function withLedger(rt: any): Ledger {
   return openLedger(ledgerPath);
 }
 
+const workloadsReturning = (status: string) => ({
+  get: vi.fn(async (id: string) => ({ workloadId: id, status })),
+});
+
 const baseOpts = (over: Partial<SpawnOptions> = {}): SpawnOptions => ({
   prompt: 'summarize the repo',
   kind: 'prompt',
   json: false,
+  // The --workload preflight finds every workload ready unless a test says otherwise.
+  workloads: workloadsReturning('ready'),
   ...over,
 });
 
@@ -333,3 +340,195 @@ describe('cmdSpawn — failure paths that must not create a ledger orphan', () =
 
 // Imported late to keep the file's top imports stable.
 type LedgerRecord = ReturnType<Ledger['readAll']>[number];
+
+/* --- --workload --- */
+
+describe('cmdSpawn — --workload', () => {
+  it('sends workloadId in the run envelope and records it in the ledger row', async () => {
+    const { rt } = makeRt();
+    const ledger = withLedger(rt);
+    const { io } = makeIo();
+    let seenEnvelope: LeafEnvelope | undefined;
+    const forkFn: SpawnOptions['forkFn'] = (_sid, _tok, env) => {
+      seenEnvelope = env;
+      return 7;
+    };
+    const r = await cmdSpawn(rt, io, baseOpts({ workloadId: 'demo', forkFn, ledger }));
+    expect(r).toBe(0);
+    expect(seenEnvelope).toEqual({
+      sessionId: 'sess-abc',
+      kind: 'prompt',
+      prompt: 'summarize the repo',
+      workloadId: 'demo',
+    });
+    const row = openLedger(ledgerPath).readAll()[0]!;
+    expect(row.workloadId).toBe('demo');
+    expect(row.envelope.workloadId).toBe('demo');
+  });
+
+  it('refuses --workload with --kind solve, and an invalid workload id, before creating a session', async () => {
+    for (const over of [
+      { kind: 'solve' as const, repoUrl: 'https://x', ref: 'main', workloadId: 'demo' },
+      { workloadId: 'Bad/Id' },
+    ]) {
+      const { rt, cp } = makeRt();
+      const { io, err } = makeIo();
+      const r = await cmdSpawn(
+        rt,
+        io,
+        baseOpts({ ...over, forkFn: () => 1, ledger: withLedger(rt) }),
+      );
+      expect(r).toBe(2);
+      expect(cp.createSession).not.toHaveBeenCalled();
+      expect(err.join('\n')).toMatch(/--workload needs --kind prompt|invalid workload id/);
+    }
+  });
+
+  it('--writable sends contextWritable and records writable in the ledger row', async () => {
+    const { rt } = makeRt();
+    const ledger = withLedger(rt);
+    const { io } = makeIo();
+    let seenEnvelope: LeafEnvelope | undefined;
+    const forkFn: SpawnOptions['forkFn'] = (_sid, _tok, env) => {
+      seenEnvelope = env;
+      return 7;
+    };
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ workloadId: 'demo', writable: true, forkFn, ledger }),
+    );
+    expect(r).toBe(0);
+    expect(seenEnvelope).toEqual({
+      sessionId: 'sess-abc',
+      kind: 'prompt',
+      prompt: 'summarize the repo',
+      workloadId: 'demo',
+      contextWritable: true,
+    });
+    const row = openLedger(ledgerPath).readAll()[0]!;
+    expect(row.writable).toBe(true);
+    expect(row.envelope.contextWritable).toBe(true);
+  });
+
+  it('a read-only workload run sends no contextWritable and records no writable', async () => {
+    const { rt } = makeRt();
+    const ledger = withLedger(rt);
+    let seenEnvelope: LeafEnvelope | undefined;
+    const forkFn: SpawnOptions['forkFn'] = (_sid, _tok, env) => {
+      seenEnvelope = env;
+      return 7;
+    };
+    await cmdSpawn(
+      rt,
+      makeIo().io,
+      baseOpts({ workloadId: 'demo', writable: false, forkFn, ledger }),
+    );
+    expect(seenEnvelope).not.toHaveProperty('contextWritable');
+    expect(openLedger(ledgerPath).readAll()[0]).not.toHaveProperty('writable');
+  });
+
+  it('refuses --writable without --workload before creating a session', async () => {
+    const { rt, cp } = makeRt();
+    const { io, err } = makeIo();
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ writable: true, forkFn: () => 1, ledger: withLedger(rt) }),
+    );
+    expect(r).toBe(2);
+    expect(cp.createSession).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('--writable needs --workload ID');
+  });
+
+  it('preflights the workload with GET /workloads/{id} and the API token', async () => {
+    const { rt, cp } = makeRt();
+    const calls: Array<{ url: string; method?: string; auth?: string }> = [];
+    rt.fetchImpl = (async (url: string, init: RequestInit) => {
+      calls.push({
+        url,
+        method: init.method,
+        auth: (init.headers as Record<string, string>).authorization,
+      });
+      return new Response(JSON.stringify({ workloadId: 'demo', status: 'ready' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    const r = await cmdSpawn(
+      rt,
+      makeIo().io,
+      baseOpts({
+        workloadId: 'demo',
+        workloads: undefined,
+        forkFn: () => 7,
+        ledger: withLedger(rt),
+      }),
+    );
+    expect(r).toBe(0);
+    expect(calls).toEqual([
+      { url: 'https://harness.test/workloads/demo', method: 'GET', auth: 'Bearer api-tok' },
+    ]);
+    expect(cp.createSession).toHaveBeenCalled();
+  });
+
+  it.each(['awaiting_upload', 'creating', 'deleting'])(
+    'exits 1 for a %s workload before creating a session or forking',
+    async (status) => {
+      const { rt, cp } = makeRt();
+      const { io, err } = makeIo();
+      const forkFn = vi.fn(() => 7);
+      const r = await cmdSpawn(
+        rt,
+        io,
+        baseOpts({
+          workloadId: 'demo',
+          workloads: workloadsReturning(status),
+          forkFn,
+          ledger: withLedger(rt),
+        }),
+      );
+      expect(r).toBe(1);
+      expect(cp.createSession).not.toHaveBeenCalled();
+      expect(forkFn).not.toHaveBeenCalled();
+      expect(err.join('\n')).toContain(`workload demo is ${status}, not ready`);
+    },
+  );
+
+  it('exits 1 for a missing workload, or one that is not yours', async () => {
+    const { rt, cp } = makeRt();
+    const { io, err } = makeIo();
+    const workloads = {
+      get: vi.fn(async () => {
+        throw new ApiError('harness', 404, 'workload_not_found');
+      }),
+    };
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ workloadId: 'demo', workloads, forkFn: () => 7, ledger: withLedger(rt) }),
+    );
+    expect(r).toBe(1);
+    expect(cp.createSession).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain("no workload 'demo' (or it is not yours)");
+    expect(openLedger(ledgerPath).readAll()).toEqual([]);
+  });
+
+  it('the worker transport puts workloadId in the POST /v1/runs body', async () => {
+    const { LeafTransport } = await import('../src/transport/leaf-turn.js');
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ status: 'responded', text: 'ok' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    const transport = new LeafTransport({ baseUrl: async () => 'https://harness.test' }, fetchImpl);
+    await transport.submitLeafTurn(
+      { sessionId: 's', kind: 'prompt', prompt: 'p', workloadId: 'demo' },
+      'tok',
+    );
+    expect(bodies[0]).toMatchObject({ kind: 'prompt', workloadId: 'demo' });
+  });
+});

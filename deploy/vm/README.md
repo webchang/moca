@@ -492,9 +492,14 @@ restriction survives a reboot and is in place before the relay — and so before
 container — starts. The unit is also `RequiredBy=` both, so the deployment fails closed: if the
 table does not load at boot, the relay does not start and neither does `podman-restart.service`,
 which keeps Redis and every `--restart=always` container down until the firewall loads. The table
-only filters the `input` hook (traffic addressed to the host itself); forwarded traffic (outbound
-internet access from a sandbox) is untouched in this round — that is MI1 S5's `moca-egress` work,
-not this one. The rules match the bridge a packet arrives on — `MOCA_SANDBOX_BRIDGE`, default
+filters both the `input` hook (traffic addressed to the host itself) and the `forward` hook, but the
+forward chain drops only link-local destinations — `169.254.0.0/16` and the IPv6 metadata address
+`fd00:ec2::254` — arriving from the sandbox bridge: link-local cloud instance metadata, which on a
+cloud VM can expose the instance role's credentials, credentials that belong to the host and not
+to any session or user (rossoctl/moca#357). All other forwarded traffic (outbound internet access
+from a sandbox)
+is untouched in this round — that is MI1 S5's `moca-egress` work, not this one. The rules match the
+bridge a packet arrives on — `MOCA_SANDBOX_BRIDGE`, default
 `moca-sandbox0`, pinned when the network is created and checked on every run — not only its source
 address: netavark leaves IPv6 enabled on the bridge and in every container, so link-local IPv6
 reaches the host even though `moca-sandbox` has only an IPv4 subnet. Three rules accept: replies on
@@ -524,6 +529,16 @@ On the same host:
 - a pre-MI1 install migrates to the split exec listener;
 - a fresh install with the default image completes a turn.
 
+A second live run (2026-10-14, same host) verified the forward chain (rossoctl/moca#357): with the
+original input-only table, `http://169.254.169.254/latest/meta-data/` answered from inside a sandbox
+(HTTP 401 — IMDSv2 wanted a token, but the request had reached the service through the forward
+path); with the forward chain loaded, the same request timed out and the drop rule's counter
+incremented, while outbound internet, the relay's attach port, and the input chain's other drops
+(host port 22) were all unchanged. The candidate table also parsed and loaded cleanly on that
+host's nftables 1.0.4 — the fail-closed risk that kept this out of #350. The IPv6 rule
+(`fd00:ec2::254`) was not exercised there: that container has no IPv6 route to it. It covers hosts
+where the IPv6 metadata endpoint is routable.
+
 Not verified: SELinux- or AppArmor-enforcing hosts, rootless podman, a distro-packaged podman, and
 an actual reboot — the fail-closed ordering was exercised with `systemctl`, not a boot.
 
@@ -531,13 +546,18 @@ If a sandbox container cannot attach on a real VM, `SH_SANDBOX_RELAY_ADDR` (or, 
 cannot resolve `host.containers.internal`, the VM's actual gateway or bridge IP) is the override to
 reach for first; `sudo nft list table inet moca_sandbox` shows the loaded rules.
 
-**Cloud instance metadata is still reachable from sandboxes.** Because forwarded traffic is
-untouched, a sandbox can reach `169.254.169.254`. On a cloud VM that can expose the instance's own
-role credentials, which belong to the host, not to any session. Until S5 filters egress, close it at
-the platform. On EC2, require IMDSv2 with a hop limit of 1 (`aws ec2 modify-instance-metadata-options
---http-tokens required --http-put-response-hop-limit 1`): a forwarded container request then cannot
-obtain a token. On other clouds, use the equivalent, or drop `169.254.0.0/16` from `moca-sandbox0`
-in your own forward-hook table. The in-product fix is tracked in rossoctl/moca#357.
+**Link-local instance metadata is blocked in-product** (closed rossoctl/moca#357). The
+`moca_sandbox` table's forward chain drops link-local destinations — `169.254.0.0/16`, which
+carries `169.254.169.254`, and the IPv6 metadata address `fd00:ec2::254` — arriving from the
+sandbox bridge, so a sandbox cannot reach the link-local metadata endpoints that AWS, GCP, Azure
+and OCI serve, even though general forwarded traffic stays untouched until S5's `moca-egress`.
+Clouds that serve instance data from routable addresses are not covered by a link-local drop —
+Alibaba's `100.100.100.200`, Azure's WireServer `168.63.129.16`; S5's egress allowlist is what
+closes those. Platform hardening is still worth it on every cloud — defense in depth where the
+table already covers the endpoint, the only barrier where it does not. On EC2, require IMDSv2
+with a hop limit of 1 (`aws ec2 modify-instance-metadata-options --instance-id <id>
+--http-tokens required --http-put-response-hop-limit 1`): a forwarded container request then
+cannot obtain a token even if the table is ever unloaded. Other clouds have the equivalent.
 
 ## A research turn: curl and git in the sandbox
 

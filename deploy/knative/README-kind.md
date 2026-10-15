@@ -82,10 +82,14 @@ on `curl -N`) aborts the in-flight turn; the session still persists to its last 
 so it resumes identically to a completed turn.
 
 An unknown `sessionId` or a missing `prompt` still returns a real HTTP `404`/`400` with the same JSON
-body as the non-streaming path — the `200` + SSE headers are only sent once the first frame is ready.
+body as the non-streaming path — the `200` + SSE headers are sent once the first frame is ready, or
+after `SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS` (below) if it is not ready by then; a failure after that
+point is a terminal `error` frame.
 
 Tuning knobs (env): `SH_TURN_STREAM_TOOL_RESULT_PREVIEW_BYTES` (tool-result `preview` byte cap,
-default `2048`) and `SH_TURN_STREAM_KEEPALIVE_MS` (heartbeat interval, default `20000`).
+default `2048`), `SH_TURN_STREAM_KEEPALIVE_MS` (heartbeat interval, default `20000`) and
+`SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS` (flush SSE headers if no frame has been written by then,
+default `15000`, `0` disables; keeps a proxy idle timeout from cutting a slow first frame).
 
 > **Deployment note (Knative):** annotate the streaming revision with
 > `autoscaling.knative.dev/target-burst-capacity: "0"` so the Knative activator drops out of the

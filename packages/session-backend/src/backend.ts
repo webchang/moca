@@ -17,6 +17,8 @@ export interface LogStore<E = unknown> {
   nextPosition(session_id: string): Promise<number>;
   /** Position (1-based) of the stored entry whose decoded payload `.id` equals `id`, or null. O(N). */
   positionOfId(session_id: string, id: string): Promise<number | null>;
-  /** All known session ids. */
-  list(): Promise<string[]>;
+  // NOTE: no list(). A store keyed by session id has no subject concept, so any listing it could
+  // offer is an all-tenant enumeration (rossoctl/moca#361). The scoped path is the control plane's
+  // OwnershipIndex.listByOwner, backed by per-owner zsets -- spec §13 of the multi-user isolation
+  // design. This interface must not grow a listing back.
 }

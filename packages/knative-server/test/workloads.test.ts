@@ -213,7 +213,10 @@ describe('workload authentication', () => {
       status: 401,
       body: { error: 'token_required' },
     });
-    expect((await call('GET', '/workloads/demo')).status).toBe(401);
+    expect(await call('GET', '/workloads/demo')).toMatchObject({
+      status: 401,
+      body: { error: 'token_required' },
+    });
     expect(cs.calls).toEqual([]);
   });
 
@@ -384,7 +387,10 @@ describe('workload lifecycle', () => {
     expect(
       await call('POST', '/workloads/missing/activate', alice, { revision: 'not-a-digest' }),
     ).toEqual({ status: 400, body: { error: 'revision_invalid' } });
-    expect((await call('PUT', '/workloads/demo', alice, {})).status).toBe(405);
+    expect(await call('PUT', '/workloads/demo', alice, {})).toEqual({
+      status: 405,
+      body: { error: 'method_not_allowed' },
+    });
     expect(cs.calls).toEqual([]);
   });
 });
@@ -499,7 +505,7 @@ describe('lifecycle races', () => {
     expect((await create(alice, 'reused')).status).toBe(201);
     const [[newer]] = cs.ownedBy(alice);
     release();
-    expect((await stale).status).toBe(409);
+    expect(await stale).toEqual({ status: 409, body: { error: 'workload_state_changed' } });
     expect(cs.ownedBy(alice).map(([name]) => name)).toEqual([newer]);
     expect((await call('GET', '/workloads/reused', alice)).body).toMatchObject({
       status: 'awaiting_upload',

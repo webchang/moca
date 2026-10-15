@@ -18,6 +18,7 @@ import {
 } from './headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
 import { cmdGet, cmdSpawn, cmdSubagents, runSpawnWorker } from './subagent.js';
+import { cmdWorkloadCreate, cmdWorkloadDelete, cmdWorkloadGet } from './workloads.js';
 import { VERSION } from './version.js';
 
 export const USAGE = `usage:
@@ -41,8 +42,16 @@ export const USAGE = `usage:
   mocactl credentials delete NAME [--json]
   mocactl spawn "prompt" [--config DIGEST] --kind prompt|solve
       [--repo URL --ref REF] [--tag T] [--json]   fork a detached subagent (solve needs --repo/--ref)
+  mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]
+                                                 run the subagent on a workload's context
+                                                 (--writable: its own copy, discarded after)
   mocactl subagents [--tag T] [--json]            list spawned subagents + current state
   mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
+  mocactl workloads create --context FILE [--name NAME] [--json]
+                                                 upload a context file (contextctl ctx export) to a
+                                                 new workload; prints its id
+  mocactl workloads get ID [--json]
+  mocactl workloads delete ID [--json]           delete a workload and its context
 flags for every command: --control-plane-url URL
   (the control plane says where the harness is; --harness-url URL overrides that)`;
 
@@ -108,6 +117,10 @@ export async function main(
         ref: { type: 'string' },
         tag: { type: 'string' },
         out: { type: 'string' },
+        workload: { type: 'string' },
+        writable: { type: 'boolean' },
+        context: { type: 'string' },
+        name: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'V' },
       },
@@ -163,6 +176,25 @@ export async function main(
   }
   if (values.out !== undefined && command !== 'get') {
     io.err(`--out only applies to \`mocactl get\`\n${USAGE}`);
+    return 2;
+  }
+  if (values.workload !== undefined && command !== 'spawn') {
+    io.err(`--workload only applies to \`mocactl spawn\`\n${USAGE}`);
+    return 2;
+  }
+  if (values.writable !== undefined && command !== 'spawn') {
+    io.err(`--writable only applies to \`mocactl spawn\`\n${USAGE}`);
+    return 2;
+  }
+  if (values.writable && values.workload === undefined) {
+    io.err(`--writable needs --workload ID: only a workload's context is copied\n${USAGE}`);
+    return 2;
+  }
+  const workloadsCreate = command === 'workloads' && rest[0] === 'create';
+  if ((values.context !== undefined || values.name !== undefined) && !workloadsCreate) {
+    io.err(
+      `--${values.context !== undefined ? 'context' : 'name'} only applies to \`mocactl workloads create\`\n${USAGE}`,
+    );
     return 2;
   }
   // B14: refresh an expired API token once, up front, so every command's login check -- and the
@@ -292,6 +324,8 @@ export async function main(
         repoUrl: values.repo,
         ref: values.ref,
         tag: values.tag,
+        workloadId: values.workload,
+        writable: values.writable === true,
         json,
       });
     }
@@ -303,6 +337,32 @@ export async function main(
       const [sid, ...extra] = rest;
       if (sid === undefined || extra.length > 0) return usage(io);
       return cmdGet(rt, io, { sessionId: sid, outDir: values.out, json, signal });
+    }
+    case 'workloads': {
+      const [sub, id, ...extra] = rest;
+      if (sub === undefined) {
+        // The harness has no route that lists workloads.
+        io.err(`mocactl workloads needs create, get or delete (there is no list)\n${USAGE}`);
+        return 2;
+      }
+      if (sub === 'create') {
+        if (id !== undefined) return usage(io);
+        if (!values.context) {
+          io.err(`workloads create needs --context FILE\n${USAGE}`);
+          return 2;
+        }
+        return cmdWorkloadCreate(rt, io, {
+          contextPath: values.context,
+          name: values.name,
+          json,
+          signal,
+        });
+      }
+      if (sub !== 'get' && sub !== 'delete') return unknown(io, 'workloads', sub);
+      if (id === undefined || extra.length > 0) return usage(io);
+      return sub === 'get'
+        ? cmdWorkloadGet(rt, io, { id, json, signal })
+        : cmdWorkloadDelete(rt, io, { id, json, signal });
     }
     // Hidden entrypoint: the detached worker forked by `mocactl spawn` re-execs itself with this
     // subcommand, reads its payload from stdin, and writes the result to the ledger. Not in USAGE

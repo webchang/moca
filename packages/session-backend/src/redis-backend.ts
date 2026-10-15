@@ -152,11 +152,9 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
     return null;
   }
 
-  async list(): Promise<string[]> {
-    await this.open();
-    const keys = await this.client.keys('session:*');
-    return keys.filter((k) => !k.endsWith(':seq')).map((k) => k.slice('session:'.length));
-  }
+  // No list(): it was a keys('session:*') scan -- O(keyspace), Redis-blocking, and an all-tenant
+  // enumerator with no owner concept (rossoctl/moca#361). The scoped listing is the control plane's
+  // OwnershipIndex.listByOwner. Deleted rather than SCAN-ified because nothing called it.
 
   /** Test helper: delete a session's stream + sequence counter. */
   async reset(sid: string): Promise<void> {

@@ -35,6 +35,7 @@ P6 on Kubernetes; the criteria, the status of each path and the support policy a
 | Operate P6 on Kubernetes            | [Operations](operations/index.md)                                                                                                                                                         |
 | Understand how it works             | [Concepts](concepts/index.md)                                                                                                                                                             |
 | See the terms MOCA uses             | [Glossary](glossary.md)                                                                                                                                                                   |
+| Know what changes need notice       | [Change policy](reference/change-policy.md)                                                                                                                                               |
 | Know what Stable requires           | [Maturity and lifecycle](reference/maturity-and-lifecycle.md)                                                                                                                             |
 | Look up an environment variable     | [Configuration reference](reference/configuration.md)                                                                                                                                     |
 | Look up a `mocactl` command         | [`mocactl` reference](reference/cli-mocactl.md)                                                                                                                                           |
@@ -46,21 +47,21 @@ P6 on Kubernetes; the criteria, the status of each path and the support policy a
 
 ## What is in `docs/`
 
-| Location                                    | What it is                                                             | Audience                  |
-| ------------------------------------------- | ---------------------------------------------------------------------- | ------------------------- |
-| `get-started/`                              | Install-path chooser                                                   | New users                 |
-| `migrating-from-knative.md`                 | The single deprecation and migration page                              | Operators                 |
-| `guides/`                                   | Task guides: multi-user sessions, remote sandbox, promoting a workflow | Operators and users       |
-| `operations/`                               | Upgrades, Redis backup, observability, sizing, troubleshooting         | Operators                 |
-| `concepts/`                                 | How sessions, sandboxes, multiplexing, multi-user and dispatch work    | Everyone                  |
-| `reference/`                                | Configuration, `mocactl` commands, HTTP API guide, leaf envelope       | Operators and integrators |
-| `glossary.md`, `context-service.md`, `api/` | Terms and API reference                                                | Integrators               |
-| `demos/`                                    | Guided, hand-driven walkthroughs                                       | Evaluators                |
-| `specs/` (registry: `specs/README.md`)      | Design specs; the milestone registry is the source of truth for status | Maintainers               |
-| `adrs/`                                     | Immutable decision records                                             | Maintainers               |
-| `notes/`                                    | Working notes, runbooks and result write-ups                           | Maintainers               |
-| `archive/`                                  | Dated historical write-ups (Knative-era)                               | Background                |
-| `REORG-PLAN.md`                             | The plan this structure follows, with the audit and open questions     | Maintainers               |
+| Location                                    | What it is                                                                             | Audience                  |
+| ------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------- |
+| `get-started/`                              | Install-path chooser                                                                   | New users                 |
+| `migrating-from-knative.md`                 | The single deprecation and migration page                                              | Operators                 |
+| `guides/`                                   | Task guides: multi-user sessions, remote sandbox, promoting a workflow                 | Operators and users       |
+| `operations/`                               | Upgrades, Redis backup, observability, sizing, troubleshooting                         | Operators                 |
+| `concepts/`                                 | How sessions, sandboxes, multiplexing, multi-user, dispatch and context workflows work | Everyone                  |
+| `reference/`                                | Configuration, `mocactl` commands, HTTP API guide, leaf envelope                       | Operators and integrators |
+| `glossary.md`, `context-service.md`, `api/` | Terms and API reference                                                                | Integrators               |
+| `demos/`                                    | Guided, hand-driven walkthroughs                                                       | Evaluators                |
+| `specs/` (registry: `specs/README.md`)      | Design specs; the milestone registry is the source of truth for status                 | Maintainers               |
+| `adrs/`                                     | Immutable decision records                                                             | Maintainers               |
+| `notes/`                                    | Working notes, runbooks and result write-ups                                           | Maintainers               |
+| `archive/`                                  | Dated historical write-ups (Knative-era)                                               | Background                |
+| `REORG-PLAN.md`                             | The plan this structure follows, with the audit and open questions                     | Maintainers               |
 
 Install guides live next to the scripts they describe: `deploy/compose/`, `deploy/vm/`, `deploy/k8s/` and
 `deploy/microvm/`. Day-two operations for P6 on Kubernetes are in [`operations/`](operations/index.md); the

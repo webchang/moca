@@ -1,5 +1,10 @@
 # Two users, one VM — `mocactl` login and session ownership on P6
 
+> **Preview.** Run by one person with two GitHub accounts on one laptop. It predates the `mocactl` installer (use the
+> one-line installer in [Get started](../get-started/index.md)) and says the container worker ignores the workspace key,
+> which is out of date. The task version is [Manage multi-user sessions](../guides/manage-multi-user-sessions.md).
+> Labels: [Maturity and lifecycle](../reference/maturity-and-lifecycle.md).
+
 > **The claim:** two people, each on their own laptop with their own GitHub account, log in to the
 > same P6 VM with `mocactl`. Each creates and resumes sessions, and neither can see or reach the
 > other's. Another user's session is not "forbidden". It **does not exist** (404), and a session

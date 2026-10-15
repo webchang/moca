@@ -52,9 +52,6 @@ class FakeStore implements LogStore<FileEntry> {
     }
     return null;
   }
-  async list(): Promise<string[]> {
-    return ['s'];
-  }
 }
 
 describe('BufferedRedisBackend', () => {
@@ -75,6 +72,14 @@ describe('BufferedRedisBackend', () => {
     const b = new BufferedRedisBackend(store);
     b.append('s', msg());
     await expect(b.flush()).rejects.toThrow('boom');
+  });
+
+  it("list() refuses rather than enumerate every tenant's sessions (#361)", async () => {
+    // Pi's SessionStorageBackend requires the method, so it cannot be deleted -- but the storage
+    // layer has no subject concept, and the pass-through used to delegate to a keys('session:*')
+    // scan. The control plane's OwnershipIndex.listByOwner is the only list path (spec §13).
+    const b = new BufferedRedisBackend(new FakeStore());
+    await expect(b.list()).rejects.toThrow(/OwnershipIndex\.listByOwner/);
   });
 
   it('read unwraps stored entries; latestCheckpoint finds the checkpoint custom entry', async () => {

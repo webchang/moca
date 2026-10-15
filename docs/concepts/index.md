@@ -12,6 +12,7 @@
 | [Sandboxes and tiers](sandboxes-and-tiers.md)   | What isolation does a sandbox give, and how does a session find "its" sandbox?   |
 | [Multi-user](multi-user.md)                     | Who can do what, and where do credentials live?                                  |
 | [Dispatch archetypes](dispatch-archetypes.md)   | How does an orchestrator hand work to MOCA, and which patterns work on P6 today? |
+| [Context workflows](context-workflows.md)       | How do users move context into and out of MOCA, and which ways work today?       |
 
 The ideas that hold across deployments are: durable resumable sessions, a brain/hands split, several
 users on one deployment, and disposable sandboxes. Scale-to-zero was a property of the deprecated

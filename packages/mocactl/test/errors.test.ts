@@ -69,6 +69,16 @@ describe('classify', () => {
     });
   });
 
+  it('tells a connection closed under the request from one that was never made', () => {
+    const closed = (code: string) =>
+      networkError('harness', new TypeError('fetch failed', { cause: { code } }));
+    expect(closed('UND_ERR_SOCKET').code).toBe('connection_dropped');
+    expect(closed('ECONNRESET').code).toBe('connection_dropped');
+    expect(closed('ECONNREFUSED').code).toBe('network_error');
+    expect(closed('ENOTFOUND').code).toBe('network_error');
+    expect(networkError('harness', new TypeError('fetch failed')).code).toBe('network_error');
+  });
+
   it('classifies identity_provider_misconfigured as the operator\'s fix, not as "unavailable"', () => {
     // A 502, so without its own branch it would fall into the >= 500 "try again shortly" (#405).
     expect(

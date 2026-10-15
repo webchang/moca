@@ -12,7 +12,7 @@ describe('RedisSessionBackend credential redaction', () => {
     });
     try {
       const store = new RedisSessionBackend('redis://:topsecret@127.0.0.1:6399');
-      const err = await store.list().then(
+      const err = await store.read('probe').then(
         () => undefined,
         (e: unknown) => e,
       );

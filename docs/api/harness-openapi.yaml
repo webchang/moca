@@ -74,7 +74,11 @@ paths:
         text/event-stream` for the streamed form; omit it for the sync form. The two run the
         same execution core and report the same facts (§3.4): a failure before the first frame
         is a real HTTP error byte-identical to the sync path's; a failure after streaming has
-        begun degrades to a terminal `error` frame, since the status code is spent.
+        begun degrades to a terminal `error` frame, since the status code is spent. Streaming
+        begins at the first frame, or at SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS (default 15000, 0
+        disables) if none has come by then, so a proxy idle timeout cannot cut a slow first
+        frame: a failure slower than that is an `error` frame, including a 503 that would have
+        carried `Retry-After`.
 
         Authenticated turns run on the caller's exchanged credential, with the session's
         config bundle and sandbox tier taken from the control plane — never from the request
@@ -102,10 +106,11 @@ paths:
         also the terminal the starting connection receives. A detached turn nobody watches is aborted
         after SH_TURN_DETACHED_MAX_S (default 1800), and its log is retained for
         SH_TURN_LOG_TTL_S (default 86400). A turn the harness ended itself carries the reason
-        on its terminal `error` frame (`abortReason`). The lazy flush is unchanged: the
-        session's one-live-turn lease is taken before the first frame, so a 409 or 503 is
-        still a real status code, and a failure before the first frame is the sync path's
-        status and JSON.
+        on its terminal `error` frame (`abortReason`). The lazy flush is unchanged except for
+        its deadline: the session's one-live-turn lease is taken before the first frame, so a
+        409 or 503 from it is still a real status code, and a failure before the first frame
+        is the sync path's status and JSON. At SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS the `turn`
+        frame is written on its own, and a failure after that is an `error` frame.
 
         ONE LIVE TURN PER SESSION. With SH_TURN_DETACH=1, every /v1/turn — detachable or not —
         checks for a running detachable turn on its session before its first frame, and is
@@ -409,8 +414,10 @@ paths:
         never settable by an external caller. A synchronous prompt run naming a `workloadId` runs
         with that workload's frozen context, which Moca copies read-only into the sandbox; the
         session token's user must own the workload (docs/context-service.md). With workloads off,
-        or for an async run, it is refused with 501 workload_runs_unavailable rather than run on
-        the default pool.
+        or for any async run, it is refused with 501 workload_runs_unavailable rather than run on
+        the default pool; a synchronous one without a token is 401 token_required.
+        `contextWritable: true` gives that run its own writable copy of the context instead,
+        discarded when the run ends.
       security:
         - sessionToken: []
       requestBody:
@@ -437,7 +444,8 @@ paths:
             session_mismatch · subject_conflict · credential_required · credential_ambiguous ·
             endpoint_unresolved (the control-plane exchange refused the caller's credential or
             its endpoint) · workload_run_requires_prompt (a run naming a workloadId must be a
-            prompt run)
+            prompt run) · context_writable_invalid (contextWritable is not a boolean) ·
+            context_writable_requires_workload (contextWritable true without a workloadId)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -464,7 +472,9 @@ paths:
             async_runs_unavailable — async: true with a token-bearing caller. Not a capability
             this deployment grants; a token-less caller on a require-auth deployment never
             reaches it (401 token_required fires first). workload_runs_unavailable — the
-            envelope named a workloadId, but workloads are off or the run is async.
+            envelope named a workloadId, but workloads are off or the run is async. It is
+            checked before async_runs_unavailable, so an async run naming a workload gets it
+            whether or not it carries a token.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -490,7 +500,10 @@ paths:
                       reason: { type: string, enum: [saturated] }
                   - $ref: '#/components/schemas/Error'
         '500':
-          description: internal_error — not retryable as-is
+          description: |
+            internal_error — not retryable as-is. workloads_misconfigured — the run named a
+            workloadId, but the operator's Context Service settings are missing or unsafe
+            (docs/context-service.md).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -836,6 +849,14 @@ components:
             kind: { type: string, enum: [prompt] }
             sessionId: { type: string }
             prompt: { type: string, description: The free-form prompt to run. }
+            workloadId:
+              type: string
+              description: Run on this workload's frozen context. Synchronous runs only.
+            contextWritable:
+              type: boolean
+              description: |
+                Give the run its own writable copy of the workload's context, discarded when the
+                run ends, instead of a read-only view. true needs workloadId; false is ignored.
     LeafItem:
       type: object
       required: [item_id, file, pattern]

@@ -23,8 +23,16 @@ Context Service:
 3. **Activate:** `POST /workloads/{id}/activate` names the uploaded revision; Context Service freezes
    it.
 4. **Run:** a synchronous `POST /runs` with a `workloadId` runs the prompt on a shared sandbox with
-   the workload's frozen revision available read-only.
+   the workload's frozen revision available read-only, or as a writable copy for that run.
 5. **Delete:** `DELETE /workloads/{id}` deletes the Context, then the workload.
+
+`mocactl` is the client for this flow
+([#495](https://github.com/rossoctl/moca/issues/495), one CLI for delegating subagent tasks;
+[#517](https://github.com/rossoctl/moca/issues/517), seed sandbox files before a leaf runs):
+`mocactl workloads create --context FILE` does steps 1 to 3, `mocactl spawn --kind prompt --workload ID`
+step 4, and `mocactl workloads delete ID` step 5. It does not build the context file:
+`contextctl ctx export` does. See "Delegate with context" in
+[`packages/mocactl/README.md`](../packages/mocactl/README.md).
 
 The routes are off by default. With them off, every `/workloads` route answers
 `501 workloads_unavailable`.
@@ -67,26 +75,53 @@ answers `409 workload_state_changed` and changes nothing. Context Service failur
 A run on a workload is a synchronous prompt run (`"kind": "prompt"`) with a `workloadId`, made with
 a session token (scope `turn:write`). The token's user must own the workload: another user's
 workload, like a missing one, is `404 workload_not_found`. A workload that is not `ready` answers
-`409 workload_not_ready`, and another kind of run `400 workload_run_requires_prompt`. A run with no
-token is `401 token_required`. Asynchronous runs on a workload, and every workload run while the
-routes are off, answer `501 workload_runs_unavailable`. The sandbox tier is the session's, chosen as
-for any other run.
+`409 workload_not_ready`, and another kind of run `400 workload_run_requires_prompt`. A synchronous
+run with no token is `401 token_required`. Asynchronous runs on a workload, and every workload run
+while the routes are off, answer `501 workload_runs_unavailable`; an asynchronous run gets it before
+the general `501 async_runs_unavailable` for tokened callers. Authentication still comes first: on a
+deployment with `SH_REQUIRE_AUTH=true` (as `deploy/k8s` sets), a request with no token is
+`401 token_required` before either check. The
+sandbox tier is the session's, chosen as for any other run.
 
 Delivery is lazy. Moca downloads the frozen bundle from Context Service's trusted export
 (`GET /internal/v1/namespaces/{ns}/contexts/{name}/revisions/{sha256}/bundle`) only when the
 selected sandbox lacks that revision, once per revision: concurrent runs share one download, and a
-bounded in-memory cache, keyed by user, Context and revision, serves later ones. A bundle over the
-size ceiling or with an incomplete gzip stream is refused and never cached. The harness copies the
-raw bytes over SandboxExec in 8 MiB chunks, checks their sha256 in the sandbox, extracts them
-read-only (directories `0555`, files `0444`) and publishes the revision atomically under `flock`.
+bounded in-memory cache, keyed by user, Context and revision, serves later ones. Deleting a workload
+drops its cached bundles. Downloads in flight share a byte budget: each reserves its
+`Content-Length`, or the size ceiling when the length is unknown, before buffering, and waits up to
+the export timeout for budget to come free. A bundle over the size ceiling, that inflates past the
+expanded ceiling, or with an incomplete gzip stream is refused and never cached. The harness copies
+the raw bytes over SandboxExec in 8 MiB chunks, checks their sha256 in the sandbox, refuses an
+archive with more entries than the entry limit, extracts it read-only (write permission removed;
+directories stay traversable and executable files keep their exec bit) and publishes the revision
+atomically under `flock`.
 The run gets its own view at `/workspace/.moca-context/runs/<session>`, and the prompt tells the
 agent that path. Each user's copy is cached separately, so two users never share one, even for
 identical content. Only P6 sandboxes (Moca's long-running sandbox workers, reached through the
 relay) are supported: a run whose sandbox is reached another way fails without running a turn.
 
+The sha256 check in the sandbox proves transport integrity only: the extracted bytes are the ones
+Moca downloaded. It does not prove they are the pinned revision. A Context Service revision is a
+digest of the Context's files (their paths, checksums and sizes), not of the compressed bundle, and
+the bundle carries no record from which Moca could recompute it exactly. Moca trusts Context
+Service's authenticated export for the revision's identity.
+
+**Writable copies.** A run that also sets `"contextWritable": true` gets its own writable copy of
+the revision instead of a read-only view, for tasks that edit files, rerun tests or build. The
+harness first places the revision in the sandbox's read-only cache as usual, then copies it
+(`cp -a`) into a staging directory, makes the copy writable for the agent, and renames it into
+place, so the run's path is a real directory, never a partial one. The cached copy stays read-only
+and is shared, ref-counted and swept as for any other run. The prompt tells the agent the copy is
+writable and is discarded when the run ends, so the agent should return any changes, such as a diff
+or test output, in its response. Exec bits survive the copy, so a bundled `./test.sh` runs as is.
+`contextWritable` must be a boolean (`400 context_writable_invalid`), and `true` needs a
+`workloadId` (`400 context_writable_requires_workload`); `false` is ignored.
+
 Read-only is enforced by file permissions only: the agent runs as the same user as the files and
-could change them. Separating users is why each user's copy is its own; enforcing read-only with a
-mount or a separate user comes with per-workload sandboxes
+could change them. Each user's copy is its own, under a cache name derived with an HMAC under a
+secret the agents never see, so an agent cannot compute another user's name and plant a copy for a
+revision it knows. It can still alter, and learn the name of, any copy present on the sandbox.
+Enforcing read-only with a mount or a separate user comes with per-workload sandboxes
 ([#476](https://github.com/rossoctl/moca/issues/476), phase 2 workloads).
 
 **Multiple users.** Several users can create workloads and run tasks at once: names, ownership,
@@ -94,10 +129,12 @@ Contexts and sandbox caches are per user. The sandboxes themselves are shared, t
 a security boundary between users: tasks from different users can run on the same sandbox, as the
 same Linux user, one after another. Per-user sandboxes come with #476.
 
-After the run, its view is removed and, by default, so is any revision no run still uses. Shared
-sandboxes serve several users, so a user's context should not stay on them for the next user's
-task. `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES` keeps unused revisions longer, which saves a transfer
-for repeated runs at the cost of leaving that context on the sandbox for the period.
+After the run, its view, or its writable copy, is removed and, by default, so is any revision no
+run still uses. A writable copy left by a harness that died is swept a day later, as abandoned
+uploads are. Shared sandboxes serve several users, so a user's context should not stay on them for
+the next user's task. `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES` keeps unused revisions longer, which
+saves a transfer for repeated runs at the cost of leaving that context on the sandbox for the
+period.
 
 ## Names are per user
 
@@ -112,24 +149,36 @@ Context's owner.
 
 ## Settings
 
-| Variable                               | Meaning                                                             |
-| -------------------------------------- | ------------------------------------------------------------------- |
-| `MOCA_CONTEXT_WORKLOADS_ENABLED`       | `1` turns the routes on, together with `CONTEXT_SERVICE_URL`        |
-| `CONTEXT_SERVICE_URL`                  | Internal base URL of Context Service                                |
-| `CONTEXT_SERVICE_TOKEN`                | Bearer Context Service accepts for its trusted routes               |
-| `CONTEXT_SERVICE_PUBLIC_URL`           | Base URL clients upload to; HTTPS, or HTTP on loopback only         |
-| `CONTEXT_SERVICE_NAMESPACE`            | Context namespace; defaults to `POD_NAMESPACE`, then `default`      |
-| `CONTEXT_SERVICE_TIMEOUT_MS`           | Per-request timeout, default `5000`                                 |
-| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER` | Live workloads per user, default `5`                                |
-| `MOCA_CONTEXT_MAX_STORAGE_GIB`         | Largest `workspace.size`, default `10`                              |
-| `MOCA_CONTEXT_STORAGE_CLASSES`         | Comma-separated StorageClasses a caller may name; empty allows none |
-| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`    | How long `GET` still reports a deleted workload, default `86400`    |
-| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`        | Largest bundle a run downloads, default `268435456` (256 MiB)       |
-| `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`      | Moca's in-memory bundle cache, default `67108864` (64 MiB)          |
-| `MOCA_CONTEXT_EXPORT_TIMEOUT_MS`       | Timeout for one bundle download, default `300000`                   |
-| `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES`  | Minutes an unused revision stays on a sandbox, default `0`          |
+| Variable                                 | Meaning                                                                 |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| `MOCA_CONTEXT_WORKLOADS_ENABLED`         | `1` turns the routes on, together with `CONTEXT_SERVICE_URL`            |
+| `CONTEXT_SERVICE_URL`                    | Internal base URL of Context Service                                    |
+| `CONTEXT_SERVICE_TOKEN`                  | Bearer Context Service accepts for its trusted routes                   |
+| `CONTEXT_SERVICE_PUBLIC_URL`             | Base URL clients upload to; HTTPS, or HTTP on loopback only             |
+| `CONTEXT_SERVICE_NAMESPACE`              | Context namespace; defaults to `POD_NAMESPACE`, then `default`          |
+| `CONTEXT_SERVICE_TIMEOUT_MS`             | Per-request timeout, default `5000`                                     |
+| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER`   | Live workloads per user, default `5`                                    |
+| `MOCA_CONTEXT_MAX_STORAGE_GIB`           | Largest `workspace.size`, default `10`                                  |
+| `MOCA_CONTEXT_STORAGE_CLASSES`           | Comma-separated StorageClasses a caller may name; empty allows none     |
+| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`      | How long `GET` still reports a deleted workload, default `86400`        |
+| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`          | Largest bundle a run downloads, default `268435456` (256 MiB)           |
+| `MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES` | Most a bundle may inflate to, default `1342177280` (1.25 GiB)           |
+| `MOCA_CONTEXT_BUNDLE_MAX_ENTRIES`        | Most entries a bundle may hold, default `10000`                         |
+| `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`        | Moca's in-memory bundle cache, default `67108864` (64 MiB)              |
+| `MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES`     | Bytes all downloads in flight may buffer, default `536870912` (512 MiB) |
+| `MOCA_CONTEXT_EXPORT_TIMEOUT_MS`         | Timeout for one bundle download, default `300000`                       |
+| `MOCA_CONTEXT_CACHE_SECRET`              | Secret for the sandbox cache names; random per process if unset         |
+| `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES`    | Minutes an unused revision stays on a sandbox, default `0`              |
 
 A missing token or an unsafe public URL answers `500 workloads_misconfigured`.
+
+A writable run keeps the cached revision and its own copy, so it takes up to twice the expanded
+limit on the sandbox's disk while it runs, plus what the agent writes. There is no separate limit
+for it.
+
+The entry limit matches Context Service's upload limit. The expanded limit is a quarter above
+Context Service's 1 GiB, because it also counts tar headers and padding. The download budget must
+be at least `MOCA_CONTEXT_BUNDLE_MAX_BYTES`: a download that could never fit is refused at once.
 
 On Kubernetes, `deploy/k8s` reads these from an optional `moca-context-service` ConfigMap (keys
 `enabled`, `url`, `public-url`, `namespace`) and Secret (key `token`), and allows the supervisor to

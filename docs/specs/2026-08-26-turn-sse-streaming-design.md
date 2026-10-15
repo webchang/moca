@@ -178,6 +178,12 @@ onEvent: (f) => writeFrame(res, f), signal: ac.signal })`. Progress frames strea
   `SH_TURN_STREAM_KEEPALIVE_MS` (default `20000`), reset on every real frame and cleared at turn end,
   so a long silent tool execution can't trip a proxy idle-timeout. Comments are invisible to
   `EventSource` and to `curl` content — they never touch the frame vocabulary.
+- **First-frame flush deadline:** the heartbeat is armed by the first write, so a turn whose first
+  frame is slow would otherwise send nothing at all, and a proxy with a short idle timeout (a cloud
+  load balancer's 50 s) cuts the connection before headers arrive. A one-shot timer,
+  `SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS` (default `15000`, `0` disables), flushes the SSE headers
+  with a keepalive comment (a detachable turn writes its `turn` frame instead, so the client learns
+  its turnId) and arms the heartbeat. The timer is cleared by the first real frame and at turn end.
 
 ### 3.4 Error taxonomy & back-compat — parity by construction
 
@@ -195,6 +201,11 @@ Lazy header flush partitions failures into three regimes, each mapped to preserv
 3. **Post-first-frame (mid-turn failure).** Once tokens have flowed, `headersSent` is true and status
    codes are spent. The catch emits a terminal `error` frame then `res.end()`s. Guarded by
    `!res.writableEnded` so a concurrent disconnect can't double-write or `EPIPE`.
+
+The boundary between regimes 2 and 3 is "the first write", and the first-frame flush deadline (§3.3)
+can make that a write with no progress frame: a failure that lands _after_ the deadline (default
+15 s) gets the terminal `error` frame, not its HTTP status. Failures faster than the deadline keep
+full status parity. This is the price of keeping a proxy idle timeout from cutting a slow first frame.
 
 **Terminal frame selection.** When `executeTurn` _returns_ a `TurnResult` (the HTTP-200 equivalent),
 the terminal frame carries **every field the sync `TurnResult` exposes** (`sessionId`, `stopReason`,

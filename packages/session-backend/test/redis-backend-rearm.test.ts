@@ -30,7 +30,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  */
 const connect = vi.fn<() => Promise<void>>();
 const quit = vi.fn(async () => 'OK');
-const keys = vi.fn(async () => [] as string[]);
+// The command the probes below run. list() is gone (rossoctl/moca#361): it was a keys('session:*')
+// scan, and read() is the cheapest remaining read-only command through the same open() path.
+const xRange = vi.fn(async () => [] as unknown[]);
 // `on` is a stub, not an emitter: the constructor registers its 'error' listener through it, and
 // nothing here ever fires one. That is the boundary between the two files -- the crash on the event
 // channel is `redis-error-listener.test.ts`, which mocks a real EventEmitter for it.
@@ -50,7 +52,7 @@ const client = {
     }
   },
   quit,
-  keys,
+  xRange,
   on,
   isOpen: false,
 };
@@ -74,10 +76,10 @@ describe('RedisSessionBackend connect re-arm', () => {
 
     const b = new RedisSessionBackend(); // attempt 1, eager, as before
 
-    await expect(b.list()).rejects.toThrow('connect ETIMEDOUT');
+    await expect(b.read('probe')).rejects.toThrow('connect ETIMEDOUT');
     // The assertion that fails on the old code: `ready` held one rejected promise, so this call
     // replayed the SAME error and never attempted a second connect.
-    await expect(b.list()).resolves.toEqual([]);
+    await expect(b.read('probe')).resolves.toEqual([]);
     expect(connect).toHaveBeenCalledTimes(2);
   });
 
@@ -85,7 +87,7 @@ describe('RedisSessionBackend connect re-arm', () => {
     connect.mockResolvedValue(undefined);
     const b = new RedisSessionBackend();
 
-    await Promise.all([b.list(), b.list(), b.list()]);
+    await Promise.all([b.read('probe'), b.read('probe'), b.read('probe')]);
 
     // One connection per backend is the whole point of memoising it -- a re-arm that fired on the
     // happy path would put the per-turn leak straight back.
@@ -98,11 +100,11 @@ describe('RedisSessionBackend connect re-arm', () => {
       .mockRejectedValueOnce(new Error('second ETIMEDOUT'));
     const b = new RedisSessionBackend();
 
-    await expect(b.list()).rejects.toThrow('first ETIMEDOUT');
+    await expect(b.read('probe')).rejects.toThrow('first ETIMEDOUT');
     // On the old code this second call replayed the cached `first` rejection forever -- Redis
     // recovering could not change the answer. Seeing the second attempt's own error is the
     // observable difference.
-    await expect(b.list()).rejects.toThrow('second ETIMEDOUT');
+    await expect(b.read('probe')).rejects.toThrow('second ETIMEDOUT');
     expect(connect).toHaveBeenCalledTimes(2);
   });
 
@@ -112,7 +114,7 @@ describe('RedisSessionBackend connect re-arm', () => {
     // a leak inside the teardown that exists to prevent leaks.
     connect.mockRejectedValue(new Error('connect ETIMEDOUT'));
     const b = new RedisSessionBackend();
-    await expect(b.list()).rejects.toThrow();
+    await expect(b.read('probe')).rejects.toThrow();
 
     await expect(b.close()).resolves.toBeUndefined();
     expect(quit).not.toHaveBeenCalled(); // nothing was open to quit
@@ -121,7 +123,7 @@ describe('RedisSessionBackend connect re-arm', () => {
   it('close() quits a client that did connect', async () => {
     connect.mockResolvedValue(undefined);
     const b = new RedisSessionBackend();
-    await b.list();
+    await b.read('probe');
     client.isOpen = true;
 
     await b.close();
@@ -132,7 +134,7 @@ describe('RedisSessionBackend connect re-arm', () => {
   it('reconnects after node-redis permanently closes the socket', async () => {
     connect.mockResolvedValue(undefined);
     const b = new RedisSessionBackend();
-    await b.list();
+    await b.read('probe');
     expect(connect).toHaveBeenCalledTimes(1);
 
     // Past resilientClientOptions' bound node-redis sets isOpen false, swallows its own
@@ -142,7 +144,7 @@ describe('RedisSessionBackend connect re-arm', () => {
     // the isOpen check in open() this call would reuse the dead client forever.
     client.isOpen = false;
 
-    await expect(b.list()).resolves.toEqual([]);
+    await expect(b.read('probe')).resolves.toEqual([]);
     expect(connect).toHaveBeenCalledTimes(2);
   });
 });

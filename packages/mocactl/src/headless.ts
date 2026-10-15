@@ -155,7 +155,10 @@ export interface RunOptions {
 }
 
 /** False (with the reason on stderr) unless there is a control plane and a valid login for it. */
-function ready(rt: Runtime, io: Io): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
+export function ready(
+  rt: Runtime,
+  io: Io,
+): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
   if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp || !rt.harness) return false;
   if (!apiTokenValid(rt.auth, rt.now())) {
     io.err(

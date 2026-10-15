@@ -5,8 +5,15 @@ import type { SandboxTransport } from '@moca/k8s-sandbox';
  * Delivers a workload's frozen Context Service revision into a shared P6 sandbox, read-only, for one
  * run. The sandbox keeps one extracted copy per owner and revision under `cache/`; each run
  * registers a ref on it and gets its own view at `runs/<session>`. The bundle crosses the relay only
- * on a miss. Keying the cache by owner means two users never share a copy, so one user's agent
- * cannot alter what another user's run reads, even when both uploaded identical content.
+ * on a miss. A writable run gets its own copy of the cached revision there instead of a link, which
+ * it may change and which cleanup removes; the cached copy stays read-only. Keying the cache by
+ * owner means two users never share a copy, even when both uploaded identical content. The owner's
+ * part of the key is an HMAC under a secret agents never see, so an agent cannot derive another
+ * user's key from their name and plant a copy for a revision it knows.
+ * It is not isolation: every agent runs as the same uid as these files, so it can still alter any
+ * copy it can see, and learn that copy's scope from its name. The read-only modes stop accidents,
+ * not a determined agent. Isolation between users needs separate sandboxes (rossoctl/moca#476,
+ * phase 2 workloads).
  */
 
 /**
@@ -26,14 +33,14 @@ function sq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-const OWNER_SCOPE = /^[a-f0-9]{32}$/;
+const CACHE_SCOPE = /^[a-f0-9]{32}$/;
 const CACHE_KEY = /^[a-f0-9]{32}-[a-f0-9]{64}$/;
 
-/** The sandbox cache key for one owner's revision: `<owner scope>-<revision>`. */
-export function contextCacheKey(ownerScope: string, revision: string): string {
-  if (!OWNER_SCOPE.test(ownerScope)) throw new Error('invalid context owner scope');
+/** The sandbox cache key for one owner's revision: `<cache scope>-<revision>`. */
+export function contextCacheKey(cacheScope: string, revision: string): string {
+  if (!CACHE_SCOPE.test(cacheScope)) throw new Error('invalid context cache scope');
   if (!SHA256.test(revision)) throw new Error('invalid context revision');
-  return `${ownerScope}-${revision}`;
+  return `${cacheScope}-${revision}`;
 }
 
 function cacheKeyValue(key: string): string {
@@ -58,6 +65,16 @@ export function contextRetainMinutes(env: NodeJS.ProcessEnv = process.env): numb
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+/**
+ * Most entries a bundle may hold, `MOCA_CONTEXT_BUNDLE_MAX_ENTRIES`, default 10000 (Context
+ * Service's own upload limit). Moca already bounds the bytes a bundle inflates to; this bounds the
+ * inodes its extraction takes on a disk that several users share.
+ */
+export function contextMaxEntries(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseInt(env.MOCA_CONTEXT_BUNDLE_MAX_ENTRIES ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 10_000;
+}
+
 export function contextCacheDir(key: string): string {
   return `${BASE}/cache/${cacheKeyValue(key)}`;
 }
@@ -67,6 +84,7 @@ export function contextRoot(sessionId: string): string {
 }
 
 const uploadPath = (rev: string, sid: string) => `${BASE}/incoming/${rev}.${sid}.context`;
+const writableStage = (sid: string) => `${BASE}/runs/.stage.${sid}`;
 
 /**
  * Remove revisions that no live run references and no run used within the retention window, plus
@@ -97,6 +115,11 @@ function sweepLines(retainMinutes: number): string[] {
     `    [ -d "${BASE}/cache/$REV" ] || [ -n "$(ls -A "${BASE}/refs/$REV" 2>/dev/null)" ] || rm -f "$USED"`,
     `  done`,
     `  rmdir "${BASE}"/refs/* 2>/dev/null || true`,
+    // A writable copy, or its staging dir, left by a harness that died. Links are left alone.
+    `  for STALE in "${BASE}"/runs/* "${BASE}"/runs/.stage.*; do`,
+    `    [ -d "$STALE" ] && [ ! -L "$STALE" ] && [ -n "$(find "$STALE" -maxdepth 0 -mmin +${STALE_MINUTES})" ] || continue`,
+    `    chmod -R u+w "$STALE" 2>/dev/null || true; rm -rf "$STALE" 2>/dev/null || true`,
+    `  done`,
   ];
 }
 
@@ -136,15 +159,25 @@ export function buildContextAcquireScript(
 }
 
 /**
- * Verify the assembled upload against the digest Moca computed, extract it outside the lock into a
- * private staging dir beside the cache, make it read-only, then publish it with one same-directory
- * rename under the lock. A concurrent run that published first wins and this copy is discarded, so
- * a published revision is never partial.
+ * Verify the assembled upload against the digest Moca computed (transport integrity: the bytes are
+ * the ones Moca sent), refuse it when it holds more than `maxEntries` entries, extract it outside the
+ * lock into a private staging dir beside the cache, make it read-only (write bits removed, exec bits
+ * kept, so a bundled script stays runnable), then publish it with one
+ * same-directory rename under the lock. A concurrent run that published first wins and this copy is
+ * discarded, so a published revision is never partial.
  */
-export function buildContextPopulateScript(key: string, sessionId: string, sha256: string): string {
+export function buildContextPopulateScript(
+  key: string,
+  sessionId: string,
+  sha256: string,
+  maxEntries = contextMaxEntries(),
+): string {
   const rev = cacheKeyValue(key);
   const sid = sessionValue(sessionId);
   if (!SHA256.test(sha256)) throw new Error('invalid context bundle digest');
+  if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+    throw new Error('invalid context bundle entry limit');
+  }
   return [
     'set -euo pipefail',
     '# CONTEXT_POPULATE',
@@ -153,10 +186,11 @@ export function buildContextPopulateScript(key: string, sessionId: string, sha25
     `STAGE=${sq(`${BASE}/cache/.stage.${rev}.${sid}`)}`,
     `trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE" "$ARCHIVE"' EXIT`,
     `printf '%s  %s\\n' ${sq(sha256)} "$ARCHIVE" | sha256sum -c --status`,
+    `ENTRIES="$(tar -tzf "$ARCHIVE" | wc -l)"; [ "$ENTRIES" -le ${maxEntries} ] || { echo "context bundle has $ENTRIES entries, over ${maxEntries}" >&2; exit 1; }`,
     'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"; mkdir -p "$STAGE"',
     'tar -xzf "$ARCHIVE" --no-same-owner --no-same-permissions -C "$STAGE"',
-    'find "$STAGE" -type d -exec chmod 0555 {} +',
-    'find "$STAGE" -type f -exec chmod 0444 {} +',
+    // `X` keeps every directory traversable; files keep their exec bits.
+    'chmod -R u+rX,a-w "$STAGE"',
     '(',
     '  flock 9',
     '  [ -d "$CACHE" ] || mv "$STAGE" "$CACHE"',
@@ -166,9 +200,44 @@ export function buildContextPopulateScript(key: string, sessionId: string, sha25
 }
 
 /**
- * Expose one frozen revision read-only to this run and return the path of its view. `loadBundle`
- * is called only when the sandbox lacks the revision; the bytes then go over SandboxExec stdin in
- * chunks and are checked against their sha256 in the sandbox before anything is extracted.
+ * Replace this run's read-only link with its own writable copy of the cached revision. The ref this
+ * run holds keeps the cached copy from being swept while `cp -a` reads it, so the copy runs outside
+ * the lock. It is staged beside the run's view and renamed into place, so the agent never sees a
+ * partial copy. `touch` restarts the stage's age: `cp -a` keeps the cached copy's mtime, which the
+ * sweep would otherwise read as abandoned.
+ */
+export function buildContextWritableScript(key: string, sessionId: string): string {
+  const rev = cacheKeyValue(key);
+  const sid = sessionValue(sessionId);
+  return [
+    'set -euo pipefail',
+    '# CONTEXT_WRITABLE_COPY',
+    `CACHE=${sq(contextCacheDir(rev))}; ROOT=${sq(contextRoot(sid))}`,
+    `STAGE=${sq(writableStage(sid))}`,
+    `trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"' EXIT`,
+    '[ -d "$CACHE" ]',
+    'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"',
+    'cp -a "$CACHE" "$STAGE"',
+    'chmod -R u+w "$STAGE"',
+    'touch "$STAGE"',
+    // `rm -rf` on the link removes only the link, never the cached copy it points at.
+    'rm -rf "$ROOT"',
+    'mv "$STAGE" "$ROOT"',
+  ].join('\n');
+}
+
+export interface OverlayContextOptions {
+  /** Give the run its own writable copy at its view rather than a link to the read-only cache. */
+  writable?: boolean;
+}
+
+/**
+ * Expose one frozen revision to this run, read-only unless `writable`, and return the path of its
+ * view. `loadBundle` is called only when the sandbox lacks the revision; the bytes then go over
+ * SandboxExec stdin in chunks and are checked against their sha256 in the sandbox before anything is
+ * extracted. That check proves the copy is intact, not which revision it is: Moca trusts Context
+ * Service's authenticated export for that. A writable copy is made from the cached revision after
+ * it is in place, so it doubles the bytes the revision takes on the sandbox for the run.
  *
  * The transport must be a P6 relay transport, whose stdin is binary-safe.
  */
@@ -177,12 +246,25 @@ export async function overlayContext(
   key: string,
   sessionId: string,
   loadBundle: () => Promise<Buffer>,
+  options: OverlayContextOptions = {},
 ): Promise<string> {
   const rev = cacheKeyValue(key);
   const sid = sessionValue(sessionId);
   const root = contextRoot(sid);
-  if ((await run(transport, buildContextAcquireScript(rev, sid))).trim() === 'hit') return root;
+  if ((await run(transport, buildContextAcquireScript(rev, sid))).trim() !== 'hit') {
+    await populate(transport, rev, sid, loadBundle);
+  }
+  if (options.writable) await run(transport, buildContextWritableScript(rev, sid));
+  return root;
+}
 
+/** Load the bundle, send it over in chunks, and extract it into the cache. */
+async function populate(
+  transport: SandboxTransport,
+  rev: string,
+  sid: string,
+  loadBundle: () => Promise<Buffer>,
+): Promise<void> {
   const bundle = await loadBundle();
   if (!Buffer.isBuffer(bundle) || bundle.length === 0) throw new Error('empty context bundle');
   const sha256 = createHash('sha256').update(bundle).digest('hex');
@@ -202,12 +284,11 @@ export async function overlayContext(
     await run(transport, `rm -f ${archive} 2>/dev/null || true`).catch(() => {});
     throw err;
   }
-  return root;
 }
 
 /**
- * Remove this run's view and ref, then sweep revisions past retention. Best effort (`set -u`): a
- * teardown hiccup must never mask the run's verdict.
+ * Remove this run's view (a link, or a writable copy) and ref, then sweep revisions past retention.
+ * Best effort (`set -u`): a teardown hiccup must never mask the run's verdict.
  */
 export function buildContextCleanupScript(
   key: string,
@@ -219,7 +300,10 @@ export function buildContextCleanupScript(
   return [
     'set -u',
     '# CONTEXT_CLEANUP',
-    `rm -f ${sq(contextRoot(sid))} ${sq(uploadPath(rev, sid))} 2>/dev/null || true`,
+    `ROOT=${sq(contextRoot(sid))}; STAGE=${sq(writableStage(sid))}`,
+    // Never `chmod -R` the link: chmod follows a link named on its command line, into the cache.
+    '{ [ -L "$ROOT" ] || chmod -R u+w "$ROOT"; chmod -R u+w "$STAGE"; } 2>/dev/null || true',
+    `rm -rf "$ROOT" "$STAGE" ${sq(uploadPath(rev, sid))} 2>/dev/null || true`,
     `mkdir -p "${BASE}" 2>/dev/null || exit 0`,
     '(',
     '  flock 9 || exit 0',

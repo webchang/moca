@@ -414,10 +414,23 @@ export function turnErrorHeaders(status: number, err?: unknown): Record<string, 
 }
 
 // Serialize frames to the SSE wire form, flushing SSE headers on the FIRST frame (lazy flush →
-// pre-first-frame failures keep sync status-code parity, §3.4). The heartbeat is armed only inside
-// writeFrame, so it never fires before the first real frame.
-function makeFrameWriter(res: ServerResponse, keepaliveMs: number) {
+// pre-first-frame failures keep sync status-code parity, §3.4). The lazy flush has a deadline: a
+// middlebox with a short idle timeout (a cloud load balancer's 50 s) cuts a connection that has
+// carried no bytes, so when no frame was written within `firstFrameFlushMs` the headers go out
+// anyway, with `preamble` (the detachable turn's `turn` frame, so the client learns its turnId) or
+// else a keepalive comment. Status parity then holds for failures faster than the deadline; a later
+// failure ends the stream with a terminal `error` frame (§3.4 regime 3). The heartbeat is armed by
+// the first write of either kind, so it never fires before the stream has begun.
+function makeFrameWriter(
+  res: ServerResponse,
+  keepaliveMs: number,
+  opts: {
+    firstFrameFlushMs?: number;
+    preamble?: () => { frame: TurnStreamFrame; id?: string };
+  } = {},
+) {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
   const arm = () => {
     if (keepaliveMs <= 0) return;
     if (heartbeat) clearInterval(heartbeat);
@@ -425,16 +438,37 @@ function makeFrameWriter(res: ServerResponse, keepaliveMs: number) {
       if (!res.writableEnded) res.write(': keepalive\n\n'); // SSE comment — invisible to EventSource
     }, keepaliveMs);
   };
-  const writeFrame = (frame: TurnStreamFrame, id?: string) => {
+  const emit = (frame: TurnStreamFrame, id?: string) => {
     if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
     res.write(`${id ? `id: ${id}\n` : ''}event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`);
     arm(); // reset the idle timer on every real frame
   };
+  const writeFrame = (frame: TurnStreamFrame, id?: string) => {
+    if (flushTimer) clearTimeout(flushTimer);
+    emit(frame, id);
+  };
+  const flushMs = opts.firstFrameFlushMs ?? 0;
+  if (flushMs > 0) {
+    flushTimer = setTimeout(() => {
+      if (res.headersSent || res.writableEnded || res.destroyed) return;
+      if (opts.preamble) {
+        const p = opts.preamble();
+        emit(p.frame, p.id);
+        return;
+      }
+      res.writeHead(200, SSE_HEADERS);
+      res.write(': keepalive\n\n');
+      arm();
+    }, flushMs);
+  }
   const stop = () => {
+    if (flushTimer) clearTimeout(flushTimer);
     if (heartbeat) clearInterval(heartbeat);
   };
   return { writeFrame, stop };
 }
+
+const firstFrameFlushMs = () => intEnv('SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS', 15000);
 
 // SSE representation of /turn. Same executeTurn core as the sync path (called directly with the
 // additive onEvent/signal inputs); the server owns transport, lazy flush, heartbeat, and abort.
@@ -459,7 +493,9 @@ async function handleTurnStream(
     }
   });
 
-  const { writeFrame, stop } = makeFrameWriter(res, intEnv('SH_TURN_STREAM_KEEPALIVE_MS', 20000));
+  const { writeFrame, stop } = makeFrameWriter(res, intEnv('SH_TURN_STREAM_KEEPALIVE_MS', 20000), {
+    firstFrameFlushMs: firstFrameFlushMs(),
+  });
   const effectiveSessionId = auth?.sessionId ?? sessionId;
   if (auth) void deps.reportRuntime?.(auth.sessionId, runtimeFieldsForTurn(process.env, 'start'));
   let result: TurnResult | undefined;
@@ -559,8 +595,14 @@ async function handleDetachableTurn(
     }
     return;
   }
-  const { writeFrame, stop } = makeFrameWriter(res, intEnv('SH_TURN_STREAM_KEEPALIVE_MS', 20000));
   let started = false;
+  const { writeFrame, stop } = makeFrameWriter(res, intEnv('SH_TURN_STREAM_KEEPALIVE_MS', 20000), {
+    firstFrameFlushMs: firstFrameFlushMs(),
+    preamble: () => {
+      started = true;
+      return turn.start;
+    },
+  });
   const send = (frame: TurnStreamFrame, id?: string) => {
     if (res.writableEnded || res.destroyed) return;
     if (!started) {
@@ -837,6 +879,24 @@ function rejectWorkloadRun(res: ServerResponse): void {
 }
 
 /**
+ * `contextWritable` asks for a writable per-run copy of a workload's context, so it must be a
+ * boolean, and `true` needs a `workloadId` (`false` asks for nothing and is ignored). Writes the 400
+ * and returns true when the request must not proceed.
+ */
+function rejectInvalidContextWritable(body: any, res: ServerResponse): boolean {
+  if (body?.contextWritable === undefined) return false;
+  const error =
+    typeof body.contextWritable !== 'boolean'
+      ? 'context_writable_invalid'
+      : body.contextWritable && body.workloadId === undefined
+        ? 'context_writable_requires_workload'
+        : null;
+  if (!error) return false;
+  res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error }));
+  return true;
+}
+
+/**
  * Resolve the workload a synchronous run names into the trusted `internalContext` the harness
  * delivers to the sandbox. The caller's session token must belong to the workload's owner. The
  * bundle is downloaded lazily, only when the selected sandbox lacks the revision. Writes the
@@ -873,13 +933,14 @@ async function resolveRunWorkload(
     res.writeHead(workload.status, JSON_HEADERS).end(JSON.stringify({ error: workload.error }));
     return null;
   }
-  const { contextName, revision, ownerScope } = workload;
+  const { contextName, revision, cacheScope } = workload;
   return {
     ...body,
     internalContext: {
       revision,
-      ownerScope,
+      cacheScope,
       loadBundle: () => downloadContextBundle(contextName, revision, owner),
+      writable: body.contextWritable === true,
     },
   };
 }
@@ -890,7 +951,6 @@ async function handleEnqueueLeafParsed(body: any, res: ServerResponse): Promise<
     return;
   }
   if (rejectInvalidConfigRef(body, res)) return;
-  if (body.workloadId !== undefined) return rejectWorkloadRun(res);
   const q = getQueue();
   await q.ensureGroup();
   await q.enqueue(body);
@@ -1103,8 +1163,11 @@ export function handler(req: IncomingMessage, res: ServerResponse): void {
         res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error: 'tenant_not_allowed' }));
         return;
       }
+      if (rejectInvalidContextWritable(parsed, res)) return;
 
       if (parsed && parsed.async === true) {
+        // Before the gate below, so every asynchronous run naming a workload gets the same answer.
+        if (parsed.workloadId !== undefined) return rejectWorkloadRun(res);
         if (deps.requireAuth || auth) {
           // Running it later on its caller's credential would mean storing a bearer in the queue
           // (MI1 §6.5); running it on the ambient credential would spend the operator's key for a

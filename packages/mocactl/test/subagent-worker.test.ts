@@ -86,15 +86,102 @@ describe('runSpawnWorker — happy path', () => {
   });
 });
 
-/* --- failure paths that must still write a terminal ledger line --- */
+/* --- failure paths: after-send reconciles, connect-phase stays terminal, server rejection stays terminal --- */
 
-describe('runSpawnWorker — terminal ledger writes on every non-retry exit', () => {
-  it('on submitLeafTurn throwing, marks the ledger failed with the error message', async () => {
+describe('runSpawnWorker — after-send fetch error reconciles instead of recording terminal failed', () => {
+  it('UND_ERR_HEADERS_TIMEOUT (undici 5-min cutoff after request landed) → non-terminal + reconcile hint', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
     const rt = makeRt(scratch);
     seedLedgerRow(rt.paths.subagentsFile);
     const transport = {
       submitLeafTurn: vi.fn(async () => {
-        throw new Error('socket hang up');
+        throw new ApiError(
+          'harness',
+          0,
+          'network_error',
+          'fetch failed',
+          undefined,
+          'UND_ERR_HEADERS_TIMEOUT',
+        );
+      }),
+    } as unknown as LeafTransport;
+    const r = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport,
+    });
+    expect(r).toBe(1);
+    const row = openLedger(rt.paths.subagentsFile).readAll()[0]!;
+    expect(row.lastKnownState).toBe('running');
+    expect(row.stateDetail).toContain('client disconnected');
+    expect(row.stateDetail).toContain('reconciling');
+  });
+
+  it('UND_ERR_BODY_TIMEOUT also reconciles', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
+    const rt = makeRt(scratch);
+    seedLedgerRow(rt.paths.subagentsFile);
+    const transport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new ApiError(
+          'harness',
+          0,
+          'network_error',
+          'terminated',
+          undefined,
+          'UND_ERR_BODY_TIMEOUT',
+        );
+      }),
+    } as unknown as LeafTransport;
+    const r = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport,
+    });
+    expect(r).toBe(1);
+    expect(openLedger(rt.paths.subagentsFile).readAll()[0]!.lastKnownState).toBe('running');
+  });
+
+  it('UND_ERR_SOCKET is ambiguous (fires both before and after send on the same code) and stays terminal', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
+    const rt = makeRt(scratch);
+    seedLedgerRow(rt.paths.subagentsFile);
+    const transport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new ApiError(
+          'harness',
+          0,
+          'network_error',
+          'other side closed',
+          undefined,
+          'UND_ERR_SOCKET',
+        );
+      }),
+    } as unknown as LeafTransport;
+    const r = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport,
+    });
+    expect(r).toBe(1);
+    // Verified by a Node 24 probe: UND_ERR_SOCKET also fires when the server destroys the
+    // socket before reading any bytes, so we cannot safely treat it as "server has the record".
+    expect(openLedger(rt.paths.subagentsFile).readAll()[0]!.lastKnownState).toBe('failed');
+  });
+});
+
+describe('runSpawnWorker — connect-phase and server rejection stay terminal', () => {
+  it('ECONNREFUSED (server never saw request) → terminal failed, not reconciling', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
+    const rt = makeRt(scratch);
+    seedLedgerRow(rt.paths.subagentsFile);
+    const transport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new ApiError(
+          'harness',
+          0,
+          'network_error',
+          'connect ECONNREFUSED',
+          undefined,
+          'ECONNREFUSED',
+        );
       }),
     } as unknown as LeafTransport;
     const r = await runSpawnWorker(rt, {
@@ -104,9 +191,65 @@ describe('runSpawnWorker — terminal ledger writes on every non-retry exit', ()
     expect(r).toBe(1);
     const row = openLedger(rt.paths.subagentsFile).readAll()[0]!;
     expect(row.lastKnownState).toBe('failed');
-    expect(row.stateDetail).toContain('socket hang up');
+    expect(row.stateDetail).toContain('ECONNREFUSED');
+    expect(row.stateDetail).not.toContain('reconciling');
   });
 
+  it('ENOTFOUND (DNS) and UND_ERR_CONNECT_TIMEOUT also stay terminal', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
+    for (const code of ['ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'EAI_AGAIN']) {
+      const rt = makeRt(scratch);
+      seedLedgerRow(rt.paths.subagentsFile);
+      const transport = {
+        submitLeafTurn: vi.fn(async () => {
+          throw new ApiError('harness', 0, 'network_error', code, undefined, code);
+        }),
+      } as unknown as LeafTransport;
+      await runSpawnWorker(rt, {
+        readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+        transport,
+      });
+      expect(openLedger(rt.paths.subagentsFile).readAll()[0]!.lastKnownState).toBe('failed');
+    }
+  });
+
+  it('a plain Error (no cause code) stays terminal — we only reconcile when we know it is after-send', async () => {
+    const rt = makeRt(scratch);
+    seedLedgerRow(rt.paths.subagentsFile);
+    const transport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new Error('mystery');
+      }),
+    } as unknown as LeafTransport;
+    const r = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport,
+    });
+    expect(r).toBe(1);
+    expect(openLedger(rt.paths.subagentsFile).readAll()[0]!.lastKnownState).toBe('failed');
+  });
+
+  it('server rejection (ApiError with HTTP status) remains terminal', async () => {
+    const { ApiError } = await import('../src/api/errors.js');
+    const rt = makeRt(scratch);
+    seedLedgerRow(rt.paths.subagentsFile);
+    const transport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new ApiError('harness', 400, 'bad_inputs', 'empty prompt');
+      }),
+    } as unknown as LeafTransport;
+    const r = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport,
+    });
+    expect(r).toBe(1);
+    const row = openLedger(rt.paths.subagentsFile).readAll()[0]!;
+    expect(row.lastKnownState).toBe('failed');
+    expect(row.stateDetail).toContain('empty prompt');
+  });
+});
+
+describe('runSpawnWorker — terminal failed paths that remain terminal', () => {
   it('on a terminal failed body, mirrors the server reason into the ledger detail', async () => {
     const rt = makeRt(scratch);
     seedLedgerRow(rt.paths.subagentsFile);
@@ -182,6 +325,55 @@ describe('runSpawnWorker — sync 503 saturated retries with bounded budget', ()
     expect(r).toBe(0);
     const row = openLedger(rt.paths.subagentsFile).readAll()[0]!;
     expect(row.lastKnownState).toBe('done');
+  });
+
+  // Fetch cut off client-side → worker records non-terminal; next `cmdSubagents` poll reads
+  // `/runs/status` and flips the ledger to the real server-side outcome.
+  it('end-to-end: fetch error on POST /v1/runs lets cmdSubagents reconcile to done via GET /runs/status', async () => {
+    const { cmdSubagents } = await import('../src/subagent.js');
+    const rt = makeRt(scratch, {
+      // mintSessionToken used by cmdSubagents to re-poll /runs/status
+      cp: { mintSessionToken: vi.fn(async () => ({ token: 'tok', expiresAt: 9 })) },
+    });
+    seedLedgerRow(rt.paths.subagentsFile);
+
+    // Phase 1: worker fetch throws with the undici headers-timeout cause code — the real
+    // #515 shape. Ledger must stay non-terminal so cmdSubagents re-polls.
+    const { ApiError } = await import('../src/api/errors.js');
+    const workerTransport = {
+      submitLeafTurn: vi.fn(async () => {
+        throw new ApiError(
+          'harness',
+          0,
+          'network_error',
+          'fetch failed',
+          undefined,
+          'UND_ERR_HEADERS_TIMEOUT',
+        );
+      }),
+    } as unknown as LeafTransport;
+    const workerRc = await runSpawnWorker(rt, {
+      readStdin: payloadStdin({ sessionId: 'sess-abc', token: 'tok', envelope: ENV }),
+      transport: workerTransport,
+    });
+    expect(workerRc).toBe(1);
+    const after1 = openLedger(rt.paths.subagentsFile).readAll()[0]!;
+    expect(after1.lastKnownState).toBe('running');
+    expect(after1.stateDetail).toContain('reconciling');
+
+    // Phase 2: cmdSubagents re-polls /runs/status; the server has recorded a terminal success.
+    const io = { out: vi.fn(), err: vi.fn() };
+    const subagentsTransport = {
+      readLeafState: vi.fn(async () => ({ status: 'responded', text: 'done' })),
+    } as unknown as LeafTransport;
+    const subRc = await cmdSubagents(rt, io, {
+      json: true,
+      transport: subagentsTransport,
+    });
+    expect(subRc).toBe(0);
+    // Ledger reconciled to done — the user no longer sees a misleading "failed".
+    const after2 = openLedger(rt.paths.subagentsFile).readAll()[0]!;
+    expect(after2.lastKnownState).toBe('done');
   });
 
   // Guards against the "retry loop never fires in production" mode by driving through the real

@@ -47,7 +47,17 @@ export class BufferedRedisBackend implements SessionStorageBackend {
     return row ? row.entry : null;
   }
 
+  /**
+   * Refuses, always. Pi's SessionStorageBackend requires the method, so it cannot be deleted --
+   * but the storage layer has no subject concept, and this used to pass through to a
+   * keys('session:*') scan: an all-tenant session enumerator (rossoctl/moca#361). Throwing is the
+   * structural form of spec §13's "no caller-facing use of list() may be added": a future caller
+   * fails loudly here instead of silently enumerating. The scoped listing is the control plane's
+   * OwnershipIndex.listByOwner.
+   */
   async list(): Promise<string[]> {
-    return this.store.list();
+    throw new Error(
+      'unscoped session listing is not supported; use the control plane OwnershipIndex.listByOwner (rossoctl/moca#361)',
+    );
   }
 }

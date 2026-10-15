@@ -236,6 +236,16 @@ function cacheBundle(key: string, bundle: Buffer): void {
   bundleCacheBytes += bundle.length;
 }
 
+/** Drops `owner`'s cached bundles of Context `name`, every revision. Called when it is deleted. */
+export function evictContextBundles(name: string, owner: string): void {
+  const prefix = `${owner}\0${name}\0`;
+  for (const [key, entry] of bundleCache) {
+    if (!key.startsWith(prefix)) continue;
+    bundleCache.delete(key);
+    bundleCacheBytes -= entry.length;
+  }
+}
+
 /** Empties the bundle cache. For tests. */
 export function clearContextBundleCache(): void {
   bundleCache.clear();
@@ -243,23 +253,95 @@ export function clearContextBundleCache(): void {
 }
 
 /**
- * Context Service streams the export after its 200 header, so an export that fails midway ends the
- * response cleanly with a short body. Only a complete gzip stream is cached or delivered.
+ * Bytes the downloads in flight may buffer, process-wide, within
+ * `MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES`. Bundles over the cache limit are downloaded again for every
+ * run, so without it N concurrent runs of a large workload would buffer N bundles at once.
  */
-async function assertCompleteGzip(bundle: Buffer): Promise<void> {
+let downloadBytesInFlight = 0;
+const downloadBudgetWaiters = new Set<() => void>();
+
+/**
+ * Reserves `bytes` of the download budget, waiting until `deadline` (epoch ms) for other downloads
+ * to release theirs. Resolves to the function that releases the reservation.
+ */
+async function reserveDownloadBytes(bytes: number, deadline: number): Promise<() => void> {
+  const budget = positiveIntEnv('MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES', 512 * 1024 * 1024);
+  if (bytes > budget) {
+    throw new ContextServiceError(
+      'Context Service bundle exceeds MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES',
+    );
+  }
+  while (downloadBytesInFlight + bytes > budget) {
+    const wait = deadline - Date.now();
+    if (wait <= 0) {
+      throw new ContextServiceError(
+        'no MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES came free within MOCA_CONTEXT_EXPORT_TIMEOUT_MS',
+      );
+    }
+    await new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        downloadBudgetWaiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, wait);
+      downloadBudgetWaiters.add(wake);
+    });
+  }
+  downloadBytesInFlight += bytes;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    downloadBytesInFlight -= bytes;
+    // Every waiter rechecks; those that still do not fit wait again.
+    for (const wake of [...downloadBudgetWaiters]) wake();
+  };
+}
+
+/** Bytes the downloads in flight have reserved. For tests. */
+export function contextDownloadBytesInFlight(): number {
+  return downloadBytesInFlight;
+}
+
+/**
+ * Context Service streams the export after its 200 header, so an export that fails midway ends the
+ * response cleanly with a short body. Only a complete gzip stream is cached or delivered, and only
+ * one that inflates to at most `maxExpanded` bytes: the sandbox extracts it onto a disk that several
+ * users share, so a small bundle that inflates without bound would fill it for everyone.
+ */
+async function assertCompleteGzip(bundle: Buffer, maxExpanded: number): Promise<void> {
+  let expanded = 0;
+  let tooLarge = false;
   try {
     await pipeline(
       Readable.from([bundle]),
       createGunzip(),
-      new Writable({ write: (_chunk, _encoding, done) => done() }),
+      new Writable({
+        write: (chunk: Buffer, _encoding, done) => {
+          expanded += chunk.length;
+          if (expanded <= maxExpanded) return done();
+          tooLarge = true;
+          done(new Error('expanded size limit'));
+        },
+      }),
     );
   } catch {
-    throw new ContextServiceError('Context Service returned a truncated or invalid bundle');
+    throw new ContextServiceError(
+      tooLarge
+        ? 'Context Service bundle expands past MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES'
+        : 'Context Service returned a truncated or invalid bundle',
+    );
   }
 }
 
 async function fetchBundle(name: string, revision: string, owner: string): Promise<Buffer> {
   const maxBytes = positiveIntEnv('MOCA_CONTEXT_BUNDLE_MAX_BYTES', 256 * 1024 * 1024);
+  // Context Service limits an upload's files to 1 GiB. This counts the inflated tar stream, headers
+  // and padding included, so it leaves headroom: a bundle Context Service accepted is never refused.
+  const maxExpanded = positiveIntEnv('MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES', 1280 * 1024 * 1024);
+  const timeout = positiveIntEnv('MOCA_CONTEXT_EXPORT_TIMEOUT_MS', 300_000);
+  const deadline = Date.now() + timeout;
   const tooLarge = () =>
     new ContextServiceError('Context Service bundle exceeds MOCA_CONTEXT_BUNDLE_MAX_BYTES');
   // The timeout covers the body as well as the headers.
@@ -269,7 +351,7 @@ async function fetchBundle(name: string, revision: string, owner: string): Promi
     'GET',
     undefined,
     [],
-    positiveIntEnv('MOCA_CONTEXT_EXPORT_TIMEOUT_MS', 300_000),
+    timeout,
   );
   const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim();
   if (contentType !== CONTEXT_BUNDLE_TYPE) {
@@ -282,24 +364,39 @@ async function fetchBundle(name: string, revision: string, owner: string): Promi
     throw tooLarge();
   }
   if (!response.body) throw new ContextServiceError('Context Service returned no bundle body');
-  const chunks: Buffer[] = [];
-  let received = 0;
-  const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read().catch((err: unknown) => {
-      throw new ContextServiceError(`Context Service bundle stream failed: ${String(err)}`);
-    });
-    if (done) break;
-    received += value.byteLength;
-    if (received > maxBytes) {
-      await reader.cancel().catch(() => {});
-      throw tooLarge();
-    }
-    chunks.push(Buffer.from(value));
+  // Reserve before buffering: the declared length, or the most a bundle may be.
+  const reserved = Number.isFinite(declared) && declared >= 0 ? declared : maxBytes;
+  let release: () => void;
+  try {
+    release = await reserveDownloadBytes(reserved, deadline);
+  } catch (err) {
+    await response.body.cancel().catch(() => {});
+    throw err;
   }
-  const bundle = Buffer.concat(chunks, received);
-  await assertCompleteGzip(bundle);
-  return bundle;
+  try {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read().catch((err: unknown) => {
+        throw new ContextServiceError(`Context Service bundle stream failed: ${String(err)}`);
+      });
+      if (done) break;
+      received += value.byteLength;
+      if (received > reserved) {
+        await reader.cancel().catch(() => {});
+        throw received > maxBytes
+          ? tooLarge()
+          : new ContextServiceError('Context Service bundle exceeds its Content-Length');
+      }
+      chunks.push(Buffer.from(value));
+    }
+    const bundle = Buffer.concat(chunks, received);
+    await assertCompleteGzip(bundle, maxExpanded);
+    return bundle;
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -307,6 +404,10 @@ async function fetchBundle(name: string, revision: string, owner: string): Promi
  * (`GET /internal/v1/namespaces/{ns}/contexts/{name}/revisions/{sha256}/bundle`). Served from the
  * in-memory cache when present; concurrent requests for the same revision share one download, and
  * a failed download is never cached.
+ *
+ * The revision is Context Service's digest of the Context's files, not of the compressed bundle, so
+ * Moca cannot check the bytes against it. It trusts this authenticated export for which revision
+ * the bytes are; the sha256 the sandbox later checks proves only that the relay copy is intact.
  */
 export async function downloadContextBundle(
   name: string,

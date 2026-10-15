@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { CpError, statusFor } from '@moca/control-plane';
 import {
@@ -8,6 +8,7 @@ import {
   createContext,
   createUploadGrant,
   deleteContext,
+  evictContextBundles,
   freezeContext,
   type ContextStorage,
 } from './context-service.js';
@@ -70,11 +71,25 @@ export function workloadsEnabled(): boolean {
 }
 
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
-const ownerScope = (owner: string) => sha256(owner).slice(0, 32);
+/** Scopes the owner's Redis keys. Anyone who knows the owner can compute it, which is fine there. */
+const recordScope = (owner: string) => sha256(owner).slice(0, 32);
 // `sh:wl:`, not `sh:workload:`: the upgrade note's cleanup of legacy records (`sh:workload:*`, see
 // docs/context-service.md) must never match a live workload.
-const recordKey = (owner: string, name: string) => `sh:wl:${ownerScope(owner)}:${name}`;
-const quotaKey = (owner: string) => `sh:wl-quota:${ownerScope(owner)}`;
+const recordKey = (owner: string, name: string) => `sh:wl:${recordScope(owner)}:${name}`;
+const quotaKey = (owner: string) => `sh:wl-quota:${recordScope(owner)}`;
+let cacheSecret: string | Buffer | undefined;
+
+/**
+ * Names the owner's copies in a shared sandbox's context cache (`cache/<scope>-<revision>`). An
+ * HMAC under a secret the agents never see, so an agent cannot compute another user's scope and
+ * plant a copy for a revision it knows. The secret is `MOCA_CONTEXT_CACHE_SECRET`, or random per
+ * process: replicas with different secrets only miss each other's copies.
+ */
+export function sandboxCacheScope(owner: string): string {
+  cacheSecret ??= process.env.MOCA_CONTEXT_CACHE_SECRET?.trim() || randomBytes(32);
+  return createHmac('sha256', cacheSecret).update(owner).digest('hex').slice(0, 32);
+}
+
 /** Unique per owner, name and reservation, so a rollback can never delete a newer Context. */
 const contextNameFor = (owner: string, name: string, generation: string) =>
   `w-${sha256(`${owner}\0${name}\0${generation}`).slice(0, 32)}`;
@@ -367,6 +382,7 @@ async function deleteWorkload(
     }
     // Even while `creating`: the create may already have made the Context. An absent one is fine.
     await deleteContext(record.contextName, record.owner);
+    evictContextBundles(record.contextName, record.owner);
     if (!(await transition(store, deleting, { ...deleting, status: 'deleted' }))) {
       const current = await findWorkload(store, record.owner, record.name);
       // A concurrent retry finished the same delete.
@@ -382,7 +398,7 @@ async function deleteWorkload(
 
 /** What a run needs from a workload, or the refusal to answer with. */
 export type WorkloadRun =
-  | { contextName: string; revision: string; ownerScope: string }
+  | { contextName: string; revision: string; cacheScope: string }
   | { status: number; error: 'workload_not_found' | 'workload_not_ready' };
 
 /**
@@ -405,7 +421,7 @@ export async function resolveWorkloadRun(
   return {
     contextName: record.contextName,
     revision: record.revision,
-    ownerScope: ownerScope(owner),
+    cacheScope: sandboxCacheScope(owner),
   };
 }
 

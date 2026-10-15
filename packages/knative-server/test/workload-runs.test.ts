@@ -26,6 +26,8 @@ const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const signer = makeSigner(privateKey.export({ format: 'pem', type: 'pkcs8' }).toString());
 const sessionToken = (sub: string, sid: string) =>
   signer.mint({ sub, tenant: sub, roles: [], scope: ['turn:write'], sid, ttlSeconds: 300 });
+const apiToken = (sub: string) =>
+  signer.mint({ sub, tenant: sub, roles: [], scope: ['api'], ttlSeconds: 300 });
 
 const scope = (owner: string) => createHash('sha256').update(owner).digest('hex').slice(0, 32);
 
@@ -148,8 +150,10 @@ describe('a run on a workload', () => {
     expect(res).toEqual({ status: 200, body: { status: 'responded', text: 'ok' } });
     const env = runLeaf.mock.calls[0]![0];
     expect(env.internalContext.revision).toBe(REVISION);
-    // The sandbox cache is keyed per owner, so users never share a copy.
-    expect(env.internalContext.ownerScope).toBe(scope(alice));
+    // The sandbox cache is keyed per owner, so users never share a copy, by a scope that cannot be
+    // computed from the owner's name (unlike the workload record's).
+    expect(env.internalContext.cacheScope).toMatch(/^[a-f0-9]{32}$/);
+    expect(env.internalContext.cacheScope).not.toBe(scope(alice));
     // Nothing is downloaded until the harness finds the sandbox lacks the revision.
     expect(csCalls).toEqual([]);
 
@@ -191,7 +195,49 @@ describe('a run on a workload', () => {
 
   it('answers 404 for a deleted workload', async () => {
     await seed(alice, 'demo', 'deleted', REVISION);
-    expect((await run(alice, prompt('demo'))).status).toBe(404);
+    expect(await run(alice, prompt('demo'))).toEqual({
+      status: 404,
+      body: { error: 'workload_not_found' },
+    });
+  });
+
+  it('keeps one stable cache scope per owner, distinct between owners', async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    await seed(bob, 'demo', 'ready', REVISION);
+    await run(alice, prompt('demo'));
+    await run(alice, prompt('demo'));
+    await run(bob, prompt('demo'));
+    const [first, second, other] = runLeaf.mock.calls.map(
+      ([env]) => (env as { internalContext: { cacheScope: string } }).internalContext.cacheScope,
+    );
+    expect(second).toBe(first);
+    expect(other).not.toBe(first);
+  });
+
+  it('answers 401 token_required for a synchronous workload run without a token', async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    expect(await run(null, prompt('demo'))).toMatchObject({
+      status: 401,
+      body: { error: 'token_required' },
+    });
+    expect(runLeaf).not.toHaveBeenCalled();
+  });
+
+  it("evicts the deleted workload's cached bundle", async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    await run(alice, prompt('demo'));
+    const { loadBundle } = runLeaf.mock.calls[0]![0].internalContext;
+    await loadBundle();
+    await loadBundle();
+    expect(csCalls.filter((c) => c.method === 'GET')).toHaveLength(1);
+    const deleted = await fetch(`${base}/workloads/demo`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${apiToken(alice)}` },
+    });
+    expect(deleted.status).toBe(204);
+    // The next load downloads again: nothing of the deleted workload stayed cached.
+    await loadBundle();
+    expect(csCalls.filter((c) => c.method === 'GET')).toHaveLength(2);
   });
 
   it('accepts only prompt runs', async () => {
@@ -217,9 +263,75 @@ describe('a run on a workload', () => {
     });
   });
 
-  it('keeps asynchronous workload runs unavailable', async () => {
+  it('keeps asynchronous workload runs unavailable, with or without a token', async () => {
     await seed(alice, 'demo', 'ready', REVISION);
-    expect((await run(alice, prompt('demo', { async: true }))).status).toBe(501);
+    const unavailable = { status: 501, body: { error: 'workload_runs_unavailable' } };
+    // A tokened request would otherwise meet the async gate's async_runs_unavailable first.
+    expect(await run(alice, prompt('demo', { async: true }))).toEqual(unavailable);
+    expect(await run(null, prompt('demo', { async: true }))).toEqual(unavailable);
     expect(runLeaf).not.toHaveBeenCalled();
+  });
+
+  it('passes contextWritable through to the harness as internalContext.writable', async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    expect(await run(alice, prompt('demo', { contextWritable: true }))).toMatchObject({
+      status: 200,
+    });
+    expect(await run(alice, prompt('demo', { contextWritable: false }))).toMatchObject({
+      status: 200,
+    });
+    expect(await run(alice, prompt('demo'))).toMatchObject({ status: 200 });
+    const writable = runLeaf.mock.calls.map(
+      ([env]) => (env as { internalContext: { writable: boolean } }).internalContext.writable,
+    );
+    expect(writable).toEqual([true, false, false]);
+  });
+
+  it('never takes the writable flag from a caller-supplied internalContext', async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    await run(alice, prompt('demo', { internalContext: { writable: true } }));
+    expect(runLeaf.mock.calls[0]![0].internalContext.writable).toBe(false);
+  });
+
+  it.each([['yes'], [1], [null], [{}]])(
+    'answers 400 context_writable_invalid for contextWritable %j',
+    async (value) => {
+      await seed(alice, 'demo', 'ready', REVISION);
+      expect(await run(alice, prompt('demo', { contextWritable: value }))).toEqual({
+        status: 400,
+        body: { error: 'context_writable_invalid' },
+      });
+      expect(runLeaf).not.toHaveBeenCalled();
+    },
+  );
+
+  it('answers 400 context_writable_requires_workload without a workloadId', async () => {
+    const bare = { sessionId: `s-${randomUUID()}`, kind: 'prompt', prompt: 'Hi.' };
+    for (const extra of [{}, { async: true }]) {
+      expect(await run(alice, { ...bare, ...extra, contextWritable: true })).toEqual({
+        status: 400,
+        body: { error: 'context_writable_requires_workload' },
+      });
+    }
+    expect(runLeaf).not.toHaveBeenCalled();
+  });
+
+  it('accepts and ignores contextWritable false without a workloadId', async () => {
+    const res = await run(alice, {
+      sessionId: `s-${randomUUID()}`,
+      kind: 'prompt',
+      prompt: 'Hi.',
+      contextWritable: false,
+    });
+    expect(res).toEqual({ status: 200, body: { status: 'responded', text: 'ok' } });
+    expect(runLeaf.mock.calls[0]![0].internalContext).toBeUndefined();
+  });
+
+  it('still answers 400 context_writable_invalid without a workloadId', async () => {
+    const bare = { sessionId: `s-${randomUUID()}`, kind: 'prompt', prompt: 'Hi.' };
+    expect(await run(alice, { ...bare, contextWritable: 'false' })).toEqual({
+      status: 400,
+      body: { error: 'context_writable_invalid' },
+    });
   });
 });

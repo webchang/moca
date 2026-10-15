@@ -2,10 +2,12 @@ import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   clearContextBundleCache,
+  contextDownloadBytesInFlight,
   ContextServiceError,
   createUploadGrant,
   deleteContext,
   downloadContextBundle,
+  evictContextBundles,
   publicBaseUrl,
 } from '../src/context-service.js';
 
@@ -208,5 +210,146 @@ describe('frozen bundle download', () => {
       await downloadContextBundle(`w-${name}`, REVISION, 'github:alice');
     // a, b, (a hit), c evicts b, (a hit), b again evicts c.
     expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("evicts every cached revision of one owner's Context, and nothing else", async () => {
+    const fetch = vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE)));
+    vi.stubGlobal('fetch', fetch);
+    const other = 'f'.repeat(64);
+    const loads: [string, string, string][] = [
+      ['w-7', REVISION, 'github:alice'],
+      ['w-7', other, 'github:alice'],
+      ['w-7', REVISION, 'github:bob'],
+      ['w-8', REVISION, 'github:alice'],
+    ];
+    for (const load of loads) await downloadContextBundle(...load);
+    expect(fetch).toHaveBeenCalledTimes(4);
+    evictContextBundles('w-7', 'github:alice');
+    for (const load of loads) await downloadContextBundle(...load);
+    // Only alice's two w-7 revisions download again.
+    expect(fetch).toHaveBeenCalledTimes(6);
+  });
+
+  it('refuses a bundle that inflates past MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES and does not cache it', async () => {
+    // 4096 bytes inflated; the bomb is the same shape, only smaller.
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES', '4095');
+    const fetch = vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE)));
+    vi.stubGlobal('fetch', fetch);
+    await expect(downloadContextBundle('w-9', REVISION, 'github:alice')).rejects.toThrow(
+      'MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES',
+    );
+    await expect(downloadContextBundle('w-9', REVISION, 'github:alice')).rejects.toThrow(
+      'MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES',
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(contextDownloadBytesInFlight()).toBe(0);
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES', '4096');
+    await expect(downloadContextBundle('w-9', REVISION, 'github:alice')).resolves.toEqual(BUNDLE);
+  });
+
+  it('refuses a highly compressed bomb under the compressed ceiling, by its inflated size', async () => {
+    const bomb = gzipSync(Buffer.alloc(8 * 1024 * 1024));
+    expect(bomb.length).toBeLessThan(64 * 1024);
+    vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES', String(1024 * 1024));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => bundleResponse(new Uint8Array(bomb))),
+    );
+    await expect(downloadContextBundle('w-10', REVISION, 'github:alice')).rejects.toThrow(
+      'expands past MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES',
+    );
+  });
+
+  it('refuses a body longer than its Content-Length', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        bundleResponse(new Uint8Array(BUNDLE), { 'content-length': String(BUNDLE.length - 1) }),
+      ),
+    );
+    await expect(downloadContextBundle('w-11', REVISION, 'github:alice')).rejects.toThrow(
+      'exceeds its Content-Length',
+    );
+    expect(contextDownloadBytesInFlight()).toBe(0);
+  });
+
+  describe('in-flight byte budget', () => {
+    /** A fetch whose replies are held until released, in order. */
+    function heldFetch(headers: Record<string, string> = {}) {
+      const releases: (() => void)[] = [];
+      const fetch = vi.fn(async () => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            releases.push(() => {
+              controller.enqueue(new Uint8Array(BUNDLE));
+              controller.close();
+            });
+          },
+        });
+        return bundleResponse(body, headers);
+      });
+      vi.stubGlobal('fetch', fetch);
+      return { fetch, releases };
+    }
+
+    it('reserves the Content-Length, queues a download that does not fit, and releases on success', async () => {
+      vi.stubEnv('MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES', String(BUNDLE.length + 1));
+      const { fetch, releases } = heldFetch({ 'content-length': String(BUNDLE.length) });
+      const first = downloadContextBundle('w-b1', REVISION, 'github:alice');
+      const second = downloadContextBundle('w-b2', REVISION, 'github:alice');
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(contextDownloadBytesInFlight()).toBe(BUNDLE.length));
+      // The second waits for the budget, so its body is not read yet.
+      releases[0]!();
+      await expect(first).resolves.toEqual(BUNDLE);
+      releases[1]!();
+      await expect(second).resolves.toEqual(BUNDLE);
+      expect(contextDownloadBytesInFlight()).toBe(0);
+    });
+
+    it('reserves the bundle ceiling when the length is unknown', async () => {
+      vi.stubEnv('MOCA_CONTEXT_BUNDLE_MAX_BYTES', '100000');
+      const { fetch, releases } = heldFetch();
+      const load = downloadContextBundle('w-b3', REVISION, 'github:alice');
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(contextDownloadBytesInFlight()).toBe(100000));
+      releases[0]!();
+      await load;
+      expect(contextDownloadBytesInFlight()).toBe(0);
+    });
+
+    it('fails clearly when no budget comes free within the export timeout, and releases on failure', async () => {
+      vi.stubEnv('MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES', String(BUNDLE.length + 1));
+      vi.stubEnv('MOCA_CONTEXT_EXPORT_TIMEOUT_MS', '200');
+      const { releases } = heldFetch({ 'content-length': String(BUNDLE.length) });
+      const first = downloadContextBundle('w-b4', REVISION, 'github:alice');
+      await vi.waitFor(() => expect(contextDownloadBytesInFlight()).toBe(BUNDLE.length));
+      await expect(downloadContextBundle('w-b5', REVISION, 'github:alice')).rejects.toThrow(
+        'no MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES came free within MOCA_CONTEXT_EXPORT_TIMEOUT_MS',
+      );
+      releases[0]!();
+      await first;
+      expect(contextDownloadBytesInFlight()).toBe(0);
+    });
+
+    it('refuses at once a download larger than the whole budget', async () => {
+      vi.stubEnv('MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES', String(BUNDLE.length - 1));
+      heldFetch({ 'content-length': String(BUNDLE.length) });
+      await expect(downloadContextBundle('w-b6', REVISION, 'github:alice')).rejects.toThrow(
+        'exceeds MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES',
+      );
+      expect(contextDownloadBytesInFlight()).toBe(0);
+    });
+
+    it('releases the reservation when the download fails', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => bundleResponse(new Uint8Array(BUNDLE.subarray(0, BUNDLE.length - 8)))),
+      );
+      await expect(downloadContextBundle('w-b7', REVISION, 'github:alice')).rejects.toThrow(
+        'truncated',
+      );
+      expect(contextDownloadBytesInFlight()).toBe(0);
+    });
   });
 });

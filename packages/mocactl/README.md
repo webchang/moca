@@ -1,5 +1,9 @@
 # mocactl
 
+> **Preview.** `mocactl` is implemented but not yet declared Stable. The command reference is in
+> [`docs/reference/cli-mocactl.md`](../../docs/reference/cli-mocactl.md); the change policy in
+> [`docs/reference/change-policy.md`](../../docs/reference/change-policy.md).
+
 A terminal client for the harness: log in, manage sessions and inference credentials, and watch
 turns stream live. It talks only to the control plane's `/v1` API and the harness's `/v1/turn`,
 so it works the same whatever runs behind those URLs. Design:
@@ -98,6 +102,13 @@ mocactl spawn "prompt" [--config sha256:…] --kind prompt|solve \
   [--repo URL --ref REF] [--tag T] [--json]  # fork a detached subagent; prints its sessionId
 mocactl subagents [--tag T] [--json]        # list spawned subagents + current honest state
 mocactl get SESSIONID [--out DIR] [--json]  # write result files + bounded summary
+mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]  # run it on a workload's context
+```
+
+```bash
+mocactl workloads create --context FILE [--name NAME] [--json]  # upload a context; prints its id
+mocactl workloads get ID [--json]           # status, context type, size and frozen revision
+mocactl workloads delete ID [--json]        # delete the workload and its context
 ```
 
 `mocactl spawn` creates a session (pinned to the bundle if `--config` is given), writes a record
@@ -111,7 +122,10 @@ can list them in isolation.
 `mocactl subagents` reads the ledger and joins it with `/runs/status`, resolving the server's
 `queued` ambiguity with child-pid liveness and a 60-second grace: a `queued` row with a live
 child is `running`; past the grace with a dead child it is `unknown`. Without `--tag`, every
-spawn you own is listed, oldest first by dispatch time.
+spawn you own is listed, oldest first by dispatch time. A client-side fetch cutoff on the
+worker _after the request landed_ (undici's 5-min `headersTimeout` is the common one) is
+reconciled on the next poll instead of reported as failed; a connect-phase failure
+(`ECONNREFUSED`, DNS, TLS) is still terminal, since the server never saw the request.
 
 `mocactl get SESSIONID` fetches a terminal result and writes files to `--out DIR` (default: cwd):
 `<sid>.text` for a prompt response, `<sid>.patch` for a solve result (with a trailing newline
@@ -153,6 +167,46 @@ Exit codes, for every command: `0` it worked, `1` it failed (the turn, or the co
 refused), `2` a usage or setup problem (bad flags, not logged in, no destination for the turn),
 `130` cancelled (Ctrl-C, which also stops a listing or a stdin read that is waiting).
 
+### Delegate with context
+
+A workload gives a subagent files to work from: a context, uploaded once and available read-only
+to every run on it ([`docs/context-service.md`](../../docs/context-service.md)). Build the context
+file with `contextctl` (`mocactl` never calls it), then:
+
+```bash
+contextctl ctx export ... -o ctx.context
+id=$(mocactl workloads create --context ctx.context --name demo)
+sid=$(mocactl spawn "summarize the repo in the context" --kind prompt --workload "$id")
+mocactl get "$sid"                          # once `mocactl subagents` says done
+mocactl workloads delete "$id"
+```
+
+`workloads create` creates the workload (`POST /workloads` on the harness, with your API token),
+uploads the file straight to Context Service with the one-time grant it returns, then activates the
+revision the upload reports, which freezes it. It checks that the file exists before it starts, and
+that it is no larger than the grant allows before it uploads; the upload streams from disk. A grant
+that has expired, or that the upload refuses with `401`, is replaced once
+(`POST /workloads/ID/uploads`). The grant's URL must be HTTPS (plain HTTP only on loopback). If
+anything fails after the workload exists, `create` deletes it again, so it does not count against
+your quota (5 live workloads by default), and exits `1`. `--name` is a lowercase Kubernetes name of
+at most 50 characters; without one `create` generates one (`wl-` and 8 hex) before it sends the
+request, so if the reply is lost (Ctrl-C, a dropped connection) it can still name the workload to
+delete. The harness has no route that lists workloads, so there is no `mocactl workloads` listing:
+keep the id `create` prints.
+
+`spawn --workload ID` adds `workloadId` to the run and records it in the ledger row
+(`mocactl subagents --json` shows it as `workload`). Only prompt runs can use a workload, so
+`--workload` needs `--kind prompt`. Before it creates the session, `spawn` checks the workload
+(`GET /workloads/ID`) and exits `1` when it is missing, not yours, or not `ready` (naming its
+status). A workload that stops being ready after that fails the run (`workload_not_ready`,
+`workload_not_found`), as `mocactl subagents` then shows.
+
+`spawn --workload ID --writable` gives the run its own writable copy of the context instead, for a
+subagent that edits files or reruns tests. The copy is discarded when the run ends, so ask the
+subagent to return its changes (a diff, test output) in its answer. It sends `contextWritable: true`
+and records `writable` in the ledger row, which `mocactl subagents --json` shows as `"writable": true`
+on that row only. `--writable` without `--workload` exits `2`.
+
 ### Output
 
 stdout carries only the result; every message goes to stderr, including "no sessions" for an
@@ -168,8 +222,11 @@ their own shapes. These shapes are stable: fields may be added, but none is rena
 | `credentials add`    | `{"name","status":"stored"}`                                                                       |
 | `credentials delete` | `{"name","status":"deleted"}`                                                                      |
 | `spawn`              | `{"type":"session","sessionId","pid"}`                                                             |
-| `subagents`          | `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","submittedAt"}]}`               |
+| `subagents`          | `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","workload","submittedAt"}]}`    |
 | `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?}`                                 |
+| `workloads create`   | `{"workloadId","status","contextType","revision","files","bytes"}`                                 |
+| `workloads get`      | `{"workloadId","status","contextType","workspace","revision"}`, `null` for what is not set         |
+| `workloads delete`   | `{"workloadId","status":"deleted"}`                                                                |
 
 `createdAt` and `lastTurnAt` are epoch milliseconds as the control plane sends them (`lastTurnAt`
 is `null` before the first turn); `endpoint` is `null` when the deployment default applies.

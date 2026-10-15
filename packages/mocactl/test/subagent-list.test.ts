@@ -203,3 +203,42 @@ describe('cmdSubagents — terminal rows are not re-queried (24h TTL safety)', (
     expect(parsed.subagents[0].detail).toBe('boom');
   });
 });
+
+describe('cmdSubagents — workload', () => {
+  it('reports the workload a row ran on, and null for one without', async () => {
+    const rt = makeRt(scratch);
+    const ledger = openLedger(rt.paths.subagentsFile, rt.now);
+    ledger.append(seedRecord({ sessionId: 'w', workloadId: 'demo', lastKnownState: 'done' }));
+    ledger.append(seedRecord({ sessionId: 'n', submittedAt: 2, lastKnownState: 'done' }));
+    const { io, out } = makeIo();
+    await cmdSubagents(rt, io, base({ json: true, ledger, transport: {} as LeafTransport }));
+    const rows = JSON.parse(out[0]!.trim()).subagents;
+    expect(rows.map((r: { workload: string | null }) => r.workload)).toEqual(['demo', null]);
+  });
+
+  it('shows writable only on rows that had a writable copy', async () => {
+    const rt = makeRt(scratch);
+    const ledger = openLedger(rt.paths.subagentsFile, rt.now);
+    ledger.append(
+      seedRecord({ sessionId: 'w', workloadId: 'demo', writable: true, lastKnownState: 'done' }),
+    );
+    ledger.append(
+      seedRecord({ sessionId: 'r', workloadId: 'demo', submittedAt: 2, lastKnownState: 'done' }),
+    );
+    const { io, out } = makeIo();
+    await cmdSubagents(rt, io, base({ json: true, ledger, transport: {} as LeafTransport }));
+    const [writable, readOnly] = JSON.parse(out[0]!.trim()).subagents;
+    expect(writable).toMatchObject({ sessionId: 'w', workload: 'demo', writable: true });
+    expect(readOnly).not.toHaveProperty('writable');
+    expect(Object.keys(readOnly)).toEqual([
+      'sessionId',
+      'tag',
+      'kind',
+      'state',
+      'detail',
+      'bundle',
+      'workload',
+      'submittedAt',
+    ]);
+  });
+});

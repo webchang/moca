@@ -14,6 +14,10 @@ export interface LeafEnvelope {
   repoUrl?: string;
   ref?: string;
   configRef?: string;
+  /** A ready workload whose context the run sees (prompt runs only). */
+  workloadId?: string;
+  /** Give the run its own writable copy of the workload's context. */
+  contextWritable?: boolean;
 }
 
 /**

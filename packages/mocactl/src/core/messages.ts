@@ -11,6 +11,10 @@ export function describeError(err: unknown): string {
 
 function describe(err: unknown): string {
   if (err instanceof ApiError) {
+    // Reached, then cut: not "cannot reach". Raised for any request or stream body the peer closed,
+    // so the text claims nothing about how far the exchange got.
+    if (err.code === 'connection_dropped')
+      return `the ${err.source === 'harness' ? 'harness' : 'control plane'} closed the connection (a proxy idle timeout?)`;
     const action = classify(err);
     switch (action.kind) {
       case 'login':

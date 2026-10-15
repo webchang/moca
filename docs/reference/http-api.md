@@ -110,6 +110,11 @@ SSE framing is `[id: <turnId>:<entryId>\n]event: <type>\ndata: <frame JSON>\n\n`
 `: keepalive` is sent every `SH_TURN_STREAM_KEEPALIVE_MS` (default 20000) so proxies keep the
 connection. Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`.
 
+Headers go out with the first frame. If none has been written after `SH_TURN_STREAM_FIRST_FRAME_FLUSH_MS`
+(default 15000, `0` disables), they go out anyway with a `: keepalive` comment (a detachable turn writes its
+`turn` frame instead), so a proxy idle timeout cannot cut a slow first frame. A failure after that point is a
+terminal `error` frame, not an HTTP status.
+
 | Event             | Fields                                                               | Notes                                                                                       |
 | ----------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `turn`            | `turnId`, `sessionId`, `truncated?`, `ended?`                        | Detachable and attach only; not terminal                                                    |

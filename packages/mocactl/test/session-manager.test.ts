@@ -444,6 +444,68 @@ describe('detachable turns', () => {
     ]);
   });
 
+  describe('a turn POST cut before any frame (a proxy idle timeout)', () => {
+    const cut = () => new ApiError('harness', 0, 'connection_dropped', 'fetch failed');
+
+    it('attaches by session, follows the running turn, and never sends the prompt twice', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'sm-'));
+      const transcripts = new TranscriptStore(dir, { subject: 'u', controlPlaneUrl: 'http://cp' });
+      const { session, harness, ends } = await started(
+        [{ frames: [], error: cut() }],
+        { detachable: true, transcripts },
+        [{ frames: [turnF, text('b'), doneFrame()], ids: ['t1:1-0', 't1:2-0', 't1:3-0'] }],
+      );
+      session.submit('go');
+      await session.idle();
+      expect(harness.turns.map((t) => t.prompt)).toEqual(['go']);
+      expect(harness.attaches).toHaveLength(1);
+      expect(ends()).toMatchObject([{ outcome: 'done' }]);
+      // The question is saved before its answer, as on the normal path.
+      expect(transcripts.load('s1')!.entries.map((e) => e.kind)).toEqual([
+        'prompt',
+        'turn',
+        'frame',
+        'frame',
+      ]);
+    });
+
+    it('surfaces the original error when the session has no turn to attach to', async () => {
+      const none = { error: new ApiError('harness', 404, 'turn_not_found') };
+      const { session, harness, ends } = await started(
+        [{ frames: [], error: cut() }],
+        { detachable: true },
+        [none],
+      );
+      session.submit('go');
+      await session.idle();
+      expect(harness.turns).toHaveLength(1);
+      expect(ends()).toMatchObject([{ outcome: 'error', error: { code: 'connection_dropped' } }]);
+    });
+
+    it('does not mistake a finished earlier turn for the dropped prompt', async () => {
+      const { session, ends } = await started(
+        [{ frames: [], error: cut() }],
+        { detachable: true },
+        [{ frames: [{ ...turnF, ended: true }, doneFrame()], ids: ['t0:1-0', 't0:2-0'] }],
+      );
+      session.submit('go');
+      await session.idle();
+      expect(ends()).toMatchObject([{ outcome: 'error', error: { code: 'connection_dropped' } }]);
+    });
+
+    it('a refused connection is not recovered, and a non-detachable session never attaches', async () => {
+      const refused = new ApiError('harness', 0, 'network_error', 'ECONNREFUSED');
+      const a = await started([{ frames: [], error: refused }], { detachable: true });
+      a.session.submit('go');
+      await a.session.idle();
+      expect(a.harness.attaches).toHaveLength(0);
+      const b = await started([{ frames: [], error: cut() }]);
+      b.session.submit('go');
+      await b.session.idle();
+      expect(b.harness.attaches).toHaveLength(0);
+    });
+  });
+
   it('gives up after 5 tries with the lost-turn error', async () => {
     const drop = () => ({ error: new ApiError('harness', 0, 'network_error', 'x') });
     const { session, ends, slept } = await started(

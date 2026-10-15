@@ -855,12 +855,21 @@ prediction sealed before E8's next rung, since it sits on the hot path.
 - **Per-user admission quota** (rossoctl/moca#360). `packages/supervisor/src/admission.ts` bounds the worker as a whole,
   so one user can use every slot. This belongs with S2's grants, which name the user.
 - **Tenant-scoped session listing** (rossoctl/moca#361). `RedisSessionBackend.list()`
-  (`packages/session-backend/src/redis-backend.ts`) returns every tenant's sessions. No route
-  exposes it to a caller today, but no caller-facing use may be added before S2 scopes it.
-- **Blocking cloud instance metadata from sandboxes** on `deploy/vm` (rossoctl/moca#357). R8 filters only the input
-  hook, so a sandbox can reach `169.254.169.254` and, on an IMDSv1 or hop-limit-2 EC2 host, the
-  instance role's credentials. S5's egress filtering closes it. Until then, `deploy/vm/README.md`
-  gives the platform-side mitigation.
+  (`packages/session-backend/src/redis-backend.ts`) returned every tenant's sessions. No route ever
+  exposed it to a caller, and no caller-facing use was to be added before S2 scoped it.
+  **Closed in-product 2026-10-15 (rossoctl/moca#541):** `list()` is deleted from `LogStore` and
+  `RedisSessionBackend` (nothing called it, so no SCAN-based admin listing was kept), and
+  `BufferedRedisBackend.list()` — which Pi's `SessionStorageBackend` requires — now throws an error
+  naming the scoped path, making this §13 clause structural rather than advisory. The scoped listing
+  remains `OwnershipIndex.listByOwner` (§7.1-§7.3), with the cross-tenant isolation test in
+  `packages/control-plane/test/ownership.test.ts`.
+- **Blocking cloud instance metadata from sandboxes** on `deploy/vm` (rossoctl/moca#357). R8 filtered only the input
+  hook, so a sandbox could reach `169.254.169.254` and, on an IMDSv1 or hop-limit-2 EC2 host, the
+  instance role's credentials. **Closed in-product 2026-10-15 (rossoctl/moca#539):** the
+  `moca_sandbox` table now drops link-local destinations from the sandbox bridge in its forward
+  chain. Metadata served from routable addresses (Alibaba's `100.100.100.200`, Azure's WireServer
+  `168.63.129.16`) remains for S5's egress filtering; `deploy/vm/README.md` still gives the
+  platform-side mitigation as defense in depth.
 - **An atomic workload create** (rossoctl/moca#356). `POST /workloads` checks for another subject's live workload, then
   creates. Two subjects creating one new name concurrently can both succeed, and the later write's
   owner wins. Closing it needs a set-if-absent owner reservation before Context Service is called.
