@@ -25,6 +25,11 @@ import {
 } from '@moca/k8s-sandbox';
 import { RedisRecordStore, affinityTimings } from '@moca/harness';
 import {
+  makeClientTokenAuthenticator,
+  workspaceKeyAllowed,
+  type ClientGrant,
+} from './client-tokens.js';
+import {
   createRelay,
   type Relay,
   type RelayDeps,
@@ -73,6 +78,8 @@ function execStreamError(message: string): Error {
 /** Relay server dependencies: the relay's own, plus the SandboxExec caller check (MI1 §5 R5). */
 export interface RelayServerDeps extends RelayDeps {
   validateExecToken: (presented: string | undefined) => boolean;
+  /** Direct clients (client-tokens.ts). Omitted: only the harness's exec token is accepted. */
+  authenticateClient?: (presented: string | undefined) => ClientGrant | undefined;
 }
 
 /**
@@ -133,6 +140,28 @@ function unauthenticated(): Error & { code: number; details: string } {
   return err;
 }
 
+function permissionDenied(message: string): Error & { code: number; details: string } {
+  const err = new Error(message) as Error & { code: number; details: string };
+  err.code = status.PERMISSION_DENIED;
+  err.details = message;
+  return err;
+}
+
+/**
+ * Who is calling SandboxExec: the harness (its exec token, unrestricted, as before), a direct client
+ * (a grant), or nobody.
+ */
+type ExecCaller = { kind: 'harness' } | { kind: 'client'; grant: ClientGrant } | undefined;
+
+function execCaller(md: Metadata, deps: ExecAuth): ExecCaller {
+  const presented = bearerOf(md);
+  if (deps.validateExecToken(presented)) return { kind: 'harness' };
+  const grant = deps.authenticateClient?.(presented);
+  return grant ? { kind: 'client', grant } : undefined;
+}
+
+type ExecAuth = Pick<RelayServerDeps, 'validateExecToken' | 'authenticateClient'>;
+
 function newServer(): Server {
   // Raise the ingress limit above gRPC's 4 MiB default. This is the hop that rejects an
   // oversized write today: the harness's ExecRequest carries base64 stdin at 4/3 of the
@@ -158,8 +187,12 @@ function addWorkerService(server: Server, relay: ReturnType<typeof createRelay>)
 function addExecService(
   server: Server,
   relay: ReturnType<typeof createRelay>,
-  validate: RelayServerDeps['validateExecToken'],
+  auth: ExecAuth,
 ): void {
+  // A client may abort only the Execs it started: req_ids are not secret, so without this one client
+  // could kill another's command. Keyed by sandbox and req_id, held for the Exec's lifetime.
+  const clientExecs = new Map<string, ClientGrant>();
+  const execKey = (sandboxId: string, reqId: number) => `${sandboxId}\0${reqId}`;
   const execImpl: SandboxExecServer = {
     // Server-streaming: one ExecRequest in, a stream of ExecEvents out.
     //
@@ -173,7 +206,8 @@ function addExecService(
     // cleans up the sink). This makes worker-disconnect (Task 6) and
     // client-cancel (this task) both terminate the generator cleanly.
     exec: async (call: ServerWritableStream<ExecRequest, ExecEvent>) => {
-      if (!validate(bearerOf(call.metadata))) {
+      const caller = execCaller(call.metadata, auth);
+      if (!caller) {
         failExecStream(call, unauthenticated());
         return;
       }
@@ -189,6 +223,17 @@ function addExecService(
         err.details = err.message;
         failExecStream(call, err);
         return;
+      }
+      let owned: string | undefined;
+      if (caller.kind === 'client') {
+        const { grant } = caller;
+        // Checked before routing, so a refused Exec never reaches a worker.
+        if (req.sandboxId !== grant.sandboxId || !workspaceKeyAllowed(grant, e.workspaceKey)) {
+          failExecStream(call, permissionDenied('exec not permitted for this client token'));
+          return;
+        }
+        owned = execKey(req.sandboxId, e.reqId);
+        clientExecs.set(owned, grant);
       }
       // Registered synchronously (before the loop's first await) so a
       // cancellation that races the very first event is never missed.
@@ -236,14 +281,23 @@ function addExecService(
         failExecStream(call, err as Error);
       } finally {
         call.removeListener('cancelled', onCancelled);
+        if (owned) clientExecs.delete(owned);
       }
     },
     abort: (
       call: ServerUnaryCall<AbortRequest, AbortResponse>,
       cb: sendUnaryData<AbortResponse>,
     ) => {
-      if (!validate(bearerOf(call.metadata))) {
+      const caller = execCaller(call.metadata, auth);
+      if (!caller) {
         cb(unauthenticated(), null);
+        return;
+      }
+      if (
+        caller.kind === 'client' &&
+        clientExecs.get(execKey(call.request.sandboxId, call.request.reqId)) !== caller.grant
+      ) {
+        cb(permissionDenied('abort not permitted: not an exec this client started'), null);
         return;
       }
       relay.routeAbort(call.request.sandboxId, call.request.reqId);
@@ -262,7 +316,7 @@ export function buildServer(deps: RelayServerDeps): { server: Server; relay: Rel
   const relay = createRelay(deps);
   const server = newServer();
   addWorkerService(server, relay);
-  addExecService(server, relay, deps.validateExecToken);
+  addExecService(server, relay, deps);
   return { server, relay };
 }
 
@@ -282,7 +336,7 @@ export function buildServers(deps: RelayServerDeps): {
   const attachServer = newServer();
   const execServer = newServer();
   addWorkerService(attachServer, relay);
-  addExecService(execServer, relay, deps.validateExecToken);
+  addExecService(execServer, relay, deps);
   return { attachServer, execServer, relay };
 }
 
@@ -386,6 +440,7 @@ export async function startRelay(
     opts.deps ??
     (() => {
       const validateExecToken = makeExecTokenValidator(env);
+      const authenticateClient = makeClientTokenAuthenticator(env);
       const records = new RedisRecordStore();
       ownedRecords = records;
       return {
@@ -393,6 +448,7 @@ export async function startRelay(
         detach: detachMarks(records, env),
         validateToken: makeDefaultValidateToken(env),
         validateExecToken,
+        authenticateClient,
       };
     })();
   const close = ownedRecords ? () => ownedRecords!.close() : undefined;
