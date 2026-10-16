@@ -269,7 +269,11 @@ export async function cmdRun(rt: Runtime, io: Io, opts: RunOptions): Promise<num
       }
       if (r.status === 'needs-input') {
         const label = r.field.label.toLowerCase();
-        const declared = r.choices.map((c) => sanitizeRemote(c.value)).join(', ');
+        // '' is the model field's "deployment default" choice: named in words, not as a bare comma.
+        const named = r.choices.filter((c) => c.value !== '');
+        const declared =
+          named.map((c) => sanitizeRemote(c.value)).join(', ') +
+          (named.length < r.choices.length ? ' (or empty for the deployment default)' : '');
         const given = opts.options[r.field.key];
         // A value given with --option but not among the choices is named as rejected, not asked for
         // again as though none had been given. It is user input echoed to a terminal, so sanitized.

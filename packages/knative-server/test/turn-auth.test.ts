@@ -886,4 +886,65 @@ describe('configRef from the exchange', () => {
       ).rejects.toMatchObject({ code: 'credential_unavailable' });
     }
   });
+
+  const withModel = (model: unknown) =>
+    deps({
+      fetchImpl: fakeExchange({
+        status: 200,
+        body: {
+          mode: 'direct',
+          anthropicAuthToken: 'sk-alice', // notsecret
+          anthropicBaseUrl: 'https://litellm.internal',
+          sessionId: 'sid-1',
+          subject: 'github:1234',
+          model,
+        },
+      }).fetchImpl,
+    });
+
+  it('carries the session model from the exchange (per-session model spec §5.1)', async () => {
+    const auth = await resolveTurnAuth(
+      { authorization: `Bearer ${sessionToken()}` },
+      { sessionId: 'sid-1' },
+      withModel({ id: 'meta-llama/Llama-3.1-8B-Instruct', contextWindow: 131072 }),
+    );
+    expect(auth?.model).toEqual({ id: 'meta-llama/Llama-3.1-8B-Instruct', contextWindow: 131072 });
+  });
+
+  it('carries a context window of exactly 10M', async () => {
+    const auth = await resolveTurnAuth(
+      { authorization: `Bearer ${sessionToken()}` },
+      { sessionId: 'sid-1' },
+      withModel({ id: 'm', contextWindow: 10_000_000 }),
+    );
+    expect(auth?.model).toEqual({ id: 'm', contextWindow: 10_000_000 });
+  });
+
+  it('omits the model when the exchange names none', async () => {
+    const auth = await resolveTurnAuth(
+      { authorization: `Bearer ${sessionToken()}` },
+      { sessionId: 'sid-1' },
+      deps(),
+    );
+    expect(auth).not.toHaveProperty('model');
+  });
+
+  it.each([
+    [{ contextWindow: 1 }],
+    [{ id: 'has space' }],
+    [{ id: 'm', contextWindow: -5 }],
+    ['m'],
+    // PR #540 review R9: the control plane never hands out a window above 10M; one that arrives
+    // anyway is a wrong shape, not a limit to run with.
+    [{ id: 'm', contextWindow: 10_000_001 }],
+    [{ id: 'm', contextWindow: 1e300 }],
+  ])('fails the turn on a malformed model %j rather than guessing', async (model) => {
+    await expect(
+      resolveTurnAuth(
+        { authorization: `Bearer ${sessionToken()}` },
+        { sessionId: 'sid-1' },
+        withModel(model),
+      ),
+    ).rejects.toMatchObject({ code: 'credential_unavailable' });
+  });
 });

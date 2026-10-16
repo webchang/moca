@@ -161,7 +161,9 @@ every request, runs Pi with extensions, context files and skills switched off, a
 state with tests rather than refactoring them, and documents a fifth (`fileMutationQueues`) unchanged. The design records residual hazards: a write error in the output guard
 would exit the whole process (pinned unreachable in server mode), the project-settings trust gate defaults to open, and
 a settings lock can busy-wait for up to about 200 ms. The worker's sentinel assignment to `ANTHROPIC_API_KEY` is also
-process-wide, though it is the same constant for every caller.
+process-wide, though it is the same constant for every caller. One subject cannot take every turn slot: the worker caps
+each authenticated subject at `SH_TURNS_PER_SUBJECT` in-flight turns (default half the per-worker cap S), answering
+`subject_quota_exceeded` with `Retry-After`; the count is per worker, so the host-wide bound is `cap/S`.
 
 ## Transport security
 

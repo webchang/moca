@@ -10,7 +10,7 @@ import { streamOf } from './helpers/sse.js';
 const root = new URL('../../../', import.meta.url);
 const openapi = parse(readFileSync(new URL('docs/api/openapi.yaml', root), 'utf8')) as {
   paths: Record<string, Record<string, any>>;
-  components: { schemas: { Error: { properties: { error: { enum: string[] } } } } };
+  components: { schemas: Record<string, any> };
 };
 
 // Every control-plane call the client makes, with the response fields it reads and the request
@@ -43,10 +43,10 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
   {
     method: 'post',
     path: '/v1/sessions',
-    reads: ['sessionId', 'token', 'expiresAt'],
-    sends: ['credentials', 'sandbox', 'configRef'],
+    reads: ['sessionId', 'token', 'expiresAt', 'model', 'modelVerified'],
+    sends: ['credentials', 'sandbox', 'configRef', 'model'],
   },
-  { method: 'get', path: '/v1/sessions/{id}' },
+  { method: 'get', path: '/v1/sessions/{id}', reads: ['model'] },
   { method: 'delete', path: '/v1/sessions/{id}' },
   { method: 'post', path: '/v1/sessions/{id}/token', reads: ['token', 'expiresAt'] },
   { method: 'get', path: '/v1/credentials', reads: ['credentials'] },
@@ -59,6 +59,14 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
     sends: ['digest', 'tar'],
   },
   { method: 'delete', path: '/v1/config-bundles/{digest}' },
+  { method: 'get', path: '/v1/models', reads: ['credential', 'models'] },
+  { method: 'get', path: '/v1/sessions/{id}/models', reads: ['credential', 'models'] },
+  {
+    method: 'patch',
+    path: '/v1/sessions/{id}',
+    reads: ['model', 'modelVerified'],
+    sends: ['model'],
+  },
 ];
 
 // Codes the client branches on (api/errors.ts, core/session-manager.ts).
@@ -79,11 +87,26 @@ const CODES_USED = [
   'credential_ambiguous',
   'config_bundle_not_found',
   'forbidden',
+  'model_unavailable',
+  'model_catalog_unavailable',
 ];
 
 function responseSchema(op: any): any {
   const ok = Object.entries(op.responses).find(([s]) => s.startsWith('2'));
-  return (ok?.[1] as any)?.content?.['application/json']?.schema;
+  const schema = (ok?.[1] as any)?.content?.['application/json']?.schema;
+  return resolveSchema(schema);
+}
+
+// `$ref` to a component and `allOf` both appear in 2xx schemas; flatten them to one properties map.
+function resolveSchema(s: any): any {
+  if (!s) return s;
+  if (s.$ref) return resolveSchema(openapi.components.schemas[s.$ref.split('/').pop()]);
+  if (s.allOf) {
+    return {
+      properties: Object.assign({}, ...s.allOf.map((p: any) => resolveSchema(p)?.properties)),
+    };
+  }
+  return s;
 }
 
 describe('control-plane contract (docs/api/openapi.yaml)', () => {
@@ -106,7 +129,7 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
 
   it('covers every call the client makes', async () => {
     const reply = () => json({ credentials: [], sessions: [], nextCursor: null });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 20 }, () => reply));
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 30 }, () => reply));
     const c = new ControlPlaneClient('http://cp', () => 't', fetch);
     const invokedMethods = new Set<string>();
     const handler: ProxyHandler<ControlPlaneClient> = {
@@ -149,6 +172,9 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
     await cProxy.deleteCredential('NAME');
     await cProxy.putConfigBundle({ digest: 'sha256:x', tar: '' });
     await cProxy.deleteConfigBundle('DIGEST');
+    await cProxy.listModels('cred');
+    await cProxy.listSessionModels('ID');
+    await cProxy.setSessionModel('ID', null);
     const seen = calls.map((k) => {
       const path = new URL(k.url).pathname
         .replace('/ID', '/{id}')

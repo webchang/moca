@@ -26,7 +26,7 @@ interface Props {
   currentSessionId?: string;
   remove: (id: string) => Promise<unknown>;
   /** `configRef` is the session's bundle digest, so the status line can show it once attached. */
-  onResume: (id: string, configRef?: string | null) => void;
+  onResume: (id: string, configRef?: string | null, model?: string | null) => void;
   onNew: () => void;
   onDeleted: (id: string) => void;
   onCancel: () => void;
@@ -92,7 +92,7 @@ export function SessionsOverlay({
           key: s.sessionId,
           label: title,
           detail,
-          value: { id: s.sessionId, title, configRef: s.configRef },
+          value: { id: s.sessionId, title, configRef: s.configRef, model: s.model ?? null },
         };
       }),
     [sessions, reload, now, transcripts, currentSessionId],
@@ -146,7 +146,7 @@ export function SessionsOverlay({
         items={items}
         filter="slash"
         emptyText="no sessions yet — press n to start one"
-        onSelect={(v) => onResume(v.id, v.configRef)}
+        onSelect={(v) => onResume(v.id, v.configRef, v.model)}
         onCancel={onCancel}
         keys={{
           n: () => onNew(),

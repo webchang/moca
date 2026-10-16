@@ -33,7 +33,13 @@ export interface SessionOptionField {
    * that did not choose leaves it unset instead of being refused with "choose with --option".
    */
   serverDefaults?: boolean;
-  source(api: ControlPlaneApi): Promise<Choice[]>;
+  /**
+   * With no choices to offer (the catalog is unavailable), send a value the caller gave as-is for
+   * the server to check, rather than blocking (per-session model spec §4.2: accepted unverified).
+   */
+  acceptUnlisted?: boolean;
+  /** `values` are the fields resolved before this one, so a choice can depend on them (the model on the credential). */
+  source(api: ControlPlaneApi, values: Record<string, string>): Promise<Choice[]>;
   toRequest(value: string, req: CreateSessionRequest): CreateSessionRequest;
 }
 
@@ -43,7 +49,7 @@ export const inferenceCredentialField: SessionOptionField = {
   emptyHint: 'add an inference credential to start',
   serverMayResolve: true,
   refusalCode: 'credential_required',
-  async source(api) {
+  async source(api, _values) {
     return (await api.listCredentials())
       .filter((c) => c.consumer === 'inference')
       .map((c) => {
@@ -65,7 +71,7 @@ export const sandboxTierField: SessionOptionField = {
   emptyHint: 'this deployment declares no sandbox tiers',
   serverMayResolve: true,
   serverDefaults: true,
-  async source(api) {
+  async source(api, _values) {
     let tiers: Discovery['sandboxTiers'];
     try {
       tiers = (await api.discovery()).sandboxTiers;
@@ -95,8 +101,73 @@ function isSandboxTiers(v: unknown): v is NonNullable<Discovery['sandboxTiers']>
   );
 }
 
+/**
+ * `200k ctx` for 200000: the label's only job is telling a big window from a small one. A remote
+ * value, so undefined unless it is a finite positive number (PR #540 review R6) -- anything else
+ * would reach the label through String() unsanitized. Shared with the /model overlay.
+ */
+export function formatWindow(n: unknown): string | undefined {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return undefined;
+  return `${n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)} ctx`;
+}
+
+/** The catalog's entries with a string id; a body without a models array has none (R6). */
+function catalogEntries(list: unknown): Array<{ id: string; contextWindow?: unknown }> {
+  const models = (list as { models?: unknown } | null)?.models;
+  if (!Array.isArray(models)) return [];
+  return models.filter(
+    (m): m is { id: string; contextWindow?: unknown } =>
+      typeof m === 'object' && m !== null && typeof (m as { id?: unknown }).id === 'string',
+  );
+}
+
+export const modelField: SessionOptionField = {
+  key: 'model',
+  label: 'Model',
+  emptyHint: 'the inference credential lists no models',
+  serverMayResolve: true,
+  serverDefaults: true,
+  acceptUnlisted: true,
+  async source(api, values) {
+    let list;
+    try {
+      list = await api.listModels(values.inferenceCredential);
+    } catch (err) {
+      // No catalog to offer: a control plane that predates it (a route 404, as distinct from a
+      // named credential that does not exist), a gateway that cannot list, or a subject with no
+      // credential at all (create then refuses with the credential field's own hint). The session
+      // runs on the deployment default. Anything else is real.
+      // A 503 is skipped whatever its code (spec §6): an unavailable catalog, by any name.
+      if (
+        err instanceof ApiError &&
+        ((err.status === 404 && err.code !== 'credential_not_found') ||
+          err.status === 503 ||
+          err.code === 'model_catalog_unavailable' ||
+          err.code === 'credential_required')
+      ) {
+        return [];
+      }
+      throw err;
+    }
+    // A remote body, shape-checked as sandboxTierField's is: a 200 without a models array skips the
+    // field rather than breaking New Session and `mocactl run` with a TypeError (R6).
+    const models = catalogEntries(list).map((m) => {
+      const id = sanitizeRemote(m.id);
+      const window = formatWindow(m.contextWindow);
+      return { value: m.id, label: window ? `${id}  ${window}` : id };
+    });
+    // The deployment default is always a choice (final review F3): without it a one-model catalog
+    // would be auto-pinned, and New Session could never leave the model to the deployment. '' is
+    // never a model id (MODEL_ID_RE); it means "send no model", for a preset or last use too.
+    if (models.length === 0) return [];
+    return [{ value: '', label: 'deployment default', isDefault: true }, ...models];
+  },
+  toRequest: (value, req) => (value === '' ? req : { ...req, model: value }),
+};
+
 export const SESSION_OPTION_FIELDS: readonly SessionOptionField[] = [
   inferenceCredentialField,
+  modelField,
   sandboxTierField,
 ];
 
@@ -120,13 +191,17 @@ export async function resolveSessionOptions(
 ): Promise<Resolution> {
   const values: Record<string, string> = {};
   for (const field of fields) {
-    const choices = await field.source(api);
+    const choices = await field.source(api, values);
     const wanted = given[field.key];
     if (wanted !== undefined && choices.some((c) => c.value === wanted)) {
       values[field.key] = wanted;
       continue;
     }
     if (choices.length === 0) {
+      if (wanted !== undefined && field.acceptUnlisted) {
+        values[field.key] = wanted;
+        continue;
+      }
       if (field.serverMayResolve && wanted === undefined) continue;
       return { status: 'blocked', field, values };
     }

@@ -371,3 +371,61 @@ describe('cascadeDelete', () => {
     expect((await index.listByOwner('github:1234')).sessions).toEqual([]);
   });
 });
+
+describe('the session model fields', () => {
+  const base = {
+    sessionId: 'sid-m',
+    owner: 'github:1',
+    tenant: 'github:1',
+    createdAt: 1,
+    state: 'active' as const,
+    poolSelector: null,
+    credentialName: 'c',
+    configRef: null,
+    tombstone: false,
+    sandboxTier: '',
+  };
+
+  it('round-trips a model id with slashes and colons, and its limits', async () => {
+    const { redis } = fakeRedis();
+    const index = new OwnershipIndex(redis);
+    await index.create({
+      ...base,
+      model: 'bedrock/anthropic.claude-3:0',
+      modelLimits: { contextWindow: 200000, reasoning: true },
+    });
+    const rec = await index.get('sid-m');
+    expect(rec?.model).toBe('bedrock/anthropic.claude-3:0');
+    expect(rec?.modelLimits).toEqual({ contextWindow: 200000, reasoning: true });
+  });
+
+  it('reads a record written before this change as naming no model', async () => {
+    const { redis } = fakeRedis();
+    const index = new OwnershipIndex(redis);
+    await index.create(base);
+    const rec = await index.get('sid-m');
+    expect(rec?.model).toBeUndefined();
+    expect(rec?.modelLimits).toBeUndefined();
+  });
+
+  it('reads corrupted limits as no limits rather than throwing', async () => {
+    const { redis } = fakeRedis();
+    const index = new OwnershipIndex(redis);
+    await index.create({ ...base, model: 'm' });
+    await redis.hSet(sessionKey('sid-m'), { modelLimits: '{not json' });
+    const rec = await index.get('sid-m');
+    expect(rec?.model).toBe('m');
+    expect(rec?.modelLimits).toBeUndefined();
+  });
+
+  it('setModel replaces the model and clears limits it is not given', async () => {
+    const { redis } = fakeRedis();
+    const index = new OwnershipIndex(redis);
+    await index.create({ ...base, model: 'a', modelLimits: { contextWindow: 1000 } });
+    await index.setModel('sid-m', 'b');
+    expect(await index.get('sid-m')).toMatchObject({ model: 'b' });
+    expect((await index.get('sid-m'))?.modelLimits).toBeUndefined();
+    await index.setModel('sid-m', '');
+    expect((await index.get('sid-m'))?.model).toBeUndefined();
+  });
+});

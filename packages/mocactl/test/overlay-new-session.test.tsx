@@ -93,7 +93,7 @@ describe('NewSessionOverlay', () => {
 
   it('uses a preset, and notes preset fields the client no longer knows', async () => {
     const { stdin, onCreate, lastFrame } = setup(cpWith('a', 'b'), {
-      presets: [{ name: 'work', values: { inferenceCredential: 'b', model: 'opus' } }],
+      presets: [{ name: 'work', values: { inferenceCredential: 'b', unknown: 'value' } }],
     });
     await waitFor(() => (lastFrame() ?? '').includes('work') && inputReady(stdin), 1000, lastFrame);
     expect(lastFrame()).toContain('work');
@@ -104,7 +104,7 @@ describe('NewSessionOverlay', () => {
       { inferenceCredential: 'b' },
     );
     expect(onCreate).toHaveBeenCalledTimes(1);
-    expect(lastFrame()).toContain('ignoring preset fields this version does not know: model');
+    expect(lastFrame()).toContain('ignoring preset fields this version does not know: unknown');
   });
 
   it('shows a creation error', async () => {

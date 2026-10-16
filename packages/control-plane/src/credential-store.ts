@@ -227,6 +227,9 @@ function invalid(why: string): never {
   throw new CpError('invalid_request', why);
 }
 
+/** The longest `endpoint` a credential may store (PR #540 review R3). */
+export const MAX_ENDPOINT_LENGTH = 2048;
+
 /** A host allow-list entry is a HOST, never a URL: `api.github.com`, not `https://api.github.com/x`. */
 function validateHost(h: unknown): string {
   if (typeof h !== 'string' || h.length === 0 || /[:/?#]/.test(h)) {
@@ -277,6 +280,11 @@ export function parseCredentialBody(name: string, body: unknown): StoredCredenti
   if (body.endpoint !== undefined && body.endpoint !== null) {
     if (consumer !== 'inference') invalid('endpoint is only valid for consumer: inference');
     if (typeof body.endpoint !== 'string') invalid('endpoint must be a string');
+    // Capped at store time (PR #540 review R3): every catalog call and exchange parses it, and the
+    // value is the user's to choose. No real gateway URL is near the cap.
+    if (body.endpoint.length > MAX_ENDPOINT_LENGTH) {
+      invalid(`endpoint must be at most ${MAX_ENDPOINT_LENGTH} characters`);
+    }
     let parsed: URL;
     try {
       parsed = new URL(body.endpoint);

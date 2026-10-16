@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveModelSelection, requireModel } from '../src/run-turn';
+import { resolveModelSelection, requireModel, sessionModelFor } from '../src/run-turn';
 
 describe('resolveModelSelection', () => {
   it('defaults to anthropic / claude-opus-4-8 when nothing is set', () => {
@@ -206,5 +206,79 @@ describe('requireModel SH_MODEL_API validation', () => {
         SH_MODEL_BASE_URL: 'https://x/v1',
       }),
     ).toThrowError(/Unknown SH_MODEL_API "grpc-magic"/);
+  });
+});
+
+describe('sessionModelFor (per-session model spec §5.2)', () => {
+  const lite = 'https://litellm.internal';
+
+  it('takes a direct Anthropic model from the registry, ignoring the limits and SH_MODEL_CUSTOM', () => {
+    const m = sessionModelFor(
+      { id: 'claude-opus-4-8', contextWindow: 1000 },
+      'https://api.anthropic.com',
+      { SH_MODEL_CUSTOM: '1' },
+    ) as { id: string; contextWindow: number; baseUrl: string };
+    const registry = requireModel('anthropic', 'claude-opus-4-8', {}) as { contextWindow: number };
+    expect(m.id).toBe('claude-opus-4-8');
+    expect(m.contextWindow).toBe(registry.contextWindow);
+  });
+
+  it('synthesizes a gateway model from the limits, without SH_MODEL_CUSTOM', () => {
+    const m = sessionModelFor(
+      {
+        id: 'meta-llama/Llama-3.1-8B-Instruct',
+        contextWindow: 32000,
+        maxTokens: 4096,
+        reasoning: true,
+        vision: true,
+      },
+      lite,
+      {},
+    ) as {
+      id: string;
+      api: string;
+      contextWindow: number;
+      maxTokens: number;
+      reasoning: boolean;
+      input: string[];
+    };
+    expect(m).toMatchObject({
+      id: 'meta-llama/Llama-3.1-8B-Instruct',
+      api: 'anthropic-messages',
+      contextWindow: 32000,
+      maxTokens: 4096,
+      reasoning: true,
+    });
+    expect(m.input).toEqual(['text', 'image']);
+  });
+
+  it('falls back to the environment limits, then the defaults, field by field', () => {
+    const m = sessionModelFor({ id: 'x', maxTokens: 2048 }, lite, {
+      SH_MODEL_CONTEXT_WINDOW: '64000',
+    }) as { contextWindow: number; maxTokens: number; reasoning: boolean; input: string[] };
+    expect(m.contextWindow).toBe(64000);
+    expect(m.maxTokens).toBe(2048);
+    expect(m.reasoning).toBe(false);
+    expect(m.input).toEqual(['text']);
+    const d = sessionModelFor({ id: 'x' }, lite, {}) as {
+      contextWindow: number;
+      maxTokens: number;
+    };
+    expect(d.contextWindow).toBe(131072);
+    expect(d.maxTokens).toBe(8192);
+  });
+
+  it('honours a deployment-wide SH_MODEL_API', () => {
+    const m = sessionModelFor({ id: 'x' }, lite, {
+      SH_MODEL_API: 'openai-completions',
+      OPENAI_API_KEY: 'k', // notsecret
+    }) as { api: string };
+    expect(m.api).toBe('openai-completions');
+  });
+
+  it('names the unknown id for a direct Anthropic model pi does not know', () => {
+    expect(() => sessionModelFor({ id: 'claude-nope' }, 'https://api.anthropic.com', {})).toThrow(
+      /Unknown model "anthropic\/claude-nope"/,
+    );
   });
 });

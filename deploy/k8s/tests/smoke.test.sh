@@ -36,17 +36,22 @@ MOCK
 # of a counter (s1, s2, ...). /v1/turn streams the file $MOCK_TURN_SSE when it is set; otherwise, with
 # MOCK_SESSIONS=1, it builds the turn from its request body: one bash tool_result, then the done
 # frame of the request's sessionId. A K8S-SMOKE-WHERE-1 turn prints where=<host>, its host the
-# session's entry in MOCK_WHERE ("s4=moca-sandbox-0 s5=..."); a K8S-SMOKE-WHERE-2 turn reads
+# session's entry in MOCK_WHERE ("s5=moca-sandbox-0 s6=..."); a K8S-SMOKE-WHERE-2 turn reads
 # MOCK_WHERE_2 first, so a case can move one session's second turn. MOCK_ENVELOPE=1 wraps the
 # preview in the JSON envelope a real model's run carries (see p4_sse below). Every turn's prompt is
 # appended to $MOCK_STATE/prompts.log. MOCK_SESSIONS_DOWN=N: once claim 10 has deleted redis-0 (the
 # kubectl mock's $MOCK_STATE/redis-restarted), the next N session POSTs fail, as a stack still
-# reconnecting to Redis does. Everything else is a refused connection.
+# reconnecting to Redis does. Claim M1: a session POST's "model" and a PATCH /v1/sessions/<id> set the
+# model the next turn reports (a K8S-SMOKE-MODEL turn prints model=<it>, as the mock gateway does);
+# MOCK_PATCH_IGNORED=1 answers the PATCH 200 but keeps the old model. Everything else is a refused
+# connection.
 cat >"$TMP/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
-url='' data='' prev=''
+url='' data='' prev='' ofile='' wfmt=''
 for a in "$@"; do
   [[ "$prev" != -d ]] || data="$a"
+  [[ "$prev" != -o ]] || ofile="$a"
+  [[ "$prev" != -w ]] || wfmt="$a"
   [[ "$a" != http* ]] || url="$a"
   prev="$a"
 done
@@ -63,9 +68,17 @@ case "$url" in
     [[ "$d" -gt "${MOCK_SESSIONS_DOWN:-0}" ]] || { echo '{"error":"redis: connection lost"}'; exit 0; }
   fi
   printf '%s\n' "$data" >>"$MOCK_STATE/sessions.log"
+  jq -r '.model // empty' <<<"$data" >"$MOCK_STATE/model"
   n=$(($(cat "$MOCK_STATE/sessions" 2>/dev/null || echo 0) + 1))
   echo "$n" >"$MOCK_STATE/sessions"
   echo "{\"sessionId\":\"s$n\",\"token\":\"t$n\"}" ;;
+*/v1/sessions/*)
+  [[ "${MOCK_SESSIONS-}" == 1 ]] || exit 7
+  printf '%s\n' "$data" >>"$MOCK_STATE/patches.log"
+  [[ -n "${MOCK_PATCH_IGNORED-}" ]] || jq -r '.model // empty' <<<"$data" >"$MOCK_STATE/model"
+  body="$(jq -nc --arg s "${url##*/}" --arg m "$(cat "$MOCK_STATE/model")" '{sessionId: $s, model: $m}')"
+  if [[ -n "$ofile" ]]; then printf '%s' "$body" >"$ofile"; else printf '%s' "$body"; fi
+  [[ "$wfmt" != '%{http_code}' ]] || printf '200' ;;
 */v1/turn)
   if [[ -n "${MOCK_TURN_SSE-}" ]]; then cat "$MOCK_TURN_SSE"; exit 0; fi
   [[ "${MOCK_SESSIONS-}" == 1 ]] || exit 7
@@ -78,6 +91,7 @@ case "$url" in
   *) table='' ;;
   esac
   text='ran'
+  [[ "$prompt" != *K8S-SMOKE-MODEL* ]] || text="model=$(cat "$MOCK_STATE/model" 2>/dev/null)"
   for kv in $table; do
     [[ "${kv%%=*}" != "$sid" ]] || { text="where=${kv#*=}"; break; }
   done
@@ -253,17 +267,34 @@ pass 'p4 tier: P3 reads the guest kernel out of a JSON-envelope preview and pass
     fail 'P3 did not FAIL naming the node kernel read out of the envelope')
 pass 'p4 tier: P3 FAILs when the envelope text is a node kernel'
 
+echo "== claim M1: a session's model is switched with PATCH (per-session model selection)"
+m1() { sed -n '/Claim M1:/,/^--- /p' "$TMP/out"; }
+(export MOCK_SESSIONS=1
+  run_smoke
+  m1 | grep -qx '  ok session s2 switched to mock-b and its turn reached the gateway as mock-b' ||
+    fail "claim M1 did not pass when the PATCH took effect: $(m1)"
+  [[ "$(cat "$MOCK_STATE/patches.log")" == '{"model":"mock-b"}' ]] || fail "claim M1 did not PATCH to mock-b: $(cat "$MOCK_STATE/patches.log")")
+pass 'claim M1: created on mock-a, PATCHed to mock-b, and the turn carries mock-b'
+
+(export MOCK_SESSIONS=1 MOCK_PATCH_IGNORED=1
+  run_smoke
+  m1 | grep -qF '  FAIL model turn:' || fail "claim M1 passed though the turn still carried mock-a: $(m1)")
+pass 'claim M1: a PATCH that does not reach the turn is a FAIL'
+
 echo "== claim 12: a session returns to its sandbox (P6.3, #425)"
-# Sessions are numbered across the run: claims 3, 8 and 9 take s1-s3, so claim 12's four are s4-s7.
-SPREAD='s4=moca-sandbox-0 s5=moca-sandbox-1 s6=moca-sandbox-0 s7=moca-sandbox-1'
+# Sessions are numbered across the run: claims 3, M1, 8 and 9 take s1-s4, so claim 12's four are s5-s8.
+SPREAD='s5=moca-sandbox-0 s6=moca-sandbox-1 s7=moca-sandbox-0 s8=moca-sandbox-1'
 claim12() { sed -n '/Claim 12:/,/^PASS=/p' "$TMP/out"; }
 (export MOCK_SESSIONS=1 MOCK_ENVELOPE=1 MOCK_WHERE="$SPREAD"
   run_smoke
   claim12 | grep -qx '  ok 4 sessions, each on one sandbox for both turns' ||
     fail "claim 12 did not pass with every second turn on its first turn's sandbox: $(claim12)"
   ! grep -qF 'could not tell affinity from luck' "$TMP/out" || fail 'a spread run printed the luck note'
-  [[ "$(sort -u "$MOCK_STATE/sessions.log")" == '{}' ]] ||
-    fail "an untiered stack's sessions did not post {}: $(sort -u "$MOCK_STATE/sessions.log" | tr '\n' ' ')")
+  # Claim M1's own session adds a model; every other session posts {}.
+  [[ "$(grep -v '"model"' "$MOCK_STATE/sessions.log" | sort -u)" == '{}' ]] ||
+    fail "an untiered stack's sessions did not post {}: $(sort -u "$MOCK_STATE/sessions.log" | tr '\n' ' ')"
+  [[ "$(grep '"model"' "$MOCK_STATE/sessions.log")" == '{"model":"mock-a"}' ]] ||
+    fail "claim M1 did not create its session on mock-a: $(grep model "$MOCK_STATE/sessions.log")")
 pass 'claim 12: first turns on two sandboxes, each second turn on its first: ok, no luck note; untiered sessions post {}'
 
 # The first turns must overlap for least-loaded to spread them: each holds its lease for 2 s. The
@@ -304,16 +335,16 @@ pass 'claim 12: waits for the stack to take a session after the Redis restart, t
   expect_kept 'claim 12 wait timed out')
 pass 'claim 12: a stack that takes no session within 60 s of the Redis restart FAILs, saying so'
 
-(export MOCK_SESSIONS=1 MOCK_WHERE="$SPREAD" MOCK_WHERE_2='s6=moca-sandbox-1'
+(export MOCK_SESSIONS=1 MOCK_WHERE="$SPREAD" MOCK_WHERE_2='s7=moca-sandbox-1'
   run_smoke
   claim12 | grep -qx '  FAIL a session moved between sandboxes, or a turn failed' ||
     fail "a session that moved did not fail claim 12: $(claim12)"
-  claim12 | grep -qF "session s6: first 'moca-sandbox-0', then 'moca-sandbox-1'" ||
+  claim12 | grep -qF "session s7: first 'moca-sandbox-0', then 'moca-sandbox-1'" ||
     fail "claim 12 did not name the session that moved: $(claim12)"
   expect_kept 'claim 12 moved')
 pass 'claim 12: a second turn on the other sandbox fails, naming the session and both sandboxes'
 
-(export MOCK_SESSIONS=1 MOCK_WHERE='s4=moca-sandbox-0 s5=moca-sandbox-0 s6=moca-sandbox-0 s7=moca-sandbox-0'
+(export MOCK_SESSIONS=1 MOCK_WHERE='s5=moca-sandbox-0 s6=moca-sandbox-0 s7=moca-sandbox-0 s8=moca-sandbox-0'
   run_smoke
   claim12 | grep -qx '  ok 4 sessions, each on one sandbox for both turns' || fail "claim 12 did not pass on one sandbox: $(claim12)"
   claim12 | grep -qF 'note the first turns all landed on one sandbox, so this run could not tell affinity from luck' ||
@@ -340,8 +371,10 @@ pass 'ocp-single (never tiered): every session posts {}'
 echo "== a tiered stack (P6.3, #425)"
 (export MOCK_SESSIONS=1 MOCK_TIERS=container,microvm MOCK_WHERE="$SPREAD"
   run_smoke
-  [[ "$(sort -u "$MOCK_STATE/sessions.log")" == '{"sandbox":{"tier":"container"}}' ]] ||
+  [[ "$(grep -v '"model"' "$MOCK_STATE/sessions.log" | sort -u)" == '{"sandbox":{"tier":"container"}}' ]] ||
     fail "a tiered container smoke did not ask for the container tier: $(sort -u "$MOCK_STATE/sessions.log" | tr '\n' ' ')"
+  [[ "$(grep '"model"' "$MOCK_STATE/sessions.log")" == '{"sandbox":{"tier":"container"},"model":"mock-a"}' ]] ||
+    fail "claim M1 dropped the tier from its session: $(grep model "$MOCK_STATE/sessions.log")"
   expect_out 'note this stack is tiered (container,microvm): every session asks for the container tier')
 pass 'tiered: the container smoke creates container-tier sessions and says so'
 

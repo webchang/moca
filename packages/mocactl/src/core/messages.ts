@@ -9,6 +9,16 @@ export function describeError(err: unknown): string {
   return sanitizeRemote(describe(err));
 }
 
+/**
+ * A newer mocactl against a control plane that predates model switching (per-session model spec
+ * §7): its router answers the catalog and PATCH routes with a bare 404 `not_found`. A 404
+ * `session_not_found` is a real answer about the session, so it is not this.
+ */
+export const MODEL_SWITCH_UNSUPPORTED = 'this control plane does not support switching models';
+export function isModelSwitchUnsupported(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 404 && err.code !== 'session_not_found';
+}
+
 function describe(err: unknown): string {
   if (err instanceof ApiError) {
     // Reached, then cut: not "cannot reach". Raised for any request or stream body the peer closed,

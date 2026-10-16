@@ -88,7 +88,7 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
       // route here is new in MU1, so no existing caller depends on the old codes.
       authorize(matched.route, req, deps, ctx);
 
-      if (req.method === 'POST' || req.method === 'PUT') {
+      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
         const raw = await readBody(req, bodyLimitFor(matched.route));
         if (raw.length > 0) {
           try {
@@ -98,7 +98,7 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
           }
         } else if (matched.route.bodyRequired !== false) {
           // A route whose handler never reads ctx.body (startDeviceAuth, mintSessionToken) sets
-          // bodyRequired: false; every other POST/PUT needs one, and an empty body must be a 400
+          // bodyRequired: false; every other POST/PUT/PATCH needs one, and an empty body must be a 400
           // rather than an `undefined` a handler then misreads as `{}`.
           throw new CpError('invalid_json', 'body is required');
         }

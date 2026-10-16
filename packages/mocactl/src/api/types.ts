@@ -1,6 +1,21 @@
 import type { TurnFrame } from './frames.js';
 
 // Mirrors docs/api/openapi.yaml; test/contract.test.ts holds the two together (spec §7.4).
+
+/** A model an inference credential reaches (GET /v1/models); limits are absent when unreported. */
+export interface ModelEntry {
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  vision?: boolean;
+}
+
+export interface ModelList {
+  credential: string;
+  models: ModelEntry[];
+}
+
 export interface DeviceStart {
   deviceCode: string;
   userCode: string;
@@ -41,6 +56,8 @@ export interface SessionSummary {
    * before P6.3.
    */
   sandboxTier?: string | null;
+  /** The session's model; null on the deployment default, absent before per-session models. */
+  model?: string | null;
 }
 
 export interface SessionPage {
@@ -53,6 +70,8 @@ export interface CreateSessionRequest {
   /** A promoted config bundle digest; fixed for the session's life (ADR-0038). */
   configRef?: string;
   sandbox?: { tier?: string };
+  /** A model id the credential lists; fixed until switched with /model. */
+  model?: string;
 }
 
 export interface SessionToken {
@@ -62,6 +81,8 @@ export interface SessionToken {
 
 export interface CreatedSession extends SessionToken {
   sessionId: string;
+  model?: string;
+  modelVerified?: boolean;
 }
 
 export type CredentialConsumer = 'inference' | 'sandbox-egress' | 'control-plane';
@@ -110,6 +131,14 @@ export interface ControlPlaneApi {
   listSessions(opts?: { limit?: number; cursor?: number }): Promise<SessionPage>;
   createSession(req: CreateSessionRequest): Promise<CreatedSession>;
   getSession(id: string): Promise<SessionSummary>;
+  /** The models a credential reaches; the credential a new session would use when omitted. */
+  listModels(credential?: string): Promise<ModelList>;
+  listSessionModels(id: string): Promise<ModelList>;
+  /** Switch a session's model; null returns it to the deployment default. */
+  setSessionModel(
+    id: string,
+    model: string | null,
+  ): Promise<SessionSummary & { modelVerified?: boolean }>;
   deleteSession(id: string): Promise<'deleted' | 'accepted'>;
   mintSessionToken(id: string): Promise<SessionToken>;
   listCredentials(): Promise<CredentialDescriptor[]>;

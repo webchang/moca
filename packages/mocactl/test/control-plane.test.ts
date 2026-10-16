@@ -235,3 +235,24 @@ it('putConfigBundle POSTs digest and tar to /v1/config-bundles', async () => {
   expect(calls[0]).toMatchObject({ method: 'POST', url: 'http://cp/v1/config-bundles' });
   expect(calls[0].body).toEqual({ digest: 'sha256:x', tar: 'AAAA' });
 });
+
+it('lists models for a credential, and for a session', async () => {
+  const body = { credential: 'c', models: [{ id: 'm' }] };
+  const { fetch, calls } = scriptedFetch(json(body), json(body), json(body));
+  expect(await client(fetch).listModels('litellm-prod')).toEqual(body);
+  expect(calls[0]).toMatchObject({
+    url: 'http://cp/v1/models?credential=litellm-prod',
+    method: 'GET',
+  });
+  await client(fetch).listModels();
+  expect(calls[1]!.url).toBe('http://cp/v1/models');
+  await client(fetch).listSessionModels('s/1');
+  expect(calls[2]!.url).toBe('http://cp/v1/sessions/s%2F1/models');
+});
+
+it('switches a model with PATCH, null for the default', async () => {
+  const { fetch, calls } = scriptedFetch(json({ sessionId: 's', model: null }));
+  await client(fetch).setSessionModel('s', null);
+  expect(calls[0]).toMatchObject({ url: 'http://cp/v1/sessions/s', method: 'PATCH' });
+  expect(calls[0]!.body).toEqual({ model: null });
+});

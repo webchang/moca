@@ -83,7 +83,7 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 - The prompt is the positionals joined with spaces. Exit 2 for an empty prompt, `--new` with
   `--session`, `--config` with `--session` (a session's bundle is fixed at creation), a blank
   `--config`, or an `--option` without `=`.
-- `--option` keys: `inferenceCredential=NAME` and `sandboxTier=NAME`. An ambiguous or unknown choice for
+- `--option` keys: `inferenceCredential=NAME`, `model=ID` and `sandboxTier=NAME`. `model` is listed from the chosen credential's endpoint, with the deployment default as the first choice; `mocactl run` never asks: with none given, the session runs on the deployment default (only the TUI's New Session form asks, even for a single listed model, the deployment default preselected unless a model was used last); `model=` (empty) also means the deployment default; an id the catalog does not list exits 2 (`unknown model 'X'; declared: …`), including an id a LiteLLM wildcard route such as `anthropic/*` would accept, because `GET /v1/models` lists only concrete models (switch to such an id with `/model X` in the TUI); when the endpoint cannot list its models, the id is sent as given and checked by the gateway at the first turn. An ambiguous or unknown choice for
   `inferenceCredential` exits 2 with the declared values. With several `sandboxTier` choices and none given,
   the tier is left unset for the server default; a value for a field that has no choices exits 2. Unknown
   keys are silently ignored, and `=x` (no key) exits 2. `--option` is ignored when resuming a session.
@@ -196,6 +196,7 @@ using the command id.
 | `session.new`       | `/new`                             | `ctrl+x n`            |
 | `session.promote`   | `/promote DIR`, `/promote --clear` | none                  |
 | `session.rename`    | `/rename <title>`                  | `ctrl+x r`            |
+| `session.model`     | `/model [id\|default]`             | `ctrl+x m`            |
 | `credentials`       | `/credentials`                     | `ctrl+x k`            |
 | `view.details`      | `/details`                         | `ctrl+x d`            |
 | `view.thinking`     | `/thinking`                        | `ctrl+x t`            |

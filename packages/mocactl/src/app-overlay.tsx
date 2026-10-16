@@ -17,6 +17,7 @@ import { DoctorOverlay } from './views/overlays/Doctor.js';
 import { HelpOverlay } from './views/overlays/Help.js';
 import { LeaveTurnOverlay } from './views/overlays/LeaveTurn.js';
 import { LoginOverlay } from './views/overlays/Login.js';
+import { ModelOverlay } from './views/overlays/Model.js';
 import { NewSessionOverlay } from './views/overlays/NewSession.js';
 import { OnboardingOverlay } from './views/overlays/Onboarding.js';
 import { PaletteOverlay } from './views/overlays/Palette.js';
@@ -35,6 +36,8 @@ interface Props {
   registry: CommandRegistry<CommandHost>;
   host: CommandHost;
   currentSessionId?: string;
+  /** The attached session's model; null on the deployment default. */
+  currentModel?: string | null;
   open: (o: Overlay) => void;
   close: () => void;
   onConnected: () => void;
@@ -44,7 +47,7 @@ interface Props {
   /** Offered each control-plane error an overlay hits; true when it opened Login instead. */
   onCpError: (err: unknown) => boolean;
   onCreate: (req: CreateSessionRequest, values: Record<string, string>) => Promise<void>;
-  onResume: (id: string, configRef?: string | null) => void;
+  onResume: (id: string, configRef?: string | null, model?: string | null) => void;
   onDeleted: (id: string) => void;
   onInputless: (inputless: boolean) => void;
   bundle?: { digest: string; skills: number; dropped: number };
@@ -52,7 +55,7 @@ interface Props {
   leave: { keep: () => void; cancel: () => void; stay: () => void };
 }
 
-// Every overlay owns Esc on its interactive screens. Onboarding, Sessions, New Session and
+// Every overlay owns Esc on its interactive screens. Onboarding, Sessions, New Session, Model and
 // Credentials also have screens with no input at all (a spinner, an error); they report those via
 // onInputless and the App cancels the overlay on Esc from there, so no screen strands the user.
 export function AppOverlay({
@@ -62,6 +65,7 @@ export function AppOverlay({
   registry,
   host,
   currentSessionId,
+  currentModel,
   open,
   close,
   onConnected,
@@ -121,6 +125,20 @@ export function AppOverlay({
           onResume={onResume}
           onNew={() => open({ name: 'new-session' })}
           onDeleted={onDeleted}
+          onCancel={close}
+          onError={onCpError}
+          onInputless={onInputless}
+        />
+      );
+    case 'model':
+      return (
+        <ModelOverlay
+          load={() => rt.cp!.listSessionModels(currentSessionId!)}
+          current={currentModel ?? null}
+          onSelect={(id) => {
+            close();
+            void host.switchModel(id);
+          }}
           onCancel={close}
           onError={onCpError}
           onInputless={onInputless}

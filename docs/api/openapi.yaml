@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -81,6 +81,8 @@ components:
             - credential_not_found
             - credential_unavailable
             - endpoint_unresolved
+            - model_unavailable
+            - model_catalog_unavailable
             - authorization_pending
             - device_code_expired
             - identity_provider_misconfigured
@@ -115,6 +117,11 @@ components:
             tiers), today's deployment default, which the data plane applies; null whenever the
             deployment declares no tiers, even for a session that recorded one (the data plane
             then runs untiered)
+        model:
+          type: [string, 'null']
+          description: |
+            the model the session's turns run on, as chosen at creation or by PATCH; null when it
+            runs on the deployment default
     CredentialDescriptor:
       type: object
       required: [name, kind, consumer, destination, binding]
@@ -142,7 +149,28 @@ components:
             format: { type: string }
         endpoint:
           type: [string, 'null']
+          maxLength: 2048
           description: full gateway origin; meaningful only for consumer `inference`
+    ModelList:
+      type: object
+      required: [credential, models]
+      properties:
+        credential:
+          {
+            type: string,
+            description: 'the credential listed for; operator-fallback for the fallback',
+          }
+        models:
+          type: array
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: { type: string }
+              contextWindow: { type: integer }
+              maxTokens: { type: integer }
+              reasoning: { type: boolean }
+              vision: { type: boolean }
   responses:
     Unauthorized:
       description: no token, a bad token, or a failed exchange authentication
@@ -414,6 +442,44 @@ paths:
                   tenant: { type: string }
                   roles: { type: array, items: { type: string } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: The models an inference credential reaches
+      description: |
+        Asked of the credential's own endpoint: LiteLLM's /model/info, or Anthropic's /v1/models for
+        api.anthropic.com (ids only). `credential` omitted means the credential a new session would
+        use: the only inference credential, or the operator fallback when the subject has none.
+
+        The control plane asks only an allow-listed host: api.anthropic.com, the deployment default
+        endpoint's host, or a host in SH_MODEL_CATALOG_HOSTS. Any other host is not contacted and
+        answers 503 `model_catalog_unavailable`, as an unreachable endpoint does; every catalog
+        failure carries the same message. Lists only concrete models: a LiteLLM wildcard route
+        (e.g. `anthropic/*`) is not listed, though `model` on createSession / updateSession accepts
+        an id it matches.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: credential, in: query, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: the catalog
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '`credential_not_found`: no credential with that name'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `model_catalog_unavailable`: the endpoint could not list its models (unreachable,
+            refused, an unreadable body, or a host outside the catalog allow-list)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/sessions:
     post:
       operationId: createSession
@@ -426,6 +492,14 @@ paths:
         `sandbox.tier` must be one of the tiers `/v1/discovery` advertises; omitted, the deployment
         default is recorded. A 400 `invalid_request` names the declared tiers. `sandbox`, when
         present, must be an object; any tier is a 400 on a deployment that declares none.
+
+        `model`, when given, is checked against the credential's catalog (GET /v1/models):
+        - listed → recorded with its limits, `modelVerified: true`;
+        - not listed, but a LiteLLM wildcard route (e.g. `anthropic/*`) matches it as a whole string
+          → recorded without limits, `modelVerified: true`;
+        - the catalog cannot be read, or the endpoint's host is not in the catalog allow-list (see
+          listModels) → recorded without limits, `modelVerified: false`;
+        - otherwise → 400 `model_unavailable`.
       security: [{ sessionToken: [] }]
       requestBody:
         required: false
@@ -443,6 +517,12 @@ paths:
                   type: object
                   properties:
                     tier: { type: string }
+                model:
+                  type: string
+                  pattern: '^[\x21-\x7e]{1,256}$'
+                  description: |
+                    a model id the credential's endpoint lists (GET /v1/models), or one its
+                    wildcard routes match
       responses:
         '201':
           description: created
@@ -455,6 +535,10 @@ paths:
                   sessionId: { type: string }
                   token: { type: string }
                   expiresAt: { type: integer, description: epoch seconds }
+                  model: { type: string }
+                  modelVerified:
+                    type: boolean
+                    description: false when the catalog could not be read and the id was accepted unchecked
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
@@ -526,6 +610,52 @@ paths:
         '204': { description: deleted }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateSession
+      summary: Switch the session's model
+      description: |
+        `model` is a model id, checked against the session's credential's catalog exactly as on
+        createSession, or null for the deployment default:
+        - listed → stored with its limits, `modelVerified: true`;
+        - not listed, but a LiteLLM wildcard route (e.g. `anthropic/*`) matches it as a whole string
+          → stored without limits, `modelVerified: true`;
+        - the catalog cannot be read, or the endpoint's host is not in the catalog allow-list (see
+          listModels) → stored without limits, `modelVerified: false`;
+        - otherwise → 400 `model_unavailable`.
+        A turn already running keeps its model; the next turn uses the new one. Any other field is
+        `invalid_request`. A session deleted while the catalog answered is `session_not_found`, and
+        nothing is written. Audited as `model_changed`.
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              additionalProperties: false
+              properties:
+                model: { type: [string, 'null'], pattern: '^[\x21-\x7e]{1,256}$' }
+      responses:
+        '200':
+          description: the session, switched
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Session' }
+                  - type: object
+                    properties:
+                      modelVerified:
+                        type: boolean
+                        description: |
+                          false when the catalog could not be read (or its host is not
+                          allow-listed) and the id was accepted unchecked; true for null
+                          (the deployment default)
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/sessions/{id}/resources:
     get:
       operationId: getSessionResources
@@ -580,6 +710,26 @@ paths:
                           from: { type: string, description: the sandbox the session left }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /v1/sessions/{id}/models:
+    get:
+      operationId: listSessionModels
+      summary: The models this session's credential reaches
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      responses:
+        '200':
+          description: the catalog
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: '`model_catalog_unavailable`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/sessions/{id}/token:
     post:
       operationId: mintSessionToken
@@ -772,6 +922,18 @@ paths:
                       the tier the session's turn runs in (P6.3): the recorded tier, or today's
                       default for a session that recorded none; absent whenever the deployment
                       declares no tiers, even for a session that recorded one
+                  model:
+                    type: object
+                    description: |
+                      the session's model and the limits recorded when it was chosen; absent when
+                      the session names none (the data plane then uses its deployment default)
+                    required: [id]
+                    properties:
+                      id: { type: string }
+                      contextWindow: { type: integer }
+                      maxTokens: { type: integer }
+                      reasoning: { type: boolean }
+                      vision: { type: boolean }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }

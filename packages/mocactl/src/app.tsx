@@ -12,7 +12,11 @@ import { CommandRegistry } from './commands/registry.js';
 import type { CachedAuth, TuiConfig } from './config.js';
 import { apiTokenValid, loginExpiryMinutes } from './core/auth.js';
 import { collectBannerInfo, type BannerInfo } from './core/banner.js';
-import { describeError } from './core/messages.js';
+import {
+  describeError,
+  isModelSwitchUnsupported,
+  MODEL_SWITCH_UNSUPPORTED,
+} from './core/messages.js';
 import {
   describeBundleSession,
   describePromotion,
@@ -68,6 +72,8 @@ interface Attached {
   initialUsage?: Usage;
   /** The session's config bundle digest, fixed for its life; shown so it is never a guess. */
   configRef?: string;
+  /** The session's model; null on the deployment default. */
+  model?: string | null;
 }
 const DETACHED: Attached = { initial: EMPTY_BLOCKS };
 
@@ -353,7 +359,14 @@ export function App({ rt, opts, env, os, write }: AppProps) {
       const prompt = pendingRef.current;
       sendOnAttach.current = prompt;
       attach(
-        { session: s, initial: EMPTY_BLOCKS, configRef: bundle?.digest },
+        {
+          session: s,
+          initial: EMPTY_BLOCKS,
+          configRef: bundle?.digest,
+          // '' is the preselected "deployment default" choice, never a model id (MODEL_ID_RE): `||`,
+          // not `??`, or the status line reads "model " and /model marks a bogus row (PR #540 R2).
+          model: values.model || null,
+        },
         prompt ? deriveTitle(prompt) : undefined,
         prompt ? [prompt] : [],
       );
@@ -364,7 +377,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
     }
   };
 
-  const resume = (id: string, configRef?: string | null) =>
+  const resume = (id: string, configRef?: string | null, model?: string | null) =>
     leave(() => {
       void (async () => {
         if (busy.current) return;
@@ -388,7 +401,13 @@ export function App({ rt, opts, env, os, write }: AppProps) {
             expectOpen: t ? lastTurnState(t) === 'open-detachable' : false,
           };
           attach(
-            { session: s, initial, initialUsage: t?.usage, configRef: configRef ?? undefined },
+            {
+              session: s,
+              initial,
+              initialUsage: t?.usage,
+              configRef: configRef ?? undefined,
+              model: model ?? null,
+            },
             t?.title ?? id.slice(0, 8),
             [...(t?.prompts ?? [])],
           );
@@ -442,6 +461,26 @@ export function App({ rt, opts, env, os, write }: AppProps) {
       rt.transcripts?.rename(s.sessionId, t);
       setTitle(t);
       notify(`renamed to "${t}"`);
+    },
+    switchModel: async (model) => {
+      const s = sessionRef.current;
+      if (!s || !rt.cp) return;
+      try {
+        const r = await rt.cp.setSessionModel(s.sessionId, model);
+        setAttached((a) => (a.session === s ? { ...a, model: r.model ?? null } : a));
+        const name = r.model ?? 'the deployment default';
+        // The turn running now read its model at its exchange; the switch applies from the next.
+        notify(
+          r.modelVerified === false
+            ? `model: ${name} (not checked: the endpoint could not list its models) — from the next turn`
+            : `model: ${name} — from the next turn`,
+          r.modelVerified === false ? 'warning' : undefined,
+        );
+      } catch (err) {
+        // An older control plane 404s the PATCH route itself (spec §7): say so, not "not found".
+        if (isModelSwitchUnsupported(err)) notify(MODEL_SWITCH_UNSUPPORTED, 'error');
+        else if (!loginIfExpired(err, undefined)) notify(describeError(err), 'error');
+      }
     },
     prefillInput: (text) => setPrefill((p) => ({ text, nonce: (p?.nonce ?? 0) + 1 })),
     toggleDetails: () => {
@@ -585,6 +624,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
       registry={registry}
       host={host}
       currentSessionId={attached.session?.sessionId}
+      currentModel={attached.model}
       open={open}
       close={close}
       onOnboarded={() => {
@@ -648,6 +688,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
         ? [{ key: 'subject' as const, text: rt.auth.displayName ?? rt.auth.subject }]
         : []),
       { key: 'title', text: title ?? (session ? session.sessionId.slice(0, 8) : 'no session') },
+      ...(session ? [{ key: 'model' as const, text: `model ${attached.model ?? 'default'}` }] : []),
       ...(session && attached.configRef
         ? [{ key: 'bundle' as const, text: `bundle ${shortDigest(attached.configRef)}` }]
         : []),

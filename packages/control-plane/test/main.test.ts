@@ -165,6 +165,26 @@ describe('configFromEnv', () => {
     }
   });
 
+  // PR #540 review R1: the operator's extra catalog hosts, validated at boot like the rest.
+  it('reads SH_MODEL_CATALOG_HOSTS as lower-case hostnames, empty when unset', () => {
+    expect(configFromEnv(baseEnv).modelCatalogHosts).toEqual([]);
+    expect(configFromEnv({ ...baseEnv, SH_MODEL_CATALOG_HOSTS: '' }).modelCatalogHosts).toEqual([]);
+    expect(
+      configFromEnv({
+        ...baseEnv,
+        SH_MODEL_CATALOG_HOSTS: ' LiteLLM.moca.svc , 10.0.0.5,gw.example,',
+      }).modelCatalogHosts,
+    ).toEqual(['litellm.moca.svc', '10.0.0.5', 'gw.example']);
+  });
+
+  it('refuses to boot on a SH_MODEL_CATALOG_HOSTS entry that is not a bare hostname', () => {
+    for (const bad of ['https://gw.example', 'gw.example:4000', 'gw.example/v1', 'a b', 'u@gw']) {
+      expect(() => configFromEnv({ ...baseEnv, SH_MODEL_CATALOG_HOSTS: bad }), bad).toThrow(
+        /SH_MODEL_CATALOG_HOSTS/,
+      );
+    }
+  });
+
   it('reads SH_SANDBOX_TIERS, and refuses to boot on a tier list it cannot serve', () => {
     const base = baseEnv;
     expect(configFromEnv(base).sandboxTiers).toBeNull();

@@ -25,10 +25,25 @@ import {
   resolveInferenceName,
   parseCredentialBody,
   validateCredentialName,
+  type CredentialDescriptor,
   type CredentialStore,
   type InferenceAuthHeader,
 } from './credential-store.js';
-import { exchangeCredential, OPERATOR_FALLBACK_NAME, viewTier } from './exchange.js';
+import {
+  exchangeCredential,
+  OPERATOR_FALLBACK_NAME,
+  refuseMisdirectedSecret,
+  resolveInference,
+  targetOf,
+  viewTier,
+} from './exchange.js';
+import { MODEL_ID_RE } from './models.js';
+import {
+  catalogAllowList,
+  chooseModel,
+  fetchModelCatalog,
+  type ModelChoice,
+} from './model-catalog.js';
 import type { RunKubectl } from './kubectl.js';
 import { DEFAULT_PAGE_SIZE, type OwnershipIndex, type SessionRecord } from './ownership.js';
 import type { IdentityProvider } from './identity.js';
@@ -51,6 +66,11 @@ export interface CpConfig {
   exchangeToken?: string;
   /** Deployment-level gateway origin, used when a credential carries no `endpoint` (spec §6.2). */
   defaultInferenceEndpoint?: string;
+  /**
+   * Hosts the model catalog may contact besides api.anthropic.com and defaultInferenceEndpoint's
+   * host (`SH_MODEL_CATALOG_HOSTS`, per-session model spec §4.1): exact, lower-case hostnames.
+   */
+  modelCatalogHosts?: string[];
   /** The operator's own key, resolved at EXCHANGE time behind allowOperatorFallback (spec §6.4). */
   operatorInferenceToken?: string;
   /**
@@ -100,6 +120,8 @@ export interface CpDeps {
   /** randomUUID by default. A control-plane-minted id is always its own leafSessionId (gap #10). */
   newId(): string;
   runKubectl?: RunKubectl;
+  /** The model catalog's fetch (per-session model spec §4.1); global fetch when absent. A test seam. */
+  fetchImpl?: typeof fetch;
   /**
    * Whether the Redis client is connected and ready (main.ts: `client.isReady`). A command issued
    * while it is not ready waits in node-redis's offline queue for as long as the outage lasts, so
@@ -339,6 +361,71 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     lastTurnAt: runtime.lastTurnAt ? Number(runtime.lastTurnAt) : null,
     turns: runtime.turns ? Number(runtime.turns) : 0,
     sandboxTier: tier,
+    model: rec.model || null,
+  };
+}
+
+/**
+ * The credential a session created now would record: the named one, or -- for a subject with no
+ * inference credential of its own -- '' for the operator fallback (spec §6.4). Shared by
+ * createSession and the catalog route, which must list for exactly the credential a session would use.
+ */
+export function newSessionCredential(
+  descriptors: CredentialDescriptor[],
+  requested: string | undefined,
+  deps: CpDeps,
+): string {
+  const fallback =
+    requested === undefined &&
+    deps.config.allowOperatorFallback &&
+    !!deps.config.operatorInferenceToken &&
+    !descriptors.some((d) => d.consumer === 'inference');
+  return fallback ? '' : resolveInferenceName(descriptors, requested);
+}
+
+/** A requested model id, validated: undefined when absent (spec §4.2). */
+function modelParam(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !MODEL_ID_RE.test(raw)) {
+    throw new CpError(
+      'invalid_request',
+      'model must be a model id: 1-256 printable ASCII characters, no spaces',
+    );
+  }
+  return raw;
+}
+
+/** Check a model against the catalog of the credential `rec` runs on (spec §4.2, §4.3). */
+async function chooseFor(
+  rec: { owner: string; credentialName: string; sessionId?: string },
+  model: string,
+  deps: CpDeps,
+): Promise<ModelChoice> {
+  const r = await resolveInference(rec, deps);
+  // The catalog sends the real secret in every mode, so the exchange's direct-mode refusal applies
+  // here unconditionally: a misdirected secret must not leave even to list models (final review F1).
+  refuseMisdirectedSecret(r, rec.sessionId);
+  return chooseModel(targetOf(r), model, r.credentialName, catalogHostsOf(deps), deps.fetchImpl);
+}
+
+/** The hosts the catalog may contact (spec §4.1): never a user-chosen endpoint unvetted (R1). */
+const catalogHostsOf = (deps: CpDeps) =>
+  catalogAllowList(deps.config.modelCatalogHosts ?? [], deps.config.defaultInferenceEndpoint);
+
+/** The catalog body for the credential `rec` runs on (per-session model spec §4.1). */
+async function catalogFor(
+  rec: { owner: string; credentialName: string; sessionId?: string },
+  deps: CpDeps,
+) {
+  const r = await resolveInference(rec, deps);
+  refuseMisdirectedSecret(r, rec.sessionId); // as in chooseFor
+  return {
+    status: 200,
+    body: {
+      credential: r.credentialName,
+      // Wildcard routes are not models (final review F8): the body keeps its `{ credential, models }`.
+      models: (await fetchModelCatalog(targetOf(r), catalogHostsOf(deps), deps.fetchImpl)).models,
+    },
   };
 }
 
@@ -424,6 +511,16 @@ export const HANDLERS: Record<string, Handler> = {
     return { status: 200, body: { subject: p.sub, tenant: p.tenant, roles: p.roles ?? [] } };
   },
 
+  listModels: async (ctx, deps) => {
+    const p = requirePrincipal(ctx);
+    const requested = ctx.query.get('credential') ?? undefined;
+    const descriptors = await deps.credentials.list(p.sub);
+    return catalogFor(
+      { owner: p.sub, credentialName: newSessionCredential(descriptors, requested, deps) },
+      deps,
+    );
+  },
+
   createSession: async (ctx, deps) => {
     const p = requirePrincipal(ctx);
     const body = asRecord(ctx.body);
@@ -452,12 +549,8 @@ export const HANDLERS: Record<string, Handler> = {
     // a session records NO credential name, and the exchange resolves the operator's key per turn,
     // attributably. A session that names a credential never falls back, here or at exchange: a typo
     // must 400, and a credential deleted mid-session ends its turns (exchange.ts).
-    const fallback =
-      requested === undefined &&
-      deps.config.allowOperatorFallback &&
-      !!deps.config.operatorInferenceToken &&
-      !descriptors.some((d) => d.consumer === 'inference');
-    const credentialName = fallback ? '' : resolveInferenceName(descriptors, requested);
+    const credentialName = newSessionCredential(descriptors, requested, deps);
+    const requestedModel = modelParam(body.model);
 
     // The sandbox tier (P6.3 spec §3.3), resolved and RECORDED here like the credential: a later change
     // to the deployment default must not move an existing session between tiers.
@@ -504,6 +597,11 @@ export const HANDLERS: Record<string, Handler> = {
       }
     }
 
+    // Checked against the catalog of the credential just resolved (per-session model spec §4.2).
+    const choice = requestedModel
+      ? await chooseFor({ owner: p.sub, credentialName }, requestedModel, deps)
+      : undefined;
+
     const sessionId = deps.newId();
     const rec: SessionRecord = {
       sessionId,
@@ -516,6 +614,8 @@ export const HANDLERS: Record<string, Handler> = {
       configRef,
       sandboxTier,
       tombstone: false,
+      model: choice?.model ?? '',
+      ...(choice?.limits ? { modelLimits: choice.limits } : {}),
     };
     await deps.index.create(rec);
     await deps.index.audit({
@@ -523,6 +623,7 @@ export const HANDLERS: Record<string, Handler> = {
       sessionId,
       credential: credentialName || OPERATOR_FALLBACK_NAME,
       decision: 'session_created',
+      ...(choice ? { model: choice.model } : {}),
     });
     const iat = seconds(deps);
     return {
@@ -539,6 +640,7 @@ export const HANDLERS: Record<string, Handler> = {
           now: iat,
         }),
         expiresAt: iat + deps.config.sessionTokenTtlSeconds,
+        ...(choice ? { model: choice.model, modelVerified: choice.verified } : {}),
       },
     };
   },
@@ -571,6 +673,51 @@ export const HANDLERS: Record<string, Handler> = {
   getSession: async (ctx, deps) => {
     const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
     return { status: 200, body: await sessionView(rec, deps) };
+  },
+
+  /**
+   * Switch the session's model (per-session model spec §4.3). A turn in flight read its model at
+   * its exchange and keeps it; the next turn's exchange returns the new one -- so there is no
+   * turn-in-progress refusal. `null` returns the session to the deployment default.
+   */
+  updateSession: async (ctx, deps) => {
+    const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
+    if (rec.tombstone) throw new CpError('session_not_found', undefined, rec.sessionId);
+    const body = asRecord(ctx.body);
+    const extra = Object.keys(body).filter((k) => k !== 'model');
+    if (extra.length > 0) {
+      throw new CpError('invalid_request', `only model can be changed (got ${extra.join(', ')})`);
+    }
+    if (!('model' in body)) {
+      throw new CpError(
+        'invalid_request',
+        'model is required: a model id, or null for the deployment default',
+      );
+    }
+    const choice: ModelChoice =
+      body.model === null
+        ? { model: '', verified: true }
+        : await chooseFor(rec, modelParam(body.model)!, deps);
+    // The catalog can take seconds (R8): a DELETE in that window must not be undone by an HSET
+    // that recreates `session:<id>` with only model fields -- a key nothing reads and nothing
+    // cleans up -- and an overlapping PATCH must not audit a stale `fromModel`. So re-read here.
+    const fresh = await deps.index.get(rec.sessionId);
+    if (!fresh || fresh.owner !== rec.owner || fresh.tombstone) {
+      throw new CpError('session_not_found', undefined, rec.sessionId);
+    }
+    await deps.index.setModel(rec.sessionId, choice.model, choice.limits);
+    await deps.index.audit({
+      subject: rec.owner,
+      sessionId: rec.sessionId,
+      decision: 'model_changed',
+      model: choice.model || 'default',
+      fromModel: fresh.model || 'default',
+    });
+    const updated: SessionRecord = { ...fresh, model: choice.model, modelLimits: choice.limits };
+    return {
+      status: 200,
+      body: { ...(await sessionView(updated, deps)), modelVerified: choice.verified },
+    };
   },
 
   mintSessionToken: async (ctx, deps) => {
@@ -743,6 +890,12 @@ export const HANDLERS: Record<string, Handler> = {
       rec.tenant,
     );
     return { status: 200, body: projectResources(rec, runtime, sandbox, deps.config.sandboxTiers) };
+  },
+
+  listSessionModels: async (ctx, deps) => {
+    const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
+    if (rec.tombstone) throw new CpError('session_not_found', undefined, rec.sessionId);
+    return catalogFor(rec, deps);
   },
 
   exchangeCredential: async (ctx, deps) => {

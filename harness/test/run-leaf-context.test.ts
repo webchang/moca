@@ -32,7 +32,7 @@ const relayLease = () => {
   };
   return {
     lease: {
-      config: { pod: 'sbx-0', namespace: 'moca', podCwd: '/workspace', headCwd: '/tmp' },
+      config: { pod: 'sbx-0', namespace: 'moca', podCwd: '/workspace/run-1', headCwd: '/tmp' },
       transport,
       leased: true,
       heartbeat: vi.fn(async () => {}),
@@ -73,9 +73,17 @@ describe('frozen context on a prompt leaf', () => {
       loadBundle,
       { writable: false },
     );
-    expect(executeTurn.mock.calls[0]![0].prompt).toBe(
-      "Inspect.\n\nThe workload's frozen context is available read-only at /workspace/.moca-context/runs/run-1.",
+    const turn = executeTurn.mock.calls[0]![0];
+    expect(turn.prompt).toBe(
+      "Inspect.\n\nYour working directory, /workspace/.moca-context/runs/run-1, is the workload's " +
+        'read-only context. Use /workspace/run-1 as writable scratch space.',
     );
+    // The run starts in its context; the rest of the lease's config is passed through unchanged.
+    expect(turn.sandbox).toEqual({
+      config: { ...lease.config, podCwd: '/workspace/.moca-context/runs/run-1' },
+      transport,
+    });
+    expect(lease.config.podCwd).toBe('/workspace/run-1');
     expect(
       transport.exec.mock.calls.some(([script]) => String(script).includes('CONTEXT_CLEANUP')),
     ).toBe(true);
@@ -127,7 +135,13 @@ describe('frozen context on a prompt leaf', () => {
       { writable: true },
     );
     const prompt = executeTurn.mock.calls[0]![0].prompt;
-    expect(prompt).toBe(`Inspect.\n\n${contextNote('/workspace/.moca-context/runs/run-1', true)}`);
+    expect(prompt).toBe(
+      `Inspect.\n\n${contextNote('/workspace/.moca-context/runs/run-1', true, '/workspace/run-1')}`,
+    );
+    expect(executeTurn.mock.calls[0]![0].sandbox?.config?.podCwd).toBe(
+      '/workspace/.moca-context/runs/run-1',
+    );
+    expect(prompt).toContain('working directory');
     expect(prompt).toContain('writable');
     expect(prompt).toContain('discarded when the run ends');
     expect(prompt).toContain('diff or test output');

@@ -1,6 +1,6 @@
 /**
  * `mocactl workloads create | get | delete`: a workload carries a context (built elsewhere, e.g.
- * with `contextctl ctx export`) that `mocactl spawn --workload` runs prompts on. The harness has no
+ * with `contextctl ctx pack`) that `mocactl spawn --workload` runs prompts on. The harness has no
  * route that lists workloads, so there is no list command.
  */
 import { randomBytes } from 'node:crypto';
@@ -86,7 +86,7 @@ export function generateWorkloadId(): string {
 // --- create ---
 
 export interface CreateOptions extends WorkloadOptions {
-  /** The context file to upload, as `contextctl ctx export` writes it. */
+  /** The context file to upload, as `contextctl ctx pack` writes it. */
   contextPath: string;
   name?: string;
 }
@@ -116,7 +116,7 @@ export async function cmdWorkloadCreate(rt: Runtime, io: Io, opts: CreateOptions
     size = st.size;
   } catch {
     io.err(
-      `--context ${opts.contextPath} does not exist (build one with \`contextctl ctx export\`)`,
+      `--context ${opts.contextPath} does not exist (build one with \`contextctl ctx pack DIR -o FILE\`)`,
     );
     return 2;
   }

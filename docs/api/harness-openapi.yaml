@@ -184,6 +184,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: |
+            subject_quota_exceeded — the authenticated subject already holds
+            SH_TURNS_PER_SUBJECT in-flight turns on this worker (default half the per-worker
+            turn cap). Distinct from the supervisor's pre-hand-off `overloaded` 429, which has
+            no error body: this one names the caller's own share, so a client can tell "you are
+            over your share" from "the host is full". Carries Retry-After. No quota is
+            configured (neither SH_TURNS_PER_SUBJECT nor SH_TURNS_PER_WORKER set) or the caller
+            is unauthenticated ⇒ this response does not occur.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
             Retryable, from one of three causes: no sandbox capacity right now (every candidate

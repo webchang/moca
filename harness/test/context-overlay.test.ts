@@ -253,7 +253,7 @@ describe('P6 context overlay', () => {
   it('stages the writable copy and renames it into place, so it is never partial', () => {
     const script = buildContextWritableScript(revision, 'run-w');
     const order = [
-      'cp -a "$CACHE" "$STAGE"',
+      'cp -a "$SRC" "$STAGE"',
       'chmod -R u+w "$STAGE"\n',
       'touch "$STAGE"',
       'rm -rf "$ROOT"',
@@ -314,6 +314,156 @@ describe('P6 context overlay', () => {
     } finally {
       execFileSync('chmod', ['-R', 'u+w', base]);
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("roots every run's view at the revision's workspace/ directory when it has one", () => {
+    const pick =
+      'SRC="$CACHE"; if [ -d "$CACHE/workspace" ] && [ ! -L "$CACHE/workspace" ] && [ ! -e "$CACHE/harnesses" ] && [ ! -e "$CACHE/memory" ] && [ ! -e "$CACHE/knowledge" ] && [ ! -e "$CACHE/artifacts" ]; then SRC="$CACHE/workspace"; fi';
+    const acquire = buildContextAcquireScript(revision, 'run-1');
+    const populate = buildContextPopulateScript(revision, 'run-1', digest);
+    const writable = buildContextWritableScript(revision, 'run-1');
+    for (const script of [acquire, populate, writable]) {
+      expect(script).toContain(pick);
+      expect(script).not.toContain('ln -sfn "$CACHE"');
+      expect(script).not.toContain('cp -a "$CACHE"');
+    }
+    expect(acquire).toContain(`then ${pick}; ln -sfn "$SRC" "$ROOT"; printf hit;`);
+    // Picked after publication, under the lock, from whichever copy won.
+    expect(populate.indexOf(pick)).toBeGreaterThan(
+      populate.indexOf('[ -d "$CACHE" ] || mv "$STAGE" "$CACHE"'),
+    );
+    expect(populate.indexOf('ln -sfn "$SRC" "$ROOT"')).toBeGreaterThan(populate.indexOf(pick));
+    expect(writable.indexOf('cp -a "$SRC" "$STAGE"')).toBeGreaterThan(writable.indexOf(pick));
+  });
+
+  it('in a real shell, a view shows workspace/ when the revision has it and the whole revision otherwise', () => {
+    // macOS has no flock(1); the lock is not under test here.
+    const noFlock = 'flock() { :; }\n';
+    for (const shape of ['workspace', 'flat', 'workspace-link'] as const) {
+      const base = mkdtempSync(join(tmpdir(), `moca-context-view-${shape}-`));
+      const sh = (script: string) =>
+        execFileSync(
+          'bash',
+          ['-c', noFlock + script.replaceAll('/workspace/.moca-context', base)],
+          {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        ).toString();
+      const cache = join(base, 'cache', revision);
+      const root = join(base, 'runs', 'run-v');
+      const outside = join(base, 'outside');
+      try {
+        const files = shape === 'workspace' ? join(cache, 'workspace') : cache;
+        mkdirSync(join(files, 'src'), { recursive: true });
+        writeFileSync(join(files, 'src', 'greet.py'), 'print("hi")\n');
+        if (shape === 'workspace') writeFileSync(join(cache, 'manifest.json'), '{}');
+        // A bundled `workspace` link must never root a view outside the cache.
+        if (shape === 'workspace-link') {
+          mkdirSync(join(outside, 'secret'), { recursive: true });
+          symlinkSync(outside, join(cache, 'workspace'));
+        }
+        const view = shape === 'workspace' ? join(cache, 'workspace') : cache;
+        // Recently used, so the acquire's own sweep keeps the unreferenced revision for this hit.
+        mkdirSync(join(base, 'used'), { recursive: true });
+        writeFileSync(join(base, 'used', revision), '');
+
+        expect(sh(buildContextAcquireScript(revision, 'run-v', 60))).toBe('hit');
+        expect(lstatSync(root).isSymbolicLink()).toBe(true);
+        expect(execFileSync('readlink', [root]).toString().trim()).toBe(view);
+        expect(execFileSync('ls', [root]).toString()).toContain('src\n');
+        expect(readFileSync(join(root, 'src', 'greet.py'), 'utf8')).toBe('print("hi")\n');
+
+        sh(buildContextWritableScript(revision, 'run-v'));
+        expect(lstatSync(root).isSymbolicLink()).toBe(false);
+        expect(lstatSync(join(root, 'src')).isDirectory()).toBe(true);
+        expect(() => lstatSync(join(root, 'manifest.json'))).toThrow();
+        expect(() => lstatSync(join(root, 'secret'))).toThrow();
+        writeFileSync(join(root, 'src', 'greet.py'), 'edited');
+        expect(readFileSync(join(files, 'src', 'greet.py'), 'utf8')).toBe('print("hi")\n');
+
+        sh(buildContextCleanupScript(revision, 'run-v', 0));
+        expect(() => lstatSync(root)).toThrow();
+        if (shape === 'workspace-link')
+          expect(lstatSync(join(outside, 'secret')).isDirectory()).toBe(true);
+      } finally {
+        execFileSync('chmod', ['-R', 'u+w', base]);
+        rmSync(base, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('in a real shell, a revision with workspace/ and other roots shows the whole revision', () => {
+    const base = mkdtempSync(join(tmpdir(), 'moca-context-mixed-'));
+    const sh = (script: string) =>
+      execFileSync(
+        'bash',
+        ['-c', 'flock() { :; }\n' + script.replaceAll('/workspace/.moca-context', base)],
+        {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      ).toString();
+    const cache = join(base, 'cache', revision);
+    const root = join(base, 'runs', 'run-m');
+    try {
+      mkdirSync(join(cache, 'workspace', 'src'), { recursive: true });
+      writeFileSync(join(cache, 'workspace', 'src', 'greet.py'), 'print("hi")\n');
+      mkdirSync(join(cache, 'memory'), { recursive: true });
+      writeFileSync(join(cache, 'memory', 'notes.md'), 'remember\n');
+      mkdirSync(join(base, 'used'), { recursive: true });
+      writeFileSync(join(base, 'used', revision), '');
+
+      expect(sh(buildContextAcquireScript(revision, 'run-m', 60))).toBe('hit');
+      expect(execFileSync('readlink', [root]).toString().trim()).toBe(cache);
+      const listing = execFileSync('ls', [root]).toString();
+      expect(listing).toContain('workspace\n');
+      expect(listing).toContain('memory\n');
+
+      sh(buildContextWritableScript(revision, 'run-m'));
+      expect(readFileSync(join(root, 'memory', 'notes.md'), 'utf8')).toBe('remember\n');
+      expect(readFileSync(join(root, 'workspace', 'src', 'greet.py'), 'utf8')).toBe(
+        'print("hi")\n',
+      );
+      sh(buildContextCleanupScript(revision, 'run-m', 0));
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      execFileSync('chmod', ['-R', 'u+w', base]);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('in a real shell, a populated revision with workspace/ links the view to it', () => {
+    const base = mkdtempSync(join(tmpdir(), 'moca-context-populate-'));
+    const src = mkdtempSync(join(tmpdir(), 'moca-context-bundle-'));
+    try {
+      mkdirSync(join(src, 'workspace', 'src'), { recursive: true });
+      writeFileSync(join(src, 'workspace', 'src', 'greet.py'), 'print("hi")\n');
+      mkdirSync(join(base, 'cache'), { recursive: true });
+      mkdirSync(join(base, 'runs'));
+      mkdirSync(join(base, 'incoming'));
+      const archive = join(base, 'incoming', `${revision}.run-p.context`);
+      execFileSync('tar', ['-czf', archive, '-C', src, 'workspace'], {
+        env: { ...process.env, COPYFILE_DISABLE: '1' },
+      });
+      const sha = createHash('sha256').update(readFileSync(archive)).digest('hex');
+      // No flock(1) on macOS, and its sha256sum lacks --status; neither is under test here.
+      execFileSync('bash', [
+        '-c',
+        'flock() { :; }\nsha256sum() { cat >/dev/null; }\n' +
+          buildContextPopulateScript(revision, 'run-p', sha).replaceAll(
+            '/workspace/.moca-context',
+            base,
+          ),
+      ]);
+      const root = join(base, 'runs', 'run-p');
+      expect(execFileSync('readlink', [root]).toString().trim()).toBe(
+        join(base, 'cache', revision, 'workspace'),
+      );
+      expect(execFileSync('ls', [root]).toString()).toBe('src\n');
+    } finally {
+      execFileSync('chmod', ['-R', 'u+w', base]);
+      rmSync(base, { recursive: true, force: true });
+      rmSync(src, { recursive: true, force: true });
     }
   });
 

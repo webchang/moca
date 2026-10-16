@@ -854,6 +854,14 @@ prediction sealed before E8's next rung, since it sits on the hot path.
   first slice that multiplexes users (S2).
 - **Per-user admission quota** (rossoctl/moca#360). `packages/supervisor/src/admission.ts` bounds the worker as a whole,
   so one user can use every slot. This belongs with S2's grants, which name the user.
+  **Closed in-product 2026-10-15 (rossoctl/moca#542):** the subject is known to the worker after `resolveTurnAuth`, and only there, so the
+  cap is enforced at that point (`packages/knative-server/src/subject-quota.ts`, wired into `handleTurn`): a subject
+  over `SH_TURNS_PER_SUBJECT` in-flight turns — default half the per-worker slots, `max(1, ⌊S/2⌋)` — is refused with
+  `429 subject_quota_exceeded` plus `Retry-After`, distinct from the supervisor's pool-wide `overloaded` so a client
+  can tell "you are over your share" from "the host is full". The count is per-worker, not host-wide: no shared state
+  joins the turn hot path (this tier's own rule — a Redis that cannot answer must not gate a caller), and the bound it
+  buys is `cap/S` of the host. An unauthenticated caller has no subject and no slot. Moving enforcement to the
+  supervisor — exact and host-wide, on grants that name the user — remains with S2, as this clause already recorded.
 - **Tenant-scoped session listing** (rossoctl/moca#361). `RedisSessionBackend.list()`
   (`packages/session-backend/src/redis-backend.ts`) returned every tenant's sessions. No route ever
   exposed it to a caller, and no caller-facing use was to be added before S2 scoped it.

@@ -46,6 +46,9 @@ const SCRIPTS = {
   // least-loaded spread them over the sandboxes. The second turns run one at a time.
   'K8S-SMOKE-WHERE-1': { steps: ['sleep 2; echo "where=$HOSTNAME"'], done: 'done-k8s-where-1' },
   'K8S-SMOKE-WHERE-2': { steps: ['echo "where=$HOSTNAME"'], done: 'done-k8s-where-2' },
+  // deploy/k8s/smoke.sh, per-session models: no tool step, and the reply names the model the
+  // request carried, so the smoke can see a PATCHed model reach the gateway.
+  'K8S-SMOKE-MODEL': { steps: [], done: (model) => `model=${model}` },
 };
 
 const isToolResult = (m) =>
@@ -161,7 +164,10 @@ function reply(res, model, { marker, step, results }) {
       {
         type: 'content_block_delta',
         index: 0,
-        delta: { type: 'text_delta', text: [s.done, ...results].join('\n') },
+        delta: {
+          type: 'text_delta',
+          text: [typeof s.done === 'function' ? s.done(model) : s.done, ...results].join('\n'),
+        },
       },
     ],
     ['content_block_stop', { type: 'content_block_stop', index: 0 }],

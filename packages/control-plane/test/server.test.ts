@@ -182,6 +182,19 @@ describe('routing', () => {
     expect(res.status).toBe(204);
     expect(await d.credentials.get('github:1234', 'github-work')).not.toBeNull();
   });
+
+  it('routes PATCH /v1/sessions/{id} and parses its body', async () => {
+    const token = await apiToken();
+    const auth = { Authorization: `Bearer ${token}` };
+    const created = await request('POST', '/v1/sessions', { body: {}, headers: auth });
+    const sessionId = (created.json() as { sessionId: string }).sessionId;
+    const res = await request('PATCH', `/v1/sessions/${sessionId}`, {
+      body: { model: null },
+      headers: auth,
+    });
+    expect(res.status).toBe(200);
+    expect(res.json()).toMatchObject({ sessionId, model: null });
+  });
 });
 
 describe('api auth', () => {

@@ -167,22 +167,29 @@ is the leaf result; both are specified in [Leaf envelope and result](leaf-and-en
 
 The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.yaml). In outline:
 
-| Area           | Routes                                                                                                                                 |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Probes         | `GET /healthz`, `GET /readyz`, `GET /v1/discovery` (harness URL, sandbox tiers, version; no auth)                                      |
-| Login          | `POST /v1/auth/device`, `/v1/auth/device/token`, `/v1/auth/token` (refresh), `/v1/auth/revoke`, `/v1/auth/revoke-all`, `GET /v1/me`    |
-| Sessions       | `POST` and `GET /v1/sessions`, `GET` and `DELETE /v1/sessions/{id}`, `GET /v1/sessions/{id}/resources`, `POST /v1/sessions/{id}/token` |
-| Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                       |
-| Config bundles | `POST /v1/config-bundles`, `DELETE /v1/config-bundles/{digest}`                                                                        |
-| Internal       | `POST /internal/credentials`: data plane only, authenticated with `SH_EXCHANGE_TOKEN`                                                  |
+| Area           | Routes                                                                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Probes         | `GET /healthz`, `GET /readyz`, `GET /v1/discovery` (harness URL, sandbox tiers, version; no auth)                                                   |
+| Login          | `POST /v1/auth/device`, `/v1/auth/device/token`, `/v1/auth/token` (refresh), `/v1/auth/revoke`, `/v1/auth/revoke-all`, `GET /v1/me`                 |
+| Sessions       | `POST` and `GET /v1/sessions`, `GET`, `PATCH` and `DELETE /v1/sessions/{id}`, `GET /v1/sessions/{id}/resources`, `POST /v1/sessions/{id}/token`     |
+| Models         | `GET /v1/models?credential=` (the models a credential's endpoint lists), `GET /v1/sessions/{id}/models` (the models the session's credential lists) |
+| Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                                    |
+| Config bundles | `POST /v1/config-bundles`, `DELETE /v1/config-bundles/{digest}`                                                                                     |
+| Internal       | `POST /internal/credentials`: data plane only, authenticated with `SH_EXCHANGE_TOKEN`                                                               |
+
+`POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
+returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
+The id is checked against the credential's catalog (400 `model_unavailable` when it is not listed); when the endpoint
+cannot list its models, the id is accepted unverified and the answer has `modelVerified: false`. Only the two list routes
+answer 503 `model_catalog_unavailable`. These routes came with API 1.1.0; see the [changelog](../api/CHANGELOG.md).
 
 Another user's session returns 404, not 403. Control-plane error codes and statuses: 400
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`,
-`digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`), 401 (`token_required`,
+`digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`, `model_unavailable`), 401 (`token_required`,
 `token_invalid`, `token_expired`, `unauthorized`), 403 `forbidden`, 404 (`session_not_found`, `config_bundle_not_found`,
 `credential_not_found`), 410 `device_code_expired`, 428 `authorization_pending`, 429
 `bundle_quota_exceeded`, 500 `internal_error`, 502 `identity_provider_misconfigured`, 503
-(`credential_unavailable`, `redis_unavailable`). The list may not be complete; the mapping is in
+(`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in
 `packages/control-plane/src/errors.ts`.
 
 Note that the same `config_bundle_not_found` is 404 on the control plane and 410 on the harness.

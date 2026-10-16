@@ -3,6 +3,7 @@ import {
   checkExchangeAuth,
   exchangeCredential,
   placeholderFor,
+  resolveInference,
   sessionTier,
   viewTier,
 } from '../src/exchange.js';
@@ -629,5 +630,69 @@ describe('exchange refreshes the session bundle TTL, best effort', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('the session model in the exchange (per-session model spec §4.5)', () => {
+  it('omits model for a session that names none — the response is unchanged', async () => {
+    const d = makeDeps();
+    await seedCredential(d);
+    const res = await exchangeCredential(await sessionToken(d), d);
+    expect(res).not.toHaveProperty('model');
+  });
+
+  it('returns the stored model and its limits', async () => {
+    const d = makeDeps();
+    await seedCredential(d);
+    const token = await sessionToken(d);
+    await d.index.setModel('sid-fixed', 'granite-4.1-8b', { contextWindow: 131072, vision: false });
+    const res = await exchangeCredential(token, d);
+    expect(res.model).toEqual({ id: 'granite-4.1-8b', contextWindow: 131072, vision: false });
+  });
+
+  it('returns a model with no limits as just its id', async () => {
+    const d = makeDeps();
+    await seedCredential(d);
+    const token = await sessionToken(d);
+    await d.index.setModel('sid-fixed', 'unverified-model');
+    expect((await exchangeCredential(token, d)).model).toEqual({ id: 'unverified-model' });
+  });
+});
+
+describe('resolveInference', () => {
+  it('resolves a stored credential to its secret, endpoint and header', async () => {
+    const d = makeDeps();
+    await seedCredential(d);
+    expect(
+      await resolveInference({ owner: 'github:1234', credentialName: 'my-anthropic' }, d),
+    ).toEqual({
+      secretValue: 'sk-fake', // notsecret
+      credentialName: 'my-anthropic',
+      baseUrl: 'https://litellm.internal/v1',
+      authHeader: 'authorization',
+      usedOperatorFallback: false,
+    });
+  });
+
+  it('resolves the operator fallback for a record with no credential', async () => {
+    const d = makeDeps({
+      config: {
+        allowOperatorFallback: true,
+        operatorInferenceToken: 'op-tok', // notsecret
+        defaultInferenceEndpoint: 'https://litellm.internal',
+      },
+    });
+    expect(await resolveInference({ owner: 'github:1234', credentialName: '' }, d)).toMatchObject({
+      credentialName: 'operator-fallback',
+      baseUrl: 'https://litellm.internal',
+      usedOperatorFallback: true,
+    });
+  });
+
+  it('refuses a credential that is gone, as the exchange does', async () => {
+    const d = makeDeps();
+    expect(
+      await codeOf(() => resolveInference({ owner: 'github:1234', credentialName: 'gone' }, d)),
+    ).toBe('credential_required');
   });
 });

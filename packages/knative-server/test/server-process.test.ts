@@ -280,6 +280,20 @@ describe('buildConfig marks every server turn (MI1 R3)', () => {
     expect(buildConfig(auth).sandboxTier).toBe('microvm');
     expect(buildConfig(null).sandboxTier).toBeUndefined();
   });
+
+  it('passes the session model as sessionModel, never as model (per-session model spec §5.1)', () => {
+    const auth = {
+      subject: 'github:1',
+      sessionId: 's',
+      credential: { mode: 'direct' as const, value: 'k' }, // notsecret
+      anthropicBaseUrl: 'https://x',
+      model: { id: 'granite-4.1-8b', contextWindow: 131072 },
+    };
+    const config = buildConfig(auth);
+    expect(config.sessionModel).toEqual({ id: 'granite-4.1-8b', contextWindow: 131072 });
+    expect(config.model).toBeUndefined();
+    expect(buildConfig(null).sessionModel).toBeUndefined();
+  });
 });
 
 describe('prepareServerProcess gives the process a private agent directory (MI1 R4)', () => {

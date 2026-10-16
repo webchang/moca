@@ -80,5 +80,11 @@ code="$(post '{"model":"mock-k8s","stream":true,"messages":[
   {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"drained"}]}]}')"
 check "DRAIN ends with its done text and the tool output" "$(grep -c 'done-k8s-drain\\ndrained' "$TMP/body")" "1"
 
+echo "== the per-session model smoke: no tool step, and the reply names the request's model"
+code="$(post '{"model":"mock-b","stream":true,"messages":[{"role":"user","content":"Reply with the model you are. [K8S-SMOKE-MODEL]"}]}')"
+check "K8S-SMOKE-MODEL is 200" "$code" "200"
+check "K8S-SMOKE-MODEL has no tool_use" "$(grep -c '"type":"tool_use"' "$TMP/body")" "0"
+check "K8S-SMOKE-MODEL text names the model" "$(grep -c 'model=mock-b' "$TMP/body")" "1"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

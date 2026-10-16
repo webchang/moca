@@ -66,6 +66,26 @@ function byteBudgetEnv(env: NodeJS.ProcessEnv, name: string, def: number): numbe
   return Number(v);
 }
 
+/**
+ * `SH_MODEL_CATALOG_HOSTS`: the hosts the model catalog may contact besides api.anthropic.com and
+ * SH_DEFAULT_INFERENCE_ENDPOINT's (per-session model spec §4.1). Comma-separated, case-insensitive,
+ * exact hostnames: a URL, a port or a path is refused at BOOT rather than silently never matching.
+ */
+function catalogHostsEnv(env: NodeJS.ProcessEnv): string[] {
+  const out: string[] = [];
+  for (const raw of (env.SH_MODEL_CATALOG_HOSTS ?? '').split(',')) {
+    const h = raw.trim().toLowerCase();
+    if (h === '') continue;
+    if (URL.parse(`http://${h}`)?.hostname !== h || h.includes('@')) {
+      throw new Error(
+        `SH_MODEL_CATALOG_HOSTS entries must be bare hostnames (no scheme, port or path), got "${h}"`,
+      );
+    }
+    out.push(h);
+  }
+  return out;
+}
+
 export function portFromEnv(env: NodeJS.ProcessEnv): number {
   return intEnv(env, 'SH_CONTROL_PLANE_PORT', 8080);
 }
@@ -100,6 +120,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     refreshReuseGraceSeconds: intEnv(env, 'SH_REFRESH_REUSE_GRACE_SECONDS', 30),
     exchangeToken: required(env, 'SH_EXCHANGE_TOKEN'),
     defaultInferenceEndpoint: env.SH_DEFAULT_INFERENCE_ENDPOINT || undefined,
+    modelCatalogHosts: catalogHostsEnv(env),
     operatorInferenceToken: env.SH_OPERATOR_INFERENCE_TOKEN || undefined,
     operatorInferenceHeader: operatorHeaderFromEnv(env),
     // Exactly 'true'. A typo must not silently switch on a fallback that lets one subject spend the

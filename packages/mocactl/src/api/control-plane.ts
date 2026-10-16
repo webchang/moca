@@ -9,6 +9,7 @@ import type {
   DeviceStart,
   Discovery,
   Me,
+  ModelList,
   PutCredentialRequest,
   SessionPage,
   SessionSummary,
@@ -174,6 +175,21 @@ export class ControlPlaneClient implements ControlPlaneApi {
 
   getSession(id: string): Promise<SessionSummary> {
     return this.json('GET', `/v1/sessions/${encodeURIComponent(id)}`);
+  }
+
+  listModels(credential?: string): Promise<ModelList> {
+    return this.json('GET', '/v1/models', { query: { credential } });
+  }
+
+  listSessionModels(id: string): Promise<ModelList> {
+    return this.json('GET', `/v1/sessions/${encodeURIComponent(id)}/models`);
+  }
+
+  setSessionModel(
+    id: string,
+    model: string | null,
+  ): Promise<SessionSummary & { modelVerified?: boolean }> {
+    return this.json('PATCH', `/v1/sessions/${encodeURIComponent(id)}`, { body: { model } });
   }
 
   async deleteSession(id: string): Promise<'deleted' | 'accepted'> {

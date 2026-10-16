@@ -8,6 +8,7 @@ function host(hasSession = true): CommandHost & Record<string, ReturnType<typeof
     openOverlay: vi.fn(),
     newSession: vi.fn(),
     renameSession: vi.fn(),
+    switchModel: vi.fn(),
     prefillInput: vi.fn(),
     toggleDetails: vi.fn(),
     toggleThinking: vi.fn(),
@@ -35,6 +36,7 @@ describe('BUILTIN_COMMANDS', () => {
     ['/resume', 'ctrl+x l'],
     ['/new', 'ctrl+x n'],
     ['/rename', 'ctrl+x r'],
+    ['/model', 'ctrl+x m'],
     ['/credentials', 'ctrl+x k'],
     ['/details', 'ctrl+x d'],
     ['/thinking', 'ctrl+x t'],
@@ -109,5 +111,27 @@ describe('BUILTIN_COMMANDS', () => {
     expect(ids).not.toContain('reply.copy');
     expect(ids).not.toContain('transcript.export');
     expect(ids).toContain('session.new');
+  });
+
+  it('/model with an id switches; without one it opens the model list', async () => {
+    const h = host();
+    const hit = registry.bySlash('/model meta-llama/Llama-3.1-8B-Instruct')!;
+    await hit.command.run(h, hit.arg);
+    expect(h.switchModel).toHaveBeenCalledWith('meta-llama/Llama-3.1-8B-Instruct');
+    const bare = registry.bySlash('/model')!;
+    await bare.command.run(h, bare.arg);
+    expect(h.openOverlay).toHaveBeenCalledWith('model');
+  });
+
+  // PR #540 review R5: only the slash command maps the word `default`; the host takes string | null.
+  it('/model default asks for the deployment default as null', async () => {
+    const h = host();
+    const hit = registry.bySlash('/model default')!;
+    await hit.command.run(h, hit.arg);
+    expect(h.switchModel).toHaveBeenCalledWith(null);
+  });
+
+  it('/model needs an open session', () => {
+    expect(registry.available(host(false)).map((c) => c.id)).not.toContain('session.model');
   });
 });

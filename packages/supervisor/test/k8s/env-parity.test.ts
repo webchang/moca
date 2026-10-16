@@ -13,10 +13,16 @@ function templateVars(file: string): string[] {
   return [...text.matchAll(/^#?([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!);
 }
 
-/** Differences in credential TRANSPORT, not in what the process receives. Each one says why. */
+/**
+ * Differences between the tiers, each with its reason: credential TRANSPORT (how a secret reaches
+ * the process, not whether it does), or a value one tier deliberately DERIVES rather than sets.
+ */
 const NOT_ENV_ON_K8S: Record<string, string> = {
-  // (none today: SH_EXCHANGE_TOKEN is not a template line -- it is a systemd credential on the VM and
-  // a file under CREDENTIALS_DIRECTORY here; base-supervisor.test.ts pins that.)
+  // (SH_EXCHANGE_TOKEN is not a template line -- it is a systemd credential on the VM and a file
+  // under CREDENTIALS_DIRECTORY here; base-supervisor.test.ts pins that.)
+  // Deliberately not set: the per-subject cap defaults to half of SH_TURNS_PER_WORKER (#360), so
+  // a pinned literal here would drift the moment an operator changes S.
+  SH_TURNS_PER_SUBJECT: 'derived (half of SH_TURNS_PER_WORKER), so the manifest does not pin it',
 };
 
 describe.skipIf(NO_KUBECTL)('deploy/k8s env parity with deploy/vm/env', () => {

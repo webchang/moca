@@ -1,5 +1,6 @@
 import { CpError } from './errors.js';
 import { subjectHash } from './k8s-secret-store.js';
+import { sanitizeLimits, type ModelLimits } from './models.js';
 
 /**
  * The session-ownership index (spec §7.1-§7.3). It lives in Redis BECAUSE Redis is ephemeral: if
@@ -58,6 +59,13 @@ export interface SessionRecord {
    * as stored, never coerced; the exchange gives both today's default (sessionTier, exchange.ts).
    */
   sandboxTier?: string;
+  /**
+   * The model this session's turns run on (per-session model spec §4.4). '' or absent means the
+   * deployment default. Changed by PATCH /v1/sessions/{id}, unlike the fields above.
+   */
+  model?: string;
+  /** The catalog's limits for `model`, snapshotted when it was chosen; absent when unverified. */
+  modelLimits?: ModelLimits;
 }
 
 export const AUDIT_STREAM = 'sh:cp:audit';
@@ -105,6 +113,16 @@ const RUNTIME_FIELDS = [
   'workspaceResetFrom',
 ] as const;
 
+/** A stored limits field, read tolerantly: '' or a corrupted value is "no limits", never a throw. */
+function readLimits(raw: string | undefined): ModelLimits | undefined {
+  if (!raw) return undefined;
+  try {
+    return sanitizeLimits(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
 export class OwnershipIndex {
   constructor(private readonly redis: CpRedisLike) {}
 
@@ -141,6 +159,8 @@ export class OwnershipIndex {
         configRef: rec.configRef ?? '',
         tombstone: rec.tombstone ? '1' : '0',
         sandboxTier: rec.sandboxTier ?? '',
+        model: rec.model ?? '',
+        modelLimits: rec.modelLimits ? JSON.stringify(rec.modelLimits) : '',
       }),
     );
     await this.guard(() =>
@@ -164,6 +184,8 @@ export class OwnershipIndex {
       configRef: h.configRef ? h.configRef : null,
       tombstone: h.tombstone === '1',
       sandboxTier: h.sandboxTier,
+      ...(h.model ? { model: h.model } : {}),
+      ...(readLimits(h.modelLimits) ? { modelLimits: readLimits(h.modelLimits) } : {}),
     };
   }
 
@@ -222,6 +244,16 @@ export class OwnershipIndex {
     await this.guard(() => this.redis.hSet(sessionKey(sid), { tombstone: '1', state: 'deleting' }));
   }
 
+  /** Replace the session's model (spec §4.3). Limits not given are cleared, never kept stale. */
+  async setModel(sid: string, model: string, limits?: ModelLimits): Promise<void> {
+    await this.guard(() =>
+      this.redis.hSet(sessionKey(sid), {
+        model,
+        modelLimits: limits ? JSON.stringify(limits) : '',
+      }),
+    );
+  }
+
   /**
    * Self-reported by the harness (spec §7.4). Written by the BRAIN tier, so it is untrusted,
    * display-only data and is never consulted for authz -- stated here because the tempting later
@@ -255,6 +287,8 @@ export class OwnershipIndex {
     decision: string;
     /** The error code of a refusal. */
     reason?: string;
+    model?: string;
+    fromModel?: string;
   }): Promise<void> {
     await this.guard(() =>
       this.redis.xAdd(
@@ -270,6 +304,8 @@ export class OwnershipIndex {
           ...(entry.configRef ? { configRef: entry.configRef } : {}),
           ...(entry.bytes !== undefined ? { bytes: String(entry.bytes) } : {}),
           ...(entry.reason ? { reason: entry.reason } : {}),
+          ...(entry.model ? { model: entry.model } : {}),
+          ...(entry.fromModel ? { fromModel: entry.fromModel } : {}),
         },
         { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: AUDIT_MAXLEN } },
       ),

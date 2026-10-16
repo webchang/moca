@@ -326,6 +326,30 @@ else
   fi
 fi
 
+# kind-ci only: the ids are the mock's, which a real model does not have. The mock listens on the
+# harness pod's loopback, so the control plane cannot list the credential's models and accepts both
+# ids unverified (spec §8); the gateway, the mock, then sees which one each turn carries.
+if [[ "$TARGET" == kind-ci ]]; then
+  claim M1 "a session's model is chosen at creation and switched with PATCH; the turn names the switched one"
+  # SESSION_BODY may already name a sandbox tier: add the model to it rather than replace it.
+  SESSION_BODY_SAVED="$SESSION_BODY"
+  SESSION_BODY="$(jq -c '. + {model: "mock-a"}' <<<"$SESSION_BODY")"
+  SID=''
+  if new_session; then
+    sw="$(curl -s -o "$OUT/patch.json" -w '%{http_code}' -X PATCH -H @"$OUT/api.hdr" -H 'Content-Type: application/json' \
+      -d '{"model":"mock-b"}' "$CP/v1/sessions/$SID" || true)"
+    if [[ "$sw" != 200 ]]; then
+      ko "PATCH /v1/sessions/$SID answered $sw: $(head -c 300 "$OUT/patch.json")"
+    elif turn model "$SID" "Reply with the model you are. [K8S-SMOKE-MODEL]" &&
+      grep -q 'model=mock-b' "$OUT/model.sse"; then
+      ok "session $SID switched to mock-b and its turn reached the gateway as mock-b"
+    else
+      ko "model turn: $(head -c 600 "$OUT/model.sse" 2>/dev/null)"
+    fi
+  fi
+  SESSION_BODY="$SESSION_BODY_SAVED"
+fi
+
 if [[ "$TIER" == p4 ]]; then
   # Runs in the control-plane pod (its egress allows 443 anywhere), from the relay package's directory:
   # that is where the image's tsx, @grpc/grpc-js and @moca/k8s-sandbox resolve. The exec token and

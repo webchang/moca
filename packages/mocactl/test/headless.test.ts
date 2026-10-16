@@ -116,6 +116,20 @@ describe('cmdRun', () => {
     expect(cp.calls).not.toContain('createSession');
   });
 
+  it('names a rejected --option model, the deployment default as the empty value (final review F3)', async () => {
+    const o = io();
+    const cp = fakeControlPlane({
+      listCredentials: async () => [credential('a')],
+      listModels: async () => ({ credential: 'a', models: [{ id: 'm1' }, { id: 'm2' }] }),
+    });
+    expect(
+      await cmdRun(runtime({ cp }), o, { prompt: 'hi', options: { model: 'gpt-x' }, json: false }),
+    ).toBe(2);
+    expect(o.stderr.join('\n')).toContain(
+      "unknown model 'gpt-x'; declared: m1, m2 (or empty for the deployment default)",
+    );
+  });
+
   it('uses the credential named with --option', async () => {
     let asked: unknown;
     const rt = runtime({

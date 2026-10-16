@@ -279,6 +279,22 @@ describe('parseCredentialBody', () => {
     ).toBe('invalid_request');
   });
 
+  // PR #540 review R3: defence in depth -- the endpoint is the user's, and every catalog call and
+  // exchange parses it; no real gateway URL is near 2048 characters.
+  it('refuses an endpoint over 2048 characters', () => {
+    const at = (n: number) =>
+      `https://litellm.internal/${'v'.repeat(n - 'https://litellm.internal/'.length)}`;
+    expect(
+      parseCredentialBody('x', bearerBody({ consumer: 'inference', endpoint: at(2048) })).descriptor
+        .endpoint,
+    ).toHaveLength(2048);
+    expect(
+      codeOf(() =>
+        parseCredentialBody('x', bearerBody({ consumer: 'inference', endpoint: at(2049) })),
+      ),
+    ).toBe('invalid_request');
+  });
+
   it('defaults endpoint to null rather than undefined', () => {
     expect(
       parseCredentialBody('x', bearerBody({ consumer: 'inference' })).descriptor.endpoint,

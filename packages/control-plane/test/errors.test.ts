@@ -35,6 +35,10 @@ const EXPECTED: Record<CpErrorCode, number> = {
   credential_not_found: 404,
   credential_unavailable: 503,
   endpoint_unresolved: 400,
+  // 400: the credential's endpoint does not offer that model id (per-session model spec §4.2).
+  model_unavailable: 400,
+  // 503: the endpoint could not list its models. (per-session model spec §4.2)
+  model_catalog_unavailable: 503,
   // 428 Precondition Required: a polling client tells "not yet" from "denied" without a body read.
   authorization_pending: 428,
   // 410 Gone: the device code itself is spent; a client starts a new one rather than polling on.

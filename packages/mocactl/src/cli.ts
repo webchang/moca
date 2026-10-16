@@ -48,7 +48,7 @@ export const USAGE = `usage:
   mocactl subagents [--tag T] [--json]            list spawned subagents + current state
   mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
   mocactl workloads create --context FILE [--name NAME] [--json]
-                                                 upload a context file (contextctl ctx export) to a
+                                                 upload a context file (contextctl ctx pack) to a
                                                  new workload; prints its id
   mocactl workloads get ID [--json]
   mocactl workloads delete ID [--json]           delete a workload and its context

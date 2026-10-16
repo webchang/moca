@@ -2,6 +2,7 @@ import type { KeyObject } from 'node:crypto';
 import { createClient } from 'redis';
 import {
   CpError,
+  MODEL_ID_RE,
   OwnershipIndex,
   credentialValue,
   parseKeyset,
@@ -9,7 +10,7 @@ import {
   type CpRedisLike,
   type ExchangeResponse,
 } from '@moca/control-plane';
-import type { TurnResult, UpstreamCredential } from '@moca/harness/run-turn';
+import type { SessionModelSpec, TurnResult, UpstreamCredential } from '@moca/harness/run-turn';
 
 /**
  * Caller authentication on the `/turn` path (MU1 spec §4.3, §4.3.1, §5.3).
@@ -33,6 +34,8 @@ export interface TurnAuth {
   configRef?: string;
   /** The session's sandbox tier from the exchange (P6.3); absent ⇒ the data plane's default. */
   sandboxTier?: string;
+  /** The session's model from the exchange (per-session model spec §5.1); absent ⇒ the deployment default. */
+  model?: SessionModelSpec;
 }
 
 export interface TurnAuthDeps {
@@ -142,6 +145,30 @@ export const PASSTHROUGH = new Set([
   'token_expired',
 ]);
 
+const optPositiveInt = (v: unknown) =>
+  v === undefined || (Number.isInteger(v) && (v as number) > 0);
+const optBool = (v: unknown) => v === undefined || typeof v === 'boolean';
+/**
+ * The control plane's own ceiling (control-plane models.ts MAX_CONTEXT_WINDOW, PR #540 review R9):
+ * it never hands out a larger window, so one arriving anyway is a wrong shape, refused like the rest.
+ */
+const MAX_CONTEXT_WINDOW = 10_000_000;
+
+/** The exchange's `model`, checked field by field: a wrong shape fails the turn, never guesses. */
+function isSessionModel(v: unknown): v is SessionModelSpec {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const m = v as Record<string, unknown>;
+  return (
+    typeof m.id === 'string' &&
+    MODEL_ID_RE.test(m.id) &&
+    optPositiveInt(m.contextWindow) &&
+    (m.contextWindow === undefined || (m.contextWindow as number) <= MAX_CONTEXT_WINDOW) &&
+    optPositiveInt(m.maxTokens) &&
+    optBool(m.reasoning) &&
+    optBool(m.vision)
+  );
+}
+
 async function exchange(token: string, deps: TurnAuthDeps): Promise<ExchangeResponse> {
   if (!deps.controlPlaneUrl) {
     throw new CpError('credential_unavailable', 'no control plane configured');
@@ -213,6 +240,10 @@ async function exchange(token: string, deps: TurnAuthDeps): Promise<ExchangeResp
   ) {
     throw new CpError('credential_unavailable', 'control plane returned a malformed configRef');
   }
+  // A model of the wrong shape would build a model with nonsense limits, or the wrong id.
+  if (body.model !== undefined && !isSessionModel(body.model)) {
+    throw new CpError('credential_unavailable', 'control plane returned a malformed model');
+  }
   return body as unknown as ExchangeResponse;
 }
 
@@ -266,6 +297,7 @@ export async function resolveTurnAuth(
     ...(typeof resolved.sandboxTier === 'string' && resolved.sandboxTier
       ? { sandboxTier: resolved.sandboxTier }
       : {}),
+    ...(resolved.model ? { model: resolved.model } : {}),
   };
 }
 

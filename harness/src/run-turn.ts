@@ -45,6 +45,8 @@ import { sseExtension, type TurnStreamFrame } from './turn-stream.js';
 import { promotedLoaderOptions, type PromotedConfig } from './config-resolver.js';
 import { leaseTimings } from './lease-timings.js';
 import { attachPromotedConfig, type AttachedPromotedConfig } from './promoted-config.js';
+import { compactIfOverflowing } from './pre-prompt-compaction.js';
+import { recordModelSwitch } from './model-switch-record.js';
 
 // Re-exported because they are now part of executeTurn's CONTRACT: since /turn leases from the pool,
 // every caller of executeTurn can be handed these errors and needs to distinguish them from a generic
@@ -315,6 +317,18 @@ export type UpstreamCredential =
   | { mode: 'placeholder'; value: string; header?: InferenceAuthHeader }
   | { mode: 'direct'; value: string; header?: InferenceAuthHeader };
 
+/**
+ * The model a control-plane session names, with the limits its catalog reported (per-session model
+ * spec §4.5). Plain data from the exchange; sessionModelFor turns it into a pi model.
+ */
+export interface SessionModelSpec {
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  vision?: boolean;
+}
+
 export interface TurnConfig {
   redisUrl?: string;
   cwd?: string;
@@ -340,6 +354,11 @@ export interface TurnConfig {
    * for every caller without a control plane; selectPoolSandbox then uses SH_SANDBOX_DEFAULT_TIER.
    */
   sandboxTier?: string;
+  /**
+   * The session's model, from the exchange (per-session model spec §5.1). Read by executeTurn only:
+   * `model` above is also read by /runs, which must not inherit an id pi's registry may not know.
+   */
+  sessionModel?: SessionModelSpec;
 }
 
 export interface ModelSelection {
@@ -550,6 +569,35 @@ export function requireModel(
     ? `Did you mean: ${suggestions.join(', ')}?`
     : `Known "${provider}" ids include: ${ids.slice(0, 12).join(', ')}${ids.length > 12 ? ', …' : ''}.`;
   throw new Error(`Unknown model "${provider}/${modelId}" — not in the pi-ai registry. ${hint}`);
+}
+
+/**
+ * Build a session's model (per-session model spec §5.2). `api.anthropic.com` keeps pi's registry,
+ * exactly as today. Any other endpoint is a gateway (LiteLLM) whose names pi may not know, so the
+ * model is always synthesized -- through requireModel's own SH_MODEL_CUSTOM path, with the session's
+ * limits overlaid on the environment's -- even when the registry happens to know the id.
+ */
+export function sessionModelFor(
+  m: SessionModelSpec,
+  baseUrl: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): ReturnType<typeof requireModel> {
+  if (baseUrl && URL.parse(baseUrl)?.hostname === 'api.anthropic.com') {
+    const { SH_MODEL_CUSTOM: _custom, ...registryEnv } = env;
+    return requireModel('anthropic', m.id, registryEnv);
+  }
+  const base = requireModel(env.SH_MODEL_PROVIDER ?? 'anthropic', m.id, {
+    ...env,
+    SH_MODEL_CUSTOM: '1',
+    ...(baseUrl ? { SH_MODEL_BASE_URL: baseUrl } : {}),
+    ...(m.contextWindow ? { SH_MODEL_CONTEXT_WINDOW: String(m.contextWindow) } : {}),
+    ...(m.maxTokens ? { SH_MODEL_MAX_TOKENS: String(m.maxTokens) } : {}),
+  });
+  return {
+    ...base,
+    ...(m.reasoning !== undefined ? { reasoning: m.reasoning } : {}),
+    ...(m.vision ? { input: ['text', 'image'] } : {}),
+  } as typeof base;
 }
 
 export interface TurnResult {
@@ -978,7 +1026,9 @@ async function executeTurnCore(
   await resourceLoader.reload();
 
   const { provider, modelId } = input.selection ?? resolveModelSelection(config);
-  const baseModel = requireModel(provider, modelId);
+  const baseModel = config?.sessionModel
+    ? sessionModelFor(config.sessionModel, config.anthropicBaseUrl)
+    : requireModel(provider, modelId);
   const model = applyModelGateway(baseModel, config);
 
   const { session } = await createAgentSession({
@@ -988,23 +1038,35 @@ async function executeTurnCore(
     settingsManager,
   });
 
+  // Per-session model spec §5.3: a switch to a smaller window compacts here, not after a failed request.
+  await compactIfOverflowing(session as never, input.signal);
+
   if (input.signal) wireAbort(input.signal, session);
 
-  await session.prompt(prompt);
-
-  const lastMessage = session.state.messages.at(-1) as AssistantMessage | undefined;
   let response = '';
   let stopReason = 'end_turn';
   let errorMessage: string | undefined;
 
-  if (lastMessage?.role === 'assistant') {
-    stopReason = lastMessage.stopReason ?? 'end_turn';
-    if (stopReason === 'error' || stopReason === 'aborted') {
-      errorMessage = lastMessage.errorMessage || `Request ${stopReason}`;
-    } else {
-      for (const content of lastMessage.content) {
-        if (content.type === 'text') {
-          response += content.text;
+  // An abort that landed before the prompt (e.g. during pre-prompt compaction) cannot reach a run
+  // that has not started: wireAbort's session.abort() is a no-op then. Report it, and spend nothing.
+  if (input.signal?.aborted) {
+    stopReason = 'aborted';
+    errorMessage = 'Request aborted';
+  } else {
+    // After the pre-prompt compaction, so a compaction stays the branch's last entry for its check;
+    // only on a turn that runs, so an aborted one records no switch it never made (R11).
+    recordModelSwitch(sessionManager, model);
+    await session.prompt(prompt);
+    const lastMessage = session.state.messages.at(-1) as AssistantMessage | undefined;
+    if (lastMessage?.role === 'assistant') {
+      stopReason = lastMessage.stopReason ?? 'end_turn';
+      if (stopReason === 'error' || stopReason === 'aborted') {
+        errorMessage = lastMessage.errorMessage || `Request ${stopReason}`;
+      } else {
+        for (const content of lastMessage.content) {
+          if (content.type === 'text') {
+            response += content.text;
+          }
         }
       }
     }

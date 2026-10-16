@@ -98,6 +98,8 @@ an opaque error.
   owed backend work (§13).
 - **Per-session model selection.** `SH_MODEL`/`SH_MODEL_API` are deployment-time env vars on the
   harness process ([multi-protocol-model-provider](2026-08-20-multi-protocol-model-provider-design.md)).
+  _Later:_ specified and implemented in the [per-session model selection spec](2026-10-14-per-session-model-selection-design.md) (MU1.3): the
+  `model` session option and `/model`.
 - **Per-session sandbox pool / resource / tool-set selection.** MU1 §8.2: `/turn` "does not lease from
   the pool at all." CPU/memory and installed tools are pod-spec / image concerns with no HTTP surface.
 - **Unauthenticated / ambient mode.** `harness/src/cli.ts` and the unauthenticated deploy scripts
@@ -651,7 +653,8 @@ its own; it is not a scope cut:
 ## 11. Scope / YAGNI — not built, and why
 
 - **No sandbox tools/mem/cpu UI and no model picker.** Nothing to submit them to (§1). The
-  session-options seam (§7.3) is where they land once the backend exposes them.
+  session-options seam (§7.3) is where they land once the backend exposes them. _Later:_ the model
+  picker landed there, in the [per-session model selection spec](2026-10-14-per-session-model-selection-design.md).
 - **No theme-file loader.** Tokens plus two shipped themes (§5.4).
 - **No dual auth mode** (§1).
 - **No local-tree features** — `@`-file search, `!`-shell, git undo/redo (§1).
@@ -685,7 +688,8 @@ In priority order for the client's experience:
 2. **A session `title` field** on `/v1/sessions` — server-side titles that follow the user across
    devices; the client already prefers a server value (§6.2).
 3. **Per-session model selection** and **per-session sandbox selection on `/turn`** (the latter owed to
-   MU2 per MU1 §8.2). Each lands in the client as one session-options field (§7.3).
+   MU2 per MU1 §8.2). Each lands in the client as one session-options field (§7.3). _Later:_ the
+   first is specified and implemented in the [per-session model selection spec](2026-10-14-per-session-model-selection-design.md) (MU1.3).
 4. **Server-side turn serialization per session** — makes §6.1's client-side queue a convenience
    rather than the only guard, and protects other clients.
 5. **A kind-registry listing endpoint** — would let §6.4 render forms for new kinds without a client

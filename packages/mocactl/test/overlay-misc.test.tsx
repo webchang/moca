@@ -14,6 +14,7 @@ const host = () =>
     openOverlay: vi.fn(),
     newSession: vi.fn(),
     renameSession: vi.fn(),
+    switchModel: vi.fn(),
     prefillInput: vi.fn(),
     toggleDetails: vi.fn(),
     toggleThinking: vi.fn(),

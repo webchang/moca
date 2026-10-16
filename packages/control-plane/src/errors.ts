@@ -33,6 +33,8 @@ export const CP_ERROR_CODES = [
   'credential_not_found',
   'credential_unavailable',
   'endpoint_unresolved',
+  'model_unavailable',
+  'model_catalog_unavailable',
   'authorization_pending',
   'device_code_expired',
   'identity_provider_misconfigured',
@@ -73,6 +75,11 @@ const STATUS: Record<CpErrorCode, number> = {
   credential_not_found: 404,
   credential_unavailable: 503,
   endpoint_unresolved: 400,
+  // 400: the credential's endpoint does not offer that model id (per-session model spec §4.2).
+  model_unavailable: 400,
+  // 503: the endpoint could not list its models (timeout, non-2xx, no /model/info). A create or
+  // switch naming a model is then accepted unverified instead (spec §4.2); only the list routes 503.
+  model_catalog_unavailable: 503,
   // 428 Precondition Required: the device-flow poll has a distinct status so a polling client needs
   // no body inspection to tell "not yet" from "denied" (plan gap #8).
   authorization_pending: 428,
