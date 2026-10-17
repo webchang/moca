@@ -245,6 +245,18 @@ reviewable isolation claim rather than continuing any one of them.
   owned asynchronous runs.
 - **Cortex replaces `moca-egress` only via MI1's conformance suite** (cortex#905, rescoped).
 
+## Sandbox Service (`SBX`-prefix)
+
+Offering the P4 microVM tier — a fresh Firecracker VM per command over a persistent workspace — as a
+service that clients other than MOCA's harness use directly: coding agents on developers' laptops
+(through MCP) and developers' own code (through `sandbox/v1`). Its own prefix because it packages the
+`P` track's P4 tier as a product with its own identity and lifecycle, rather than continuing the
+density work. The long-term multi-tenant design (SBX1) is exploratory and not in this repository.
+
+| ID       | Title                                                                                                                                                                                                                                                                   | Status                | Spec / issue                                                                                                                                                               |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **SBX0** | **A minimal sandbox service for an internal cohort** — the relay behind TLS in its own namespace; a control-plane `sandbox` route profile with explicit sandboxes and a per-sandbox Ed25519 token; `mocactl sbx` (push/pull, CLI, local MCP); no proto or worker change | **design — proposed** | [`2026-10-15-sbx0-internal-sandbox-service-design.md`](2026-10-15-sbx0-internal-sandbox-service-design.md); [ADR-0042](../adrs/0042-sbx0-sandbox-service-on-sandbox-v1.md) |
+
 ---
 
 ## Other specs (not in a track above)
@@ -265,6 +277,7 @@ These specs predate their registration. The status shown is copied from each spe
 | `mocactl promote` — config-bundle promotion (ADR-0038)        | [`2026-10-06-mocactl-config-bundle-promotion-design.md`](2026-10-06-mocactl-config-bundle-promotion-design.md) | Proposed (amended 2026-10-06)                           |
 | Re-attach to a running turn (ADR-0040)                        | [`2026-10-09-turn-reattach-design.md`](2026-10-09-turn-reattach-design.md)                                     | Proposed                                                |
 | `mocactl` subagent commands — spawn, subagents, get (#381)    | [`2026-10-12-mocactl-subagent-commands-design.md`](2026-10-12-mocactl-subagent-commands-design.md)             | Proposed                                                |
+| Per-subject claim names for `/workloads` (#358)               | [`2026-10-15-per-subject-claim-names-design.md`](2026-10-15-per-subject-claim-names-design.md)                 | Proposed                                                |
 
 ## Lineage & supersessions (explicit)
 
