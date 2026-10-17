@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { promptCacheExtension, stripCacheControl } from '../src/prompt-cache-extension';
+import {
+  bypassGatewayCache,
+  promptCacheExtension,
+  stripCacheControl,
+} from '../src/prompt-cache-extension';
 
 type Handler = (e: { payload?: unknown }) => unknown;
 
@@ -49,13 +53,18 @@ function anthropicPayload() {
 
 describe('promptCacheExtension', () => {
   const saved = process.env.SH_PROMPT_CACHE;
+  const savedGw = process.env.SH_GATEWAY_CACHE;
   beforeEach(() => {
     delete process.env.SH_PROMPT_CACHE;
+    delete process.env.SH_GATEWAY_CACHE;
   });
   afterEach(() => {
     saved === undefined
       ? delete process.env.SH_PROMPT_CACHE
       : (process.env.SH_PROMPT_CACHE = saved);
+    savedGw === undefined
+      ? delete process.env.SH_GATEWAY_CACHE
+      : (process.env.SH_GATEWAY_CACHE = savedGw);
   });
 
   it('is inert (registers no handler) unless SH_PROMPT_CACHE=off', () => {
@@ -97,5 +106,46 @@ describe('promptCacheExtension', () => {
     promptCacheExtension()(pi as never);
     expect(getHandler()!({ payload: { model: 'm' } })).toEqual({ model: 'm' });
     expect(getHandler()!({})).toBeUndefined();
+  });
+
+  it('SH_GATEWAY_CACHE=off adds cache.no-cache and leaves the prompt-cache markers alone', () => {
+    process.env.SH_GATEWAY_CACHE = 'off';
+    const { pi, getHandler } = makePi();
+    promptCacheExtension()(pi as never);
+    const out = getHandler()!({ payload: anthropicPayload() }) as Record<string, unknown>;
+    expect(out.cache).toEqual({ 'no-cache': true });
+    expect(JSON.stringify(out)).toContain('"cache_control":{"type":"ephemeral"}');
+  });
+
+  it('both switches together strip the markers and add no-cache', () => {
+    process.env.SH_PROMPT_CACHE = 'off';
+    process.env.SH_GATEWAY_CACHE = 'off';
+    const { pi, getHandler } = makePi();
+    promptCacheExtension()(pi as never);
+    const out = getHandler()!({ payload: anthropicPayload() }) as Record<string, unknown>;
+    expect(out.cache).toEqual({ 'no-cache': true });
+    expect(JSON.stringify(out)).not.toContain('"cache_control":{"type":"ephemeral"}');
+  });
+
+  it('SH_GATEWAY_CACHE other than "off" registers nothing', () => {
+    for (const v of ['', 'on', 'OFF']) {
+      process.env.SH_GATEWAY_CACHE = v;
+      const { pi, getHandler } = makePi();
+      promptCacheExtension()(pi as never);
+      expect(getHandler(), `SH_GATEWAY_CACHE=${v}`).toBeUndefined();
+    }
+  });
+});
+
+describe('bypassGatewayCache', () => {
+  it('keeps an existing cache object and only adds no-cache', () => {
+    const p: Record<string, unknown> = { cache: { ttl: 60 } };
+    bypassGatewayCache(p);
+    expect(p.cache).toEqual({ ttl: 60, 'no-cache': true });
+  });
+  it('replaces a non-object cache value', () => {
+    const p: Record<string, unknown> = { cache: 'x' };
+    bypassGatewayCache(p);
+    expect(p.cache).toEqual({ 'no-cache': true });
   });
 });

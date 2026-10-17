@@ -1,7 +1,8 @@
 import type { ExtensionFactory } from '@earendil-works/pi-coding-agent';
 
 /**
- * Turn Anthropic prompt caching OFF for every model request, opt-in via SH_PROMPT_CACHE=off.
+ * Turn Anthropic prompt caching OFF for every model request, opt-in via SH_PROMPT_CACHE=off;
+ * and, separately, a LiteLLM gateway's response cache, opt-in via SH_GATEWAY_CACHE=off.
  *
  * pi-ai's Anthropic provider always marks the system prompt and the last user message with
  * `cache_control` (and the last tool, unless the gateway compat flags drop it), and nothing on
@@ -18,20 +19,46 @@ import type { ExtensionFactory } from '@earendil-works/pi-coding-agent';
  */
 export function promptCacheExtension(): ExtensionFactory {
   return (pi) => {
-    if (process.env.SH_PROMPT_CACHE !== 'off') return;
+    const promptOff = process.env.SH_PROMPT_CACHE === 'off';
+    const gatewayOff = process.env.SH_GATEWAY_CACHE === 'off';
+    if (!promptOff && !gatewayOff) return;
     let logged = false;
     pi.on('before_provider_request', (event: { payload?: unknown }) => {
       const params = event.payload as Record<string, unknown> | undefined;
       if (!params || typeof params !== 'object') return undefined;
-      const stripped = stripCacheControl(params);
+      const stripped = promptOff ? stripCacheControl(params) : 0;
+      if (gatewayOff) bypassGatewayCache(params);
       if (!logged) {
         logged = true;
-        console.error(
-          `[prompt-cache] off: removed ${stripped} cache_control marker(s) from the first request`,
-        );
+        if (promptOff)
+          console.error(
+            `[prompt-cache] off: removed ${stripped} cache_control marker(s) from the first request`,
+          );
+        if (gatewayOff)
+          console.error('[gateway-cache] off: every request carries cache.no-cache = true');
       }
       return params;
     });
+  };
+}
+
+/**
+ * Ask a LiteLLM gateway not to answer from its RESPONSE cache, opt-in via SH_GATEWAY_CACHE=off.
+ *
+ * A LiteLLM proxy with response caching on returns its stored reply, with the same message id
+ * and no model call, for a request byte-identical to an earlier one (found on a benchmark
+ * gateway, 2026-10-17). Repeated benchmark reps send such requests, so they stop being
+ * independent samples. LiteLLM's per-request control is a body field, `cache: {"no-cache":
+ * true}`; it skips the lookup and the request goes to the model. Neither `metadata` nor a
+ * `Cache-Control` header changes the cache key. This is separate from Anthropic prompt caching
+ * (SH_PROMPT_CACHE): the two can be set independently. An existing `cache` object is kept
+ * and only gains `no-cache`.
+ */
+export function bypassGatewayCache(params: Record<string, unknown>): void {
+  const cur = params.cache;
+  params.cache = {
+    ...(cur && typeof cur === 'object' ? (cur as Record<string, unknown>) : {}),
+    'no-cache': true,
   };
 }
 
