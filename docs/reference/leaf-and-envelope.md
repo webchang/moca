@@ -59,14 +59,14 @@ own writable copy of the context, discarded when the run ends. It must be a bool
 
 The 200 body is a `LeafResult`:
 
-| `status`    | Other fields                                                                                |
-| ----------- | ------------------------------------------------------------------------------------------- |
-| `done`      | `verdict: {item_id, verdict: "FLAGGED" or "CLEAR", reason}`                                 |
-| `paused`    | `gateId` (number), `gate: {summary, proposed_action}`                                       |
-| `aborted`   |                                                                                             |
-| `solved`    | `patch`, `usage?`                                                                           |
-| `responded` | `text`, `usage?`                                                                            |
-| `failed`    | `reason`: `no_verdict`, `invalid_verdict`, `bad_inputs`, `error` or `saturated`; `message?` |
+| `status`    | Other fields                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `done`      | `verdict: {item_id, verdict: "FLAGGED" or "CLEAR", reason}`                                                                           |
+| `paused`    | `gateId` (number), `gate: {summary, proposed_action}`                                                                                 |
+| `aborted`   |                                                                                                                                       |
+| `solved`    | `patch`, `usage?`                                                                                                                     |
+| `responded` | `text`, `usage?`                                                                                                                      |
+| `failed`    | `reason`: `no_verdict`, `invalid_verdict`, `bad_inputs`, `error`, `saturated` or `owner_lost` (reaper-written only, #558); `message?` |
 
 A `failed` result is returned as HTTP 200 on the sync path, not as a 4xx or 5xx, except `saturated`,
 which becomes 503 with `Retry-After`. Every non-saturated outcome is stored at `leaf:result:<id>` with

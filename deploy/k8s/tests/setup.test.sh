@@ -387,11 +387,12 @@ expect_out 'no SH_GITHUB_CLIENT_ID'
 grep -q "^kubectl --context kind-moca apply -k $REPO/deploy/k8s/.generated/kind\$" "$MOCK_LOG" || fail 'not applied from the generated overlay'
 grep -q '^  - ../../overlays/kind$' "$MOCK_STATE/applied-kustomization.yaml" || fail 'the generated overlay does not build on overlays/kind'
 [[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:8080 ]] || fail 'kind advertises the wrong harness URL'
-# The control plane's configMapKeyRefs are not optional, bar the two tier keys: a missing key stops
-# the pod opaquely. The tier keys and the token lifetimes are written on every run too ('' when
-# untiered or defaulted, as here), so the hash input is the same eight keys on every stack.
-[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_GITHUB_CLIENT_ID","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS"]' ]] ||
-  fail 'moca-settings must hold exactly the eight keys the control plane and the supervisor reference'
+# The control plane's configMapKeyRefs are not optional, bar the two tier keys and the catalog
+# allow-list: a missing key stops the pod opaquely. Those and the token lifetimes are written on
+# every run too ('' when untiered, defaulted or empty, as here), so the hash input is the same nine
+# keys on every stack.
+[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_GITHUB_CLIENT_ID","SH_MODEL_CATALOG_HOSTS","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS"]' ]] ||
+  fail 'moca-settings must hold exactly the nine keys the control plane and the supervisor reference'
 [[ -z "$(setting SH_SANDBOX_TIERS)" && -z "$(setting SH_SANDBOX_DEFAULT_TIER)" ]] || fail 'kind is never tiered'
 expect_out 'port-forward svc/moca-supervisor 8080:8080'
 pass 'kind: generated overlay applied; control plane held at 0 without a client id; access printed'
@@ -1092,8 +1093,8 @@ jq -nc '{apiVersion: "v1", kind: "Secret", metadata: {name: "op-cert", namespace
 for k in SH_SINGLE_NAMESPACE SH_ROUTE_DOMAIN SH_TLS_SECRET SH_SANDBOX_DEFAULT_TIER SH_SANDBOX_COUNT; do
   setup_cm moca-single | jq -e --arg k "$k" '.data | has($k)' >/dev/null || fail "ocp-single with Routes: moca-setup lacks $k"
 done
-[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 8 ]] ||
-  fail 'ocp-single with Routes: moca-settings does not hold exactly eight keys'
+[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 9 ]] ||
+  fail 'ocp-single with Routes: moca-settings does not hold exactly nine keys'
 [[ "$(jq -r '.data.SH_PUBLIC_HARNESS_URL' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == https://moca.example.test ]] ||
   fail 'ocp-single with Routes: SH_PUBLIC_HARNESS_URL is not the supervisor Route'
 [[ "$(annotation_adds moca-control-plane)" == 1 && "$(annotation_adds moca-supervisor)" == 1 ]] ||
@@ -1271,5 +1272,52 @@ jq '.data.SH_SESSION_TOKEN_TTL_SECONDS = "5m"' "$MOCK_STATE/moca__ConfigMap__moc
 (export SH_GITHUB_CLIENT_ID=Iv1.a; expect_fail --target kind --skip-build)
 expect_out "moca-settings holds SH_SESSION_TOKEN_TTL_SECONDS='5m'"
 pass 'a malformed token lifetime is refused, given (before any apply) or stored'
+
+# The catalog allow-list: a sticky setting like the others.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS=gw.example.com,litellm.team-a.svc; expect_ok --target kind --skip-build)
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == 'gw.example.com,litellm.team-a.svc' ]] ||
+  fail 'SH_MODEL_CATALOG_HOSTS was not written to moca-settings'
+h_hosts="$(settings_hash)"
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == 'gw.example.com,litellm.team-a.svc' ]] ||
+  fail 'a re-run without SH_MODEL_CATALOG_HOSTS dropped it'
+[[ "$(settings_hash)" == "$h_hosts" ]] || fail 'an unchanged re-run changed the settings hash'
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS=; expect_ok --target kind --skip-build)
+[[ -z "$(setting SH_MODEL_CATALOG_HOSTS)" ]] || fail 'SH_MODEL_CATALOG_HOSTS= did not clear the allow-list'
+[[ "$(settings_hash)" != "$h_hosts" ]] || fail 'a cleared allow-list did not change the settings hash (the control plane would not roll)'
+grep -q 'key: SH_MODEL_CATALOG_HOSTS' "$REPO/deploy/k8s/base/control-plane.yaml" ||
+  fail 'the control plane does not read the catalog allow-list from moca-settings'
+pass 'SH_MODEL_CATALOG_HOSTS is a sticky setting; empty is the default; a change rolls'
+
+for bad in 'https://gw.example.com' 'gw.example.com:4000' 'gw example.com' 'user@gw.example.com' 'gw.example.com/path'; do
+  reset_state
+  (export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS="$bad"; expect_fail --target kind --skip-build)
+  expect_out "SH_MODEL_CATALOG_HOSTS='$bad'"
+  ! grep -q '^kubectl .*apply' "$MOCK_LOG" || fail "SH_MODEL_CATALOG_HOSTS='$bad' reached kubectl apply"
+done
+# An embedded newline: read -r in valid_catalog_hosts sees only the first line, so without the
+# up-front rejection this would validate here and crashloop the control plane at boot.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS=$'gw.example.com\nhttps://x'; expect_fail --target kind --skip-build)
+expect_out 'must be comma-separated bare hostnames'
+! grep -q '^kubectl .*apply' "$MOCK_LOG" || fail 'an embedded newline in SH_MODEL_CATALOG_HOSTS reached kubectl apply'
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+jq '.data.SH_MODEL_CATALOG_HOSTS = "gw.example.com\nhttps://x"' "$MOCK_STATE/moca__ConfigMap__moca-settings.json" >"$TMP/cm" &&
+  mv "$TMP/cm" "$MOCK_STATE/moca__ConfigMap__moca-settings.json"
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_fail --target kind --skip-build)
+expect_out 'moca-settings holds SH_MODEL_CATALOG_HOSTS'
+pass 'an embedded newline in the catalog allow-list is refused, given (before any apply) or stored'
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS='GW.Example.Com'; expect_ok --target kind --skip-build)
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == 'GW.Example.Com' ]] ||
+  fail 'upper-case hostnames were mangled instead of passed through for the control plane to lower-case'
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+jq '.data.SH_MODEL_CATALOG_HOSTS = "gw.example.com:4000"' "$MOCK_STATE/moca__ConfigMap__moca-settings.json" >"$TMP/cm" &&
+  mv "$TMP/cm" "$MOCK_STATE/moca__ConfigMap__moca-settings.json"
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_fail --target kind --skip-build)
+expect_out "moca-settings holds SH_MODEL_CATALOG_HOSTS='gw.example.com:4000'"
+pass 'a malformed catalog allow-list is refused, given (before any apply) or stored'
 
 echo "setup.test.sh: all passed"

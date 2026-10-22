@@ -108,6 +108,7 @@ function startExec(
   const call = client.exec(
     {
       sandboxId: opts.sandboxId ?? 'w',
+      workload: '',
       exec: {
         reqId: opts.reqId ?? 1,
         command: opts.command ?? 'true',

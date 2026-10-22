@@ -277,3 +277,50 @@ describe('relay server exec error status wiring', () => {
     expect(call.ended).toBe(false);
   });
 });
+
+describe('relay server exec workload wiring (workload sandboxes spec §3.3)', () => {
+  // The handler must hand ExecRequest.workload to routeExec: dropping it would refuse every Exec to
+  // a workload sandbox, and would let one naming a workload reach a shared-pool sandbox.
+  it('passes ExecRequest.workload through, so a mismatch fails PERMISSION_DENIED', async () => {
+    const WL = `w-${'a'.repeat(32)}`;
+    const { server } = buildServer({
+      records,
+      validateToken: () => true,
+      validateExecToken: () => true,
+      // A stand-in verifier: the shared token (validateToken) admits the worker, so it is a
+      // shared-pool sandbox, and the Exec check is armed.
+      verifyAttach: () => ({ reason: 'unused' }),
+    });
+    const attach = getHandler(server, '/sandbox.v1.SandboxWorker/Attach');
+    const exec = getHandler(server, '/sandbox.v1.SandboxExec/Exec');
+    const worker = fakeAttach();
+    attach(worker);
+    worker.emit('data', {
+      hello: {
+        sandboxId: 'sbx-1',
+        labels: {},
+        capabilities: [],
+        image: '',
+        arch: 'amd64',
+        capacityMax: 1,
+        trust: 'trusted',
+      },
+    });
+    const call = fakeExecCall({
+      sandboxId: 'sbx-1',
+      workload: WL,
+      exec: {
+        reqId: 3,
+        command: 'x',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      },
+    });
+    exec(call);
+    await vi.waitFor(() => expect(call.streamError).toBeInstanceOf(Error));
+    expect((call.streamError as { code?: number }).code).toBe(status.PERMISSION_DENIED);
+    expect(worker.written).toEqual([]);
+  });
+});

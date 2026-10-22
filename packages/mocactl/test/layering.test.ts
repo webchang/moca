@@ -25,15 +25,49 @@ describe('layering (spec §3.1)', () => {
     }
   });
 
-  // ADR-0038: exactly one exception to ADR-0036's rule. A second one must fail here.
-  const ALLOWED_WORKSPACE_DEPS = new Set(['@moca/config-bundle']);
+  // ADR-0038 and ADR-0042: exactly two exceptions to ADR-0036's rule -- @moca/config-bundle (bundle
+  // building) and @moca/sandbox-client (SBX0's exec client, tools and MCP server). Neither carries
+  // Pi, server internals or substrate assumptions. A third one must fail here.
+  const ALLOWED_WORKSPACE_DEPS = new Set(['@moca/config-bundle', '@moca/sandbox-client']);
 
-  it('declares no workspace dependency beyond the ADR-0038 allow-list', () => {
+  it('declares no workspace dependency beyond the ADR-0038/ADR-0042 allow-list', () => {
     const all = { ...pkg.dependencies, ...pkg.devDependencies };
     for (const [name, range] of Object.entries(all)) {
       if (ALLOWED_WORKSPACE_DEPS.has(name)) continue;
       expect(String(range), name).not.toMatch(/^workspace:/);
       expect(name).not.toMatch(/^@moca\//);
     }
+  });
+
+  it('keeps @moca/sandbox-client free of Pi and server packages at runtime (ADR-0042)', () => {
+    const sc = JSON.parse(
+      readFileSync(new URL('../../sandbox-client/package.json', import.meta.url), 'utf8'),
+    );
+    expect(Object.keys(sc.dependencies).sort()).toEqual([
+      '@bufbuild/protobuf',
+      '@grpc/grpc-js',
+      '@modelcontextprotocol/sdk',
+    ]);
+  });
+
+  it('keeps Pi out of @moca/sandbox-client/src: no @earendil-works import (ADR-0042)', () => {
+    const scSrc = new URL('../../sandbox-client/src/', import.meta.url).pathname;
+    const walk = (dir: string): string[] =>
+      readdirSync(join(scSrc, dir), { withFileTypes: true }).flatMap((d) =>
+        d.isDirectory() ? walk(join(dir, d.name)) : [join(dir, d.name)],
+      );
+    const files = walk('.').filter((f) => f.endsWith('.ts'));
+    expect(files.length).toBeGreaterThan(3);
+    for (const f of files) {
+      const text = readFileSync(join(scSrc, f), 'utf8');
+      const imports = [...text.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].map(
+        (m) => m[1],
+      );
+      for (const i of imports) expect(i, `${f} imports ${i}`).not.toMatch(/^@earendil-works\//);
+    }
+  });
+
+  it('depends on @moca/sandbox-client (ADR-0042)', () => {
+    expect(pkg.dependencies['@moca/sandbox-client']).toBe('workspace:*');
   });
 });

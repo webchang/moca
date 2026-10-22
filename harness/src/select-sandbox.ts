@@ -17,7 +17,9 @@ import {
   forLog,
   parseSandboxTiers,
   RedisAffinityStore,
+  OWNER_LABEL,
   TIER_LABEL,
+  WORKLOAD_LABEL,
   type AffinityStore,
 } from './sandbox-affinity.js';
 
@@ -343,6 +345,28 @@ export class SandboxPoolEmptyError extends Error {
 }
 
 /**
+ * Thrown when a run names a workload and none of that workload's sandboxes can serve it (workload
+ * sandboxes spec §3.3). Never answered by falling back to the shared pool: that would run one
+ * user's workload on a sandbox shared with everyone. A session whose workload sandbox served an
+ * earlier turn first waits out the P6.3 grace (SandboxAffinityPendingError), as any affine session
+ * does; this is what follows when there is nothing left to wait for.
+ *
+ * A subclass of SandboxPoolEmptyError, so every path that treats an empty pool as "no capacity
+ * right now" treats this the same way. `code` is the stable error the HTTP layer will answer with.
+ */
+export class WorkloadSandboxUnavailableError extends SandboxPoolEmptyError {
+  readonly code = 'workload_sandbox_unavailable';
+  constructor(
+    readonly workload: string,
+    detail = 'no sandbox of this workload is attached',
+  ) {
+    super('');
+    this.message = `workload '${forLog(workload)}': ${detail}`;
+    this.name = 'WorkloadSandboxUnavailableError';
+  }
+}
+
+/**
  * Thrown when a server-mode turn has no sandbox to run tools in (MI1 §5 R3). Without it, a `null`
  * sandbox config leaves Pi's built-in tools running locally in the worker process. Deliberately NOT
  * in turnErrorStatus's NO_CAPACITY set: this is a deployment that has no sandbox configured at all,
@@ -455,7 +479,7 @@ export interface SelectDeps {
   makeTransport?: (
     sandboxId: string,
     client: ExecClientLike,
-    opts?: { workspaceKey?: string },
+    opts?: { workspaceKey?: string; workload?: string },
   ) => SandboxTransport;
   /** Session-to-sandbox affinity (P6.3); defaults to a RedisAffinityStore. Only consulted when remoteOn. */
   affinity?: AffinityStore;
@@ -585,6 +609,18 @@ export async function selectPoolSandbox(
      * no tiers are declared.
      */
     tier?: string;
+    /**
+     * The workload key (`w-<32 hex>`) the run names (workload sandboxes spec §3.3). Set: only
+     * records labelled `moca.dev/workload=<key>` are candidates, and there is no fallback to the
+     * shared pool. Absent or '': records carrying any workload label are never candidates.
+     */
+    workload?: string;
+    /**
+     * The run owner's `recordScope` (32 hex, the hash knative-server's workloads.ts keys the owner's
+     * Redis records by). Required with `workload`: a candidate must also carry
+     * `moca.dev/owner=<ownerScope>`, a second check on the same signed binding (spec §3.3).
+     */
+    ownerScope?: string;
   },
   deps: SelectDeps = {},
 ): Promise<SelectedSandbox | null> {
@@ -608,7 +644,21 @@ async function select(
   // did before /turn began leasing here — so a caller that passes no holder keeps today's behaviour.
   const holderId = opts.holderId ?? sessionId;
   const selector = env.KAGENTI_SANDBOX_POOL_SELECTOR;
+  const workload = opts.workload || undefined;
+  const ownerScope = opts.ownerScope || undefined;
+  // Without the owner a workload run could not apply the owner half of the filter; refuse rather
+  // than fall back to matching on the workload alone.
+  if (workload && !ownerScope) {
+    throw new WorkloadSandboxUnavailableError(workload, 'the run names no owner scope');
+  }
+  // Workload sandboxes are relay records only; no other inventory can serve a workload run.
+  const noRecords = () =>
+    new WorkloadSandboxUnavailableError(
+      workload!,
+      'workload sandboxes need the relay sandbox pool (KAGENTI_SANDBOX_POOL_SELECTOR, SH_REMOTE_SANDBOX=1)',
+    );
   if (!selector) {
+    if (workload) throw noRecords();
     const config = await resolveSandboxConfig(env, headCwd, deps.run);
     return config
       ? { config, leased: false, heartbeat: async () => {}, release: async () => {} }
@@ -622,11 +672,14 @@ async function select(
   const lease = deps.lease ?? sharedLease(env.REDIS_URL);
 
   const source = resolveDiscoverySource(env, opts.remoteSandbox === true);
+  if (workload && (opts.remoteSandbox !== true || source === 'pods')) throw noRecords();
   // Read per call, like every other knob here; a bad value fails the selection naming the variable.
   const tiers = parseSandboxTiers(env);
   // `||`, not `??`: a session stored with '' (created before tiers were declared) gets the default.
   const tier = tiers ? opts.tier || tiers.default : '';
-  const listed = source === 'records' ? [] : await list(selector, namespace, context, deps.run);
+  // A workload run never lists pods: no pod is a workload sandbox.
+  const listed =
+    source === 'records' || workload ? [] : await list(selector, namespace, context, deps.run);
   // Pods are the Knative-era container inventory: the default tier, and only that (spec §4 step 1).
   const pods = tiers && tier !== tiers.default ? [] : listed;
 
@@ -646,10 +699,23 @@ async function select(
     return !!tiers && !!t && t !== tier && tiers.names.includes(t);
   };
   if (tiers) grpcRecs = grpcRecs.filter((r) => recordInTier(r, tier, tiers.names));
+  // The workload filter (spec §3.3): a workload run sees only its own workload's sandboxes, of its own
+  // owner, and a run
+  // without one never sees any workload's. A deployment with no workload sandboxes has no record
+  // carrying the label (no shipped worker sends it, and a relay with attach keys strips it from
+  // shared-pool Hellos), so for it this keeps every record, exactly as before.
+  // A workload run also requires the record's owner to be the run's (spec §3.3).
+  const inScope = (r: SandboxRecord): boolean =>
+    (r.labels?.[WORKLOAD_LABEL] || undefined) === workload &&
+    (!workload || r.labels?.[OWNER_LABEL] === ownerScope);
+  grpcRecs = grpcRecs.filter(inScope);
   const grpcById = new Map(grpcRecs.map((r) => [r.sandboxId, r]));
 
   const candidates = [...pods, ...grpcRecs.map((r) => r.sandboxId)];
-  const empty = () => new SandboxPoolEmptyError(selector, source, tiers ? tier : undefined);
+  const empty = () =>
+    workload
+      ? new WorkloadSandboxUnavailableError(workload)
+      : new SandboxPoolEmptyError(selector, source, tiers ? tier : undefined);
 
   // Acquire `name`, then build what the caller gets; a throw after the acquire releases the lease
   // before the original error propagates (unchanged from before -- it is just shared by two paths now).
@@ -685,7 +751,7 @@ async function select(
             // an unseen key and lives until an idle Reclaim (§4.4), so keying it per turn would
             // open turn 2 of a session in an empty workspace and give it its own standby VM pool
             // (§4.3) -- continuity lost and standbys multiplied per turn rather than per session.
-            { workspaceKey: sessionId },
+            { workspaceKey: sessionId, ...(workload ? { workload } : {}) },
           )
         : undefined;
       return {
@@ -756,7 +822,13 @@ async function select(
       );
       return got;
     }
-    if (allRecs.some((r) => r.sandboxId === prior.sandboxId && inOtherDeclaredTier(r))) {
+    // Present but outside this run's workload scope (a session moved between a workload and the
+    // shared pool) is the same case as retiered: waiting cannot bring it into scope.
+    if (
+      allRecs.some(
+        (r) => r.sandboxId === prior.sandboxId && (inOtherDeclaredTier(r) || !inScope(r)),
+      )
+    ) {
       // Present, but advertising another DECLARED tier: an operator re-tiered the worker. It will not
       // come back to this tier by waiting, so the grace would only delay the same outcome (Review
       // Focus 3). An UNLABELLED record, or one labelled with an undeclared tier, is not "another tier"

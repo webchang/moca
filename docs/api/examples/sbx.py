@@ -1,16 +1,20 @@
-"""sbx: a command-line client for one sandbox/v1 workspace, built on sandbox_v1_client.py.
+"""sbx: an EXAMPLE of a thin command-line client for one sandbox, built on sandbox_v1_client.py.
 
-Meant for a coding agent whose shell tool is restricted to `sbx ...`: every command runs in a fresh
-microVM over the workspace, and nothing runs on the local machine. See sandbox-v1-direct-client.md.
+The supported CLI is `mocactl sbx run` and `put` (SBX0 1c); this file shows how little a client
+needs. Every command runs in a fresh microVM over the workspace, and nothing runs on the local
+machine. See sandbox-v1-direct-client.md.
 
     sbx run [COMMAND...]      run COMMAND (or, with no arguments, the script on stdin) in /workspace
     sbx put PATH              write stdin to PATH in the workspace (parent directories created)
     sbx push [DIR]            replace /workspace with DIR's git working tree; commit it as the baseline
     sbx pull                  print every change since the push as a git patch
 
-Environment: SBX_ADDR, SBX_SANDBOX_ID, SBX_WORKSPACE_KEY, and SBX_TOKEN or SBX_TOKEN_FILE.
+Environment: what `mocactl sbx env <id>` prints (SBX_ADDR, SBX_TLS, SBX_CA_FILE, SBX_SANDBOX_ID,
+SBX_WORKSPACE_KEY, SBX_TOKEN_CMD); or, for a MOCA relay's per-client token, SBX_ADDR, SBX_TLS=0,
+SBX_SANDBOX_ID, SBX_WORKSPACE_KEY, and SBX_TOKEN or SBX_TOKEN_FILE.
 Optional: SBX_TIMEOUT (seconds per command, default 600), SBX_LOG (append one JSON line per call).
-`sbx run` exits with the command's own exit code; 124 means it timed out, 125 that the sandbox failed.
+`sbx run` exits with the command's own exit code (128 + n when killed by signal n); 124 means it
+timed out, 125 that the sandbox failed, was busy, or cancelled a command that outlived its token.
 """
 
 import io
@@ -36,9 +40,7 @@ PULL = "cd /workspace && git add -A -N . && git diff --binary HEAD"
 
 
 def sandbox() -> Sandbox:
-    env = os.environ
-    token = env.get("SBX_TOKEN") or open(env["SBX_TOKEN_FILE"]).read().strip()
-    return Sandbox(env["SBX_ADDR"], env["SBX_SANDBOX_ID"], env["SBX_WORKSPACE_KEY"], token)
+    return Sandbox.from_env()
 
 
 def log(op: str, started: float, code: int) -> None:
@@ -53,16 +55,23 @@ def run(command: str, stdin: bytes = b"", op: str = "run") -> int:
     try:
         r = sandbox().exec(command, stdin=stdin, timeout_s=int(os.environ.get("SBX_TIMEOUT", "600")))
     except RuntimeError as e:
-        msg = str(e)
-        code = 124 if "timeout:" in msg else 125
-        print(f"sbx: {'command timed out' if code == 124 else msg}", file=sys.stderr)
-        log(op, started, code)
-        return code
+        # SandboxError and its kinds -- machinery, a busy sandbox ("sandbox busy"), a command that
+        # outlived its token ("sandbox token expired during the Exec") -- or a failed token command.
+        # The message says which.
+        print(f"sbx: {e}", file=sys.stderr)
+        log(op, started, 125)
+        return 125
     sys.stdout.buffer.write(r.stdout)
     sys.stderr.buffer.write(r.stderr)
+    if r.capped:
+        print(f"sbx: timeout capped at {r.timeout_s} s, the sandbox token's lifetime minus 60 s", file=sys.stderr)
     if r.truncated:
         print("sbx: stdout exceeded 8 MiB and was cut", file=sys.stderr)
-    code = r.exit_code if r.exit_code >= 0 else 128 + 9
+    if r.timed_out:
+        print(f"sbx: command timed out after {r.timeout_s} s", file=sys.stderr)
+        log(op, started, 124)
+        return 124
+    code = r.exit_code if r.exit_code >= 0 else 128 - r.exit_code  # killed by signal n: 128 + n
     log(op, started, code)
     return code
 

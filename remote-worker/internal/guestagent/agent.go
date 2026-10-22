@@ -87,10 +87,13 @@ func (a *Agent) ShellPID() int {
 // command is the fork this whole design removes.
 func (a *Agent) forkShell() error {
 	// No explicit cmd.Env, unlike internal/exec's runner (MI1 §5 R6), and deliberately so: the
-	// guest agent is the VM's own init-time process and holds no credential or worker setting,
-	// and Request carries no environment across the vsock (protocol.go). The guard is absent
-	// because there is nothing to strip, not because it lives elsewhere. If Request or the
-	// agent's own environment ever gains a secret, commands here need R6's filter.
+	// guest agent is the VM's own init-time process and Request carries no environment across
+	// the vsock (protocol.go). The inherited env is init's: since P4.1 it carries the proxy
+	// settings (HTTPS_PROXY etc., pointing at the in-guest egress listener) and the inert
+	// placeholder GH_TOKEN/GITHUB_TOKEN=moca-placeholder, never a secret (D7); real
+	// credentials are injected on the host by moca-egress. The guard is absent because there
+	// is nothing to strip, not because it lives elsewhere. If Request or the agent's own
+	// environment ever gains a secret, commands here need R6's filter.
 	cmd := exec.Command(a.opts.Shell)
 	cmd.Dir = a.opts.WorkDir
 	in, err := cmd.StdinPipe()

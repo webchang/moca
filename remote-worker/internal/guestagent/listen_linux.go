@@ -162,3 +162,17 @@ type vsockConn struct {
 
 func (c *vsockConn) LocalAddr() net.Addr  { return c.local }
 func (c *vsockConn) RemoteAddr() net.Addr { return c.remote }
+
+// CloseWrite half-closes the connection (shutdown(SHUT_WR)) so the peer reads EOF
+// while this side can still read; the egress forwarder relies on it.
+func (c *vsockConn) CloseWrite() error {
+	rc, err := c.File.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if err := rc.Control(func(fd uintptr) { serr = unix.Shutdown(int(fd), unix.SHUT_WR) }); err != nil {
+		return err
+	}
+	return serr
+}

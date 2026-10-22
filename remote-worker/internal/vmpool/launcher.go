@@ -1,6 +1,17 @@
 package vmpool
 
-import "context"
+import (
+	"context"
+	"os"
+)
+
+// EgressBinder hands a VM's guest-egress listening socket to moca-egress (MI1 §8.3).
+// sessionID is RestoreRequest.Key; grant is nil in P4.1. Register must dup ln (the
+// caller keeps ownership of its descriptor).
+type EgressBinder interface {
+	Register(ctx context.Context, vmID, sessionID string, grant []byte, ln *os.File) error
+	Unregister(ctx context.Context, vmID string) error
+}
 
 // OutputCapBytes bounds stdout and stderr independently, and is PINNED to
 // wexec.BufferCap and hence to the harness's DEFAULT_OUTPUT_CAP. Spec §4.1 is

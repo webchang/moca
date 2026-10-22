@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -59,8 +61,16 @@ const (
 	// rather than derived from anything per-VM, because nothing about them needs to
 	// vary — every jail is a fresh, disposable root.
 	apiSockRelPath = "/run/firecracker.socket"
-	vsockRelPath   = "/vsock.sock"
+	vsockRelPath   = "/run/v.sock"
+
+	// defaultEgressVsockPort is the guest-initiated vsock port the guest agent's egress splice
+	// connects to (P4.1 §6). Firecracker maps a guest connect to it onto the host unix socket
+	// <vsock uds_path>_<port>, i.e. <jail>/run/v.sock_1025.
+	defaultEgressVsockPort uint32 = 1025
 )
+
+// egressControlTimeout bounds each Register and Unregister round trip to moca-egress.
+const egressControlTimeout = 5 * time.Second
 
 // FirecrackerOptions configures the Firecracker launcher.
 type FirecrackerOptions struct {
@@ -109,6 +119,13 @@ type FirecrackerOptions struct {
 	// VsockPort is the guest agent's listen port. Defaults to 1024 (the guest
 	// agent's own default) when zero.
 	VsockPort uint32
+
+	// Egress, when non-nil, turns guest egress on: every restored VM gets a host listener at
+	// <jail>/run/v.sock_<EgressPort> that is registered with moca-egress before the VM can
+	// become a standby. Nil is today's behaviour: no listener, nothing registered.
+	Egress EgressBinder
+	// EgressPort is the guest-initiated vsock port. Defaults to 1025 when zero.
+	EgressPort uint32
 }
 
 func (o *FirecrackerOptions) setDefaults() {
@@ -118,6 +135,22 @@ func (o *FirecrackerOptions) setDefaults() {
 	if o.WorkspaceImageBytes <= 0 {
 		o.WorkspaceImageBytes = DefaultWorkspaceImageBytes
 	}
+	if o.EgressPort == 0 {
+		o.EgressPort = defaultEgressVsockPort
+	}
+}
+
+// maxEgressSocketPath is the longest egress socket path any VM id can produce under this
+// configuration: jailer's <chroot-base>/<exec basename>/<id>/root layout, with the longest id
+// nextIDLocked can mint ("vm-" plus a 20-digit uint64), plus the vsock path and "_<port>".
+func (o FirecrackerOptions) maxEgressSocketPath() string {
+	return o.ChrootBase + "/" + filepath.Base(o.FirecrackerBin) + "/vm-" + strings.Repeat("9", 20) +
+		"/root" + vsockRelPath + "_" + strconv.FormatUint(uint64(o.EgressPort), 10)
+}
+
+// egressSocketPath is the host path of VM jailRoot's egress listener.
+func (o FirecrackerOptions) egressSocketPath(jailRoot string) string {
+	return filepath.Join(jailRoot, vsockRelPath) + "_" + strconv.FormatUint(uint64(o.EgressPort), 10)
 }
 
 func (o FirecrackerOptions) validate() error {
@@ -140,6 +173,17 @@ func (o FirecrackerOptions) validate() error {
 			"— the cgroup pool could not write a memory.max for the VMs it creates, so every " +
 			"restore would fail (spec §6 mitigation #3 would be unimplemented); set it from " +
 			"vmpool.PerVMBytes(cfg)")
+	}
+	// bind(2) fails on a path that does not fit sun_path (108 on Linux, 104 elsewhere), and it
+	// would do so per VM at restore time, as an opaque error. Refuse at construction instead,
+	// against the worst-case id. Only when egress is on: with it off the egress socket is never
+	// bound and this constraint does not exist.
+	if o.Egress != nil {
+		if p := o.maxEgressSocketPath(); len(p) >= len(syscall.RawSockaddrUnix{}.Path) {
+			return fmt.Errorf("firecracker: egress socket path %q is %d bytes, which does not fit "+
+				"sun_path (%d bytes including the terminator); shorten ChrootBase (SH_CHROOT_BASE)",
+				p, len(p), len(syscall.RawSockaddrUnix{}.Path))
+		}
 	}
 	return nil
 }
@@ -289,6 +333,10 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	}
 
 	var cmd *exec.Cmd
+	// egressLn is the pre-bound guest-egress listener (nil when egress is off); egressRegistered
+	// records that moca-egress holds a dup of it and must be told to let go.
+	var egressLn *net.UnixListener
+	egressRegistered := false
 	// cleanup mirrors Destroy's error handling below: a failure here (permission,
 	// EBUSY) must be surfaced, not swallowed, or the caller sees only the original
 	// failure with no signal that a stale jail or process was left behind — the
@@ -303,6 +351,18 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 				errs = append(errs, fmt.Errorf("kill -%d: %w", pid, err))
 			}
 			_ = cmd.Wait()
+		}
+		// SIGKILL, then Unregister, then unlink (P4.1 §6): nothing the dead guest could still
+		// have in flight may reach a registration that is gone, and the path is unlinked last.
+		if egressRegistered {
+			uctx, ucancel := context.WithTimeout(context.Background(), egressControlTimeout)
+			if err := l.opts.Egress.Unregister(uctx, req.ID); err != nil {
+				errs = append(errs, fmt.Errorf("egress unregister %s: %w", req.ID, err))
+			}
+			ucancel()
+		}
+		if egressLn != nil {
+			_ = egressLn.Close() // unlinks the path (ListenUnix's unlink-on-close)
 		}
 		if err := os.RemoveAll(jailRoot); err != nil {
 			errs = append(errs, fmt.Errorf("remove jail %s: %w", jailRoot, err))
@@ -328,6 +388,40 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 
 	if err := os.MkdirAll(filepath.Join(jailRoot, "run"), 0o700); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: create jail: %w", req.ID, err), cleanup())
+	}
+
+	// The guest-egress listener, bound and listen()ing BEFORE cmd.Start below (P4.1 §6). Firecracker
+	// maps a guest vsock connect to port N onto a connect(2) to <uds_path>_N, and a connect to a
+	// path nobody is listening on is refused (E13 saw the guest RST when its listener was not up
+	// yet). net.ListenUnix does bind+listen before it returns, so by the time the jailer exists
+	// the socket is already accepting and the race is closed by construction rather than by a
+	// retry. The VM is a standby only once Register succeeds: any failure here fails the restore,
+	// so no VM is ever pooled without an egress policy owner (fail-closed).
+	if l.opts.Egress != nil {
+		sockPath := l.opts.egressSocketPath(jailRoot)
+		_ = os.Remove(sockPath) // best-effort: a stale socket file from an aborted attempt at this ID
+		ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sockPath, Net: "unix"})
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: egress listen %s: %w", req.ID, sockPath, err), cleanup())
+		}
+		egressLn = ln
+		// Same reason as the hardlinks below: this process creates the socket, so it is owned
+		// by whatever the launcher runs as, not by the uid/gid jailer drops to.
+		if err := os.Lchown(sockPath, l.opts.UID, l.opts.GID); err != nil {
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: egress chown %s to %d:%d: %w", req.ID, sockPath, l.opts.UID, l.opts.GID, err), cleanup())
+		}
+		f, err := ln.File() // a dup; Register dups again, so this one is closed right after
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: egress listener fd: %w", req.ID, err), cleanup())
+		}
+		rctx, rcancel := context.WithTimeout(ctx, egressControlTimeout)
+		regErr := l.opts.Egress.Register(rctx, req.ID, req.Key, nil, f)
+		rcancel()
+		_ = f.Close()
+		if regErr != nil {
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: egress register: %w", req.ID, regErr), cleanup())
+		}
+		egressRegistered = true
 	}
 
 	// Hardlink the golden snapshot's components into the jail at fixed, jail-relative
@@ -495,6 +589,8 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		apiSockHost:   apiSockHost,
 		vsockHostPath: filepath.Join(jailRoot, vsockRelPath),
 		vsockPort:     l.opts.VsockPort,
+		egress:        l.opts.Egress,
+		egressLn:      egressLn,
 	}, nil
 }
 
@@ -792,6 +888,11 @@ type firecrackerVM struct {
 	vsockHostPath string
 	vsockPort     uint32
 
+	// egress and egressLn are set only when the launcher had egress on. egressLn owns the
+	// <jail>/run/v.sock_<port> path (unlink-on-close); Reap unregisters and then closes it.
+	egress   EgressBinder
+	egressLn *net.UnixListener
+
 	mu        sync.Mutex
 	destroyed bool
 	// killed latches the barrier half so the two entry points (Destroy, and
@@ -947,8 +1048,16 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 // write in Exec N is simply absent in Exec N+1 — spec §8's write-durability gate is
 // what catches its omission. `(exit $__fc_rc)` preserves the command's own exit
 // status: sync must not be able to change what the worker reports.
+//
+// The command runs in a SUBSHELL, not a brace group, so that its own `exit` ends the
+// subshell instead of this whole script — a brace group let a command ending in
+// `exit` (every writeFileCommand-based put does; packages/sandbox-client's put/edit
+// scripts end `exit 0`/`exit 1`) skip the sync and take its writes to the grave with
+// the VM's page cache. The guest agent's parked-shell path sources this same script
+// inside its own `( . file )` subshell, so the subshell here is what makes `exit`
+// survivable on BOTH paths.
 func wrapCommand(cmd string) string {
-	return "cd /workspace\n{ " + cmd + "\n}\n__fc_rc=$?\nsync\n(exit $__fc_rc)\n"
+	return "cd /workspace\n( " + cmd + "\n)\n__fc_rc=$?\nsync\n(exit $__fc_rc)\n"
 }
 
 // Run sends exactly one command over a fresh vsock connection. Dialed AFTER resume,
@@ -1135,6 +1244,21 @@ func (v *firecrackerVM) Reap() error {
 		}
 		stopObs()
 		fdGone, threadsGone, fdSeen, threadsSeen = obs.results()
+	}
+	// SIGKILL (already sent) -> Unregister -> unlink (P4.1 §6). Unregistering only after the VMM is
+	// reaped means no live guest can still be mid-connect against a registration being torn down;
+	// closing the listener (which unlinks the path) only after Unregister means moca-egress never
+	// holds a descriptor for a path that has vanished first. An Unregister failure is reported but
+	// must not skip the unlink or the jail removal below: a leaked path is worse than a leaked error.
+	if v.egressLn != nil {
+		if v.egress != nil {
+			uctx, ucancel := context.WithTimeout(context.Background(), egressControlTimeout)
+			if err := v.egress.Unregister(uctx, v.id); err != nil {
+				errs = append(errs, fmt.Errorf("egress unregister %s: %w", v.id, err))
+			}
+			ucancel()
+		}
+		_ = v.egressLn.Close()
 	}
 	// #307 Q4: removeall grows 5.92 -> 22.72 ms across the slot sweep, and it is the only step
 	// in Destroy where a storage-layer answer could apply -- but only for bytes that this unlink

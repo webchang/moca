@@ -162,4 +162,87 @@ describe('frozen context on a prompt leaf', () => {
     expect(executeTurn).not.toHaveBeenCalled();
     expect(transport.exec).not.toHaveBeenCalled();
   });
+
+  it('selects with the workload key when the context names one, and without it otherwise', async () => {
+    const WL = `w-${'a'.repeat(32)}`;
+    const { lease } = relayLease();
+    const overlayContext = vi.fn(async () => '/workspace/.moca-context/runs/run-1');
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const withWl = env(vi.fn());
+    withWl.internalContext!.workload = WL;
+    withWl.internalContext!.ownerScope = 'b'.repeat(32);
+    await runLeaf(withWl, undefined, { executeTurn: okTurn(), overlayContext });
+    expect(selectPoolSandboxMock.mock.calls[0]![3]).toMatchObject({
+      workload: WL,
+      ownerScope: 'b'.repeat(32),
+    });
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    await runLeaf(env(vi.fn()), undefined, { executeTurn: okTurn(), overlayContext });
+    expect(selectPoolSandboxMock.mock.calls[0]![3]).not.toHaveProperty('workload');
+    expect(selectPoolSandboxMock.mock.calls[0]![3]).not.toHaveProperty('ownerScope');
+  });
+
+  it('refuses a malformed workload key or owner scope, or one without the other, before selecting', async () => {
+    selectPoolSandboxMock.mockReset();
+    const WL = `w-${'a'.repeat(32)}`;
+    const OWN = 'b'.repeat(32);
+    for (const bad of [
+      { workload: 'moca-sandbox', ownerScope: OWN },
+      { workload: `w-${'A'.repeat(32)}`, ownerScope: OWN },
+      { workload: 42, ownerScope: OWN },
+      { workload: WL, ownerScope: 'B'.repeat(32) },
+      { workload: WL, ownerScope: 'short' },
+      { workload: WL },
+      { ownerScope: OWN },
+    ]) {
+      const e = env(vi.fn());
+      Object.assign(e.internalContext as Record<string, unknown>, bad);
+      const r = await runLeaf(e, undefined, { executeTurn: okTurn(), overlayContext: vi.fn() });
+      expect(r).toMatchObject({ status: 'failed', message: 'invalid internal context reference' });
+    }
+    expect(selectPoolSandboxMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('a workload on a non-prompt leaf', () => {
+  it.each([
+    [
+      'solve',
+      { kind: 'solve', problemStatement: 'Fix it.', repoUrl: 'https://x/r.git', ref: 'main' },
+    ],
+    ['verdict', { kind: undefined }],
+    ['converge', { kind: 'converge' }],
+  ] as const)(
+    'refuses a %s leaf naming a workload before selecting, never falling back to the shared pool',
+    async (_name, over) => {
+      selectPoolSandboxMock.mockReset();
+      const produceSolve = vi.fn();
+      const produceVerdict = vi.fn();
+      const e = { ...env(vi.fn()), ...over } as LeafEnvelope;
+      e.internalContext!.workload = `w-${'a'.repeat(32)}`;
+      e.internalContext!.ownerScope = 'b'.repeat(32);
+      const r = await runLeaf(e, undefined, { produceSolve, produceVerdict });
+      expect(r).toEqual({
+        status: 'failed',
+        reason: 'error',
+        message: 'a workload sandbox runs prompt leaves only',
+      });
+      expect(produceSolve).not.toHaveBeenCalled();
+      expect(produceVerdict).not.toHaveBeenCalled();
+      expect(selectPoolSandboxMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still runs a solve leaf whose context names no workload', async () => {
+    const produceSolve = vi.fn(async () => {});
+    const e = {
+      ...env(vi.fn()),
+      kind: 'solve',
+      problemStatement: 'Fix it.',
+      repoUrl: 'https://x/r.git',
+      ref: 'main',
+    } as LeafEnvelope;
+    expect(await runLeaf(e, undefined, { produceSolve })).toMatchObject({ status: 'solved' });
+    expect(produceSolve).toHaveBeenCalledOnce();
+  });
 });

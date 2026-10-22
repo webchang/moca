@@ -1,20 +1,34 @@
 import { main } from './cli.js';
 
 const ac = new AbortController();
+
+/** All of stdin, or (with `limit`) the first `limit` bytes or more: the reading stops there. */
+async function readStdinBytes(limit = Infinity): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let n = 0;
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk as Buffer);
+    n += (chunk as Buffer).length;
+    if (n >= limit) break;
+  }
+  return Buffer.concat(chunks);
+}
 process.once('SIGINT', () => ac.abort());
 
 const code = await main(
   process.argv.slice(2),
   process.env,
-  { out: (s) => void process.stdout.write(s), err: (s) => void process.stderr.write(s + '\n') },
+  {
+    out: (s) => void process.stdout.write(s),
+    err: (s) => void process.stderr.write(s + '\n'),
+    outBytes: (b) => void process.stdout.write(b),
+    errBytes: (b) => void process.stderr.write(b),
+  },
   {
     signal: ac.signal,
     stdinIsTTY: process.stdin.isTTY === true,
-    readStdin: async () => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
-      return Buffer.concat(chunks).toString('utf8');
-    },
+    readStdin: async () => (await readStdinBytes()).toString('utf8'),
+    readStdinBytes,
     // Loaded lazily so the headless commands never load Ink or React.
     startInteractive: async (rt, opts) => (await import('./start.js')).startInteractive(rt, opts),
   },

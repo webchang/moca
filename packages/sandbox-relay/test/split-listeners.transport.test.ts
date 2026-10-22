@@ -81,6 +81,7 @@ function exec(
   const call = client.exec(
     {
       sandboxId,
+      workload: '',
       exec: {
         reqId: 1,
         command: 'echo hi',

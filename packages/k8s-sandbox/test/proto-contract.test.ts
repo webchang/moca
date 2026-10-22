@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Hello, Exec, End } from '../src/gen/sandbox/v1/sandbox';
+import { Hello, Exec, End, ExecRequest } from '../src/gen/sandbox/v1/sandbox';
 import { Chunk, Stream } from '../src/gen/sandbox/v1/sandbox.js';
 
 describe('sandbox/v1 generated TypeScript stubs', () => {
@@ -64,6 +64,27 @@ describe('sandbox/v1 generated TypeScript stubs', () => {
       }).finish(),
     );
     expect(old.workspaceKey).toBe('');
+  });
+
+  it('carries ExecRequest.workload, additive: an older encoder reads as the empty string', () => {
+    const wl = `w-${'a'.repeat(32)}`;
+    const exec = {
+      reqId: 1,
+      command: 'true',
+      stdin: new Uint8Array(),
+      timeoutS: 0,
+      streaming: true,
+      workspaceKey: '',
+    };
+    const back = ExecRequest.decode(
+      ExecRequest.encode({ sandboxId: `${wl}-0`, workload: wl, exec }).finish(),
+    );
+    expect(back.workload).toBe(wl);
+    // Field 3 omitted on the wire, as a harness built before the field sends it.
+    const old = ExecRequest.decode(
+      ExecRequest.encode({ sandboxId: 'sbx-1', workload: '', exec }).finish(),
+    );
+    expect(old.workload).toBe('');
   });
 
   it('preserves a negative exit_code (sint32 zigzag)', () => {

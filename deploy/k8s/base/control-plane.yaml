@@ -87,6 +87,15 @@ spec:
             - name: SH_SESSION_TOKEN_TTL_SECONDS
               valueFrom:
                 { configMapKeyRef: { name: moca-settings, key: SH_SESSION_TOKEN_TTL_SECONDS } }
+            # Extra hosts the model catalog may contact (per-session model spec §4.1); '' or absent
+            # means only api.anthropic.com and the default inference endpoint. setup.sh validates
+            # the entries, which the control plane would otherwise refuse to boot on.
+            - name: SH_MODEL_CATALOG_HOSTS
+              valueFrom:
+                {
+                  configMapKeyRef:
+                    { name: moca-settings, key: SH_MODEL_CATALOG_HOSTS, optional: true },
+                }
           ports:
             - { name: http, containerPort: 8080 }
           securityContext:

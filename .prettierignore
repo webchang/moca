@@ -4,6 +4,7 @@ dist/
 *.log
 pnpm-lock.yaml
 packages/k8s-sandbox/src/gen/
+packages/sandbox-client/src/gen/
 gen/
 
 # Sibling checkouts of this same repo. `prettier --write .` (make fmt) walks the directory tree

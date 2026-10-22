@@ -6,6 +6,28 @@
 **Extends:** [P4 — MicroVM sandbox tier](2026-09-09-p4-microvm-sandbox-design.md)
 **Touches:** Z1 (identity spine) — partially, and behind an interface · MU2 (`sandbox-egress` credential delivery)
 
+> **Amendment, 2026-10-21 — the transport-first slice.** Seven decisions, none reversing the design.
+>
+> 1. §12.2 is decided: the proxy is `moca-egress` ([MI1](2026-09-28-moca-multi-user-isolation-design.md)
+>    D4, §2.4, §14). Rossoctl/moca#277 is implemented as MI1 S4's transport and core, without S2.
+> 2. Scope of this slice: no grants, no token endpoint, no TLS interception, no CA in the rootfs, no
+>    placeholder swap. Allowlisted hosts are tunnelled unauthenticated, and `CredentialPolicy` is the seam
+>    S2 fills. `MOCA_TENANCY=multi` is refused by `moca-egress`. #277's CA and swap acceptance items stay
+>    open until the interception slice.
+> 3. E13 is not a gate. Its design requirements are adopted: the listener is pre-bound by `vmpool`, with
+>    `listen()` returned before restore, never a process per connection; a refused vsock dial is a named
+>    error in the guest; scale gates are distributions, not single runs. Source: rossoctl/moca-experiments
+>    `microvm/EXPERIMENTS.md`, "Effect on PR #268 and P4.1", items 1-5.
+> 4. The jail-relative vsock path moves from `/vsock.sock` to `/run/v.sock`, as T1 states. Restore's
+>    existing `vsock_override` carries it, so the snapshot does not change for this reason.
+> 5. New settings: `MOCA_EGRESS_CONTROL_SOCK`, `MOCA_EGRESS_CONTROL_UIDS`, `MOCA_EGRESS_RESOLVER`,
+>    `MOCA_EGRESS_PERMIT_CIDRS`. The last one exempts operator-named private ranges, such as an internal
+>    KB. Link-local is never exempt.
+> 6. Allowlist port rule: an entry without a port allows `443` for CONNECT and `80` for plain HTTP.
+> 7. Standby admission requires `moca-egress`'s `Register` ack when egress is configured. A `moca-egress`
+>    outage therefore stops new standbys as well as egress, which is the fail-closed reading of §6. Ready
+>    standbys are unaffected.
+
 ## 1. What this is, and what it is not
 
 **It is not a new egress design.** Z5 settled credentialed egress in June: forward proxy, baked CA, TLS
@@ -139,7 +161,11 @@ nameserver — and none of the guest-side renumbering Firecracker's clone recipe
 
 Mediated L7 means **tools that ignore proxy environment variables have no network.** `curl`, `git`, `gh`
 and HTTP-transport MCP honour it; stdio-transport MCP servers run in-guest and need nothing. `ssh`, raw
-sockets, and anything doing its own DNS do not work. `NO_PROXY` must be empty.
+sockets, and anything doing its own DNS do not work. `NO_PROXY` names only the guest's own loopback
+(`localhost,127.0.0.1,::1`) and never a remote host. _Amended 2026-10-22 (#582 review):_ it was
+"must be empty", but an empty `NO_PROXY` sends in-guest loopback to `moca-egress`, which refuses it
+as a loopback destination, breaking any in-guest server. Exempting loopback opens no bypass: the
+guest has no network device (T7), so its loopback is the guest itself.
 
 This is the price of T1 and T7 together, and it is the same trade Z5 §5.2 already accepted for
 cert-pinning clients — narrower here, because on this tier the documented "route it around the proxy"
@@ -274,19 +300,21 @@ E13 and E14 remain open, but neither gates the slice below.
 
 ### 12.1 Files this slice touches — settled
 
-| Path                                                                 | Change                                                                                                                                                                                                                                                                                                                                                |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `remote-worker/cmd/guest-agent`, `remote-worker/internal/guestagent` | T2: the guest agent gains a **loopback TCP listener** on `127.0.0.1:3128` that splices each accepted connection to `CID 2:1025`. The existing framed vsock protocol in `internal/guestagent/protocol.go` is **not** involved — egress is opaque byte-splicing, not framed requests. Built static (`CGO_ENABLED=0`) exactly as now                     |
-| `remote-worker/internal/vmpool/`                                     | Replenishment creates `<jail>/run/v.sock_1025` **before** restore and marks the VM standby only once the listener verifies (fail-closed); restore passes `vsock_override` for the jail's prefix; teardown SIGKILLs the VM **then** unlinks the socket (§6's ordering)                                                                                 |
-| `deploy/microvm/build-snapshot.sh`                                   | Rootfs additions: the host CA **public** cert into the trust store (T6), and the constant inert placeholder plus `HTTPS_PROXY=http://127.0.0.1:3128` / empty `NO_PROXY` as image-shipped env (T5). All three are constants, so none violates P4 §5.2. The script's `--agent` flow and its heredoc `guest_client.go` build-time verifier are untouched |
-| `deploy/microvm/predictions.json`                                    | E13/E14 predictions, sealed before their first rung (E12's is #271's)                                                                                                                                                                                                                                                                                 |
-| `deploy/microvm/EXPERIMENTS.md`                                      | E13/E14 sections                                                                                                                                                                                                                                                                                                                                      |
-| `docs/specs/README.md`                                               | Registry row — **already done in this PR**                                                                                                                                                                                                                                                                                                            |
+| Path                                                                 | Change                                                                                                                                                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `remote-worker/cmd/guest-agent`, `remote-worker/internal/guestagent` | T2: the guest agent gains a **loopback TCP listener** on `127.0.0.1:3128` that splices each accepted connection to `CID 2:1025`. The existing framed vsock protocol in `internal/guestagent/protocol.go` is **not** involved — egress is opaque byte-splicing, not framed requests. Built static (`CGO_ENABLED=0`) exactly as now                                                     |
+| `remote-worker/internal/vmpool/`                                     | Replenishment creates `<jail>/run/v.sock_1025` **before** restore and marks the VM standby only once the listener verifies (fail-closed); restore passes `vsock_override` for the jail's prefix; teardown SIGKILLs the VM **then** unlinks the socket (§6's ordering)                                                                                                                 |
+| `deploy/microvm/build-snapshot.sh`                                   | Rootfs additions: the host CA **public** cert into the trust store (T6), and the constant inert placeholder plus `HTTPS_PROXY=http://127.0.0.1:3128` / `NO_PROXY` naming only the guest's loopback (§7) as image-shipped env (T5). All three are constants, so none violates P4 §5.2. The script's `--agent` flow and its heredoc `guest_client.go` build-time verifier are untouched |
+| `deploy/microvm/predictions.json`                                    | E13/E14 predictions, sealed before their first rung (E12's is #271's)                                                                                                                                                                                                                                                                                                                 |
+| `deploy/microvm/EXPERIMENTS.md`                                      | E13/E14 sections                                                                                                                                                                                                                                                                                                                                                                      |
+| `docs/specs/README.md`                                               | Registry row — **already done in this PR**                                                                                                                                                                                                                                                                                                                                            |
 
 **Language follows location:** everything above is Go, because jail creation and the guest agent already
 are. No `packages/` (TypeScript) change is implied by anything in §12.1.
 
 ### 12.2 The proxy component — an owed decision, not a deferral
+
+> **Decided 2026-10-21:** `moca-egress` (MI1 D4); see the amendment at the head of this spec.
 
 §6 calls it "the shared egress proxy" without saying what it _is_, and that is deliberate: the choice
 changes the file list, the language and whether a second repository is in play, and it should be made

@@ -155,6 +155,13 @@ re-running with just that one:
   `SH_GITHUB_CLIENT_ID=` takes the control plane back to 0 replicas, and an empty token lifetime is
   the control plane's default (900 seconds for the API token a login gets, 300 for a session
   token). A lifetime is a whole number of seconds; a change rolls the control plane.
+- `SH_MODEL_CATALOG_HOSTS` lives in `moca-settings` too: the comma-separated **bare hostnames**
+  the control plane's model catalog may contact besides `api.anthropic.com` and the default
+  inference endpoint -- add each gateway your users' inference credentials name
+  (`docs/reference/configuration.md`; without it, listing and choosing models per session
+  degrades to `model_catalog_unavailable`). Empty, the default, allows only those two. A scheme,
+  port or path in an entry is refused here, matching the control plane's own boot check. A change
+  rolls the control plane.
 - `SH_SANDBOX_COUNT`, and on OpenShift `--image` and `--sandbox-image`, live in the ConfigMap
   `moca-setup` (namespace `moca`, nothing secret in it). A given value replaces the stored one.
   To go back to a default, pass it explicitly (`SH_SANDBOX_COUNT=2`,

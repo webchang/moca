@@ -6,6 +6,12 @@ export class ApiError extends Error {
    * `UND_ERR_HEADERS_TIMEOUT`), used to tell "request never left" from "request may have landed".
    */
   readonly causeCode?: string;
+  /**
+   * The body's `reason` beside its `error` code, e.g. `deleted` or `expired` on a
+   * `sandbox_terminated` (SBX0 §5.1). A body with a `reason` and no `error` (`/runs`) has the reason
+   * as its `code` instead.
+   */
+  readonly reason?: string;
   constructor(
     readonly source: ErrorSource,
     readonly status: number,
@@ -13,10 +19,12 @@ export class ApiError extends Error {
     message?: string,
     readonly retryAfterS?: number,
     causeCode?: string,
+    reason?: string,
   ) {
     super(message ?? code);
     this.name = 'ApiError';
     this.causeCode = causeCode;
+    if (reason !== undefined) this.reason = reason;
   }
 }
 
@@ -31,11 +39,15 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
   const text = await res.text().catch(() => '');
   let code = `http_${res.status}`;
   let message: string | undefined;
+  let reason: string | undefined;
   try {
-    // `/runs` reports failures as `{status, reason}`; most other routes as `{error}`.
+    // `/runs` reports failures as `{status, reason}`; most other routes as `{error}`, some with a
+    // `reason` beside it (`{error:'sandbox_terminated', message, reason}`).
     const body = JSON.parse(text) as { error?: unknown; message?: unknown; reason?: unknown };
-    if (typeof body.error === 'string') code = body.error;
-    else if (typeof body.reason === 'string') code = body.reason;
+    if (typeof body.error === 'string') {
+      code = body.error;
+      if (typeof body.reason === 'string') reason = body.reason;
+    } else if (typeof body.reason === 'string') code = body.reason;
     if (typeof body.message === 'string') message = body.message;
   } catch {
     /* non-JSON body (e.g. a proxy's HTML page): keep http_<status>. */
@@ -47,6 +59,8 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
     code,
     message,
     Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined,
+    undefined,
+    reason,
   );
 }
 

@@ -89,6 +89,11 @@ export function toSessionId(sessionId: string): string {
   return cleaned.slice(start, end) || 'leaf';
 }
 
+/** A workload key: the workload record's Context name (knative-server workloads.ts). */
+const WORKLOAD_KEY = /^w-[0-9a-f]{32}$/;
+/** An owner scope: `recordScope(owner)`, 32 hex (knative-server workloads.ts). */
+const OWNER_SCOPE = /^[0-9a-f]{32}$/;
+
 export interface LeafItem {
   item_id: string;
   file: string;
@@ -116,6 +121,17 @@ export interface LeafEnvelope {
     loadBundle: () => Promise<Buffer>;
     /** Give the run its own writable copy of the context, removed when the run ends. */
     writable?: boolean;
+    /**
+     * The workload key (`w-<32 hex>`) when the workload has sandboxes of its own (workload
+     * sandboxes spec §3.3): the run then selects only those, never the shared pool. Absent for a
+     * phase 1 workload, which runs on the shared pool as before. The server sets it from PR 2 on.
+     */
+    workload?: string;
+    /**
+     * The owner's `recordScope` (32 hex), required with `workload`: selection also matches the
+     * sandbox's `moca.dev/owner` label against it. Set by the server alongside `workload`.
+     */
+    ownerScope?: string;
   };
   item: LeafItem; // inputs inline (was inputsRef)
   decision?: Decision; // resume/approve only (was decisionRef)
@@ -172,7 +188,10 @@ export type LeafResult =
   | { status: 'responded'; text: string; usage?: LeafUsage }
   | {
       status: 'failed';
-      reason: 'no_verdict' | 'invalid_verdict' | 'bad_inputs' | 'error' | 'saturated';
+      // `owner_lost` is written only by the run-lease reaper (#558): the worker holding the run
+      // died without finalizing, and a survivor reconciled it. The others are run-leaf's own.
+      reason:
+        'no_verdict' | 'invalid_verdict' | 'bad_inputs' | 'error' | 'saturated' | 'owner_lost';
       message?: string;
     };
 
@@ -265,6 +284,19 @@ export function emptyConfigRefFailure(env: LeafEnvelope): LeafResult | null {
   };
 }
 
+/**
+ * Workload sandboxes are selected by the prompt leaf only (workload sandboxes spec §3.3). A solve
+ * or verdict leaf naming a workload is refused before it selects, never run on the shared pool.
+ */
+function nonPromptWorkloadFailure(env: LeafEnvelope): LeafResult | null {
+  if (env.internalContext?.workload === undefined) return null;
+  return {
+    status: 'failed',
+    reason: 'error',
+    message: 'a workload sandbox runs prompt leaves only',
+  };
+}
+
 export function validateItem(o: unknown): LeafItem | null {
   if (typeof o !== 'object' || o === null) return null;
   const x = o as Record<string, unknown>;
@@ -309,6 +341,8 @@ export async function runLeaf(
 ): Promise<LeafResult> {
   if (env.kind === 'solve') return runSolveLeaf(env, config, deps);
   if (env.kind === 'prompt') return runPromptLeaf(env, config, deps);
+  const noWorkload = nonPromptWorkloadFailure(env);
+  if (noWorkload) return noWorkload;
   const item = validateItem(env.item);
   if (!item) return { status: 'failed', reason: 'bad_inputs' };
 
@@ -356,6 +390,8 @@ export async function runSolveLeaf(
   // Catch an empty-or-whitespace configRef before leasing a sandbox (shared with runPromptLeaf).
   const emptyRef = emptyConfigRefFailure(env);
   if (emptyRef) return emptyRef;
+  const noWorkload = nonPromptWorkloadFailure(env);
+  if (noWorkload) return noWorkload;
   const capture: SolveCapture = {};
   const produce = deps?.produceSolve ?? realProduceSolve;
   // Forward only the overlay-related slice of deps; undefined when none set so existing 3-arg
@@ -416,11 +452,24 @@ async function runPromptLeaf(
   // outside this try, and two separate reads of the environment can disagree if it is mutated
   // between them.
   const promptTimings = leaseTimings(process.env);
+  const workload = env.internalContext?.workload;
+  const ownerScope = env.internalContext?.ownerScope;
+  // Checked before selection, unlike the rest of internalContext: they decide which sandbox to lease.
+  // An owner scope is required with a workload, and meaningless without one.
+  if (
+    (workload !== undefined && (typeof workload !== 'string' || !WORKLOAD_KEY.test(workload))) ||
+    (ownerScope !== undefined &&
+      (typeof ownerScope !== 'string' || !OWNER_SCOPE.test(ownerScope))) ||
+    (workload !== undefined) !== (ownerScope !== undefined)
+  ) {
+    return { status: 'failed', reason: 'error', message: 'invalid internal context reference' };
+  }
   try {
     selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
       cap: promptTimings.cap,
       ttlMs: promptTimings.ttlMs,
       remoteSandbox: process.env.SH_REMOTE_SANDBOX === '1',
+      ...(workload ? { workload, ownerScope } : {}),
     });
   } catch (err) {
     // Saturation stays a distinct transient signal, as for the other kinds: the sync /runs path

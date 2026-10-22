@@ -60,6 +60,7 @@ function execResult(addr: string, token?: string): Promise<{ code: number; detai
   const call = client.exec(
     {
       sandboxId: 'sbx-x',
+      workload: '',
       exec: {
         reqId: 1,
         command: 'true',
@@ -259,7 +260,7 @@ describe('the relay bootstrap', () => {
     });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(
-      /^sandbox-relay: refusing to start: MOCA_RELAY_EXEC_TOKEN is required/m,
+      /^sandbox-relay: refusing to start: MOCA_RELAY_EXEC_TOKEN or SH_SANDBOX_TOKEN_PUBLIC_KEYS is required/m,
     );
     expect(r.stderr).not.toMatch(/\n\s+at /); // no stack trace
   }, 30_000);

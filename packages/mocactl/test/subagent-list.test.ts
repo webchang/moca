@@ -159,6 +159,7 @@ describe('cmdSubagents — joined view', () => {
     const stdout = out.join('');
     const lines = stdout.split('\n').filter(Boolean);
     expect(lines[0]).toContain('SESSION');
+    expect(lines[0]).toContain('LABEL');
     expect(lines[0]).toContain('STATE');
     // At least one data row.
     expect(lines[1]).toContain('s1');
@@ -240,5 +241,19 @@ describe('cmdSubagents — workload', () => {
       'workload',
       'submittedAt',
     ]);
+  });
+});
+
+describe('cmdSubagents — label', () => {
+  it('surfaces label on rows that have one, omits it on rows that do not', async () => {
+    const rt = makeRt(scratch);
+    const ledger = openLedger(rt.paths.subagentsFile, rt.now);
+    ledger.append(seedRecord({ sessionId: 'l', label: 'diagnose', lastKnownState: 'done' }));
+    ledger.append(seedRecord({ sessionId: 'n', submittedAt: 2, lastKnownState: 'done' }));
+    const { io, out } = makeIo();
+    await cmdSubagents(rt, io, base({ json: true, ledger, transport: {} as LeafTransport }));
+    const [labelled, unlabelled] = JSON.parse(out[0]!.trim()).subagents;
+    expect(labelled).toMatchObject({ sessionId: 'l', label: 'diagnose' });
+    expect(unlabelled).not.toHaveProperty('label');
   });
 });

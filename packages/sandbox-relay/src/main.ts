@@ -1,9 +1,10 @@
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import {
   Server,
   ServerCredentials,
   status,
+  type ChannelOptions,
   type Metadata,
   type ServerDuplexStream,
   type ServerWritableStream,
@@ -25,6 +26,13 @@ import {
 } from '@moca/k8s-sandbox';
 import { RedisRecordStore, affinityTimings } from '@moca/harness';
 import {
+  ATTACH_CLOCK_LEEWAY_S,
+  CpError,
+  SANDBOX_CLOCK_LEEWAY_S,
+  verifyAttachToken,
+  type SandboxTokenClaims,
+} from '@moca/control-plane';
+import {
   makeClientTokenAuthenticator,
   workspaceKeyAllowed,
   type ClientGrant,
@@ -34,50 +42,42 @@ import {
   type Relay,
   type RelayDeps,
   type AttachStream,
+  type AttachVerifier,
   type DetachMarks,
 } from './relay.js';
+import {
+  DEFAULT_SANDBOX_MAX_INFLIGHT,
+  keysetFromEnv,
+  makeSandboxTokenVerifier,
+  sandboxMaxInflight,
+  type SandboxVerifier,
+} from './sandbox-auth.js';
+import { failExecStream, grpcError, pumpExec } from './exec-stream.js';
+import { SANDBOX_DRAIN_GRACE_S, makeAudit, makeSandboxCaller } from './sandbox-caller.js';
 
-/**
- * Ends a server-streaming exec call with a non-OK status.
- *
- * `call.destroy(err)` does NOT do that, which is the trap this helper exists to name. On
- * @grpc/grpc-js 1.14.4 a `ServerWritableStream` sends its status from `_final` (which calls
- * `call.sendStatus`), and Node's `Writable` never reaches `_final` once `destroyed` is set:
- * `end()` short-circuits with ERR_STREAM_DESTROYED. Destroying therefore sends no trailers
- * at all -- verified against a real client, which sat for 12s with no status, no `end` and
- * no `error`. A hang is strictly worse than the wrong-OK of #295, because an OK at least
- * lets the caller finish its request.
- *
- * Emitting 'error' is the supported path: grpc-js registers a listener in the stream's
- * constructor that runs the error through `serverErrorToStatus` and then ends the stream,
- * which is what actually puts a code on the wire. `serverErrorToStatus` takes a numeric
- * `code` and a string `details` when present, and otherwise reports UNKNOWN with `message`
- * as the details -- so a bare Error still terminates non-OK and still carries its reason.
- *
- * `main-exec-status.transport.test.ts` pins all of this over a real transport; a fake call
- * object cannot, because the status is produced by the transport rather than the handler.
- */
-function failExecStream(call: ServerWritableStream<ExecRequest, ExecEvent>, err: Error): void {
-  call.emit('error', err);
-}
+export { grpcError } from './exec-stream.js';
+export { SANDBOX_DRAIN_GRACE_S, armDeadline } from './sandbox-caller.js';
 
-/**
- * A worker-reported in-stream exec failure, shaped so grpc-js terminates the stream with
- * a non-OK status instead of OK. INTERNAL (not UNKNOWN) because the failure is server-side
- * and not the caller's fault: `ExecEvent.error` means the exec machinery itself failed,
- * whereas a command that merely exited non-zero comes back as `ExecEvent.end{exitCode}`.
- * The worker's message travels as the status details so the cause is not lost.
- */
-function execStreamError(message: string): Error {
-  const err = new Error(message) as Error & { code: number; details: string };
-  err.code = status.INTERNAL;
-  err.details = message;
-  return err;
-}
-
-/** Relay server dependencies: the relay's own, plus the SandboxExec caller check (MI1 §5 R5). */
+/** Relay server dependencies: the relay's own, plus the SandboxExec caller checks (MI1 §5 R5, SBX0 §3). */
 export interface RelayServerDeps extends RelayDeps {
   validateExecToken: (presented: string | undefined) => boolean;
+  /** Sandbox tokens (SBX0 §3.2). Omitted: only the harness's exec token is accepted. */
+  verifySandboxToken?: SandboxVerifier;
+  /** In-flight Execs admitted per `sbx` (SBX0 §3.6). Defaults to 2. */
+  sandboxMaxInflight?: number;
+  /** Seconds past a token's `exp` at which its running Exec is cancelled. Defaults to 30; tests set 0. */
+  sandboxLeewayS?: number;
+  /**
+   * Seconds after that cancel at which an Exec the worker never acknowledged gives back its in-flight
+   * slot and its Abort ownership anyway. Defaults to 60.
+   */
+  sandboxDrainGraceS?: number;
+  /** The key of the per-sandbox req_id mapping (workerReqId). Defaults to 32 random bytes per boot. */
+  sandboxReqIdKey?: Buffer;
+  /** Where the sandbox Exec audit lines go (SBX0 §3.5). Defaults to stdout. */
+  log?: (line: string) => void;
+  /** SH_SANDBOX_AUDIT_COMMANDS=1: audit lines carry the command's first 200 bytes (SBX0 §3.5). */
+  sandboxAuditCommands?: boolean;
   /** Direct clients (client-tokens.ts). Omitted: only the harness's exec token is accepted. */
   authenticateClient?: (presented: string | undefined) => ClientGrant | undefined;
 }
@@ -134,42 +134,120 @@ function bearerOf(md: Metadata): string | undefined {
 
 function unauthenticated(): Error & { code: number; details: string } {
   // The message never contains the presented value.
-  const err = new Error('exec authentication failed') as Error & { code: number; details: string };
-  err.code = status.UNAUTHENTICATED;
-  err.details = err.message;
-  return err;
+  return grpcError(status.UNAUTHENTICATED, 'exec authentication failed');
 }
 
 function permissionDenied(message: string): Error & { code: number; details: string } {
-  const err = new Error(message) as Error & { code: number; details: string };
-  err.code = status.PERMISSION_DENIED;
-  err.details = message;
-  return err;
+  return grpcError(status.PERMISSION_DENIED, message);
 }
 
 /**
- * Who is calling SandboxExec: the harness (its exec token, unrestricted, as before), a direct client
- * (a grant), or nobody.
+ * The boot rule (SBX0 §3.3). FAIL-CLOSED: the relay serves SandboxExec only if at least one caller
+ * credential is configured -- the harness's MOCA_RELAY_EXEC_TOKEN, or the sandbox control plane's
+ * public keys (with their issuer). With neither there is no valid caller, and the relay does not
+ * boot. Each credential keeps its own boot checks: makeExecTokenValidator's clash rules, the
+ * keyset's parse. SH_SANDBOX_MAX_INFLIGHT is checked here too, so a bad value fails the boot.
  */
-type ExecCaller = { kind: 'harness' } | { kind: 'client'; grant: ClientGrant } | undefined;
-
-function execCaller(md: Metadata, deps: ExecAuth): ExecCaller {
-  const presented = bearerOf(md);
-  if (deps.validateExecToken(presented)) return { kind: 'harness' };
-  const grant = deps.authenticateClient?.(presented);
-  return grant ? { kind: 'client', grant } : undefined;
+export function makeExecAuth(
+  env: NodeJS.ProcessEnv,
+): Pick<
+  RelayServerDeps,
+  | 'validateExecToken'
+  | 'authenticateClient'
+  | 'verifySandboxToken'
+  | 'sandboxMaxInflight'
+  | 'sandboxAuditCommands'
+> {
+  const verifySandboxToken = makeSandboxTokenVerifier(env);
+  // Direct clients' static tokens (MOCA_RELAY_CLIENT_TOKENS): their own boot checks, independent of
+  // the keyset. They are an extra caller kind, not a boot credential: alone they do not let the relay boot.
+  const authenticateClient = makeClientTokenAuthenticator(env);
+  const maxInflight = sandboxMaxInflight(env);
+  if (!env.MOCA_RELAY_EXEC_TOKEN && !verifySandboxToken) {
+    throw new Error(
+      'MOCA_RELAY_EXEC_TOKEN or SH_SANDBOX_TOKEN_PUBLIC_KEYS is required: the relay refuses unauthenticated SandboxExec',
+    );
+  }
+  const validateExecToken = env.MOCA_RELAY_EXEC_TOKEN ? makeExecTokenValidator(env) : () => false;
+  return {
+    validateExecToken,
+    ...(env.MOCA_RELAY_CLIENT_TOKENS?.trim() ? { authenticateClient } : {}),
+    ...(verifySandboxToken
+      ? {
+          verifySandboxToken,
+          sandboxMaxInflight: maxInflight,
+          // Exactly "1": an operator debug flag, so anything else is off.
+          ...(env.SH_SANDBOX_AUDIT_COMMANDS === '1' ? { sandboxAuditCommands: true } : {}),
+        }
+      : {}),
+  };
 }
 
-type ExecAuth = Pick<RelayServerDeps, 'validateExecToken' | 'authenticateClient'>;
+type ExecAuth = Pick<
+  RelayServerDeps,
+  | 'validateExecToken'
+  | 'authenticateClient'
+  | 'verifySandboxToken'
+  | 'sandboxMaxInflight'
+  | 'sandboxLeewayS'
+  | 'sandboxDrainGraceS'
+  | 'sandboxReqIdKey'
+  | 'log'
+  | 'sandboxAuditCommands'
+  | 'timers'
+>;
 
-function newServer(): Server {
-  // Raise the ingress limit above gRPC's 4 MiB default. This is the hop that rejects an
-  // oversized write today: the harness's ExecRequest carries base64 stdin at 4/3 of the
-  // file, so a file the read path can return (DEFAULT_OUTPUT_CAP, 8 MiB) needs ~10.7 MiB
-  // here. MAX_EXEC_MESSAGE_BYTES is shared with the Go worker's session.MaxRecvMsgBytes
-  // and pinned equal to it — a relay that accepts more than the worker would forward a
-  // payload the worker refuses on its Attach stream, killing every exec on it (#173 item 2).
-  return new Server({ 'grpc.max_receive_message_length': MAX_EXEC_MESSAGE_BYTES });
+type ExecCaller =
+  | { kind: 'harness' }
+  | { kind: 'client'; grant: ClientGrant }
+  | { kind: 'sandbox'; claims: SandboxTokenClaims }
+  | { kind: 'none'; reason?: string };
+
+/**
+ * The caller classification (SBX0 §3.1), first match wins: the harness's exec token (unrestricted,
+ * exactly as before), then a direct client's static token (client-tokens.ts: one worker, one
+ * workspace_key prefix), then a sandbox token, else nobody. `reason` is set only when a sandbox
+ * verifier looked at the token, and is for the refusal log alone.
+ */
+function execCaller(md: Metadata, auth: ExecAuth): ExecCaller {
+  const presented = bearerOf(md);
+  if (auth.validateExecToken(presented)) return { kind: 'harness' };
+  const grant = auth.authenticateClient?.(presented);
+  if (grant) return { kind: 'client', grant };
+  if (!auth.verifySandboxToken) return { kind: 'none' };
+  const v = auth.verifySandboxToken(presented);
+  return v.claims ? { kind: 'sandbox', claims: v.claims } : { kind: 'none', reason: v.reason };
+}
+
+/**
+ * Server-side keepalive (SBX0 §3.4). Some load balancers in front of a cluster router close a TCP
+ * connection after a short idle period -- one was measured at 50 s -- so an Exec whose command prints
+ * nothing would die mid-command. The relay pings every connection instead. These are the two
+ * keepalive options grpc-js 1.14's server reads; it does not police client ping rates, so a client's
+ * own pings are never refused.
+ */
+export interface Keepalive {
+  timeMs: number;
+  timeoutMs: number;
+}
+export const RELAY_KEEPALIVE = { timeMs: 20_000, timeoutMs: 10_000 } as const;
+
+export function relayServerOptions(keepalive: Keepalive = RELAY_KEEPALIVE): ChannelOptions {
+  return {
+    // Raise the ingress limit above gRPC's 4 MiB default. This is the hop that rejects an
+    // oversized write today: the harness's ExecRequest carries base64 stdin at 4/3 of the
+    // file, so a file the read path can return (DEFAULT_OUTPUT_CAP, 8 MiB) needs ~10.7 MiB
+    // here. MAX_EXEC_MESSAGE_BYTES is shared with the Go worker's session.MaxRecvMsgBytes
+    // and pinned equal to it — a relay that accepts more than the worker would forward a
+    // payload the worker refuses on its Attach stream, killing every exec on it (#173 item 2).
+    'grpc.max_receive_message_length': MAX_EXEC_MESSAGE_BYTES,
+    'grpc.keepalive_time_ms': keepalive.timeMs,
+    'grpc.keepalive_timeout_ms': keepalive.timeoutMs,
+  };
+}
+
+function newServer(keepalive?: Keepalive): Server {
+  return new Server(relayServerOptions(keepalive));
 }
 
 function addWorkerService(server: Server, relay: ReturnType<typeof createRelay>): void {
@@ -184,47 +262,69 @@ function addWorkerService(server: Server, relay: ReturnType<typeof createRelay>)
   server.addService(SandboxWorkerService, workerImpl);
 }
 
-function addExecService(
-  server: Server,
-  relay: ReturnType<typeof createRelay>,
-  auth: ExecAuth,
-): void {
+function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
+  // Audit lines (SBX0 §3.5) only on a relay with sandbox keys, so a MOCA relay's output is
+  // unchanged. Fixed reasons, the token's sub and sbx only when it verified; never the token.
+  const audit = makeAudit(
+    auth.verifySandboxToken ? (auth.log ?? ((l: string) => console.log(l))) : undefined,
+    auth.sandboxAuditCommands === true,
+  );
+  const sandbox = makeSandboxCaller(relay, {
+    maxInflight: auth.sandboxMaxInflight ?? DEFAULT_SANDBOX_MAX_INFLIGHT,
+    leewayS: auth.sandboxLeewayS ?? SANDBOX_CLOCK_LEEWAY_S,
+    drainGraceS: auth.sandboxDrainGraceS ?? SANDBOX_DRAIN_GRACE_S,
+    // Never leaves this process. A new one at each boot changes every wid, which costs nothing: a
+    // sandbox client re-sends a req_id only for a call that never started (SBX0 §6.5).
+    reqIdKey: auth.sandboxReqIdKey ?? randomBytes(32),
+    timers: auth.timers,
+    audit,
+  });
+
   // A client may abort only the Execs it started: req_ids are not secret, so without this one client
   // could kill another's command. Keyed by sandbox and req_id, held for the Exec's lifetime.
   const clientExecs = new Map<string, ClientGrant>();
   const execKey = (sandboxId: string, reqId: number) => `${sandboxId}\0${reqId}`;
+
   const execImpl: SandboxExecServer = {
     // Server-streaming: one ExecRequest in, a stream of ExecEvents out.
-    //
-    // Client cancellation (harness deadline/abort) fires the call's "cancelled"
-    // event. We must NOT rely on calling .return() on the routeExec generator
-    // while it idles on its internal await -- that can hang forever if the
-    // worker never sends another frame. Instead, on cancellation we tell the
-    // worker to abort via relay.routeAbort(); the worker then emits an
-    // End/Error frame for that reqId, which drives the generator's sink so it
-    // yields that event and returns normally (running its `finally`, which
-    // cleans up the sink). This makes worker-disconnect (Task 6) and
-    // client-cancel (this task) both terminate the generator cleanly.
     exec: async (call: ServerWritableStream<ExecRequest, ExecEvent>) => {
+      const t0 = Date.now();
       const caller = execCaller(call.metadata, auth);
-      if (!caller) {
+      // Already decoded; read before the caller check so a refusal's line can name the request.
+      const req = call.request;
+      const e = req.exec;
+      if (caller.kind === 'none') {
+        // No claims and no command: nothing about this token verified, so both are its say-so.
+        if (caller.reason)
+          audit.exec(t0, {
+            wrk: req.sandboxId,
+            req_id: e?.reqId ?? 0,
+            outcome: 'refused',
+            reason: caller.reason,
+            out_bytes: 0,
+          });
         failExecStream(call, unauthenticated());
         return;
       }
-      const req = call.request;
-      const e = req.exec;
       if (!e) {
-        const err = new Error('ExecRequest missing exec field') as Error & {
-          code: number;
-          details: string;
-        };
         // The request itself is malformed, so this one IS the caller's fault.
-        err.code = status.INVALID_ARGUMENT;
-        err.details = err.message;
-        failExecStream(call, err);
+        const why = 'ExecRequest missing exec field';
+        if (caller.kind === 'sandbox')
+          audit.exec(t0, {
+            wrk: req.sandboxId,
+            req_id: 0,
+            claims: caller.claims,
+            outcome: 'refused',
+            reason: why,
+            out_bytes: 0,
+          });
+        failExecStream(call, grpcError(status.INVALID_ARGUMENT, why));
         return;
       }
-      let owned: string | undefined;
+      if (caller.kind === 'sandbox') {
+        await sandbox.exec(call, caller.claims, req.sandboxId, e, t0);
+        return;
+      }
       if (caller.kind === 'client') {
         const { grant } = caller;
         // Checked before routing, so a refused Exec never reaches a worker.
@@ -232,75 +332,50 @@ function addExecService(
           failExecStream(call, permissionDenied('exec not permitted for this client token'));
           return;
         }
-        owned = execKey(req.sandboxId, e.reqId);
+        const owned = execKey(req.sandboxId, e.reqId);
         clientExecs.set(owned, grant);
-      }
-      // Registered synchronously (before the loop's first await) so a
-      // cancellation that races the very first event is never missed.
-      // A client cancel also reaches us as an in-stream ExecEvent.error (the worker's
-      // acknowledgement of our abort), but that is OUR abort completing, not a server-side
-      // exec failure -- so it must not be reclassified as INTERNAL below.
-      let cancelled = false;
-      const onCancelled = () => {
-        cancelled = true;
-        relay.routeAbort(req.sandboxId, e.reqId);
-      };
-      call.on('cancelled', onCancelled);
-
-      try {
-        // Tracked as a flag, not by testing the message text: an ExecEvent.error with an
-        // EMPTY message is still a failing Exec, and classifying on `message` alone would
-        // silently re-admit it as a success (the Go exec-driver learned the same lesson --
-        // see its sawErr note in cmd/exec-driver/drive.go).
-        let sawExecError = false;
-        let execErrorMessage = '';
-        for await (const ev of relay.routeExec(req.sandboxId, e)) {
-          call.write(ev);
-          if (ev.error) {
-            sawExecError = true;
-            execErrorMessage = ev.error.message ?? '';
-          }
+        try {
+          // No workload, as for a sandbox caller: a client token never reaches a workload sandbox.
+          await pumpExec(call, relay, req.sandboxId, e);
+        } finally {
+          clientExecs.delete(owned);
         }
-        // A failed Exec must not terminate OK (#295). routeExec returns normally after
-        // yielding an error event, so ending here would report success for a command that
-        // never ran: it would count toward throughput, enter p95, and never be classified
-        // as an error by a client that reads only the terminal status.
-        if (sawExecError && !cancelled) {
-          failExecStream(call, execStreamError(execErrorMessage));
-          return;
-        }
-        call.end();
-      } catch (err) {
-        // Reached by every throw out of routeExec -- including `no live worker for sandbox`
-        // (an ordinary state: the worker died, or has not attached yet) and the reqId
-        // in-flight collision. Codes are left to grpc-js rather than classified here: an
-        // arbitrary internal throw becomes UNKNOWN with its message as the details, and a
-        // thrown error that already carries a numeric `code` keeps it. Mapping these onto
-        // specific codes (UNAVAILABLE for a missing worker, say) is a relay-semantics
-        // decision, not part of fixing the termination primitive.
-        failExecStream(call, err as Error);
-      } finally {
-        call.removeListener('cancelled', onCancelled);
-        if (owned) clientExecs.delete(owned);
+        return;
       }
+      await pumpExec(call, relay, req.sandboxId, e, { workload: req.workload });
     },
     abort: (
       call: ServerUnaryCall<AbortRequest, AbortResponse>,
       cb: sendUnaryData<AbortResponse>,
     ) => {
       const caller = execCaller(call.metadata, auth);
-      if (!caller) {
+      if (caller.kind === 'none') {
+        if (caller.reason)
+          audit.abortRefused(call.request.sandboxId, call.request.reqId, caller.reason);
         cb(unauthenticated(), null);
         return;
       }
-      if (
-        caller.kind === 'client' &&
-        clientExecs.get(execKey(call.request.sandboxId, call.request.reqId)) !== caller.grant
-      ) {
-        cb(permissionDenied('abort not permitted: not an exec this client started'), null);
+      const { sandboxId, reqId } = call.request;
+      if (caller.kind === 'harness') {
+        relay.routeAbort(sandboxId, reqId);
+        cb(null, {});
         return;
       }
-      relay.routeAbort(call.request.sandboxId, call.request.reqId);
+      if (caller.kind === 'client') {
+        if (clientExecs.get(execKey(sandboxId, reqId)) !== caller.grant) {
+          cb(permissionDenied('abort not permitted: not an exec this client started'), null);
+          return;
+        }
+        relay.routeAbort(sandboxId, reqId);
+        cb(null, {});
+        return;
+      }
+      const entry = sandbox.abort(caller.claims, sandboxId, reqId);
+      if ('refusal' in entry) {
+        cb(entry.refusal, null);
+        return;
+      }
+      relay.routeAbort(entry.wrk, entry.wid);
       cb(null, {});
     },
   };
@@ -312,9 +387,12 @@ function addExecService(
  * every sandbox can reach SandboxExec, and only a secret exec token keeps it out. With the base
  * manifest's public dev token there is no isolation between sandboxes at all.
  */
-export function buildServer(deps: RelayServerDeps): { server: Server; relay: Relay } {
+export function buildServer(
+  deps: RelayServerDeps,
+  keepalive?: Keepalive,
+): { server: Server; relay: Relay } {
   const relay = createRelay(deps);
-  const server = newServer();
+  const server = newServer(keepalive);
   addWorkerService(server, relay);
   addExecService(server, relay, deps);
   return { server, relay };
@@ -327,14 +405,17 @@ export function buildServer(deps: RelayServerDeps): { server: Server; relay: Rel
  * exec token is again the only control. Same relay instance, so an Exec routes to a worker attached
  * on the other listener.
  */
-export function buildServers(deps: RelayServerDeps): {
+export function buildServers(
+  deps: RelayServerDeps,
+  keepalive?: Keepalive,
+): {
   attachServer: Server;
   execServer: Server;
   relay: Relay;
 } {
   const relay = createRelay(deps);
-  const attachServer = newServer();
-  const execServer = newServer();
+  const attachServer = newServer(keepalive);
+  const execServer = newServer(keepalive);
   addWorkerService(attachServer, relay);
   addExecService(execServer, relay, deps);
   return { attachServer, execServer, relay };
@@ -429,37 +510,77 @@ async function stopGracefully(servers: Server[], relay: Relay, close?: () => Pro
   await close?.();
 }
 
+const ATTACH_KEYS_VAR = 'MOCA_ATTACH_PUBLIC_KEYS';
+
+/**
+ * The attach-token verifier (workload sandboxes spec §3.1-3.2), or undefined when
+ * MOCA_ATTACH_PUBLIC_KEYS is unset or blank. Undefined is the whole "no keys, nothing changes"
+ * guarantee: createRelay consults none of the workload-label rules without it. Set, it must parse,
+ * or the relay does not boot. Public keys only: the relay can verify an attach token, never mint one.
+ */
+export function makeAttachVerifier(env: NodeJS.ProcessEnv): AttachVerifier | undefined {
+  const raw = env[ATTACH_KEYS_VAR]?.trim();
+  if (!raw) return undefined;
+  const keys = keysetFromEnv(ATTACH_KEYS_VAR, raw);
+  return (presented) => {
+    if (!presented) return { reason: 'no bearer token' };
+    try {
+      const c = verifyAttachToken(presented, keys);
+      return {
+        binding: {
+          workload: c.wl,
+          owner: c.own,
+          tier: c.tr,
+          count: c.n,
+          // The same leeway the verifier allows, so a token it admitted is never closed at once.
+          expiresAtMs: (c.exp + ATTACH_CLOCK_LEEWAY_S) * 1000,
+        },
+      };
+    } catch (err) {
+      // CpError messages are the verifier's fixed strings; anything else could carry input.
+      return { reason: err instanceof CpError ? err.message : 'invalid attach token' };
+    }
+  };
+}
+
 export async function startRelay(
-  opts: { port?: number; execAddr?: string; deps?: RelayServerDeps; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    port?: number;
+    execAddr?: string;
+    deps?: RelayServerDeps;
+    env?: NodeJS.ProcessEnv;
+    keepalive?: Keepalive;
+  } = {},
 ): Promise<{ port: number; execPort?: number; shutdown: () => Promise<void> }> {
   const env = opts.env ?? process.env;
   // The store startRelay built itself, and so closes on shutdown; injected deps belong to the caller.
   let ownedRecords: RedisRecordStore | undefined;
-  // The exec validator first: it throws on a missing token before anything touches Redis.
+  // The exec auth first: it throws on a missing credential before anything touches Redis.
   const deps =
     opts.deps ??
     (() => {
-      const validateExecToken = makeExecTokenValidator(env);
-      const authenticateClient = makeClientTokenAuthenticator(env);
+      const auth = makeExecAuth(env);
+      // Before Redis too: a malformed keyset is a boot error.
+      const verifyAttach = makeAttachVerifier(env);
       const records = new RedisRecordStore();
       ownedRecords = records;
       return {
         records,
         detach: detachMarks(records, env),
         validateToken: makeDefaultValidateToken(env),
-        validateExecToken,
-        authenticateClient,
+        ...auth,
+        ...(verifyAttach ? { verifyAttach } : {}),
       };
     })();
   const close = ownedRecords ? () => ownedRecords!.close() : undefined;
   const attachAddr = `0.0.0.0:${opts.port ?? Number(env.SH_RELAY_PORT ?? 8443)}`;
   const execAddr = opts.execAddr ?? env.MOCA_RELAY_EXEC_ADDR;
   if (!execAddr) {
-    const { server, relay } = buildServer(deps);
+    const { server, relay } = buildServer(deps, opts.keepalive);
     const port = await bind(server, attachAddr);
     return { port, shutdown: () => stopGracefully([server], relay, close) };
   }
-  const { attachServer, execServer, relay } = buildServers(deps);
+  const { attachServer, execServer, relay } = buildServers(deps, opts.keepalive);
   const port = await bind(attachServer, attachAddr);
   const execPort = await bind(execServer, execAddr);
   return {

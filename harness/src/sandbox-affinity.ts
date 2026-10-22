@@ -22,6 +22,15 @@ export function forLog(value: string): string {
 /** The presence label the tier filter reads; the workers' `session.TierLabelKey`. */
 export const TIER_LABEL = 'moca.dev/tier';
 
+/**
+ * The presence labels that bind a sandbox to one workload and its owner (workload sandboxes spec
+ * §3). Trusted only from a relay with attach public keys: it sets them from a signed attach token
+ * and strips them from every other `Hello`. `selectPoolSandbox` reads both: a workload run takes
+ * only a record whose workload AND owner match its own.
+ */
+export const WORKLOAD_LABEL = 'moca.dev/workload';
+export const OWNER_LABEL = 'moca.dev/owner';
+
 export function affinityKey(sessionId: string): string {
   return `sh:sandbox:affinity:${sessionId}`;
 }

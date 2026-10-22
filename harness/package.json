@@ -5,6 +5,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./ambient-sentinel": "./src/ambient-sentinel.ts",
+    "./audit-log": "./src/audit-log.ts",
     "./run-turn": "./src/run-turn.ts",
     "./turn-stream": "./src/turn-stream.ts",
     "./run-leaf": "./src/run-leaf.ts",
@@ -12,6 +13,7 @@
     "./budget-voter": "./src/budget-voter.ts",
     "./leaf-job-runner": "./src/leaf-job-runner.ts",
     "./leaf-result-store": "./src/leaf-result-store.ts",
+    "./run-lease": "./src/run-lease.ts",
     "./sandbox-lease": "./src/sandbox-lease.ts",
     "./sandbox-affinity": "./src/sandbox-affinity.ts",
     "./turn-registry": "./src/turn-registry.ts",

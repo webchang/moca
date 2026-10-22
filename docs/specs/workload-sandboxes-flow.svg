@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1460" height="880" viewBox="0 0 1460 880" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="title">MOCA per-workload sandboxes (/workloads phase 2)</title>
+  <desc id="desc">A client creates a workload with sandboxes and uploads its context as in phase 1, then activates it. The supervisor's worker calls moca-provisioner, which resolves the workload's Context PVC through Context Service (context-service#40) and creates the workload's StatefulSet, headless Service and attach-token Secret in the moca-sandbox namespace. The sandbox pods mount the Context PVC read-only or as a seeded moca-workspace, and attach to the relay with Hello and the attach token; the relay stamps trusted moca.dev/workload and moca.dev/owner labels. A run naming the workload selects only that workload's sandboxes and executes through SandboxExec.Exec. Delete removes the sandboxes first, then the Context.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+    </marker>
+  </defs>
+  <style>
+    .box { stroke-width: 1.5; }
+    .title { font-size: 15px; font-weight: 600; fill: #111827; }
+    .sub { font-size: 12px; fill: #6b7280; }
+    .note { font-size: 12px; fill: #1f2937; }
+    .api { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: #111827; }
+    .line { stroke: #374151; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+    .step circle { fill: #1f2937; }
+    .step text { font-size: 11.5px; font-weight: 700; fill: #ffffff; text-anchor: middle; dominant-baseline: central; }
+  </style>
+
+  <rect width="1460" height="880" rx="12" fill="#ffffff"/>
+
+  <!-- Client -->
+  <rect class="box" x="20" y="95" width="180" height="355" rx="10" fill="#eef4ff" stroke="#4a6fa5"/>
+  <text class="title" x="110" y="262" text-anchor="middle">Client</text>
+  <text class="sub" x="110" y="282" text-anchor="middle">mocactl, script, or CI</text>
+
+  <!-- MOCA -->
+  <rect class="box" x="440" y="30" width="320" height="730" rx="10" fill="#fff4e5" stroke="#d08c2c"/>
+  <text class="title" x="458" y="58">MOCA</text>
+  <text class="sub" x="458" y="78">no Kubernetes token</text>
+  <rect class="box" x="460" y="95" width="280" height="375" rx="8" fill="#ffffff" stroke="#d08c2c"/>
+  <text class="title" x="600" y="262" text-anchor="middle">Supervisor worker</text>
+  <text class="sub" x="600" y="282" text-anchor="middle">workload records,</text>
+  <text class="sub" x="600" y="299" text-anchor="middle">select-sandbox</text>
+  <rect class="box" x="460" y="610" width="280" height="120" rx="8" fill="#ffffff" stroke="#d08c2c"/>
+  <text class="title" x="600" y="662" text-anchor="middle">Relay</text>
+  <text class="sub" x="600" y="682" text-anchor="middle">verifies attach tokens</text>
+
+  <!-- Context Service -->
+  <rect class="box" x="1120" y="95" width="320" height="140" rx="10" fill="#eaf7ee" stroke="#3c8d5a"/>
+  <text class="title" x="1280" y="160" text-anchor="middle">Context Service</text>
+  <text class="sub" x="1280" y="180" text-anchor="middle">owns Contexts and their PVCs</text>
+
+  <!-- Provisioner -->
+  <rect class="box" x="1120" y="300" width="320" height="140" rx="10" fill="#e6f5f5" stroke="#2a8c8c"/>
+  <text class="api" x="1280" y="364" text-anchor="middle" style="font-size: 14px; font-weight: 600;">moca-provisioner</text>
+  <text class="sub" x="1280" y="384" text-anchor="middle">Role in moca-sandbox, signs attach tokens</text>
+
+  <!-- moca-sandbox namespace -->
+  <rect class="box" x="980" y="520" width="460" height="320" rx="10" fill="#f3eefc" stroke="#7a5cc0"/>
+  <text class="title" x="1000" y="550">Workload sandboxes</text>
+  <text class="sub" x="1160" y="550">in namespace</text>
+  <text class="api" x="1238" y="550">moca-sandbox</text>
+
+  <rect class="box" x="1000" y="575" width="225" height="160" rx="8" fill="#ffffff" stroke="#7a5cc0"/>
+  <text class="api" x="1112" y="598" text-anchor="middle" style="font-size: 12px; font-weight: 600;">StatefulSet &lt;wl&gt;</text>
+  <rect class="box" x="1012" y="615" width="96" height="48" rx="7" fill="#f3eefc" stroke="#7a5cc0"/>
+  <text class="api" x="1060" y="643" text-anchor="middle">&lt;wl&gt;-0</text>
+  <rect class="box" x="1117" y="615" width="96" height="48" rx="7" fill="#f3eefc" stroke="#7a5cc0"/>
+  <text class="api" x="1165" y="643" text-anchor="middle">&lt;wl&gt;-1</text>
+  <text class="api" x="1112" y="690" text-anchor="middle">app: moca-workload-sandbox</text>
+  <text class="sub" x="1112" y="712" text-anchor="middle">pods are the sandbox ids</text>
+
+  <rect class="box" x="1000" y="750" width="108" height="70" rx="7" fill="#ffffff" stroke="#7a5cc0"/>
+  <text class="note" x="1054" y="778" text-anchor="middle">Secret</text>
+  <text class="api" x="1054" y="798" text-anchor="middle">&lt;wl&gt;-attach</text>
+  <rect class="box" x="1117" y="750" width="108" height="70" rx="7" fill="#ffffff" stroke="#7a5cc0"/>
+  <text class="note" x="1171" y="778" text-anchor="middle">headless Service</text>
+  <text class="api" x="1171" y="798" text-anchor="middle">&lt;wl&gt;</text>
+
+  <!-- Context PVC, in moca-sandbox, owned by Context Service -->
+  <path class="box" d="M1285,612 v60 a72,11 0 0,0 144,0 v-60" fill="#eaf7ee" stroke="#3c8d5a"/>
+  <ellipse class="box" cx="1357" cy="612" rx="72" ry="11" fill="#eaf7ee" stroke="#3c8d5a"/>
+  <text class="title" x="1357" y="647" text-anchor="middle" style="font-size: 14px;">Context PVC</text>
+  <text class="api" x="1357" y="666" text-anchor="middle">context-&lt;name&gt;</text>
+
+  <!-- 6 mount -->
+  <line class="line" x1="1225" y1="640" x2="1283" y2="640"/>
+  <g class="step"><circle cx="1252" cy="640" r="10"/><text x="1252" y="640">6</text></g>
+  <text class="sub" x="1262" y="718">read-only, subPath</text>
+  <text class="api" x="1262" y="734">…/materialized/&lt;revision&gt;</text>
+  <text class="sub" x="1262" y="764">or writable, subPath</text>
+  <text class="api" x="1262" y="780">moca-workspace</text>
+  <text class="sub" x="1262" y="797">init container seeds it once</text>
+
+  <!-- 1 create + upload -->
+  <line class="line" x1="200" y1="130" x2="458" y2="130"/>
+  <g class="step"><circle cx="222" cy="130" r="10"/><text x="222" y="130">1</text></g>
+  <text class="api" x="240" y="124">POST /workloads</text>
+  <text class="sub" x="240" y="146">with sandboxes, workspace.mount;</text>
+  <text class="sub" x="240" y="162">then upload, as in phase 1</text>
+
+  <line class="line" x1="740" y1="130" x2="1118" y2="130"/>
+  <g class="step"><circle cx="762" cy="130" r="10"/><text x="762" y="130">1</text></g>
+  <text class="api" x="780" y="124">POST /internal/v1/contexts</text>
+  <text class="sub" x="780" y="146">Context and PVC, in moca-sandbox</text>
+
+  <!-- 2 activate -->
+  <line class="line" x1="200" y1="215" x2="458" y2="215"/>
+  <g class="step"><circle cx="222" cy="215" r="10"/><text x="222" y="215">2</text></g>
+  <text class="api" x="240" y="209">POST /workloads/{id}/activate</text>
+  <text class="sub" x="240" y="231">freeze, status provisioning</text>
+
+  <!-- 9b delete Context -->
+  <line class="line" x1="740" y1="200" x2="1118" y2="200"/>
+  <g class="step"><circle cx="762" cy="200" r="10"/><text x="762" y="200">9</text></g>
+  <text class="api" x="780" y="194">DELETE /internal{ctx}</text>
+  <text class="sub" x="780" y="216">then the Context and its managed PVC</text>
+
+  <!-- 3 provision -->
+  <line class="line" x1="740" y1="340" x2="1118" y2="340"/>
+  <g class="step"><circle cx="762" cy="340" r="10"/><text x="762" y="340">3</text></g>
+  <text class="api" x="780" y="334">PUT /internal/v1/workloads/{name}/{generation}</text>
+  <text class="sub" x="780" y="356">service token + caller's API token;</text>
+  <text class="sub" x="780" y="372">derives wl from owner, name, generation</text>
+
+  <!-- 9a delete sandboxes -->
+  <line class="line" x1="740" y1="405" x2="1118" y2="405"/>
+  <g class="step"><circle cx="762" cy="405" r="10"/><text x="762" y="405">9</text></g>
+  <text class="api" x="780" y="399">DELETE /internal/v1/workloads/{name}/{generation}</text>
+  <text class="sub" x="780" y="421">sandboxes first: 200 once no pod remains</text>
+
+  <!-- 8 run -->
+  <line class="line" x1="200" y1="300" x2="458" y2="300"/>
+  <g class="step"><circle cx="222" cy="300" r="10"/><text x="222" y="300">8</text></g>
+  <text class="api" x="240" y="294">POST /v1/runs {workloadId}</text>
+  <text class="sub" x="240" y="316">one task on that workload</text>
+
+  <!-- 9 delete -->
+  <line class="line" x1="200" y1="385" x2="458" y2="385"/>
+  <g class="step"><circle cx="222" cy="385" r="10"/><text x="222" y="385">9</text></g>
+  <text class="api" x="240" y="379">DELETE /workloads/{id}</text>
+  <text class="sub" x="240" y="401">sandboxes, then the Context</text>
+
+  <!-- 4 resolve PVC -->
+  <line class="line" x1="1160" y1="300" x2="1160" y2="237"/>
+  <g class="step"><circle cx="1160" cy="278" r="10"/><text x="1160" y="278">4</text></g>
+  <text class="api" x="1180" y="249">resolve attachment (context-service#40)</text>
+  <text class="sub" x="1180" y="264">needs attach for the owner; returns</text>
+  <text class="api" x="1180" y="279">{namespace, claimName,</text>
+  <text class="api" x="1180" y="293">backend, accessMode}</text>
+
+  <!-- 5 create objects -->
+  <line class="line" x1="1160" y1="440" x2="1160" y2="518"/>
+  <g class="step"><circle cx="1160" cy="462" r="10"/><text x="1160" y="462">5</text></g>
+  <text class="api" x="1180" y="466">create StatefulSet, Service, Secret</text>
+  <text class="sub" x="1180" y="484">Kubernetes API; attach token in</text>
+  <text class="sub" x="1180" y="500">the Secret, mounted as a file</text>
+
+  <!-- 8 select + exec, worker to relay -->
+  <line class="line" x1="480" y1="470" x2="480" y2="608"/>
+  <g class="step"><circle cx="480" cy="495" r="10"/><text x="480" y="495">8</text></g>
+  <text class="api" x="500" y="525">SandboxExec.Exec {workload}</text>
+  <text class="sub" x="500" y="543">selection keeps only records whose</text>
+  <text class="api" x="500" y="560">moca.dev/workload = wl and</text>
+  <text class="api" x="500" y="575">moca.dev/owner = owner</text>
+
+  <!-- 7 attach -->
+  <line class="line" x1="1000" y1="640" x2="742" y2="640"/>
+  <g class="step"><circle cx="978" cy="640" r="10"/><text x="978" y="640">7</text></g>
+  <text class="api" x="760" y="634">Hello + attach token</text>
+  <text class="sub" x="760" y="656">relay stamps trusted labels</text>
+  <text class="api" x="760" y="672">moca.dev/workload,</text>
+  <text class="api" x="760" y="686">moca.dev/owner</text>
+
+  <!-- 8 exec to sandbox -->
+  <line class="line" x1="740" y1="712" x2="998" y2="712"/>
+  <g class="step"><circle cx="762" cy="712" r="10"/><text x="762" y="712">8</text></g>
+  <text class="api" x="780" y="706">SandboxExec.Exec</text>
+  <text class="sub" x="780" y="728">checks the workload field</text>
+
+  <text class="api" x="20" y="800" style="fill: #6b7280; font-size: 11px;">{ctx} = /v1/namespaces/{ns}/contexts/{name}</text>
+  <text class="api" x="20" y="818" style="fill: #6b7280; font-size: 11px;">wl = w-&lt;32 hex&gt;, derived by the provisioner from the verified owner, name and generation</text>
+</svg>

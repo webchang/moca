@@ -1,14 +1,16 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -18,6 +20,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // signal-exit), fails here rather than on a user's machine. Spec §4 and §7.
 const pkg = fileURLToPath(new URL('..', import.meta.url));
 const VERSION = 'v9.9.9-bundle-test';
+// Measured 2026-10-19 at 6 916 540 bytes (SBX0 1c, Task 9); about 11 % headroom, in whole 100 kB.
+const BUNDLE_BUDGET_BYTES = 7_700_000;
 let dir: string;
 let bundle: string;
 
@@ -56,6 +60,29 @@ describe('the bundle', () => {
     const r = run(['--version']);
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout).toBe(`${VERSION}\n`);
+  });
+
+  // SBX0 §6.4: mocactl ships as one file, and @moca/sandbox-client (grpc-js, protobuf, the MCP SDK)
+  // went into it. The budget makes growth a decision: raise BUNDLE_BUDGET_BYTES deliberately, in
+  // the change that needs it, with the new measured size. The size is printed so a reviewer sees it
+  // move. CI runs this in the `check` job (`pnpm -r test`).
+  it('stays within its size budget', () => {
+    const size = statSync(bundle).size;
+    console.log(
+      `mocactl bundle: ${size} bytes (${(size / 2 ** 20).toFixed(2)} MiB), ` +
+        `budget ${BUNDLE_BUDGET_BYTES} bytes`,
+    );
+    expect(Number.isSafeInteger(BUNDLE_BUDGET_BYTES)).toBe(true);
+    expect(size).toBeLessThanOrEqual(BUNDLE_BUDGET_BYTES);
+  });
+
+  // ADR-0036/0042: Pi stays out of mocactl. sandbox-client's contract test links Pi as a dev
+  // dependency; nothing of it may be bundled.
+  it('bundles nothing of Pi', () => {
+    const text = readFileSync(bundle, 'utf8');
+    for (const pi of ['@earendil-works', 'pi-coding-agent', 'pi-agent-core']) {
+      expect(text.includes(pi), pi).toBe(false);
+    }
   });
 
   it('starts with a node shebang, so the installer can run it as `mocactl`', () => {
@@ -139,6 +166,98 @@ describe('the bundle', () => {
     });
     expect(viaCopy.stdout).not.toBe(`${VERSION}\n`);
   });
+
+  // `sbx mcp` loads the MCP SDK's stdio transport lazily: a bundling gap would show only here. The
+  // control plane is an in-process fake; the client closes stdin, and the server must then exit.
+  it('serves MCP on stdio as `sbx mcp`, with nothing but frames on stdout', async () => {
+    const SBX = 'sbx-0123456789abcdef0123456789';
+    const srv = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url !== `/v1/sandboxes/${SBX}`) {
+        res.statusCode = 404;
+        return res.end('{"error":"not_found"}');
+      }
+      res.end(
+        JSON.stringify({
+          id: SBX,
+          owner: 'github:1',
+          name: null,
+          template: 'node22',
+          state: 'ready',
+          reason: null,
+          createdAt: 1,
+          expiresAt: 4_000_000_000,
+          terminatedAt: null,
+          labels: {},
+        }),
+      );
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+      const config = join(dir, 'mcp-config');
+      mkdirSync(join(config, 'mocactl'), { recursive: true });
+      writeFileSync(
+        join(config, 'mocactl', 'sbx-auth.json'),
+        JSON.stringify({
+          apiToken: 'api-1',
+          subject: 'github:1',
+          roles: [],
+          expiresAt: 4_000_000_000,
+          controlPlaneUrl: url,
+        }),
+      );
+      const p = spawn(process.execPath, [bundle, 'sbx', 'mcp', '--sandbox', SBX], {
+        cwd: dir,
+        env: cleanEnv({
+          XDG_CONFIG_HOME: config,
+          XDG_STATE_HOME: join(dir, 'mcp-state'),
+          MOCACTL_SBX_URL: url,
+        }),
+      });
+      let out = '';
+      let err = '';
+      p.stdout.on('data', (d) => (out += d));
+      p.stderr.on('data', (d) => (err += d));
+      const frames = () => out.split('\n').filter((l) => l.trim());
+      const send = (m: object) => p.stdin.write(JSON.stringify(m) + '\n');
+      send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 't', version: '0' },
+        },
+      });
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      send({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'sandbox_info', arguments: {} },
+      });
+      const deadline = Date.now() + 10_000;
+      while (frames().length < 2 && Date.now() < deadline)
+        await new Promise((r) => setTimeout(r, 50));
+      p.stdin.end();
+      const code = await new Promise((r) => p.on('exit', r));
+      expect(code, err).toBe(0);
+      const parsed = frames().map(
+        (l) =>
+          JSON.parse(l) as {
+            jsonrpc: string;
+            id?: number;
+            result?: { content: { text: string }[] };
+          },
+      );
+      expect(parsed.every((f) => f.jsonrpc === '2.0')).toBe(true);
+      expect(parsed.find((f) => f.id === 2)?.result?.content[0]?.text).toMatch(/template node22/);
+    } finally {
+      srv.close();
+    }
+  }, 20_000);
 
   it('turns a missing clipboard tool into a rejected copy, not a crash', () => {
     const probe = join(dir, 'clipboard-probe.mjs');

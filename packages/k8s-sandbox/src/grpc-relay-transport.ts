@@ -50,6 +50,11 @@ export function GrpcRelayTransport(
      * refuses it, because on the VM path there is nothing to fall back to.
      */
     workspaceKey?: string;
+    /**
+     * The workload key the run names, sent as ExecRequest's `workload` (workload sandboxes spec
+     * §3.3). Omitted (or '') for a shared-pool run. Only a relay with attach keys reads it.
+     */
+    workload?: string;
   } = {},
 ): SandboxTransport {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
@@ -62,6 +67,7 @@ export function GrpcRelayTransport(
       const reqId = nextReqId();
       const call = client.exec({
         sandboxId,
+        workload: opts.workload ?? '',
         exec: {
           reqId,
           command,

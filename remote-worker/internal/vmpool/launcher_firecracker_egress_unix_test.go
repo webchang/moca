@@ -1,0 +1,289 @@
+//go:build unix
+
+package vmpool
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/rossoctl/moca/remote-worker/internal/egress/control"
+)
+
+// recordingBinder is an EgressBinder that logs its calls in order and runs optional hooks
+// at the moment of each call.
+type recordingBinder struct {
+	mu            sync.Mutex
+	events        []string
+	registerErr   error
+	onRegister    func()
+	onUnregister  func()
+	registeredSID string
+}
+
+func (b *recordingBinder) Register(_ context.Context, vmID, sid string, grant []byte, ln *os.File) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.events = append(b.events, "register:"+vmID)
+	b.registeredSID = sid
+	if ln == nil {
+		return errors.New("nil listener file")
+	}
+	if b.onRegister != nil {
+		b.onRegister()
+	}
+	return b.registerErr
+}
+
+func (b *recordingBinder) Unregister(_ context.Context, vmID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.events = append(b.events, "unregister:"+vmID)
+	if b.onUnregister != nil {
+		b.onUnregister()
+	}
+	return nil
+}
+
+func (b *recordingBinder) log() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.events...)
+}
+
+// egressLauncher builds a launcher whose fake jailer records whether the egress socket
+// existed at the moment it ran. The jail layout is <base>/firecracker/<id>/root, and the
+// jailer's argv is "--id <id> ...", so the script derives the jail from $2.
+func egressLauncher(t *testing.T, b EgressBinder) (Launcher, string, string) {
+	t.Helper()
+	base, err := os.MkdirTemp("/tmp", "fceg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	marker := filepath.Join(base, "jailer-marker")
+	jailer := filepath.Join(base, "jailer")
+	script := "#!/bin/sh\njail=" + base + "/firecracker/$2/root\n" +
+		"if [ -S \"$jail/run/v.sock_1025\" ]; then echo yes >" + marker + "; else echo no >" + marker + "; fi\nexit 0\n"
+	if err := os.WriteFile(jailer, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := FirecrackerOptions{
+		JailerBin: jailer, FirecrackerBin: filepath.Join(base, "firecracker"),
+		ChrootBase: base, SnapshotDir: base,
+		UID: os.Getuid(), GID: os.Getgid(),
+	}
+	if b != nil {
+		opts.Egress = b
+	}
+	lc, err := NewFirecrackerLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewFirecrackerLauncher: %v", err)
+	}
+	return lc, base, marker
+}
+
+func egressSock(base, id string) string {
+	return filepath.Join(base, "firecracker", id, "root", "run", "v.sock_1025")
+}
+
+// seedSnapshot creates the files Restore hardlinks, so a restore gets past that step.
+func seedSnapshot(t *testing.T, base string) {
+	t.Helper()
+	for _, n := range []string{fileVMState, fileMemory, fileKernel, fileRootfs, fileAgent} {
+		if err := os.WriteFile(filepath.Join(base, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A workspace image that already looks formatted, so Restore does not shell out to mkfs.
+	img := make([]byte, ext4MagicOffset+2)
+	img[ext4MagicOffset], img[ext4MagicOffset+1] = byte(ext4Magic&0xff), byte(ext4Magic>>8)
+	if err := os.WriteFile(filepath.Join(base, "workspace.img"), img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func restoreShort(lc Launcher, base, id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := lc.Restore(ctx, RestoreRequest{ID: id, Key: "sess-1", WorkspaceDir: base, GuestRAMBytes: 256 << 20})
+	return err
+}
+
+func TestGateEgressStandbyFailsClosed(t *testing.T) {
+	b := &recordingBinder{registerErr: errors.New("refused")}
+	lc, base, marker := egressLauncher(t, b)
+	seedSnapshot(t, base)
+
+	_, err := lc.Restore(context.Background(), RestoreRequest{ID: "vm-1", Key: "sess-1", WorkspaceDir: base, GuestRAMBytes: 256 << 20})
+	if err == nil || !strings.Contains(err.Error(), "egress") {
+		t.Fatalf("Restore err = %v, want one naming egress", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("the jailer ran although Register failed: the VM would have been a standby without egress")
+	}
+	if _, statErr := os.Lstat(egressSock(base, "vm-1")); !os.IsNotExist(statErr) {
+		t.Errorf("egress socket survived a failed restore: %v", statErr)
+	}
+}
+
+func TestEgressSocketIsBoundBeforeTheJailerStarts(t *testing.T) {
+	b := &recordingBinder{}
+	lc, base, marker := egressLauncher(t, b)
+	seedSnapshot(t, base)
+	b.onRegister = func() {
+		if _, err := os.Stat(marker); err == nil {
+			t.Error("the jailer had already run when Register was called")
+		}
+		if c, err := net.Dial("unix", egressSock(base, "vm-2")); err != nil {
+			t.Errorf("socket not accepting connections at Register time: %v", err)
+		} else {
+			_ = c.Close()
+		}
+	}
+	_ = restoreShort(lc, base, "vm-2") // fails at the API socket wait; the fake jailer never creates one
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("jailer never ran: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "yes" {
+		t.Fatalf("jailer saw the egress socket as %q, want yes", got)
+	}
+	ev := b.log()
+	if len(ev) == 0 || ev[0] != "register:vm-2" {
+		t.Fatalf("events = %v, want register first", ev)
+	}
+	if b.registeredSID != "sess-1" {
+		t.Errorf("registered session %q, want the RestoreRequest key", b.registeredSID)
+	}
+}
+
+func TestGateEgressTeardownOrdering(t *testing.T) {
+	base, err := os.MkdirTemp("/tmp", "fcto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	jail := filepath.Join(base, "root")
+	if err := os.MkdirAll(filepath.Join(jail, "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(jail, "run", "v.sock_1025")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "60")
+	fcIsolateProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	b := &recordingBinder{}
+	var reaped, pathThere bool
+	b.onUnregister = func() {
+		reaped = errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+		_, statErr := os.Lstat(sock)
+		pathThere = statErr == nil
+	}
+	vm := &firecrackerVM{id: "vm-3", cmd: cmd, jailRoot: jail, egress: b, egressLn: ln}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if !reaped {
+		t.Error("Unregister ran before the VMM was killed and reaped")
+	}
+	if !pathThere {
+		t.Error("the socket path was already gone at Unregister time; unlink must come last")
+	}
+	if ev := b.log(); len(ev) != 1 || ev[0] != "unregister:vm-3" {
+		t.Errorf("events = %v, want exactly one unregister", ev)
+	}
+	if _, statErr := os.Lstat(sock); !os.IsNotExist(statErr) {
+		t.Errorf("socket path survives Destroy: %v", statErr)
+	}
+	if _, statErr := os.Stat(jail); !os.IsNotExist(statErr) {
+		t.Errorf("jail survives Destroy: %v", statErr)
+	}
+}
+
+func TestEgressOffLeavesRestoreUnchanged(t *testing.T) {
+	lc, base, marker := egressLauncher(t, nil)
+	seedSnapshot(t, base)
+	_ = restoreShort(lc, base, "vm-4")
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("jailer never ran: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "no" {
+		t.Fatalf("egress socket existed with Egress nil (marker %q)", got)
+	}
+}
+
+func TestFirecrackerRefusesAnEgressSocketPathTooLong(t *testing.T) {
+	base := "/tmp/" + strings.Repeat("a", 85) // 90 chars
+	opts := FirecrackerOptions{
+		JailerBin: "/j", FirecrackerBin: "/usr/bin/firecracker", ChrootBase: base, SnapshotDir: "/s",
+	}
+	if _, err := NewFirecrackerLauncher(opts); err != nil {
+		t.Fatalf("egress off must accept a long base: %v", err)
+	}
+	opts.Egress = &recordingBinder{}
+	_, err := NewFirecrackerLauncher(opts)
+	if err == nil {
+		t.Fatal("a too-long egress socket path was accepted")
+	}
+	opts.setDefaults()
+	want := len(opts.maxEgressSocketPath())
+	if !strings.Contains(err.Error(), "sun_path") || !strings.Contains(err.Error(), strconvItoa(want)) {
+		t.Errorf("error %q should name sun_path and the length %d", err, want)
+	}
+}
+
+func strconvItoa(n int) string {
+	const digits = "0123456789"
+	if n == 0 {
+		return "0"
+	}
+	var s string
+	for ; n > 0; n /= 10 {
+		s = string(digits[n%10]) + s
+	}
+	return s
+}
+
+func TestLauncherFromEnvRefusesEgressOnCloudHypervisor(t *testing.T) {
+	_, err := LauncherFromEnv(CloudHypervisor, envFrom(map[string]string{"MOCA_EGRESS_CONTROL_SOCK": "/x"}), t.TempDir(), 256<<20, "t")
+	if err == nil || err.Error() != "egress (MOCA_EGRESS_CONTROL_SOCK) is supported on the firecracker VMM only" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLauncherFromEnvWiresEgressFromControlSock(t *testing.T) {
+	lc, err := LauncherFromEnv(Firecracker, envFrom(map[string]string{"MOCA_EGRESS_CONTROL_SOCK": "/x"}), t.TempDir(), 256<<20, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := lc.(*firecrackerLauncher)
+	if _, ok := fc.opts.Egress.(*control.Client); !ok {
+		t.Fatalf("opts.Egress = %T, want *control.Client", fc.opts.Egress)
+	}
+	if fc.opts.EgressPort != 1025 {
+		t.Errorf("EgressPort = %d", fc.opts.EgressPort)
+	}
+	lc2, err := LauncherFromEnv(Firecracker, envFrom(nil), t.TempDir(), 256<<20, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lc2.(*firecrackerLauncher).opts.Egress != nil {
+		t.Error("egress must stay off when the control socket is unset")
+	}
+}

@@ -191,8 +191,20 @@ export interface ExecError {
 
 /** ---- harness ↔ relay (SandboxExec) ---- */
 export interface ExecRequest {
+  /** from the lease */
   sandboxId: string;
-  exec: Exec | undefined;
+  exec:
+    | Exec
+    | undefined;
+  /**
+   * workload is the workload key (`w-<32 hex>`) the run names, or empty for a run on the shared
+   * pool (workload sandboxes spec §3.3). ADDITIVE, and read by the relay alone: it is not part of
+   * Exec, so a worker never sees it. A relay with attach public keys refuses an Exec to a sandbox
+   * whose trusted moca.dev/workload label differs from it, and a non-empty value on a sandbox with
+   * no such label. A relay without them ignores it. Defense in depth against routing bugs, not a
+   * boundary: the worker that fills it in is still the trust root for routing.
+   */
+  workload: string;
 }
 
 export interface ExecEvent {
@@ -1168,7 +1180,7 @@ export const ExecError: MessageFns<ExecError> = {
 };
 
 function createBaseExecRequest(): ExecRequest {
-  return { sandboxId: "", exec: undefined };
+  return { sandboxId: "", exec: undefined, workload: "" };
 }
 
 export const ExecRequest: MessageFns<ExecRequest> = {
@@ -1178,6 +1190,9 @@ export const ExecRequest: MessageFns<ExecRequest> = {
     }
     if (message.exec !== undefined) {
       Exec.encode(message.exec, writer.uint32(18).fork()).join();
+    }
+    if (message.workload !== "") {
+      writer.uint32(26).string(message.workload);
     }
     return writer;
   },
@@ -1205,6 +1220,14 @@ export const ExecRequest: MessageFns<ExecRequest> = {
           message.exec = Exec.decode(reader, reader.uint32());
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.workload = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1218,6 +1241,7 @@ export const ExecRequest: MessageFns<ExecRequest> = {
     return {
       sandboxId: isSet(object.sandboxId) ? globalThis.String(object.sandboxId) : "",
       exec: isSet(object.exec) ? Exec.fromJSON(object.exec) : undefined,
+      workload: isSet(object.workload) ? globalThis.String(object.workload) : "",
     };
   },
 
@@ -1229,6 +1253,9 @@ export const ExecRequest: MessageFns<ExecRequest> = {
     if (message.exec !== undefined) {
       obj.exec = Exec.toJSON(message.exec);
     }
+    if (message.workload !== "") {
+      obj.workload = message.workload;
+    }
     return obj;
   },
 
@@ -1239,6 +1266,7 @@ export const ExecRequest: MessageFns<ExecRequest> = {
     const message = createBaseExecRequest();
     message.sandboxId = object.sandboxId ?? "";
     message.exec = (object.exec !== undefined && object.exec !== null) ? Exec.fromPartial(object.exec) : undefined;
+    message.workload = object.workload ?? "";
     return message;
   },
 };

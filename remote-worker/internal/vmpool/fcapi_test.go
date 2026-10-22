@@ -103,7 +103,7 @@ func TestFirecrackerClientLoadsAndResumes(t *testing.T) {
 func TestLoadSnapshotSerializesVsockOverrideAsObject(t *testing.T) {
 	sock, _, bodies := fakeFirecrackerAPI(t)
 	c := newFCClient(sock)
-	c.setVsockOverride("/vsock.sock")
+	c.setVsockOverride("/run/v.sock")
 	if err := c.LoadSnapshot(context.Background(), "/snapshot/vmstate", "/snapshot/memfile"); err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
@@ -125,8 +125,8 @@ func TestLoadSnapshotSerializesVsockOverrideAsObject(t *testing.T) {
 	if len(obj) != 1 {
 		t.Fatalf("vsock_override object = %v, want exactly one member (uds_path)", obj)
 	}
-	if udsPath, _ := obj["uds_path"].(string); udsPath != "/vsock.sock" {
-		t.Fatalf("vsock_override.uds_path = %v, want \"/vsock.sock\"", obj["uds_path"])
+	if udsPath, _ := obj["uds_path"].(string); udsPath != "/run/v.sock" {
+		t.Fatalf("vsock_override.uds_path = %v, want \"/run/v.sock\"", obj["uds_path"])
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -268,6 +269,60 @@ func TestFirecrackerSerializesExecsPerRun(t *testing.T) {
 	}
 	if lc.Kind() != Firecracker {
 		t.Fatalf("Kind = %q", lc.Kind())
+	}
+}
+
+// A command that ends in its own `exit` must not be able to skip the wrapper's sync.
+// Every writeFileCommand-based put ends its script with `exit 0`/`exit 1`
+// (packages/sandbox-client/src/tools.ts), and any run script may call exit — so this
+// is the canonical client write shape, not a corner. The VM is SIGKILLed as soon as
+// the command's shell is gone, so a sync the command's exit jumped over takes the
+// guest page cache — and with it every write the command made — to the grave (spec
+// §8's durability gate; caught live 2026-10-20: puts vanished while plain echo writes
+// survived). The command must therefore run in a SUBSHELL, so its exit ends the
+// subshell and the sync after it still runs.
+//
+// No KVM needed: bash's xtrace is the observable. `bash -x` prints every command it
+// executes to stderr, so "did execution reach sync" is a substring test on the trace —
+// a wrapper whose command can terminate the whole shell shows no sync line at all,
+// which is precisely the bug. (The cd to /workspace fails on a test host; that is
+// fine — the wrapper has no set -e, and only the trace after it matters.)
+func TestWrapCommandSyncSurvivesCommandExit(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		cmd  string
+		want int
+	}{
+		{"exit zero", "echo hi; exit 0", 0},
+		{"exit nonzero", "echo hi; exit 7", 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			bash := exec.Command("bash", "-x", "-c", wrapCommand(tc.cmd))
+			bash.Stderr = &stderr
+			err := bash.Run()
+			code := 0
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else if err != nil {
+				t.Fatalf("bash: %v", err)
+			}
+			// The command's own exit code is Run's contract (wrapCommand's own comment:
+			// sync must not be able to change what the worker reports) — so the fix must
+			// preserve it, not just reach sync.
+			if code != tc.want {
+				t.Fatalf("wrapper exited %d, want %d (the command's own code)", code, tc.want)
+			}
+			trace := stderr.String()
+			if !strings.Contains(trace, "sync") {
+				t.Fatalf("sync never ran — the command's exit terminated the wrapper shell "+
+					"before its sync, so the command's writes would die with the VM's page "+
+					"cache.\nxtrace:\n%s", trace)
+			}
+		})
 	}
 }
 

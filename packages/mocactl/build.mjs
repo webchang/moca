@@ -25,7 +25,12 @@ await build({
   jsx: 'automatic',
   tsconfig: here('tsconfig.json'),
   define: { MOCACTL_VERSION: JSON.stringify(process.env.MOCACTL_VERSION || 'dev') },
-  alias: { 'react-devtools-core': here('build/react-devtools-stub.mjs') },
+  alias: {
+    'react-devtools-core': here('build/react-devtools-stub.mjs'),
+    // jsonc-parser's `main` is a UMD build whose dynamic `require('./impl/format')` esbuild cannot
+    // follow (the bundle then fails at startup): bundle its ESM build instead.
+    'jsonc-parser': 'jsonc-parser/lib/esm/main.js',
+  },
   // The shebang lets the installer run the file as `mocactl`. The `require` is for bundled CommonJS
   // (signal-exit, via Ink) that requires Node built-ins: esbuild's ESM output has no `require`, and
   // without one the TUI dies at startup with `Dynamic require of "assert" is not supported`.

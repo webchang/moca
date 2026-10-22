@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Bash(mktemp -d)",
       "Bash(contextctl ctx pack *)",
       "Bash(mocactl workloads *)",
       "Bash(mocactl spawn *)",

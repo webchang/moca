@@ -1,5 +1,5 @@
 import { homedir, hostname } from 'node:os';
-import { ControlPlaneClient } from './api/control-plane.js';
+import { ControlPlaneClient, type ControlPlaneClientOptions } from './api/control-plane.js';
 import { DiscoveringHarness, discoverHarnessUrl } from './api/discovery.js';
 import { HarnessClient } from './api/harness.js';
 import type { ControlPlaneApi, HarnessApi } from './api/types.js';
@@ -27,6 +27,37 @@ import { SessionManager } from './core/session-manager.js';
 import { sleep } from './core/time.js';
 import { TranscriptStore } from './core/transcripts.js';
 
+/** A refresh that failed for a reason other than the login being refused. */
+export interface RefreshFailure {
+  error: unknown;
+}
+
+/**
+ * Builds the runtime's control-plane client. The default is `ControlPlaneClient`; `mocactl sbx`
+ * passes its `SandboxApiClient` (a subclass), so one client carries the refresh-and-retry wiring.
+ */
+export type ControlPlaneFactory = (
+  baseUrl: string,
+  getToken: () => string | undefined,
+  fetchImpl: typeof fetch,
+  opts: ControlPlaneClientOptions,
+) => ControlPlaneClient;
+
+export interface RuntimeOptions {
+  /**
+   * Rewrites the resolved paths before anything is read. `mocactl sbx` keeps its login in its own
+   * file (and so its own refresh lock), so a sandbox-service login never replaces a MOCA one.
+   */
+  paths?: (p: Paths) => Paths;
+  /** The control-plane client (default `ControlPlaneClient`). */
+  client?: ControlPlaneFactory;
+  /**
+   * False for a runtime with no harness: SH_HARNESS_URL and config.harnessUrl are not read, and
+   * there is neither a harness client nor a transcript store (the sandbox service has no sessions).
+   */
+  harness?: boolean;
+}
+
 export interface Runtime {
   paths: Paths;
   config: TuiConfig;
@@ -42,13 +73,21 @@ export interface Runtime {
   fetchImpl: typeof fetch;
   /** Overrides SessionDeps.cancelPauseMs (the double-Esc window); tests only. */
   cancelPauseMs?: number;
+  /**
+   * Why the forced refresh behind the client's last 401 retry failed, when it failed for a reason
+   * other than the login itself (a network failure, `not_enrolled`). The client turns a failed
+   * retry into the original 401; this is what the refresh actually hit.
+   */
+  lastRefreshFailure?: RefreshFailure;
+  /** How this runtime was built: `wire` rebuilds its clients from it. */
+  options?: Pick<RuntimeOptions, 'client' | 'harness'>;
 }
 
 // The transcript store is per subject and per control plane (spec §6.6), so it follows the login.
 function wireTranscripts(rt: Runtime): void {
   const { controlPlaneUrl } = rt.endpoints;
   rt.transcripts =
-    rt.auth && controlPlaneUrl
+    rt.options?.harness !== false && rt.auth && controlPlaneUrl
       ? new TranscriptStore(rt.paths.transcriptsDir, { subject: rt.auth.subject, controlPlaneUrl })
       : undefined;
 }
@@ -57,27 +96,37 @@ function wireTranscripts(rt: Runtime): void {
 // The harness URL is an override; without one the control plane says where the harness is.
 function wire(rt: Runtime): void {
   const { controlPlaneUrl, harnessUrl } = rt.endpoints;
+  const client: ControlPlaneFactory =
+    rt.options?.client ?? ((...a) => new ControlPlaneClient(...a));
   const cp = controlPlaneUrl
-    ? new ControlPlaneClient(controlPlaneUrl, () => rt.auth?.apiToken, rt.fetchImpl, {
+    ? client(controlPlaneUrl, () => rt.auth?.apiToken, rt.fetchImpl, {
         label: hostname(),
         // A TUI left open past the 15-minute API token: refresh once and retry (B14). Never throws:
-        // the client would surface our error instead of the original 401, so any failure is `false`.
+        // the client would surface our error instead of the original 401, so any failure is `false`,
+        // and what the refresh hit is kept in rt.lastRefreshFailure for the command to report.
         onTokenRejected: async () => {
+          rt.lastRefreshFailure = undefined;
           try {
-            return (await ensureRuntimeAuth(rt, { force: true })).kind === 'ok';
-          } catch {
+            const r = await ensureRuntimeAuth(rt, { force: true });
+            if (r.kind === 'unreachable') rt.lastRefreshFailure = { error: r.error };
+            return r.kind === 'ok';
+          } catch (error) {
+            rt.lastRefreshFailure = { error };
             return false;
           }
         },
       })
     : undefined;
   rt.cp = cp;
-  rt.harness = harnessUrl
-    ? new HarnessClient(harnessUrl, rt.fetchImpl)
-    : cp
-      ? // The signal lets an abandoned health probe abort the discovery behind it.
-        new DiscoveringHarness((signal) => discoverHarnessUrl(cp, { signal }), rt.fetchImpl)
-      : undefined;
+  rt.harness =
+    rt.options?.harness === false
+      ? undefined
+      : harnessUrl
+        ? new HarnessClient(harnessUrl, rt.fetchImpl)
+        : cp
+          ? // The signal lets an abandoned health probe abort the discovery behind it.
+            new DiscoveringHarness((signal) => discoverHarnessUrl(cp, { signal }), rt.fetchImpl)
+          : undefined;
   wireTranscripts(rt);
 }
 
@@ -86,10 +135,16 @@ export function buildRuntime(
   env: NodeJS.ProcessEnv,
   home: string = homedir(),
   fetchImpl: typeof fetch = fetch,
+  opts: RuntimeOptions = {},
 ): Runtime {
-  const paths = resolvePaths(env, home);
+  const resolved = resolvePaths(env, home);
+  const paths = opts.paths ? opts.paths(resolved) : resolved;
   const loaded = loadConfig(paths);
-  const endpoints = resolveEndpoints(flags, env, loaded.config);
+  const resolvedEndpoints = resolveEndpoints(flags, env, loaded.config);
+  const endpoints =
+    opts.harness === false
+      ? { controlPlaneUrl: resolvedEndpoints.controlPlaneUrl }
+      : resolvedEndpoints;
   const rt: Runtime = {
     paths,
     config: loaded.config,
@@ -100,6 +155,9 @@ export function buildRuntime(
     now: Date.now,
     sleep,
     fetchImpl,
+    ...(opts.client || opts.harness !== undefined
+      ? { options: { client: opts.client, harness: opts.harness } }
+      : {}),
   };
   wire(rt);
   return rt;

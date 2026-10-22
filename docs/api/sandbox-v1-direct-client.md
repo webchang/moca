@@ -1,16 +1,22 @@
-# Coding directly against the sandbox/v1 API
+# Calling the sandbox/v1 API from your own code
 
-How to run commands in a MOCA microVM sandbox from your own code (a script, an SDK, a local MCP
-server) by calling the relay's `SandboxExec` gRPC service, with no MOCA harness in between.
+How to run commands in an SBX0 sandbox from your own code (a script, an SDK, a local tool) by
+calling `SandboxExec` over gRPC. `mocactl sbx` is the supported command line; this guide is for
+everything else. The design is
+[the SBX0 spec](../specs/2026-10-15-sbx0-internal-sandbox-service-design.md), §7.
 
-> **Demo-grade.** `sandbox/v1` is MOCA's internal harness-to-relay contract, opened to a few
-> trusted clients through per-client tokens. It is not the planned public API: SBX1 replaces it with
-> a lifecycle API and the sandboxd data plane. Expect breaking changes.
+The relay accepts two kinds of direct-client credential, each checked on its own:
 
-## The contract
+- **A sandbox token** (SBX0): a short-lived signed JWT for one sandbox, from `mocactl sbx token`.
+  Most of this guide is about it.
+- **A per-client token** (MOCA rigs, demo-grade): a static token the operator lists in the relay's
+  `MOCA_RELAY_CLIENT_TOKENS`, held to one worker and one `workspace_key` prefix, reached through an
+  SSH tunnel. See [Per-client tokens on a MOCA rig](#per-client-tokens-on-a-moca-rig).
 
-[`proto/sandbox/v1/sandbox.proto`](../../proto/sandbox/v1/sandbox.proto): one self-contained file
-with no imports. A client uses one service:
+## What it is
+
+[`proto/sandbox/v1/sandbox.proto`](../../proto/sandbox/v1/sandbox.proto) is one self-contained
+file with no imports. A client uses one service, served by the SBX0 sandbox service's relay:
 
 ```proto
 service SandboxExec {
@@ -30,110 +36,185 @@ ExecRequest { sandbox_id, exec: Exec { req_id, command, stdin, timeout_s, stream
                        error { req_id, message }                          of end / error
 ```
 
-| Field           | Meaning                                                                                                                                                                |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sandbox_id`    | The **worker**, not your sandbox. The operator gives it to you, for example `moca_microvm_0`.                                                                          |
-| `workspace_key` | **Your sandbox.** Any name that starts with your token's prefix, for example `sbx-alice-calc`. The first Exec creates it. Only `/workspace` persists between calls.    |
-| `command`       | Run as `bash -c` with `/workspace` as the working directory, in a fresh Firecracker VM. No process, and no file outside `/workspace`, survives the call.               |
-| `stdin`         | Raw bytes, sent once with the call. Use it to write files: `cat > path`.                                                                                               |
-| `timeout_s`     | Kills the command when it runs out; the call ends with `error` `timeout:<s>`. 0 means the 30-minute default; the microVM tier caps it at 2 hours.                      |
-| `streaming`     | `true` streams chunks as they come; `false` buffers them until the end.                                                                                                |
-| `req_id`        | Unique per call, and what `Abort` targets. **Keep it below 2^53**: the proto says `uint64`, but the relay decodes it as a JavaScript number and refuses larger values. |
+- **Every `Exec` runs `bash -c <command>`** with `/workspace` as the working directory, in a fresh
+  Firecracker VM.
+- **Files under `/workspace` persist** between calls, for the sandbox's lifetime. Nothing else does:
+  no process, and no file outside `/workspace`, survives the call.
+- **There is no network** in the VM.
+- **There is no file RPC.** Files are commands: write with `cat > path` and the bytes on `stdin`,
+  read with `cat -- path`.
 
-**Outcomes and failures differ.**
+## Getting access
 
-- A command that ran ends with `end`, whatever its exit code. A non-zero exit is an outcome, not
+```bash
+mocactl sbx login --control-plane-url https://<api host>   # GitHub device flow, once
+mocactl sbx templates                                      # what a sandbox can be created from
+mocactl sbx create --template <id>                         # prints the sandbox id and its expiry
+eval "$(mocactl sbx env <sandbox id>)"
+```
+
+`mocactl sbx env` prints `export` lines for a direct client, never a token:
+
+| Variable            | Is                                                                                       |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `SBX_ADDR`          | Where to dial: `<exec host>:443`                                                         |
+| `SBX_TLS`           | `1`: always TLS                                                                          |
+| `SBX_CA_FILE`       | Only when the exec endpoint's certificate is self-issued: the CA to trust, as a PEM file |
+| `SBX_SANDBOX_ID`    | The **worker** serving your sandbox's template (the token's `wrk`), not your sandbox id  |
+| `SBX_WORKSPACE_KEY` | **Your sandbox's workspace** (the token's `wsk`)                                         |
+| `SBX_TOKEN_CMD`     | The command that prints a fresh token: `mocactl sbx token <sandbox id>`                  |
+
+`SBX_TOKEN_CMD` may also carry `--control-plane-url '<url>'`, when the URL came from a flag or
+`MOCACTL_SBX_URL`, so that it works in a shell that has neither. Run it with a shell-style split,
+as the example client does.
+
+## What a client sets
+
+- **TLS** to `SBX_ADDR`: against the default roots, or, when `SBX_CA_FILE` is set, against that CA
+  only. In grpcio, `root_certificates` replaces the default roots rather than adding to them.
+- **`authorization: Bearer <sandbox token>`** as metadata on every call, `Abort` included.
+- **`ExecRequest.sandbox_id = SBX_SANDBOX_ID`** and **`Exec.workspace_key = SBX_WORKSPACE_KEY`**,
+  exactly. The relay compares both for equality with the token's `wrk` and `wsk`: never a prefix,
+  never a case-folded match.
+- **`req_id`** unique within the sandbox, and below 2^53. The proto says `uint64`, but the relay
+  decodes it as a JavaScript number and refuses larger values. The relay namespaces `req_id` per
+  sandbox, so your ids cannot collide with another user's, and `Abort` reaches only your own Execs.
+  Use a fresh random 53-bit id for every call. Reusing an id that is still in flight in your
+  sandbox is refused with `ALREADY_EXISTS`. Reusing the id of a call that has **completed** replays
+  it: the worker keeps its last 256 completed results, keyed by id plus a fingerprint of `command`,
+  `stdin`, `timeout_s` and `streaming`, and answers a match with the cached `end` (or timeout
+  `error`) without running the command or sending its output again. The one deliberate reuse is
+  the retry after `UNAUTHENTICATED` (see [Tokens](#tokens)), and nothing ran before it.
+- **`timeout_s`**: the worker kills the command when it runs out. **Always send it.** The relay
+  passes it through unchanged, and the worker treats 0 or an absent value as its own default,
+  30 minutes, which is longer than a 15-minute token. Send at most what the token has left minus
+  60 s, and never more than its lifetime (`exp − iat`) minus 60 s: 840 s with the default tokens.
+  Otherwise a command that runs past the token's `exp` is cancelled at `exp` + 30 s with
+  `DEADLINE_EXCEEDED`, possibly after it has already changed the workspace. See [Tokens](#tokens).
+- **`streaming: true`**, so output arrives as it is produced. `false` buffers it until the end.
+- **Keepalive every 20 s** (`grpc.keepalive_time_ms = 20000`, and permitted without calls). The
+  relay pings too. Without it, a command that prints nothing for minutes can lose its connection to
+  a load balancer's idle cut.
+- **`stdin`**: raw bytes, sent once with the call. Keep it well under the 16 MiB message limit.
+
+## Tokens
+
+A sandbox token is an Ed25519-signed JWT (`typ: moca-sandbox+jwt`) bound to one sandbox: its
+`wrk`, its `wsk`, and the `exec` scope.
+
+- **It lives 15 minutes by default** (the deployment sets it), and never past the sandbox's own
+  expiry.
+- **Get one by running `SBX_TOKEN_CMD`.** Keep it in memory; never write it to disk or a log.
+- **Run the command again:**
+  - when the token is within 60 s of its `exp`;
+  - once, on `UNAUTHENTICATED`, if no event of that call had arrived yet; then retry the call with
+    the same `req_id`;
+  - before an Exec that needs more time than the token has left.
+- **Never re-run a command that started.** An `UNAUTHENTICATED` (or any failure) after the first
+  event means the command may have run; report it instead.
+
+**No Exec outlives its token.** The relay checks the token when it accepts an Exec, and cancels the
+Exec at the token's `exp` (plus a 30 s leeway), ending the call with `DEADLINE_EXCEEDED`. So,
+before each Exec, a client:
+
+1. makes sure its token has at least `timeout_s` + 60 s left, and mints a fresh one if not;
+2. sends a `timeout_s` of at most what the token has left minus 60 s, so that the worker's own
+   timeout fires before the relay's cancel. When it cuts a longer request, it says so.
+
+Asking for the whole cap on every call would mint a token before every call but the first, since a
+held token always has a little less than its lifetime left. The example client therefore keeps a
+held token for a call that names no timeout while the token has at least half the cap plus 60 s
+left (480 s by default), and cuts that call's timeout to what the token has left minus 60 s. A call
+that names a timeout the held token cannot cover still gets a fresh token.
+
+The longest single command is therefore one token lifetime. Split longer work into several calls.
+
+**Delete and de-enrollment are not immediate.** A token already issued keeps working until its
+`exp`, plus the relay's 30 s leeway: up to one token lifetime plus 30 s (15.5 minutes by default)
+after `mocactl sbx rm`, or after an operator removes your account. An Exec still running at that
+point is cancelled (`DEADLINE_EXCEEDED`). No new token is issued after either.
+
+You can decode the token's payload (base64url, the middle segment) to read `iat` and `exp`; do not
+verify it, which is the relay's job.
+
+## Outcomes versus failures
+
+**The command's outcome:**
+
+- `end` ends a command that ran, whatever its exit code. A non-zero `exit_code` is an outcome, not
   an error.
   - `exit_code < 0`: the command was killed by a signal (your abort, an out-of-memory kill).
   - `truncated`: stdout went over the 8 MiB cap, and the rest was dropped.
-- `error` means there is no exit status to report: the command timed out (`timeout:<s>`), the VM
-  did not boot, or the worker went away. The stream then ends with a non-OK status (`INTERNAL`).
+- An `error` event whose message is `timeout:<n>` means the command ran out of `timeout_s` (`n`
+  seconds). That is the command timing out, not a failure of the sandbox; `sbx.py` exits 124 for it.
+  The call then ends with `INTERNAL`, which a client ignores once it has seen the timeout.
+
+**The machinery's failure:** any other `error` event (the VM did not boot, the worker went away), or
+a non-OK status. There is no exit status to report. Two have an SBX0 meaning of their own:
+
+- **`DEADLINE_EXCEEDED`, "sandbox token expired during the Exec":** the command outlived its token
+  and was cancelled. Give it a shorter timeout, or split it.
+- **`RESOURCE_EXHAUSTED`, "sandbox busy: \<n> Execs already in flight":** the sandbox already has
+  its cap of Execs in flight (2 by default: one running, one waiting). Nothing ran; retry once one
+  finishes.
 
 **gRPC status codes:**
 
-| Code                                        | Cause                                                                                                                                                                                          |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UNAUTHENTICATED`                           | Missing or unknown token.                                                                                                                                                                      |
-| `PERMISSION_DENIED`                         | One of: the `sandbox_id` is not your token's worker; the `workspace_key` is not under your prefix or contains anything but `A-Z a-z 0-9 . _ -`; or you aborted an Exec that you did not start. |
-| `UNKNOWN` with `no live worker for sandbox` | The worker is not attached.                                                                                                                                                                    |
-| `INTERNAL`                                  | An `error` event, as above, including a timeout.                                                                                                                                               |
+| Code                                                                     | Cause                                                                                                                                  |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `UNAUTHENTICATED`                                                        | Missing, expired or invalid token. Refresh once, as above                                                                              |
+| `PERMISSION_DENIED`                                                      | `sandbox_id` is not the token's worker; `workspace_key` is not its workspace; or `Abort` of an Exec that is not yours, or has finished |
+| `ALREADY_EXISTS`                                                         | The `req_id` is already in flight in this sandbox                                                                                      |
+| `RESOURCE_EXHAUSTED`                                                     | The sandbox is busy                                                                                                                    |
+| `DEADLINE_EXCEEDED`                                                      | The token expired during the Exec                                                                                                      |
+| `INVALID_ARGUMENT`                                                       | No `exec` in the request, or `req_id` out of range                                                                                     |
+| `UNKNOWN` today (`UNAVAILABLE` is reserved) with `no live worker for...` | The template's worker is not attached: the template is unavailable                                                                     |
+| `INTERNAL`                                                               | An `error` event, as above, including a timeout                                                                                        |
 
-**Limits:**
+## Limits
 
-- 16 MiB per message, so keep `stdin` well under that and send large trees as several calls;
-- 8 MiB of stdout per call;
-- **one command at a time per workspace**: concurrent calls on one key queue behind each other.
+- **One command at a time per sandbox.** A second concurrent call waits at the worker until the
+  first finishes; a third is refused as busy.
+- **16 MiB** per message, so send large trees as several calls.
+- **8 MiB** of stdout per call.
+- **The longest command** is one token lifetime minus 60 s (14 minutes by default).
+- **A sandbox lives 7 days by default**, then it is gone with its workspace. There is no
+  extension: pull your work out before then. `mocactl sbx ls` shows each sandbox's expiry.
 
-## Connecting
+## Per-client tokens on a MOCA rig
 
-The relay serves `SandboxExec` on the rig's loopback, with no TLS. You reach it through an SSH
-tunnel with a key that may forward that one port and nothing else:
+A MOCA relay without the SBX0 control plane can still admit a few trusted direct clients (a
+developer's own code, a local MCP server, a coding agent through `sbx`) with per-client tokens.
+These are a demo-grade stand-in for sandbox tokens, not that design: static, never refreshed, and
+not JWTs.
 
-```bash
-ssh -N -L 9444:localhost:9444 sbx-client@<rig>     # leave running
-```
+**For the client:**
 
-Then:
+- `sandbox_id` is the **worker** the operator names, for example `moca_microvm_0`.
+- `workspace_key` is **your sandbox**: any name that starts with your token's prefix and holds only
+  `A-Z a-z 0-9 . _ -`, for example `sbx-alice-calc`. The first Exec creates it.
+- Connect through the operator's SSH tunnel and dial `localhost:9444` in plaintext (the tunnel is
+  the encryption):
 
-- dial `localhost:9444`, plaintext (the tunnel is the encryption);
-- send `authorization: Bearer <your client token>` as metadata on every call.
+  ```bash
+  ssh -N -L 9444:localhost:9444 sbx-client@<rig>     # leave running
+  export SBX_ADDR=localhost:9444 SBX_TLS=0 SBX_SANDBOX_ID=moca_microvm_0 \
+         SBX_WORKSPACE_KEY=sbx-alice-demo SBX_TOKEN=<your client token>   # or SBX_TOKEN_FILE=<path>
+  .venv/bin/python sbx.py run 'uname -a'
+  ```
 
-## Try it
+- Send `authorization: Bearer <your client token>` on every call, `Abort` included. Leave
+  `SBX_TOKEN_CMD` unset: it wins over a static token. The examples cap no timeout to a static
+  token; still send `timeout_s` (0 means the worker's 30-minute default, capped at 2 hours).
+- `PERMISSION_DENIED` means the `sandbox_id` is not your token's worker, the `workspace_key` is not
+  under your prefix, or you aborted an Exec that you did not start. `UNAUTHENTICATED` means a
+  missing or unknown token. The SBX0-only codes (`RESOURCE_EXHAUSTED` busy, `DEADLINE_EXCEEDED`
+  token expiry) do not apply, and no audit line is written.
+- [`remote-worker/cmd/sbx`](../../remote-worker/cmd/sbx) is a static Go build of `sbx.py` for this
+  path (`SBX_TOKEN` or `SBX_TOKEN_FILE`), for an agent container with no Python.
 
-From the repo root:
-
-```bash
-python -m venv .venv && .venv/bin/pip install grpcio grpcio-tools
-.venv/bin/python -m grpc_tools.protoc -I proto --python_out=docs/api/examples \
-    --grpc_python_out=docs/api/examples sandbox/v1/sandbox.proto
-export SBX_ADDR=localhost:9444 SBX_SANDBOX_ID=moca_microvm_0 \
-       SBX_WORKSPACE_KEY=sbx-alice-demo SBX_TOKEN=<your client token>
-.venv/bin/python docs/api/examples/sandbox_v1_client.py
-```
-
-[`examples/sandbox_v1_client.py`](examples/sandbox_v1_client.py) is about 100 lines. It defines a
-`Sandbox` class with `exec`, `abort`, `read_file` and `write_file`, and its `__main__` writes a file,
-reads it back and runs it.
-
-**From the shell, with `grpcurl`:**
-
-```bash
-grpcurl -plaintext -import-path proto -proto sandbox/v1/sandbox.proto \
-  -H "authorization: Bearer $SBX_TOKEN" \
-  -d '{"sandbox_id":"moca_microvm_0","exec":{"req_id":"42","command":"ls -la",
-       "timeout_s":60,"streaming":true,"workspace_key":"sbx-alice-demo"}}' \
-  localhost:9444 sandbox.v1.SandboxExec/Exec
-```
-
-Chunk `data` comes back base64-encoded in grpcurl's JSON.
-
-**Other languages:** generate a client from the one proto file with `buf generate` or `protoc`.
-MOCA's own TypeScript client is generated in `packages/k8s-sandbox/src/gen/`, and
-`GrpcRelayTransport` in the same package wraps it.
-
-## From a coding agent: the `sbx` CLI
-
-[`examples/sbx.py`](examples/sbx.py) wraps the example client into a command line for one
-workspace (`SBX_WORKSPACE_KEY`), so a local coding agent can work in the sandbox with nothing but
-its shell:
-
-| Command | Does |
-| --- | --- |
-| `sbx run [COMMAND…]` | runs `COMMAND`, or with no arguments the script on stdin, in `/workspace`; exits with its exit code (124 timeout, 125 sandbox failure) |
-| `sbx put PATH` | writes stdin to `PATH`, creating parent directories |
-| `sbx push [DIR]` | replaces `/workspace` with `DIR`'s git working tree and commits it as a baseline |
-| `sbx pull` | prints every change since the push as a git patch |
-
-Restrict the agent's shell to `sbx run` and `sbx put` (Claude Code: `--allowedTools 'Bash(sbx
-run:*)' 'Bash(sbx put:*)'` with the file tools disallowed; OpenCode: a `bash` permission map
-denying `*`). Then tell it in `CLAUDE.md`/`AGENTS.md` to use `sbx run <<'EOF' … EOF`. That
-allow-list is the only thing keeping commands off the laptop. Stock Claude Code and OpenCode
-solved SWE-bench issues this way about as well as running locally: see moca-experiments `sbx/`
-(E14).
-
-## For the operator: issuing a client token
-
-Client tokens live in the relay's environment, `/etc/serverless-harness/relay.env` on the rig:
+**For the operator:** client tokens live in the relay's environment,
+`/etc/serverless-harness/relay.env` on the rig:
 
 ```bash
 MOCA_RELAY_CLIENT_TOKENS=moca_microvm_0:sbx-alice-:<openssl rand -hex 32>,moca_microvm_0:sbx-bob-:<...>
@@ -143,15 +224,77 @@ MOCA_RELAY_CLIENT_TOKENS=moca_microvm_0:sbx-alice-:<openssl rand -hex 32>,moca_m
 - **Tokens** must be at least 32 characters, distinct from each other, and distinct from
   `MOCA_RELAY_EXEC_TOKEN` and every `SH_RELAY_TOKEN*`. The relay refuses to start otherwise, naming
   the entry but never the token.
+- **They are checked independently of SBX0's keyset**: after the harness's exec token and before a
+  sandbox token. A relay may carry both. Client tokens alone are not a boot credential: the relay
+  still needs `MOCA_RELAY_EXEC_TOKEN` or `SH_SANDBOX_TOKEN_PUBLIC_KEYS`.
 - **Apply** a change by restarting `sh-relay`.
 - **Name only microVM workers.** The container worker ignores `workspace_key` and shares one
   `/workspace` between every caller, so a client token on it would share files with everyone.
-- **What a client token cannot do:**
-  - exec on another worker;
-  - exec outside its prefix;
-  - abort another caller's Exec.
-
-  The harness's `MOCA_RELAY_EXEC_TOKEN` is unchanged and unrestricted. Never hand it to a client.
-
+- **What a client token cannot do:** exec on another worker; exec outside its prefix; abort another
+  caller's Exec. The harness's `MOCA_RELAY_EXEC_TOKEN` is unchanged and unrestricted. Never hand it
+  to a client.
 - **Tunnel access:** give each client a user whose `authorized_keys` entry is
   `restrict,port-forwarding,permitopen="localhost:9444" ssh-ed25519 ...`.
+- **From a coding agent:** restrict the agent's shell to `sbx run` and `sbx put` (Claude Code:
+  `--allowedTools 'Bash(sbx run:*)' 'Bash(sbx put:*)'` with the file tools disallowed; OpenCode: a
+  `bash` permission map denying `*`), and tell it in `CLAUDE.md`/`AGENTS.md` to use
+  `sbx run <<'EOF' … EOF`. That allow-list is the only thing keeping commands off the local machine.
+
+## The stability promise
+
+Changes to `sandbox/v1` are additive only, under
+[ADR-0024](../adrs/0024-sandbox-transport-remote-exec.md)'s rules: no field is removed or renumbered,
+and no meaning changes. Nothing else is promised: the relay's status details, the limits above and
+the token's lifetime may change.
+
+## The examples
+
+[`examples/sandbox_v1_client.py`](examples/sandbox_v1_client.py) is a small client with every rule
+above: TLS with keepalive, a `TokenSource` that re-runs `SBX_TOKEN_CMD`, token freshness and the
+timeout cap, the retry-once-if-not-started rule, and the outcome and failure mapping
+(`SandboxBusy`, `TokenExpiredDuringExec`, `SandboxError`). `Sandbox.from_env()` reads what
+`mocactl sbx env` prints. `SBX_TOKEN`, a one-off static token that is never refreshed, is used
+only when `SBX_TOKEN_CMD` is unset.
+
+[`examples/sbx.py`](examples/sbx.py) is an example of a thin command line on top of it, for one
+sandbox. It is an example only: `mocactl sbx run` and `put` (increment 1c) are the supported CLI.
+
+| Command              | Does                                                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sbx run [COMMAND…]` | Runs `COMMAND`, or with no arguments the script on stdin, in `/workspace`. Exits with its exit code: 124 timed out, 125 the sandbox failed |
+| `sbx put PATH`       | Writes stdin to `PATH`, creating parent directories                                                                                        |
+| `sbx push [DIR]`     | Replaces `/workspace` with `DIR`'s git working tree and commits it as a baseline                                                           |
+| `sbx pull`           | Prints every change since the push as a git patch                                                                                          |
+
+A busy sandbox and a token that expired during the Exec also exit 125, each with its own message.
+
+Both need Python 3.10 or later and `grpcio`. From `docs/api/examples`:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install grpcio grpcio-tools
+.venv/bin/python -m grpc_tools.protoc -I ../../../proto --python_out=. --grpc_python_out=. \
+    sandbox/v1/sandbox.proto                      # writes sandbox/v1/, which git ignores
+eval "$(mocactl sbx env <sandbox id>)"
+.venv/bin/python sandbox_v1_client.py             # writes a file, reads it back, runs it
+.venv/bin/python sbx.py run 'uname -a; ls -la'
+.venv/bin/python -m unittest test_sandbox_v1_client   # offline: no network, no relay
+```
+
+**From the shell, with `grpcurl`:**
+
+```bash
+REQ_ID="$(od -An -N6 -tu8 /dev/urandom | tr -d ' ')"   # a fresh random 48-bit id for every call
+SBX_BEARER="$(eval "$SBX_TOKEN_CMD")" grpcurl -import-path proto -proto sandbox/v1/sandbox.proto \
+  ${SBX_CA_FILE:+-cacert "$SBX_CA_FILE"} \
+  -expand-headers -H 'authorization: Bearer ${SBX_BEARER}' \
+  -d "{\"sandbox_id\":\"$SBX_SANDBOX_ID\",\"exec\":{\"req_id\":\"$REQ_ID\",\"command\":\"ls -la\",
+       \"timeout_s\":60,\"streaming\":true,\"workspace_key\":\"$SBX_WORKSPACE_KEY\"}}" \
+  "$SBX_ADDR" sandbox.v1.SandboxExec/Exec
+```
+
+The token travels in grpcurl's environment, which `-expand-headers` reads, not on its command
+line: anything in argv is visible to every user of the machine through `ps`. Chunk `data` comes
+back base64-encoded in grpcurl's JSON.
+
+**Other languages:** generate a client from the one proto file with `buf generate` or `protoc`.
+MOCA's own TypeScript client is generated in `packages/k8s-sandbox/src/gen/`.

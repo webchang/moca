@@ -1,0 +1,11 @@
+# deploy/sbx/sbx-janitor.timer -- run the SBX0 janitor every 15 minutes (spec §8.3). Installed and
+# enabled by `deploy/sbx/install-host.sh --janitor BUNDLE_DIR`; removed by --uninstall-janitor.
+[Unit]
+Description=Run the SBX0 janitor every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

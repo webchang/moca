@@ -610,6 +610,25 @@ mount -t tmpfs tmpfs /var
 # this base image, not something init should assume).
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# P4.1 egress: the guest has no NIC. Every Exec inherits this env (the parked bash
+# inherits the agent's env, which is init's env; there is no per-Exec env), so the proxy
+# settings point at the agent's in-guest listener, which relays over vsock to the
+# host-side moca-egress. GH_TOKEN/GITHUB_TOKEN are an INERT placeholder (D7): they only
+# make clients attempt auth; moca-egress swaps in the real credential on the host. No
+# secret is ever baked here, and the placeholder matches no credential pattern.
+export HTTPS_PROXY=http://127.0.0.1:3128
+export https_proxy=http://127.0.0.1:3128
+export HTTP_PROXY=http://127.0.0.1:3128
+export http_proxy=http://127.0.0.1:3128
+# NO_PROXY names only the guest's own loopback. That opens no bypass -- the guest has no
+# network device, so loopback is the guest itself (T7) -- and it keeps an in-guest server
+# (a test suite on localhost:8000) reachable: sent to moca-egress instead, it would be
+# refused as a loopback destination, correctly, since there it means the HOST's loopback.
+export NO_PROXY=localhost,127.0.0.1,::1
+export no_proxy=localhost,127.0.0.1,::1
+export GH_TOKEN=moca-placeholder
+export GITHUB_TOKEN=moca-placeholder
+
 # Fail loudly here rather than let a missing/non-executable agent binary reach
 # `exec` and communicate only as a bare kernel panic ("Attempted to kill
 # init!") with nothing on the console saying why. This is a different failure
@@ -621,7 +640,7 @@ if [ ! -x /usr/local/bin/agent ]; then
   exit 1
 fi
 
-exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace
+exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025
 INIT
   # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
   # /tmp is already mounted; the agent inherits init's environment, and so does every command.
@@ -634,6 +653,18 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
     }
   fi
   chmod 0555 "$STAGE/rootfs-tree/sbin/init"
+
+  # P4.1 egress: git over the proxy needs a credential to attempt; moca-egress replaces
+  # it on the host. The rootfs is mounted read-only, so this must land in the STAGED tree
+  # (not the host's /etc) before mkfs. Appended, because the image may already carry an
+  # /etc/gitconfig (the identity, see check_git_identity); the leading newline guards a
+  # file that lacks a trailing one.
+  mkdir -p "$STAGE/rootfs-tree/etc"
+  cat >>"$STAGE/rootfs-tree/etc/gitconfig" <<'GITCONFIG'
+
+[credential]
+	helper = "!f() { echo username=x-access-token; echo password=moca-placeholder; }; f"
+GITCONFIG
 
   # A single ext4 image is what the VMM's block device backend wants; building it
   # here (rather than shipping a directory tree) is also what makes the "rootfs"
@@ -943,6 +974,28 @@ check_git_identity() {
   fi
 }
 
+# check_egress_listener (P4.1): the guest agent must be accepting on 127.0.0.1:3128 before
+# the snapshot is taken, or every restored sandbox has a proxy env pointing at nothing and
+# its first outbound call fails with a bare "connection refused". Same failure style as
+# check_git_identity: loud, at build time. bash's /dev/tcp is enough (no curl/nc needed).
+# The probe connection is closed by the subshell's exit, so no fd state reaches the
+# snapshot.
+check_egress_listener() {
+  local uds="$1"
+  local out rc
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
+    -command '(exec 3<>/dev/tcp/127.0.0.1/3128) && echo listening' \
+    2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "listening" ]; then
+    echo "build-snapshot.sh: the guest egress listener is not accepting on 127.0.0.1:3128" >&2
+    echo "  (exit $rc). Every sandbox restored from this snapshot would have HTTPS_PROXY" >&2
+    echo "  pointing at nothing (P4.1). The init must exec the agent with" >&2
+    echo "  --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 -- or guest_client could" >&2
+    echo "  not reach the guest at all, in which case its diagnostics follow. Output: $out" >&2
+    exit 1
+  fi
+}
+
 quiesce_guest() {
   local uds="$1"
   log "quiescing the guest before snapshotting"
@@ -960,7 +1013,10 @@ quiesce_guest() {
 # convention (apiSockRelPath, vsockRelPath, the fileVMState/fileMemory/
 # fileKernel/fileRootfs/fileAgent hardlink set, workspace.img), copied
 # verbatim rather than re-derived, per this round's own instruction that the
-# launcher wins on any disagreement. No disagreement was found.
+# launcher wins on any disagreement. One deliberate divergence (P4.1): production
+# restores override the vsock uds_path to /run/v.sock (launcher_firecracker.go
+# vsockRelPath), so the build-time /vsock.sock is independent of it -- the build VM is
+# not jailed with the production layout and Restore rewrites the baked path.
 # ---------------------------------------------------------------------------
 
 # DefaultWorkspaceImageBytes in launcher_firecracker.go: 2 GiB, "matches the
@@ -1494,6 +1550,7 @@ boot_quiesce_snapshot_firecracker() {
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   check_git_identity "$vsock_uds"
+  check_egress_listener "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create; the VM stays paused because create has no resume field at all)"
@@ -1667,6 +1724,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   check_git_identity "$vsock_uds"
+  check_egress_listener "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (ch-remote pause + snapshot, no resume afterwards)"
@@ -1862,8 +1920,9 @@ verify_restore_firecracker() {
   # resources." This function used to PUT its own vsock device here first
   # (copying boot_quiesce_snapshot_firecracker's *fresh-boot* sequence, item
   # 3's PUT /vsock), reasoning that since the UDS path does not move
-  # (both build-time and here are jail-relative /vsock.sock) a same-value PUT
-  # was harmless. It is not harmless: /snapshot/load's ONE call is the only
+  # (build-time and here are both jail-relative /vsock.sock; production restores
+  # override it to /run/v.sock, launcher_firecracker.go vsockRelPath, so the build
+  # path is independent of it) a same-value PUT was harmless. It is not harmless: /snapshot/load's ONE call is the only
   # configuration a restoring instance gets at all, no matter whether the
   # value being configured matches what the snapshot already carries.
   #

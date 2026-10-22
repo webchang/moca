@@ -1,0 +1,27 @@
+# deploy/sbx/sbx-janitor.service -- one run of the SBX0 janitor (deploy/sbx/janitor.sh, spec §8.3),
+# started by sbx-janitor.timer. Installed by `deploy/sbx/install-host.sh --janitor BUNDLE_DIR`,
+# which rewrites /etc/sbx, /srv/sbx and /usr/local/libexec when SBX_ENV_DIR, SBX_SRV or
+# SBX_LIBEXEC_DIR differ. janitor.env holds SBX_API_URL, SBX_JANITOR_AGE and, optionally,
+# SBX_API_CA_FILE; the token is only in janitor.token, which the script reads itself.
+[Unit]
+Description=SBX0 janitor: free the workspaces of ended sandboxes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sbx/janitor.env
+Environment=SBX_ENV_DIR=/etc/sbx
+Environment=SBX_SRV=/srv/sbx
+Environment=SBX_JANITOR_TOKEN_FILE=/etc/sbx/janitor.token
+ExecStart=/usr/local/libexec/sbx-janitor.sh
+# A run lists and removes trees; it must not take over the host's disk or outlive the next tick.
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+# It writes only under the workspace roots (and its own /tmp for the header file).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=-/srv/sbx/workspaces

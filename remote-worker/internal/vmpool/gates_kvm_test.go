@@ -88,7 +88,11 @@ func poolFor(t *testing.T, lc Launcher) Pool {
 // would otherwise still be dirty when the VM is destroyed); on the Cloud Hypervisor arm
 // the write is already durable via virtio-fs's host-filesystem authority, so this gate is
 // expected to pass there structurally rather than by catching anything (see
-// TestCloudHypervisorRestoresPausedAndRunsOneCommand's comment).
+// TestCloudHypervisorRestoresPausedAndRunsOneCommand's comment). Exec N deliberately ends
+// in its own `exit 0` — the shape of every client put — because a wrapper whose command
+// can terminate the shell before its sync passes this gate with a plain write and lost
+// every real put (caught live 2026-10-20; the non-KVM unit gate for the same regression
+// is TestWrapCommandSyncSurvivesCommandExit).
 func TestGateWriteDurability(t *testing.T) {
 	requireKVM(t)
 	lc := launcherForArm(t)
@@ -96,7 +100,7 @@ func TestGateWriteDurability(t *testing.T) {
 	ctx := context.Background()
 	const key = "gate-durability"
 
-	if _, err := p.Exec(ctx, key, Exec{Command: "echo n1 >> log.txt", TimeoutS: 30}, &capturingSink{}); err != nil {
+	if _, err := p.Exec(ctx, key, Exec{Command: "echo n1 >> log.txt; exit 0", TimeoutS: 30}, &capturingSink{}); err != nil {
 		t.Fatalf("Exec N: %v", err)
 	}
 	var out capturingSink
@@ -326,9 +330,54 @@ func TestGateSnapshotHoldsNoSecrets(t *testing.T) {
 	if _, err := p.Exec(context.Background(), "gate-secrets", Exec{Command: "env", TimeoutS: 30}, &out); err != nil {
 		t.Fatalf("Exec env: %v", err)
 	}
+	// P4.1: the guest env now carries HTTPS_PROXY/HTTP_PROXY (and lowercase),
+	// NO_PROXY=localhost,127.0.0.1,::1 (and lowercase), and
+	// GH_TOKEN/GITHUB_TOKEN=moca-placeholder. None of those names starts with a
+	// forbidden prefix, and the placeholder is deliberately NOT a credential pattern
+	// (no AKIA, ghp_ or PEM private-key header), so this check and the memfile scan
+	// above still pass with the new variables. A real token in GH_TOKEN would trip it.
 	for _, name := range []string{"SANDBOX_TOKEN", "AWS_", "ANTHROPIC_"} {
 		if strings.Contains(out.out(), name) {
 			t.Errorf("guest env contains %q:\n%s", name, out.out())
+		}
+	}
+	for _, pattern := range credentialPatterns {
+		if strings.Contains(out.out(), pattern) {
+			t.Errorf("guest env contains credential pattern %q:\n%s", pattern, out.out())
+		}
+	}
+}
+
+// TestGateNoNetworkDevice asserts the P4.1 property directly (T7): the restored guest has
+// no NIC, no resolver, and no route, so the only way out is the in-guest egress listener
+// relayed over vsock. The proxy env and the inert placeholder must be present, because
+// they are what steers clients to that listener.
+func TestGateNoNetworkDevice(t *testing.T) {
+	requireKVM(t)
+	lc := launcherForArm(t)
+	p := poolFor(t, lc)
+	run := func(cmd string) string {
+		t.Helper()
+		var out capturingSink
+		if _, err := p.Exec(context.Background(), "gate-no-nic", Exec{Command: cmd, TimeoutS: 30}, &out); err != nil {
+			t.Fatalf("Exec %q: %v", cmd, err)
+		}
+		return out.out()
+	}
+
+	if got := strings.TrimSpace(run("ls /sys/class/net")); got != "lo" {
+		t.Errorf("/sys/class/net = %q, want exactly %q (a NIC is present)", got, "lo")
+	}
+	if got := strings.TrimSpace(run("test ! -s /etc/resolv.conf && echo empty")); got != "empty" {
+		t.Errorf("/etc/resolv.conf is non-empty (got %q): the guest has a resolver", got)
+	}
+	if got := run("bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1"); !strings.Contains(got, "Network is unreachable") {
+		t.Errorf("direct dial to 1.1.1.1:443 = %q, want it to fail with %q", got, "Network is unreachable")
+	}
+	env := run("env")
+	for _, want := range []string{"HTTPS_PROXY=http://127.0.0.1:3128", "GH_TOKEN=moca-placeholder"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("guest env lacks %q:\n%s", want, env)
 		}
 	}
 }

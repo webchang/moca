@@ -24,6 +24,12 @@ import { CpError } from './errors.js';
  */
 export const TOKEN_AUDIENCE = 'harness';
 export const DEFAULT_ISSUER = 'sh-control-plane';
+/**
+ * The `iss` of the API tokens a sandbox-profile control plane mints (SBX0 §4.1). Distinct from
+ * DEFAULT_ISSUER, so an SBX stack that shares a signing key with a MOCA one (one namespace, or a
+ * copied Secret) still mints nothing the other accepts: each verifier pins its own issuer.
+ */
+export const SANDBOX_API_ISSUER = 'sbx-control-plane-api';
 
 export interface TokenClaims {
   iss: string;
@@ -95,6 +101,22 @@ export function keyIdFor(publicKey: KeyObject): string {
 }
 
 /**
+ * A keyset entry that does not parse. `kind` is what is wrong with it, so a caller that reports the
+ * error under its own variable name (the sandbox relay's SH_SANDBOX_TOKEN_PUBLIC_KEYS) classifies on
+ * it rather than on the message, which names SH_SESSION_TOKEN_PUBLIC_KEYS and quotes the entry.
+ */
+export class KeysetError extends Error {
+  constructor(
+    /** `format`: not `<kid>:<base64 SPKI>`; `key`: not a base64 Ed25519 SPKI; `kid`: kid ≠ key. */
+    readonly kind: 'format' | 'key' | 'kid',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'KeysetError';
+  }
+}
+
+/**
  * Parse `SH_SESSION_TOKEN_PUBLIC_KEYS`: `<kid>:<base64 SPKI>[,<kid>:<base64 SPKI>...]`.
  * Accepting a LIST is what makes rotation possible without a flag day (spec §5.2). A malformed or
  * mislabelled entry THROWS rather than being skipped: a silently dropped key is a deployment that
@@ -107,7 +129,8 @@ export function parseKeyset(raw: string | undefined): Map<string, KeyObject> {
     if (!trimmed) continue;
     const idx = trimmed.indexOf(':');
     if (idx <= 0) {
-      throw new Error(
+      throw new KeysetError(
+        'format',
         `SH_SESSION_TOKEN_PUBLIC_KEYS entry '${trimmed}' is not '<kid>:<base64 SPKI>'`,
       );
     }
@@ -116,14 +139,16 @@ export function parseKeyset(raw: string | undefined): Map<string, KeyObject> {
     try {
       key = publicKeyFromBase64(trimmed.slice(idx + 1).trim());
     } catch (err) {
-      throw new Error(
+      throw new KeysetError(
+        'key',
         `SH_SESSION_TOKEN_PUBLIC_KEYS entry '${kid}' is not a base64 Ed25519 SPKI ` +
           `(a wrong curve is rejected here, not per request): ${String(err)}`,
       );
     }
     const derived = keyIdFor(key);
     if (derived !== kid) {
-      throw new Error(
+      throw new KeysetError(
+        'kid',
         `SH_SESSION_TOKEN_PUBLIC_KEYS entry kid '${kid}' does not match its key (expected '${derived}')`,
       );
     }
@@ -143,6 +168,7 @@ export function parseKeyset(raw: string | undefined): Map<string, KeyObject> {
 export function makeSigner(privateKeyPem: string): {
   kid: string;
   publicKeyBase64: string;
+  signJws(typ: string, claims: object): string;
   mint(input: MintInput): string;
 } {
   let key: KeyObject;
@@ -162,9 +188,21 @@ export function makeSigner(privateKeyPem: string): {
   }
   const publicKey = createPublicKey(key);
   const kid = keyIdFor(publicKey);
+
+  const signJws = (typ: string, claims: object): string => {
+    const signingInput = `${b64u(json({ alg: 'EdDSA', typ, kid }))}.${b64u(json(claims))}`;
+    return `${signingInput}.${b64u(cryptoSign(null, Buffer.from(signingInput), key))}`;
+  };
+
   return {
     kid,
     publicKeyBase64: publicKeyToBase64(publicKey),
+    /**
+     * Sign any claims under a pinned `typ` -- MI1 §6.1's generalization of this primitive. The
+     * session/API token is `typ: JWT`; the sandbox token (sandbox-token.ts) is `moca-sandbox+jwt`.
+     * Each verifier pins its own typ, so one kind can never pass as the other.
+     */
+    signJws,
     mint(input: MintInput): string {
       const iat = input.now ?? Math.floor(Date.now() / 1000);
       const claims: TokenClaims = {
@@ -179,8 +217,7 @@ export function makeSigner(privateKeyPem: string): {
         jti: randomUUID(),
         ...(input.sid ? { sid: input.sid } : {}),
       };
-      const signingInput = `${b64u(json({ alg: 'EdDSA', typ: 'JWT', kid }))}.${b64u(json(claims))}`;
-      return `${signingInput}.${b64u(cryptoSign(null, Buffer.from(signingInput), key))}`;
+      return signJws('JWT', claims);
     },
   };
 }
@@ -196,23 +233,18 @@ function bad(why: string): never {
 }
 
 /**
- * Verify locally -- no network, no JWKS fetch. Deliberately not a JWKS endpoint (spec §5.2):
- * fetching keys at verify time would put a control-plane round trip on every turn and undo §9.2's
- * property that an identity-provider or control-plane outage does not break running work.
- *
- * Order matters: structure, then alg, then kid, then SIGNATURE, then claims. Nothing from the
- * payload is trusted before the signature check, so a forged `exp` cannot produce `token_expired`
- * (which would tell an attacker their tampering parsed).
+ * The structural half of every verifier: structure, alg, typ, kid, then SIGNATURE, then payload
+ * parse -- in that order, so nothing from the payload is trusted before the signature check.
+ * `typ` is pinned by the caller: the harness token is `JWT`, the sandbox token `moca-sandbox+jwt`.
  */
-export function verifyToken(
+export function verifyJws(
   token: string,
   keys: Map<string, KeyObject>,
-  opts: { now?: number; requiredScope?: string } = {},
-): TokenClaims {
+  typ: string,
+): { claims: Record<string, unknown> } {
   const parts = token.split('.');
   if (parts.length !== 3 || parts.some((p) => p.length === 0)) bad('malformed token');
   const [h, p, s] = parts as [string, string, string];
-
   let header: { alg?: unknown; kid?: unknown; typ?: unknown };
   try {
     header = JSON.parse(Buffer.from(h, 'base64url').toString());
@@ -223,6 +255,7 @@ export function verifyToken(
   // Reject `alg: none` and every non-EdDSA alg BEFORE looking at the key: accepting the header's
   // word on the algorithm is the classic JWT downgrade.
   if (header.alg !== 'EdDSA') bad('unsupported alg');
+  if (header.typ !== typ) bad(`wrong token typ (want ${typ})`);
   if (typeof header.kid !== 'string') bad('token header has no kid');
   const key = keys.get(header.kid);
   // `bad()` is declared `: never`, so control flow cannot reach past it -- no `key!` needed.
@@ -230,20 +263,37 @@ export function verifyToken(
   if (!cryptoVerify(null, Buffer.from(`${h}.${p}`), key, Buffer.from(s, 'base64url'))) {
     bad('bad token signature');
   }
-
-  let claims: TokenClaims;
+  let claims: Record<string, unknown>;
   try {
-    claims = JSON.parse(Buffer.from(p, 'base64url').toString()) as TokenClaims;
+    claims = JSON.parse(Buffer.from(p, 'base64url').toString());
   } catch {
     return bad('unparseable token payload');
   }
   if (typeof claims !== 'object' || claims === null) bad('unparseable token payload');
+  return { claims };
+}
+
+/**
+ * Verify locally -- no network, no JWKS fetch. Deliberately not a JWKS endpoint (spec §5.2):
+ * fetching keys at verify time would put a control-plane round trip on every turn and undo §9.2's
+ * property that an identity-provider or control-plane outage does not break running work.
+ *
+ * Order matters: structure, then alg, then kid, then SIGNATURE, then claims. Nothing from the
+ * payload is trusted before the signature check, so a forged `exp` cannot produce `token_expired`
+ * (which would tell an attacker their tampering parsed). The structural half is in verifyJws.
+ */
+export function verifyToken(
+  token: string,
+  keys: Map<string, KeyObject>,
+  opts: { now?: number; requiredScope?: string; issuer?: string } = {},
+): TokenClaims {
+  const claims = verifyJws(token, keys, 'JWT').claims as unknown as TokenClaims;
   if (claims.aud !== TOKEN_AUDIENCE) bad('wrong token audience');
   // `iss` was minted (MintInput lets a caller set it) but never checked, so the claim was decorative:
   // a token from any other issuer signed by a key in this keyset verified fine. It matters as soon as
   // a deployment publishes more than one issuer's key -- which is exactly what the keyset LIST exists
   // to allow (spec §5.2) -- so check it while there is still only one.
-  if (claims.iss !== DEFAULT_ISSUER) bad('wrong token issuer');
+  if (claims.iss !== (opts.issuer ?? DEFAULT_ISSUER)) bad('wrong token issuer');
   if (typeof claims.sub !== 'string' || claims.sub.length === 0) bad('token has no subject');
   if (typeof claims.exp !== 'number') bad('token has no expiry');
   const now = opts.now ?? Math.floor(Date.now() / 1000);

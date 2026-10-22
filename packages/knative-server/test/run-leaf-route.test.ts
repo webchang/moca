@@ -1,22 +1,35 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Keep the result store hermetic — no live Redis in unit tests. `resultSet` records every
-// write so tests can assert whether a result record was persisted (it must NOT be on 503).
+// `leaf:result:` write so tests can assert whether a result record was persisted (it must NOT be
+// on 503); the run-lease marker writes to `sh:run:*` keys land in the same Map but are not
+// result records, so they do not count. `__mem` exposes the Map for the lease-lifecycle tests.
 const resultSet = vi.fn();
 vi.mock('@moca/harness/leaf-result-store', async (orig) => {
   const actual = await orig<typeof import('@moca/harness/leaf-result-store')>();
   const mem = new Map<string, string>();
   class FakeStore {
     async set(k: string, v: string) {
-      resultSet(k, v);
+      if (k.startsWith('leaf:result:')) resultSet(k, v);
       mem.set(k, v);
     }
     async get(k: string) {
       return mem.get(k) ?? null;
     }
+    async del(k: string) {
+      mem.delete(k);
+    }
     async close() {}
   }
-  return { ...actual, RedisResultStore: FakeStore };
+  return { ...actual, RedisResultStore: FakeStore, __mem: mem };
+});
+
+// The reaper is mocked so the arming tests observe the sweep without a Redis; beginRunLease stays
+// real because the lease-lifecycle tests below exercise it through the route.
+const reapRuns = vi.fn();
+vi.mock('@moca/harness/run-lease', async (orig) => {
+  const actual = await orig<typeof import('@moca/harness/run-lease')>();
+  return { ...actual, reapOrphanedRuns: (...a: any[]) => reapRuns(...a) };
 });
 
 const runLeaf = vi.fn();
@@ -35,13 +48,20 @@ vi.mock('@moca/harness/run-leaf', () => ({
       .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '') || 'leaf',
 }));
 
-import { startServer } from '../src/server';
+import { startServer, armRunReaper } from '../src/server';
+import * as leafResultStore from '@moca/harness/leaf-result-store';
+
+/** The mocked store's shared Map — see the vi.mock factory above. */
+const memOf = () => (leafResultStore as unknown as { __mem: Map<string, string> }).__mem;
 
 let base: string;
 let server: any;
 beforeEach(() => {
   runLeaf.mockReset();
   resultSet.mockReset();
+  reapRuns.mockReset();
+  reapRuns.mockResolvedValue([]);
+  memOf().clear();
 });
 
 async function post(path: string, body: unknown) {
@@ -82,6 +102,42 @@ describe('POST /runs', () => {
       verdict: { item_id: 'i1', verdict: 'CLEAR', reason: 'ok' },
     });
     expect(runLeaf).toHaveBeenCalledOnce();
+  });
+
+  // #558: a sync run must be visible in Redis for exactly as long as it executes, so a worker
+  // that dies mid-run leaves a marker a surviving worker's reaper can finalize.
+  it('holds a run lease while the run executes and releases it after', async () => {
+    runLeaf.mockImplementation(async () => {
+      // The lease is recorded fire-and-forget before runLeaf, so let it land before looking.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(memOf().get('sh:run:run-i1')).toBeDefined();
+      expect(JSON.parse(memOf().get('sh:run:run-i1')!)).toMatchObject({
+        owner: expect.any(String),
+        rawSessionId: 'run/i1',
+      });
+      expect(memOf().get('sh:run:run-i1:hb')).toBe('1');
+      return {
+        status: 'done',
+        verdict: { item_id: 'i1', verdict: 'CLEAR', reason: 'ok' },
+      };
+    });
+    const r = await post('/runs', {
+      sessionId: 'run/i1',
+      item: { item_id: 'i1', file: 'f', pattern: 'p' },
+    });
+    expect(r.status).toBe(200);
+    expect(memOf().get('sh:run:run-i1')).toBeUndefined();
+    expect(memOf().get('sh:run:run-i1:hb')).toBeUndefined();
+  });
+
+  it('releases the run lease on a thrown runLeaf too', async () => {
+    runLeaf.mockRejectedValue(new Error('boom'));
+    await post('/runs', {
+      sessionId: 'run/i1',
+      item: { item_id: 'i1', file: 'f', pattern: 'p' },
+    });
+    expect(memOf().get('sh:run:run-i1')).toBeUndefined();
+    expect(memOf().get('sh:run:run-i1:hb')).toBeUndefined();
   });
 
   // Issue #222 (1): `configRef: ""` used to reach the leaf, which read it as "no config requested"
@@ -259,6 +315,61 @@ describe('POST /run-leaf (deprecated alias)', () => {
     const msg = warn.mock.calls.map((c) => String(c[0])).join('\n');
     expect(msg).toContain('/run-leaf');
     expect(msg).toContain('/runs');
+    warn.mockRestore();
+  });
+});
+
+describe('run reaper (#558)', () => {
+  // The reaper's audit emission goes through defaultAuditLog's JSON console line, the same
+  // surface run-leaf-audit-log.test.ts captures.
+  let captured: string[];
+  let origConsoleLog: typeof console.log;
+
+  beforeEach(() => {
+    captured = [];
+    origConsoleLog = console.log;
+    console.log = (...args: unknown[]) => {
+      const s = String(args[0]);
+      if (s.startsWith('{')) captured.push(s);
+    };
+  });
+  afterEach(() => {
+    console.log = origConsoleLog;
+  });
+
+  it('sweeps once on arm, audits one run_finalized per reaped run, and stops on demand', async () => {
+    const reaped = [{ sid: 'run-1-i1', rawSessionId: 'run/1/i1', owner: 'pod-1:42' }];
+    reapRuns.mockImplementation(
+      async (_store: unknown, opts: { onReap?: (run: (typeof reaped)[0]) => void }) => {
+        opts.onReap?.(reaped[0]!);
+        return reaped;
+      },
+    );
+    const stop = armRunReaper();
+    await new Promise((r) => setTimeout(r, 0)); // let the immediate sweep land
+    stop();
+    expect(reapRuns).toHaveBeenCalledTimes(1);
+    const audits = captured
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((o) => o.event === 'audit');
+    expect(audits).toContainEqual(
+      expect.objectContaining({
+        decision: 'run_finalized',
+        sessionId: 'run/1/i1',
+        status: 'failed',
+        reason: 'owner_lost',
+        reaper: true,
+      }),
+    );
+  });
+
+  it('warns and stays armed when a sweep fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    reapRuns.mockRejectedValue(new Error('redis down'));
+    const stop = armRunReaper();
+    await new Promise((r) => setTimeout(r, 0));
+    stop();
+    expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });
 });

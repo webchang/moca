@@ -5,7 +5,8 @@
 #                       [--build|--skip-build] [--tls-cert FILE --tls-key FILE]
 #                       [--relay-tls-cert FILE --relay-tls-key FILE] [--tls-secret NAME]
 #
-# Environment: SH_GITHUB_CLIENT_ID, SH_ADMIN_SUBJECTS, SH_ALLOW_OPERATOR_FALLBACK (default false),
+# Environment: KIND_CLUSTER (kind only: the cluster name, default moca), SH_GITHUB_CLIENT_ID,
+# SH_ADMIN_SUBJECTS, SH_ALLOW_OPERATOR_FALLBACK (default false),
 # SH_SANDBOX_COUNT (default 2, at most 4 digits; 0 runs no container sandboxes), SH_WAIT_SECONDS
 # (default 120), SH_P4_SANDBOX_IDS (ocp only: comma-separated IDs of P4 microVM hosts outside the cluster, each
 # attaching to the relay over TLS; with SH_SANDBOX_COUNT>0 too, the stack is tiered
@@ -18,20 +19,27 @@
 # rule excepts on top of the private, CGNAT and link-local ranges -- e.g. a publicly routable node
 # network; README §6, #446), SH_API_TOKEN_TTL_SECONDS and SH_SESSION_TOKEN_TTL_SECONDS (the
 # control plane's token lifetimes, whole seconds; empty means its defaults, 900 and 300; #432),
-# SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
+# SH_MODEL_CATALOG_HOSTS (every target: comma-separated bare hostnames the control plane's model
+# catalog may contact besides api.anthropic.com and the default inference endpoint; empty, the
+# default, allows only those; a URL, port or path is refused -- the control plane would refuse to
+# boot on it), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
-# SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT and, on ocp-single, SH_ROUTE_DOMAIN
-# and --tls-secret it is not given; an explicitly empty variable (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
+# SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT, SH_MODEL_CATALOG_HOSTS and, on
+# ocp-single, SH_ROUTE_DOMAIN and --tls-secret it is not given; an explicitly empty variable
+# (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
 # a command line -- values travel through pipes and through the environment of the one jq that
 # writes each Secret.
 set -euo pipefail
 
 K8S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$K8S_DIR/../.." && pwd)"
-KIND_CLUSTER=moca
-KIND_CONTEXT=kind-moca
+# KIND_CLUSTER names the kind cluster (default moca). skills/moca-delegate-task/demo/setup.sh sources
+# this script (SH_SOURCE_ONLY=1) and sets KIND_CLUSTER and KIND_CONTEXT before calling main, so keep
+# both read at run time, not parse time.
+KIND_CLUSTER="${KIND_CLUSTER:-moca}"
+KIND_CONTEXT="kind-$KIND_CLUSTER"
 MIN_KIND_VERSION=0.24.0
 NS=moca
 SBX_NS=moca-sandbox
@@ -171,6 +179,11 @@ parse_args() {
   for ttl in SH_API_TOKEN_TTL_SECONDS SH_SESSION_TOKEN_TTL_SECONDS; do
     valid_ttl "${!ttl-}" || die "$ttl='${!ttl}' must be a whole number of seconds, 1 to 8 digits (empty: the control plane's default)"
   done
+  # The catalog allow-list: validated here when given; a stored one is checked in write_settings.
+  # The control plane refuses to BOOT on a URL, port or path (main.ts catalogHostsEnv), so a typo
+  # must be refused here instead of crashlooping it after the apply.
+  valid_catalog_hosts "${SH_MODEL_CATALOG_HOSTS-}" ||
+    die "SH_MODEL_CATALOG_HOSTS='${SH_MODEL_CATALOG_HOSTS-}' must be comma-separated bare hostnames (no scheme, port or path), or empty"
   SH_WAIT_SECONDS="${SH_WAIT_SECONDS:-120}"
 }
 
@@ -178,6 +191,31 @@ parse_args() {
 # most 8 digits (over three years): the control plane silently takes its default for anything it
 # cannot read as a positive number, so a typo must be refused here instead.
 valid_ttl() { [[ -z "$1" || "$1" =~ ^[1-9][0-9]{0,7}$ ]]; }
+
+# valid_catalog_hosts VALUE: empty (the control plane's default, no extra hosts) or comma-separated
+# bare hostnames. Mirrors main.ts catalogHostsEnv, which trims, lower-cases and skips empty entries
+# but refuses a scheme, port, path or userinfo at BOOT; this keeps to [A-Za-z0-9.-] per entry,
+# which covers every real hostname and none of what that check refuses -- and is stricter: no `_`
+# and no trailing dot, both of which URL.parse would take. Stricter is safe: an operator told to
+# use a bare hostname loses nothing real, while a value this passes but that check refuses
+# crashloops the control plane after the apply.
+valid_catalog_hosts() {
+  local raw h
+  local -a _vch_parts
+  [[ -z "$1" ]] && return 0
+  # read -r below reads only the first line, so a value with an embedded newline would validate as
+  # that line here while catalogHostsEnv (split on ',' only, trims only the ends) refuses it at
+  # boot. Reject it up front, for a given value and a stored one alike.
+  [[ "$1" == *$'\n'* ]] && return 1
+  IFS=',' read -r -a _vch_parts <<<"$1"
+  for raw in "${_vch_parts[@]}"; do
+    h="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    # Empty after trim: an entry the control plane itself skips (a,,b).
+    [[ -z "$h" ]] && continue
+    [[ "$h" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
+  done
+  return 0
+}
 
 is_kind() { [[ "$TARGET" == kind || "$TARGET" == kind-ci ]]; }
 
@@ -684,10 +722,10 @@ sha256() {
 # set, even to empty (SH_ADMIN_SUBJECTS=), replaces it. SH_PUBLIC_HARNESS_URL is not an input: it is
 # derived from the target (and the Route host) on every run; nor are SH_SANDBOX_TIERS and
 # SH_SANDBOX_DEFAULT_TIER, which derive_tiers derives from the stack (its sticky input lives in
-# moca-setup). They are written even when '' so every stack hashes the same eight keys; an empty
-# token lifetime is the control plane's default.
+# moca-setup). They are written even when '' so every stack hashes the same nine keys; an empty
+# token lifetime is the control plane's default, and an empty catalog allow-list its own.
 write_settings() {
-  local before after admins fb api_ttl session_ttl
+  local before after admins fb api_ttl session_ttl catalog_hosts
   before="$(configmap_json moca-settings)"
   if [[ -n "${SH_GITHUB_CLIENT_ID+x}" ]]; then CLIENT_ID="$SH_GITHUB_CLIENT_ID"; else CLIENT_ID="$(cm_value "$before" SH_GITHUB_CLIENT_ID)"; fi
   if [[ -z "$CLIENT_ID" && "$TARGET" == kind-ci ]]; then
@@ -699,11 +737,14 @@ write_settings() {
   fb="${fb:-false}"
   if [[ -n "${SH_API_TOKEN_TTL_SECONDS+x}" ]]; then api_ttl="$SH_API_TOKEN_TTL_SECONDS"; else api_ttl="$(cm_value "$before" SH_API_TOKEN_TTL_SECONDS)"; fi
   if [[ -n "${SH_SESSION_TOKEN_TTL_SECONDS+x}" ]]; then session_ttl="$SH_SESSION_TOKEN_TTL_SECONDS"; else session_ttl="$(cm_value "$before" SH_SESSION_TOKEN_TTL_SECONDS)"; fi
+  if [[ -n "${SH_MODEL_CATALOG_HOSTS+x}" ]]; then catalog_hosts="$SH_MODEL_CATALOG_HOSTS"; else catalog_hosts="$(cm_value "$before" SH_MODEL_CATALOG_HOSTS)"; fi
   # A given value was checked in parse_args; a stored one names where it came from, and how to clear it.
   valid_ttl "$api_ttl" ||
     die "moca-settings holds SH_API_TOKEN_TTL_SECONDS='$api_ttl': re-run with it set to a whole number of seconds, or set but empty (SH_API_TOKEN_TTL_SECONDS=) for the default"
   valid_ttl "$session_ttl" ||
     die "moca-settings holds SH_SESSION_TOKEN_TTL_SECONDS='$session_ttl': re-run with it set to a whole number of seconds, or set but empty (SH_SESSION_TOKEN_TTL_SECONDS=) for the default"
+  valid_catalog_hosts "$catalog_hosts" ||
+    die "moca-settings holds SH_MODEL_CATALOG_HOSTS='$catalog_hosts': re-run with it set to comma-separated bare hostnames, or set but empty (SH_MODEL_CATALOG_HOSTS=) for the control plane's default"
   # Valid but long: a stray extra digit must not mint near-permanent bearer tokens unnoticed.
   ((${api_ttl:-0} <= 604800)) ||
     log "WARNING: SH_API_TOKEN_TTL_SECONDS=$api_ttl is over 7 days: every API token a login mints stays valid that long"
@@ -711,9 +752,11 @@ write_settings() {
     log "WARNING: SH_SESSION_TOKEN_TTL_SECONDS=$session_ttl is over 7 days: every session token stays valid that long"
   after="$(jq -ncS --arg id "$CLIENT_ID" --arg admins "$admins" --arg url "$(public_harness_url)" \
     --arg fb "$fb" --arg tiers "$TIERS" --arg dtier "$DEFAULT_TIER" --arg api_ttl "$api_ttl" --arg session_ttl "$session_ttl" \
+    --arg catalog_hosts "$catalog_hosts" \
     '{SH_GITHUB_CLIENT_ID: $id, SH_ADMIN_SUBJECTS: $admins, SH_PUBLIC_HARNESS_URL: $url, SH_ALLOW_OPERATOR_FALLBACK: $fb,
       SH_SANDBOX_TIERS: $tiers, SH_SANDBOX_DEFAULT_TIER: $dtier,
-      SH_API_TOKEN_TTL_SECONDS: $api_ttl, SH_SESSION_TOKEN_TTL_SECONDS: $session_ttl}')"
+      SH_API_TOKEN_TTL_SECONDS: $api_ttl, SH_SESSION_TOKEN_TTL_SECONDS: $session_ttl,
+      SH_MODEL_CATALOG_HOSTS: $catalog_hosts}')"
   jq -n --arg ns "$NS" --argjson data "$after" \
     '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "moca-settings", namespace: $ns}, data: $data}' |
     kc apply --server-side --force-conflicts --field-manager=moca-setup -f - >/dev/null

@@ -2,7 +2,7 @@ import { createServer, type RequestListener, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { abortDetachedTurns, handler } from './server.js';
+import { abortDetachedTurns, armRunReaper, handler } from './server.js';
 // Boot-time validation of the sandbox-discovery enum; see its use below.
 import { resolveDiscoverySource } from '@moca/harness/select-sandbox';
 // ...and of the sandbox tier settings (P6.3), likewise.
@@ -318,6 +318,14 @@ if (isMainModule) {
     console.error(String(err instanceof Error ? err.message : err));
     process.exit(2);
   }
+  // #558: reconcile sync runs orphaned by a dead worker or supervisor pod. Armed here rather than
+  // in startServer because every first-class deployment reaches this code as the P6 worker (the
+  // standalone startServer path is the deprecated Knative one, ADR-0041), and arming it there
+  // would also arm it in the dozens of tests that call startServer as a route harness. The sweep
+  // itself is periodic, not boot-only: a worker restarted seconds after an OOM crash would
+  // otherwise find the orphan's heartbeat not yet stale and never look again.
+  armRunReaper();
+
   // process.send is overloaded three ways in @types/node; pin the signature we actually use
   // before .call() so tsc doesn't resolve .call to a differently-shaped overload.
   const sendToSupervisor = channel as (this: NodeJS.Process, msg: WorkerToSupervisor) => boolean;

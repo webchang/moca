@@ -1690,5 +1690,48 @@ check "the host file behind the symlink is untouched" "$(cat "$t/host/init")" "H
 check "the tree gets a regular file" "$([ -f "$t/tree/sbin/init" ] && [ ! -L "$t/tree/sbin/init" ] && echo yes || echo no)" "yes"
 rm -rf "$t"
 
+echo "== egress (P4.1): proxy env + inert placeholder baked into init, build-time listener probe, no NIC"
+# The parked bash inherits the agent's env, which is init's env, so every Exec sees these.
+# Each must be exported INSIDE the init heredoc and BEFORE the agent exec.
+for v in 'HTTPS_PROXY=http://127.0.0.1:3128' 'https_proxy=http://127.0.0.1:3128' \
+  'HTTP_PROXY=http://127.0.0.1:3128' 'http_proxy=http://127.0.0.1:3128' \
+  'NO_PROXY=localhost,127.0.0.1,::1' 'no_proxy=localhost,127.0.0.1,::1' 'GH_TOKEN=moca-placeholder' 'GITHUB_TOKEN=moca-placeholder'; do
+  ln=""
+  if [ -n "$init_start" ] && [ -n "$init_end" ]; then
+    ln=$(awk -v s="$init_start" -v e="$init_end" -v want="export $v" \
+      'NR>=s && NR<=e && $0==want{print NR; exit}' "$SCRIPT")
+  fi
+  ok=no
+  if [ -n "$ln" ] && [ -n "$exec_line" ] && [ "$ln" -lt "$exec_line" ]; then ok=yes; fi
+  check "init exports $v before the agent exec" "$ok" "yes"
+done
+exec_text=""
+[ -n "$exec_line" ] && exec_text=$(sed -n "${exec_line}p" "$SCRIPT")
+check "the agent exec carries --egress-listen 127.0.0.1:3128" \
+  "$(printf '%s' "$exec_text" | grep -cF -- '--egress-listen 127.0.0.1:3128')" "1"
+check "the agent exec carries --egress-vsock-port 1025" \
+  "$(printf '%s' "$exec_text" | grep -cF -- '--egress-vsock-port 1025')" "1"
+init_body=""
+[ -n "$init_start" ] && [ -n "$init_end" ] && init_body=$(sed -n "${init_start},${init_end}p" "$SCRIPT")
+check "the init heredoc holds the placeholder" \
+  "$([ "$(printf '%s' "$init_body" | grep -cF moca-placeholder)" -ge 1 ] && echo yes || echo no)" "yes"
+check "the init heredoc matches no credential pattern" \
+  "$(printf '%s' "$init_body" | grep -cE 'AKIA|ghp_|-----BEGIN')" "0"
+check "assemble_rootfs appends a credential helper to the STAGED /etc/gitconfig" \
+  "$([ "$(fn_body assemble_rootfs | grep -cF '>>"$STAGE/rootfs-tree/etc/gitconfig"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the credential helper prints the placeholder password" \
+  "$([ "$(fn_body assemble_rootfs | grep -cF 'password=moca-placeholder')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_egress_listener dials the guest listener over /dev/tcp" \
+  "$([ "$(fn_body check_egress_listener | grep -cF '/dev/tcp/127.0.0.1/3128')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_egress_listener fails the build unless the output is 'listening'" \
+  "$([ "$(fn_body check_egress_listener | grep -cF 'exit 1')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_egress_listener is called as often as check_git_identity" \
+  "$(grep -c '^  check_egress_listener "' "$SCRIPT")" "$(grep -c '^  check_git_identity "' "$SCRIPT")"
+check "at least one VMM arm calls check_egress_listener" \
+  "$([ "$(grep -c '^  check_egress_listener "' "$SCRIPT")" -ge 2 ] && echo yes || echo no)" "yes"
+# T7 regression fence: a NIC arriving quietly would void the no-network property.
+check "no network-interfaces config anywhere in the build" \
+  "$(grep -c 'network-interfaces' "$SCRIPT")" "0"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

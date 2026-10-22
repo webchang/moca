@@ -259,3 +259,32 @@ describe('GrpcRelayTransport workspace key (spec §3.4)', () => {
     expect(keys).toEqual(['']);
   });
 });
+
+describe('GrpcRelayTransport workload (workload sandboxes spec §3.3)', () => {
+  function captureRequests(): { client: ExecClientLike; requests: ExecRequest[] } {
+    const { client: inner } = fakeClient({ exitCode: 0 });
+    const requests: ExecRequest[] = [];
+    const client: ExecClientLike = {
+      ...inner,
+      exec(request: ExecRequest) {
+        requests.push(request);
+        return inner.exec(request);
+      },
+    };
+    return { client, requests };
+  }
+
+  it('sends the workload on the ExecRequest, not inside the Exec the worker receives', async () => {
+    const wl = `w-${'a'.repeat(32)}`;
+    const { client, requests } = captureRequests();
+    await GrpcRelayTransport(`${wl}-0`, client, { workload: wl }).exec('true');
+    expect(requests[0]?.workload).toBe(wl);
+    expect(requests[0]?.exec).not.toHaveProperty('workload');
+  });
+
+  it("sends '' for a shared-pool run", async () => {
+    const { client, requests } = captureRequests();
+    await GrpcRelayTransport('sbx-1', client).exec('true');
+    expect(requests[0]?.workload).toBe('');
+  });
+});

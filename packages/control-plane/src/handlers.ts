@@ -19,7 +19,9 @@ import {
   withBundleLock,
   type BundleBudgetRedisLike,
 } from './bundle-budget.js';
+import { type AuditLog, defaultAuditLog } from './audit-log.js';
 import { CpError } from './errors.js';
+import { asRecord, auditBestEffort, isAdmin, seconds } from './handler-util.js';
 import { subjectHash } from './subject-document.js';
 import {
   resolveInferenceName,
@@ -48,12 +50,23 @@ import type { RunKubectl } from './kubectl.js';
 import { DEFAULT_PAGE_SIZE, type OwnershipIndex, type SessionRecord } from './ownership.js';
 import type { IdentityProvider } from './identity.js';
 import type { KeyObject } from 'node:crypto';
-import type { MintInput, TokenClaims } from './token.js';
+import { DEFAULT_ISSUER, SANDBOX_API_ISSUER, type MintInput, type TokenClaims } from './token.js';
 import { isRefreshTokenShape, type RefreshStore } from './refresh-store.js';
 import { projectResources, resolveSandbox } from './resources.js';
 import type { SandboxTiers } from './sandbox-tiers.js';
+import type { RouteProfile } from './routes.js';
+import { isEnrolled, notEnrolled, type SandboxConfig } from './sandbox-config.js';
+import type { SandboxStore } from './sandbox-store.js';
+import { SANDBOX_HANDLERS } from './sandbox-handlers.js';
+
+/** The `iss` this control plane mints API tokens under and accepts on API routes. */
+export function apiIssuer(config: Pick<CpConfig, 'routeProfile'>): string {
+  return config.routeProfile === 'sandbox' ? SANDBOX_API_ISSUER : DEFAULT_ISSUER;
+}
 
 export interface CpConfig {
+  /** Which routes this control plane mounts (SBX0 §4.1). Absent means `harness`. */
+  routeProfile?: RouteProfile;
   apiTokenTtlSeconds: number;
   sessionTokenTtlSeconds: number;
   /** A refresh family dies this long after its last use (`SH_REFRESH_IDLE_TTL_SECONDS`, B14). */
@@ -98,6 +111,8 @@ export interface CpConfig {
   bundleTotalBytes: number;
   /** Advertised alongside harnessUrl; null when the deployment reports none (predates MOCA_VERSION). */
   version?: string;
+  /** The sandbox profile's settings (SBX0 §4, §5); configFromEnv sets it on that profile only. */
+  sandbox?: SandboxConfig;
 }
 
 export interface CpDeps {
@@ -106,7 +121,11 @@ export interface CpDeps {
   /** Content-addressed config bundles (ADR-0038); the same Redis the ownership index uses. */
   bundles: BundleRedisLike & BundleBudgetRedisLike;
   identity: IdentityProvider;
-  signer: { kid: string; mint(input: MintInput): string };
+  signer: {
+    kid: string;
+    mint(input: MintInput): string;
+    signJws(typ: string, claims: object): string;
+  };
   /** Refresh-token families (B14). RedisRefreshStore in production; MemoryRefreshStore in tests. */
   refresh: RefreshStore;
   /**
@@ -137,7 +156,14 @@ export interface CpDeps {
   readyzTimeoutMs?: number;
   /** Release the Redis client. A test that builds deps through depsFromEnv must call it. */
   close?: () => Promise<void>;
+  /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
+  sandboxes?: SandboxStore;
+  /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
+  log?: AuditLog;
 }
+
+/** `deps.log` with the production default; keeps the field optional on `CpDeps`. */
+export const resolveAuditLog = (deps: Pick<CpDeps, 'log'>): AuditLog => deps.log ?? defaultAuditLog;
 
 export interface RequestCtx {
   params: Record<string, string>;
@@ -147,6 +173,8 @@ export interface RequestCtx {
   principal?: TokenClaims;
   /** Set by the router for `auth: 'exchange'` routes. */
   exchangeAuthorized?: boolean;
+  /** Set by the router for `auth: 'janitor'` routes. */
+  janitorAuthorized?: boolean;
 }
 
 export type Handler = (ctx: RequestCtx, deps: CpDeps) => Promise<{ status: number; body: unknown }>;
@@ -181,11 +209,6 @@ export async function assertOwner(
   return rec;
 }
 
-const asRecord = (body: unknown): Record<string, unknown> =>
-  typeof body === 'object' && body !== null && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : {};
-
 /** A query integer must be rejected, not coerced: `parseInt('abc')` is NaN and pages by nothing. */
 function intQuery(query: URLSearchParams, name: string): number | undefined {
   const raw = query.get(name);
@@ -194,8 +217,6 @@ function intQuery(query: URLSearchParams, name: string): number | undefined {
   if (!Number.isFinite(n)) throw new CpError('invalid_request', `${name} must be a number`);
   return n;
 }
-
-const seconds = (deps: CpDeps): number => Math.floor(deps.now() / 1000);
 
 /**
  * The body both grants answer with (device flow and refresh, B14 §4.3): an API token now, and the
@@ -214,6 +235,7 @@ function loginBody(
       roles: who.roles,
       scope: ['api'],
       ttlSeconds: deps.config.apiTokenTtlSeconds,
+      iss: apiIssuer(deps.config),
       now: iat,
     }),
     subject: who.subject,
@@ -230,39 +252,6 @@ async function turnInFlight(sessionId: string, deps: CpDeps): Promise<boolean> {
   const started = Number(runtime.turnStartedAt ?? 0);
   const ended = Number(runtime.turnEndedAt ?? 0);
   return started > 0 && started > ended;
-}
-
-/**
- * Audit a CREDENTIAL route without letting the audit's own failure change the caller's status.
- *
- * Spec §9.2 promises "Redis down => session routes 503, while /v1/credentials stays up, because §7.1
- * put them in different stores". The credential store is Kubernetes Secrets and knows nothing about
- * Redis -- but `index.audit()` is a Redis write, and `OwnershipIndex.guard` turns any transport
- * failure into `redis_unavailable` (503). Awaiting it after a successful Secret patch therefore
- * reported 503 for a write that HAD happened: the status lied, and a user could not repair their
- * credential during a Redis outage. Availability of the repair path is worth more than the audit
- * record, so the audit is what gives way.
- *
- * Deliberately NOT applied to `audit` globally, and never to the session routes: their 503 is correct
- * and spec-mandated, because those routes' own state lives in the very Redis that is down.
- *
- * The swallow is loud. An audit gap must be discoverable, so it logs the route and the credential
- * NAME -- never the value, which this function is never given in the first place.
- */
-async function auditBestEffort(
-  deps: CpDeps,
-  route: string,
-  target: string,
-  entry: Parameters<OwnershipIndex['audit']>[0],
-): Promise<void> {
-  try {
-    await deps.index.audit(entry);
-  } catch (err) {
-    console.error(
-      `[control-plane] audit write failed for ${route} ${target}: ` +
-        `${(err as Error).message} -- the write itself SUCCEEDED`,
-    );
-  }
 }
 
 /** The body of putConfigBundle; `seen` collects what the refusal audit row can name. */
@@ -434,14 +423,32 @@ export const HANDLERS: Record<string, Handler> = {
 
   // `null`, not a 404, when unset: the client can tell "this deployment advertises no harness" from
   // "this control plane predates discovery" and name the right fix for each.
-  getDiscovery: async (_ctx, deps) => ({
-    status: 200,
-    body: {
-      harnessUrl: deps.config.publicHarnessUrl ?? null,
-      sandboxTiers: deps.config.sandboxTiers,
-      version: deps.config.version ?? null,
-    },
-  }),
+  // SBX0 §4.1 (v1.1): the sandbox profile answers only where clients send Exec, and the CA to trust
+  // when its certificate is self-issued (absent otherwise); templates are at the fixed /v1/templates.
+  getDiscovery: async (_ctx, deps) => {
+    if (deps.config.routeProfile === 'sandbox') {
+      const sbx = deps.config.sandbox;
+      // Never fall through to the harness body: a sandbox profile without its config is a bug.
+      if (!sbx) throw new CpError('internal_error', 'the sandbox profile has no sandbox config');
+      return {
+        status: 200,
+        body: {
+          profile: 'sandbox',
+          execEndpoint: sbx.execEndpoint,
+          ...(sbx.execCa ? { execCa: sbx.execCa } : {}),
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: {
+        harnessUrl: deps.config.publicHarnessUrl ?? null,
+        sandboxTiers: deps.config.sandboxTiers,
+        version: deps.config.version ?? null,
+        profile: deps.config.routeProfile ?? 'harness',
+      },
+    };
+  },
 
   startDeviceAuth: async (_ctx, deps) => ({
     status: 200,
@@ -455,6 +462,11 @@ export const HANDLERS: Record<string, Handler> = {
     }
     // A pending authorization propagates as authorization_pending (428) -- the client polls.
     const principal = await deps.identity.completeDeviceAuth(deviceCode);
+    // SBX0 §4.2: on the sandbox profile only enrolled subjects (and admins) get a login, and the
+    // refusal comes BEFORE a refresh family is issued, so nothing is left behind for them.
+    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+      throw notEnrolled(principal.subject);
+    }
     const label = asRecord(ctx.body).label;
     const issued = await deps.refresh.issue({
       subject: principal.subject,
@@ -479,17 +491,27 @@ export const HANDLERS: Record<string, Handler> = {
     const r = await deps.refresh.rotate(token, deps.now());
     // One code for every refusal: the client's only move is to log in again (errors.ts).
     if (!r.ok) throw new CpError('invalid_grant', `refresh token refused: ${r.reason}`);
+    const roles = deps.identity.rolesFor(r.subject);
+    // A subject removed from SH_ALLOWED_SUBJECTS loses access at its next refresh, not its next login.
+    // rotate() has already stored a successor the client never sees, so the token it still holds is
+    // superseded: presented again after the grace window it would read as reuse, revoke the family
+    // as theft and audit refresh_reuse_detected. Revoke the family here, under a reason of its own,
+    // so that token is a plain `revoked` refusal instead.
+    // The revoke is best effort: a store failure here must not turn the answer into a 503, which a
+    // client reads as "unreachable" and so keeps the superseded token. The refusal is the 403.
+    if (!isEnrolled(r.subject, roles, deps.config)) {
+      try {
+        await deps.refresh.revoke(r.refreshToken, deps.now(), 'not_enrolled');
+      } catch (err) {
+        console.error(
+          `[control-plane] refreshAuth: revoking a de-enrolled family failed: ${(err as Error)?.message ?? String(err)}`,
+        );
+      }
+      throw notEnrolled(r.subject, 'no longer');
+    }
     return {
       status: 200,
-      body: loginBody(
-        deps,
-        {
-          subject: r.subject,
-          displayName: r.displayName,
-          roles: deps.identity.rolesFor(r.subject),
-        },
-        r,
-      ),
+      body: loginBody(deps, { subject: r.subject, displayName: r.displayName, roles }, r),
     };
   },
 
@@ -618,13 +640,15 @@ export const HANDLERS: Record<string, Handler> = {
       ...(choice?.limits ? { modelLimits: choice.limits } : {}),
     };
     await deps.index.create(rec);
-    await deps.index.audit({
+    const sessionCreatedEntry = {
       subject: p.sub,
       sessionId,
       credential: credentialName || OPERATOR_FALLBACK_NAME,
-      decision: 'session_created',
+      decision: 'session_created' as const,
       ...(choice ? { model: choice.model } : {}),
-    });
+    };
+    resolveAuditLog(deps)({ event: 'audit', ...sessionCreatedEntry });
+    await deps.index.audit(sessionCreatedEntry);
     const iat = seconds(deps);
     return {
       status: 201,
@@ -652,7 +676,7 @@ export const HANDLERS: Record<string, Handler> = {
     if (requestedOwner !== null && requestedOwner !== p.sub) {
       // 403, not 404: "authenticated but insufficiently privileged on a resource you may know
       // exists" is exactly what 403 is reserved for (spec §8.1).
-      if (!(p.roles ?? []).includes('admin')) {
+      if (!isAdmin(p)) {
         throw new CpError('forbidden', '?owner= requires the admin role');
       }
       owner = requestedOwner;
@@ -706,13 +730,15 @@ export const HANDLERS: Record<string, Handler> = {
       throw new CpError('session_not_found', undefined, rec.sessionId);
     }
     await deps.index.setModel(rec.sessionId, choice.model, choice.limits);
-    await deps.index.audit({
+    const modelChangedEntry = {
       subject: rec.owner,
       sessionId: rec.sessionId,
-      decision: 'model_changed',
+      decision: 'model_changed' as const,
       model: choice.model || 'default',
       fromModel: fresh.model || 'default',
-    });
+    };
+    resolveAuditLog(deps)({ event: 'audit', ...modelChangedEntry });
+    await deps.index.audit(modelChangedEntry);
     const updated: SessionRecord = { ...fresh, model: choice.model, modelLimits: choice.limits };
     return {
       status: 200,
@@ -747,11 +773,14 @@ export const HANDLERS: Record<string, Handler> = {
     const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
     const inFlight = await turnInFlight(rec.sessionId, deps);
     await deps.index.cascadeDelete(rec);
-    await deps.index.audit({
+    const deletedEntry = {
       subject: rec.owner,
       sessionId: rec.sessionId,
-      decision: inFlight ? 'session_deleted_in_flight' : 'session_deleted',
-    });
+      decision: (inFlight ? 'session_deleted_in_flight' : 'session_deleted') as
+        'session_deleted' | 'session_deleted_in_flight',
+    };
+    resolveAuditLog(deps)({ event: 'audit', ...deletedEntry });
+    await deps.index.audit(deletedEntry);
     // 202 rather than pretending a synchronous delete happened; a sweeper reaps what the in-flight
     // turn writes on its way out (spec §7.3).
     return { status: inFlight ? 202 : 204, body: undefined };
@@ -856,7 +885,7 @@ export const HANDLERS: Record<string, Handler> = {
           throw new CpError('config_bundle_not_found', 'no config bundle with that digest');
         }
         // A bundle with no budget entry was stored by /promote straight into Redis: nobody's to delete.
-        if (!(p.roles ?? []).includes('admin') && owner !== subjectHash(p.sub)) {
+        if (!isAdmin(p) && owner !== subjectHash(p.sub)) {
           throw new CpError(
             'forbidden',
             'only the subject that uploaded this bundle, or an admin, may delete it',
@@ -939,4 +968,7 @@ export const HANDLERS: Record<string, Handler> = {
     }
     return { status: 200, body: 'ok' };
   },
+
+  // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
+  ...SANDBOX_HANDLERS,
 };

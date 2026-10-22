@@ -1,3 +1,5 @@
+import { status } from '@grpc/grpc-js';
+import { OWNER_LABEL, TIER_LABEL, WORKLOAD_LABEL } from '@moca/harness';
 import type { RecordStore, SandboxRecord } from '@moca/harness';
 import type { Exec, ExecEvent, ServerFrame, WorkerFrame } from '@moca/k8s-sandbox';
 
@@ -26,9 +28,41 @@ export interface DetachMarks {
   clear(sandboxId: string): Promise<void>;
 }
 
+/** What a verified attach token binds a sandbox to (workload sandboxes spec §3.1). */
+export interface AttachBinding {
+  workload: string;
+  owner: string;
+  tier: string;
+  /** The token's `n`: only sandbox ordinals below it may attach. */
+  count: number;
+  /** When the relay closes the stream (epoch ms): the token's `exp`, plus the clock leeway. */
+  expiresAtMs: number;
+}
+
+/**
+ * Verifies an attach token (`moca-attach+jwt`) with public keys only. Returns the binding, or a
+ * refusal reason for the operator's log (a fixed string, never the token). main.ts builds it from
+ * MOCA_ATTACH_PUBLIC_KEYS.
+ */
+export type AttachVerifier = (
+  token: string | undefined,
+) => { binding: AttachBinding; reason?: undefined } | { binding?: undefined; reason: string };
+
 export interface RelayDeps {
   records: RecordStore;
   validateToken: (token: string | undefined, sandboxId: string) => boolean;
+  /**
+   * Trusted workload labels (workload sandboxes spec §3.2-3.3). Set only when the relay has attach
+   * public keys. Absent, the relay behaves exactly as before: Hello labels are mirrored as sent and
+   * an Exec's `workload` field is ignored. Present:
+   *  - a Hello whose token is a valid attach token, and whose sandboxId is `<wl>-<ordinal>` with
+   *    the ordinal below the token's `n`, is parked with moca.dev/workload, moca.dev/owner and
+   *    moca.dev/tier taken from the token, and its stream is closed when the token expires;
+   *  - a Hello admitted by the shared or per-id token loses any moca.dev/workload and
+   *    moca.dev/owner label, and may not take a workload-shaped id;
+   *  - an Exec whose `workload` differs from its sandbox's trusted workload is refused.
+   */
+  verifyAttach?: AttachVerifier;
   /** Detach marks; main.ts wires them to the record store's client. */
   detach?: DetachMarks;
   /** Defaults to the global timers. */
@@ -37,8 +71,12 @@ export interface RelayDeps {
 
 interface Parked {
   stream: AttachStream;
+  /** The trusted workload key, from a verified attach token; undefined for a shared-pool sandbox. */
+  workload?: string;
   // per-reqId sinks for in-flight execs, populated by routeExec
   sinks: Map<number, (ev: ExecEvent) => void>;
+  // Cancels the attach token's expiry timer; set by an attach-token Hello, called by teardown.
+  cancelExpiry?: () => void;
   // Cancels a pending presence-put retry; set by Hello, called by teardown.
   cancelPresence?: () => void;
   // This stream's teardown, so drain can run it; settles once the remove and the mark have.
@@ -48,6 +86,55 @@ interface Parked {
 /** Presence-put backoff: 250 ms, doubling, capped at 10 s, with no attempt limit (#423, Task 16b). */
 const PRESENCE_RETRY_BASE_MS = 250;
 const PRESENCE_RETRY_MAX_MS = 10_000;
+
+/**
+ * A sandbox id shaped like a workload sandbox's, `w-<32 hex>-<n>` (spec §4.2). With attach keys
+ * configured, only an attach token for that workload may register one: a shared-pool sandbox taking
+ * the id first would otherwise hold it against the workload's own pod (the duplicate-id refusal).
+ */
+const WORKLOAD_SANDBOX_ID_RE = /^w-[0-9a-f]{32}-[0-9]+$/;
+
+/**
+ * `sandboxId` is `<wl>-<ordinal>` with a canonical ordinal below the token's `n`: the binding check of
+ * spec §3.2 (`^<wl>-(0|[1-9][0-9]*)$`). Canonical, so `-01` cannot shadow `-1`.
+ */
+function idMatchesWorkload(sandboxId: string, binding: AttachBinding): boolean {
+  const prefix = `${binding.workload}-`;
+  if (!sandboxId.startsWith(prefix)) return false;
+  const ordinal = sandboxId.slice(prefix.length);
+  return /^(0|[1-9][0-9]*)$/.test(ordinal) && Number(ordinal) < binding.count;
+}
+
+/** setTimeout's delay is a signed 32-bit ms count; a longer one fires at once (Node clamps to 1). */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * The labels a parked sandbox's record carries. With an attach binding, its three labels overwrite
+ * whatever Hello sent; without one (a shared-pool sandbox on a relay with attach keys), the workload
+ * and owner labels are removed, so no sandbox can claim to be someone's by saying so.
+ */
+function trustedLabels(
+  sent: Record<string, string> | undefined,
+  binding: AttachBinding | undefined,
+): Record<string, string> {
+  const labels = { ...(sent ?? {}) };
+  delete labels[WORKLOAD_LABEL];
+  delete labels[OWNER_LABEL];
+  if (binding) {
+    labels[WORKLOAD_LABEL] = binding.workload;
+    labels[OWNER_LABEL] = binding.owner;
+    labels[TIER_LABEL] = binding.tier;
+  }
+  return labels;
+}
+
+/** An Exec refused by the workload check: PERMISSION_DENIED on the wire, via grpc-js's code mapping. */
+function workloadMismatch(message: string): Error & { code: number; details: string } {
+  const err = new Error(message) as Error & { code: number; details: string };
+  err.code = status.PERMISSION_DENIED;
+  err.details = message;
+  return err;
+}
 
 const defaultTimers: RelayTimers = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -66,8 +153,12 @@ export interface Relay {
    * been taught about. `workspace_key` was the field that made that concrete: the
    * relay is a bridge keyed by sandbox_id, not a translator (worker DESIGN.md,
    * "No matching in the relay").
+   *
+   * `opts.workload` is ExecRequest's `workload` (spec §3.3). Checked only when the relay has attach
+   * keys: an Exec to a workload sandbox must name that workload, and one naming a workload must
+   * target a sandbox bound to it. A mismatch throws PERMISSION_DENIED before the worker sees it.
    */
-  routeExec(sandboxId: string, exec: Exec): AsyncIterable<ExecEvent>;
+  routeExec(sandboxId: string, exec: Exec, opts?: { workload?: string }): AsyncIterable<ExecEvent>;
   routeAbort(sandboxId: string, reqId: number): void;
   /**
    * Graceful stop (#453): refuse every later Hello, run each parked session's teardown and await
@@ -164,7 +255,36 @@ export function createRelay(deps: RelayDeps): Relay {
         const id = frame.hello.sandboxId;
         // Draining: the stop already removed every record, so a session parked now would write one
         // that nothing removes.
-        if (draining || !deps.validateToken(bearer(stream.metadata), id)) {
+        if (draining) {
+          close(stream);
+          return;
+        }
+        const token = bearer(stream.metadata);
+        let binding: AttachBinding | undefined;
+        if (deps.validateToken(token, id)) {
+          // The shared or per-id token. With attach keys configured it cannot take a workload's id.
+          if (deps.verifyAttach && WORKLOAD_SANDBOX_ID_RE.test(id)) {
+            console.error(`attach refused for ${id}: a workload sandbox id needs an attach token`);
+            close(stream);
+            return;
+          }
+        } else if (deps.verifyAttach) {
+          const verdict = deps.verifyAttach(token);
+          if (!verdict.binding) {
+            // Only reported when a token was presented: a missing one is the ordinary bad-token path.
+            if (token) console.error(`attach refused for ${id}: ${verdict.reason}`);
+            close(stream);
+            return;
+          }
+          if (!idMatchesWorkload(id, verdict.binding)) {
+            console.error(
+              `attach refused for ${id}: sandbox id is not an ordinal below n of its token's workload`,
+            );
+            close(stream);
+            return;
+          }
+          binding = verdict.binding;
+        } else {
           close(stream); // reject before parking; no presence written
           return;
         }
@@ -180,12 +300,21 @@ export function createRelay(deps: RelayDeps): Relay {
           return;
         }
         sandboxId = id;
-        const session: Parked = { stream, sinks: new Map(), teardown };
+        const session: Parked = {
+          stream,
+          sinks: new Map(),
+          teardown,
+          ...(binding ? { workload: binding.workload } : {}),
+        };
         own = session;
         sessions.set(id, session);
+        if (binding) armExpiry(session, binding.expiresAtMs);
         const rec: SandboxRecord = {
           sandboxId: id,
-          labels: frame.hello.labels,
+          // Without attach keys, exactly as sent (today's behaviour).
+          labels: deps.verifyAttach
+            ? trustedLabels(frame.hello.labels, binding)
+            : frame.hello.labels,
           capabilities: frame.hello.capabilities,
           // Advertised by the worker but not yet consulted for leasing —
           // select-sandbox still leases against its own opts.cap. Wiring
@@ -212,10 +341,41 @@ export function createRelay(deps: RelayDeps): Relay {
      * session under the same id, which a by-id teardown used to evict: cancelling its presence
      * retry, failing its execs and removing its record.
      */
+    /**
+     * No attach stream outlives its token (spec §3.1): at the deadline the session is torn down and
+     * the stream ended, so the worker redials and re-reads its token file. Torn down first, as drain
+     * does, so its record is gone before the worker can park again. Re-armed across setTimeout's
+     * 24.8-day ceiling so a long-lived token is never cut early.
+     */
+    function armExpiry(session: Parked, deadlineMs: number): void {
+      let handle: unknown;
+      const arm = () => {
+        const left = deadlineMs - Date.now();
+        if (left > MAX_TIMER_MS) {
+          handle = timers.setTimeout(arm, MAX_TIMER_MS);
+          return;
+        }
+        handle = timers.setTimeout(
+          () => {
+            handle = undefined;
+            if (sessions.get(sandboxId!) !== session) return;
+            console.error(`attach stream for ${sandboxId} closed: its attach token expired`);
+            void teardown().then(() => close(stream));
+          },
+          Math.max(0, left),
+        );
+      };
+      session.cancelExpiry = () => {
+        if (handle !== undefined) timers.clearTimeout(handle);
+        handle = undefined;
+      };
+      arm();
+    }
     function teardown(): Promise<void> {
       if (!sandboxId || !own || sessions.get(sandboxId) !== own) return Promise.resolve();
       const parked = own;
       own = undefined;
+      parked.cancelExpiry?.();
       parked.cancelPresence?.();
       // Fail any in-flight execs fast instead of leaving their routeExec
       // generators parked forever on a frame that will never arrive.
@@ -244,10 +404,28 @@ export function createRelay(deps: RelayDeps): Relay {
     });
   }
 
-  async function* routeExec(sandboxId: string, exec: Exec): AsyncGenerator<ExecEvent> {
+  async function* routeExec(
+    sandboxId: string,
+    exec: Exec,
+    opts: { workload?: string } = {},
+  ): AsyncGenerator<ExecEvent> {
     const reqId = exec.reqId;
     const parked = sessions.get(sandboxId);
     if (!parked) throw new Error(`no live worker for sandbox '${sandboxId}'`);
+    if (deps.verifyAttach) {
+      const want = opts.workload ?? '';
+      const have = parked.workload ?? '';
+      if (have && want !== have) {
+        throw workloadMismatch(
+          `sandbox '${sandboxId}' belongs to a workload this Exec does not name`,
+        );
+      }
+      if (!have && want) {
+        throw workloadMismatch(
+          `sandbox '${sandboxId}' belongs to no workload; this Exec names one`,
+        );
+      }
+    }
 
     if (parked.sinks.has(reqId))
       throw new Error(

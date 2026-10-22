@@ -171,7 +171,7 @@ func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, 
 		if err != nil {
 			return nil, err
 		}
-		return NewFirecrackerLauncher(FirecrackerOptions{
+		opts := FirecrackerOptions{
 			SnapshotDir:          snapshotDir,
 			JailerBin:            vmmBin(get, "SH_JAILER_BIN", "jailer", "/usr/bin/jailer"),
 			FirecrackerBin:       vmmBin(get, "SH_FIRECRACKER_BIN", "firecracker", "/usr/bin/firecracker"),
@@ -182,8 +182,20 @@ func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, 
 			CgroupMemoryMaxBytes: perVMBytes,
 			WorkspaceImageBytes:  wsImageMB << 20,
 			VsockPort:            1024,
-		})
+		}
+		if sock := get("MOCA_EGRESS_CONTROL_SOCK"); sock != "" {
+			b, err := newEgressBinder(sock)
+			if err != nil {
+				return nil, err
+			}
+			opts.Egress = b
+			opts.EgressPort = defaultEgressVsockPort
+		}
+		return NewFirecrackerLauncher(opts)
 	case CloudHypervisor:
+		if get("MOCA_EGRESS_CONTROL_SOCK") != "" {
+			return nil, errors.New("egress (MOCA_EGRESS_CONTROL_SOCK) is supported on the firecracker VMM only")
+		}
 		// VirtiofsdUID/VirtiofsdGID deliberately do NOT mirror the Firecracker case's
 		// os.Getuid()/os.Getgid() above: a caller of this function may itself run
 		// privileged (microvm-worker needs /dev/kvm and jailer), so os.Getuid() here

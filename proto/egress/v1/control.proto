@@ -1,0 +1,42 @@
+syntax = "proto3";
+package egress.v1;
+
+// Control protocol between the vmpool and moca-egress (MI1 spec section 8.3).
+// The vmpool dials moca-egress's control socket and hands over, per microVM,
+// the listening fd that fronts that VM's egress vsock port.
+//
+// Framing: a 4-byte big-endian length, then a marshalled ControlRequest.
+// moca-egress answers each request with exactly one ControlReply, framed the
+// same way. A frame is at most 64 KiB.
+//
+// Register's listening fd rides as SCM_RIGHTS ancillary data on the sendmsg
+// that carries the first byte of its frame.
+//
+// Rebind lands with MI1 S2. ControlRequest declares `reserved 3;` at message
+// level, because proto3 allows no `reserved` inside a oneof; S2 adds
+// `Rebind rebind = 3` to the oneof.
+
+message ControlRequest {
+  reserved 3;
+  oneof msg {
+    Register   register   = 1;
+    Unregister unregister = 2;
+  }
+}
+
+// Register binds a VM's listening fd (passed out of band) to its session.
+message Register {
+  string vm_id = 1;
+  string sid   = 2;
+  bytes  grant = 3;   // empty in S4 (single tenancy); non-empty is refused
+}
+
+message Unregister {
+  string vm_id = 1;
+}
+
+message ControlReply {
+  bool   ok      = 1;
+  string code    = 2;   // named refusal code when ok is false
+  string message = 3;
+}

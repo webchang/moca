@@ -47,6 +47,15 @@ The control plane's `/healthz` does not depend on Redis, so an outage does not r
   `worker_channel_error`, `handoff_retry`, `handoff_failed`, `head_truncated`, `over_admission`.
 - **Control plane:** plain prefixed lines, for example `[control-plane] redis client error: ...`,
   `[control-plane] audit write failed for <route> <target>: ... -- the write itself SUCCEEDED`.
+- **Audit log mirror** (control plane and knative-server, [ADR-0044](../adrs/0044-audit-log-mirror-stdout.md)):
+  one JSON object per audit decision on stdout, shape `{"event":"audit","decision":"...","subject":"...","sessionId":"...",...}`.
+  Field whitelist: `event, decision, subject, sessionId, workloadId?, configRef?, sandboxId?, credential?,
+model?, fromModel?, kind?, status?, reason?, bytes?, writable?, family?, graceReplay?`. Never carries
+  token / credential / prompt / response / filename / display-name values —
+  [the spec](../specs/2026-10-20-audit-log-mirror-design.md) names the data-handling rules; three
+  tests in `packages/control-plane/test/audit-log.test.ts` enforce them. `run_started` and
+  `run_finalized` emit from the P6 run path (`handleRunLeafParsed`); the deprecated KEDA drain
+  (ADR-0041) stays silent.
 - **Data plane and workers:** `[redis] <label>: <message> (node-redis will reconnect)`, and
   `[deprecation] ... is deprecated` for the old route aliases.
 - **Relay:** plain text, for example `presence put failed for <id> (attempt N, retrying in X ms): ...`,
@@ -64,7 +73,9 @@ The control plane appends to the Redis stream `sh:cp:audit` (trimmed to about 1,
 `family` (written by every refresh-token decision). Decisions: `credential_issued`, `operator_fallback_used`, `session_created`, `session_deleted`,
 `session_deleted_in_flight`, `credential_written`, `credential_deleted`, `config_bundle_uploaded`,
 `config_bundle_unchanged`, `config_bundle_refused`, `config_bundle_deleted`, and the refresh-token decisions
-`refresh_issued`, `refresh_rotated`, `refresh_refused`, `refresh_reuse_detected`, `refresh_revoked`. Anonymous
+`refresh_issued`, `refresh_rotated`, `refresh_refused`, `refresh_reuse_detected`, `refresh_revoked` (`reason`
+`logout`, `logout_all`, or `not_enrolled`: a sandbox-profile refresh by a subject no longer in `SH_ALLOWED_SUBJECTS`,
+whose family the control plane revokes so the client's last token is later refused as `revoked`, not as reuse). Anonymous
 refusals go to `sh:cp:audit:anon` (about 100,000). Read them with `redis-cli XREVRANGE sh:cp:audit + - COUNT 50`
 through `kubectl exec`; no HTTP endpoint for the audit stream is documented.
 

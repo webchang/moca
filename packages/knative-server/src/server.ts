@@ -12,6 +12,7 @@ import {
   type LeafEnvelope,
   type LeafResult,
 } from '@moca/harness/run-leaf';
+import { defaultAuditLog } from '@moca/harness/audit-log';
 import { RedisWorkQueue } from '@moca/work-queue';
 import {
   RedisResultStore,
@@ -19,6 +20,7 @@ import {
   writeResult,
   readResult,
 } from '@moca/harness/leaf-result-store';
+import { beginRunLease, reapOrphanedRuns } from '@moca/harness/run-lease';
 import { CpError, statusFor } from '@moca/control-plane';
 import {
   authorizeRunRead,
@@ -132,6 +134,65 @@ export async function resetTurnRegistryForTests(): Promise<void> {
 /** Worker exit (§5.5): end every detached turn with a terminal frame before the process goes. */
 export async function abortDetachedTurns(reason: 'restarting'): Promise<void> {
   await registry?.abortAll(reason);
+}
+
+// #558: how often an armed reaper sweeps for orphaned runs. Every worker arms one; the claims are
+// atomic (see reapOrphanedRuns), so overlapping sweeps are harmless and the interval is a
+// compromise between reconciliation latency after a crash and SCAN load on the data-plane Redis.
+// A value of 0 (or less) would be a hot timer, so it means the default — the same guard
+// statsIntervalMs applies to its interval.
+const RUN_REAP_INTERVAL_MS = 30_000;
+const runReapIntervalMs = () => {
+  const ms = intEnv('SH_RUN_REAP_INTERVAL_MS', RUN_REAP_INTERVAL_MS);
+  return ms > 0 ? ms : RUN_REAP_INTERVAL_MS;
+};
+
+/**
+ * One reaper sweep (#558): finalize every sync run whose holder died without writing its result
+ * — the supervisor-pod-kill counterpart to the sandbox-pod-kill path, which reconciles in-band
+ * because its worker survives. Each reaped run gets the `run_finalized` audit its `run_started`
+ * is still waiting for, marked `reaper` so an operator can tell a reconciled failure from one the
+ * holder reported itself.
+ */
+export async function sweepOrphanedRuns(): Promise<number> {
+  const reaped = await reapOrphanedRuns(getResultStore(), {
+    ttlSeconds: RESULT_TTL_SECONDS,
+    onReap: (run) =>
+      defaultAuditLog({
+        event: 'audit',
+        decision: 'run_finalized',
+        sessionId: run.rawSessionId,
+        status: 'failed',
+        reason: 'owner_lost',
+        reaper: true,
+      }),
+  });
+  if (reaped.length > 0)
+    console.log(
+      `[run-reaper] finalized ${reaped.length} orphaned run(s): ${reaped.map((r) => r.sid).join(', ')}`,
+    );
+  return reaped.length;
+}
+
+/**
+ * Arm the periodic sweep. Runs the first sweep at once (a restarted worker reconciles what its
+ * predecessor died holding) and then on the interval — periodic, not boot-only, because a worker
+ * that OOM-crashes mid-run is restarted by the supervisor within seconds, long before the run's
+ * heartbeat goes stale, so a one-shot scan at boot would find the orphan still "alive" and never
+ * look again. Unref'd, so a reaper never holds a draining worker open. Returns a stop function
+ * (tests); nothing in the worker's own lifecycle needs to call it.
+ */
+export function armRunReaper(): () => void {
+  const sweep = () =>
+    void sweepOrphanedRuns().catch((err: unknown) =>
+      console.warn(
+        `[run-reaper] sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
+  sweep();
+  const timer = setInterval(sweep, runReapIntervalMs());
+  timer.unref();
+  return () => clearInterval(timer);
 }
 
 // A slow Redis (reconnecting, offline queue) must not stall non-detachable turns: fail open past this.
@@ -1008,36 +1069,88 @@ async function handleRunLeafParsed(
   body = await resolveRunWorkload(body, auth, res);
   if (!body) return;
 
-  // Spec §4.3: on pool saturation the sync path bounded-waits with backoff, then 503 Retry-After.
-  // selectPoolSandbox throws before taking any lease or doing agent work, so re-running runLeaf on a
-  // "saturated" result only re-attempts acquisition — the preceding steps (validate, model resolve,
-  // Redis verdict fast-path) are idempotent. The async path is untouched (queue drains as leases free).
-  const cfg = saturationWaitConfig();
-  const deadline = Date.now() + cfg.waitMs;
-  let delay = cfg.backoffMs;
-  let result = await runLeaf(body, buildConfig(auth));
-  while (isSaturated(result) && Date.now() < deadline) {
-    await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-    delay = Math.min(delay * 2, cfg.maxBackoffMs);
-    result = await runLeaf(body, buildConfig(auth));
-  }
+  // run_started once (saturation retries don't re-emit), run_finalized once.
+  // subject is omitted when auth is null; sh:cp:audit carries it via session_created.
+  const emitLifecycle = (
+    decision: 'run_started' | 'run_finalized',
+    extra: Record<string, unknown>,
+  ) =>
+    defaultAuditLog({
+      event: 'audit',
+      decision,
+      ...(auth?.subject ? { subject: auth.subject } : {}),
+      sessionId: body.sessionId,
+      ...extra,
+    });
+  emitLifecycle('run_started', {
+    ...(body.workloadId ? { workloadId: body.workloadId } : {}),
+    kind: body.kind,
+  });
 
-  if (isSaturated(result)) {
-    // Still saturated after the budget: tell the client to retry. Do NOT persist a result record —
-    // a 503 is "retry", not a terminal failure, and /runs/status must not report it as one.
-    res
-      .writeHead(503, { ...JSON_HEADERS, 'Retry-After': String(cfg.retryAfterS) })
-      .end(JSON.stringify({ status: 'failed', reason: 'saturated' }));
-    return;
-  }
+  // #558: record the run as in-flight for the whole handler, so a worker that dies mid-run (the
+  // supervisor pod's exit SIGKILLs it before any graceful path can run) leaves a marker a
+  // surviving worker's reaper can finalize instead of a session `queued` forever. Fail-open by
+  // design — see beginRunLease — and released in the finally below, covering the saturation-retry
+  // loop, the 503 early return, and a thrown runLeaf alike.
+  const lease = beginRunLease(getResultStore(), leafSessionId(body), {
+    owner: `${hostname()}:${process.pid}`,
+    rawSessionId: body.sessionId,
+    ttlSeconds: RESULT_TTL_SECONDS,
+  });
 
-  await writeResult(
-    getResultStore(),
-    leafSessionId(body),
-    toResultRecord(result, body.sessionId, new Date().toISOString()),
-    RESULT_TTL_SECONDS,
-  );
-  res.writeHead(200, JSON_HEADERS).end(JSON.stringify(result));
+  // Finally-with-flag so every run_started pairs with exactly one run_finalized, including on
+  // thrown runLeaf / writeResult errors. Without this, a Redis-down writeResult (the exact case
+  // the mirror is for) leaves the operator grepping for an unterminated run.
+  let finalized = false;
+  const finalize = (extra: Record<string, unknown>) => {
+    if (finalized) return;
+    finalized = true;
+    emitLifecycle('run_finalized', extra);
+  };
+  try {
+    // Spec §4.3: on pool saturation the sync path bounded-waits with backoff, then 503 Retry-After.
+    // selectPoolSandbox throws before taking any lease or doing agent work, so re-running runLeaf on a
+    // "saturated" result only re-attempts acquisition — the preceding steps (validate, model resolve,
+    // Redis verdict fast-path) are idempotent. The async path is untouched (queue drains as leases free).
+    const cfg = saturationWaitConfig();
+    const deadline = Date.now() + cfg.waitMs;
+    let delay = cfg.backoffMs;
+    let result = await runLeaf(body, buildConfig(auth));
+    while (isSaturated(result) && Date.now() < deadline) {
+      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+      delay = Math.min(delay * 2, cfg.maxBackoffMs);
+      result = await runLeaf(body, buildConfig(auth));
+    }
+
+    if (isSaturated(result)) {
+      // Still saturated after the budget: tell the client to retry. Do NOT persist a result record —
+      // a 503 is "retry", not a terminal failure, and /runs/status must not report it as one.
+      finalize({ status: 'failed', reason: 'saturated' });
+      res
+        .writeHead(503, { ...JSON_HEADERS, 'Retry-After': String(cfg.retryAfterS) })
+        .end(JSON.stringify({ status: 'failed', reason: 'saturated' }));
+      return;
+    }
+
+    await writeResult(
+      getResultStore(),
+      leafSessionId(body),
+      toResultRecord(result, body.sessionId, new Date().toISOString()),
+      RESULT_TTL_SECONDS,
+    );
+    finalize({
+      status: result.status,
+      ...('reason' in result && result.reason ? { reason: result.reason } : {}),
+    });
+    res.writeHead(200, JSON_HEADERS).end(JSON.stringify(result));
+  } catch (err) {
+    finalize({ status: 'failed', reason: 'error' });
+    throw err;
+  } finally {
+    // After the response (or the throw): the marker must not outlive the run it describes, or
+    // the reaper would read a finished run as orphaned. Never rejects — see RunLease.release.
+    await lease.release();
+  }
 }
 
 async function handleLeafStatus(url: URL, res: ServerResponse): Promise<void> {

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { CpError } from '../src/errors.js';
 import {
   DEFAULT_ISSUER,
+  KeysetError,
   TOKEN_AUDIENCE,
   keyIdFor,
   makeSigner,
@@ -78,6 +79,21 @@ describe('key encoding and kid derivation', () => {
     // A dropped key is a deployment that rejects every token minted with it, discovered at runtime.
     expect(() => parseKeyset('no-colon-here')).toThrow(/SH_SESSION_TOKEN_PUBLIC_KEYS/);
     expect(() => parseKeyset('kid:not-base64-der')).toThrow(/SH_SESSION_TOKEN_PUBLIC_KEYS/);
+  });
+
+  it('throws a KeysetError whose kind names the defect, so a caller never parses the message', () => {
+    const a = keypair();
+    const kindOf = (raw: string) => {
+      try {
+        parseKeyset(raw);
+      } catch (e) {
+        return e instanceof KeysetError ? e.kind : 'not a KeysetError';
+      }
+      return 'no throw';
+    };
+    expect(kindOf('no-colon-here')).toBe('format');
+    expect(kindOf('kid:not-base64-der')).toBe('key');
+    expect(kindOf(`deadbeefdeadbeef:${publicKeyToBase64(a.publicKey)}`)).toBe('kid');
   });
 
   it('rejects a keyset entry whose kid does not match its key', () => {

@@ -36,6 +36,28 @@ describe('errorFromResponse', () => {
   });
 });
 
+describe('errorFromResponse: a reason beside the error code', () => {
+  it("carries the body's reason onto the error (SBX0 sandbox_terminated)", async () => {
+    const e = await errorFromResponse(
+      'control-plane',
+      json({ error: 'sandbox_terminated', message: 'sandbox was deleted', reason: 'deleted' }, 409),
+    );
+    expect(e).toMatchObject({ code: 'sandbox_terminated', reason: 'deleted', status: 409 });
+  });
+
+  it('has no reason when the body has none, or when the reason is the code', async () => {
+    expect(
+      (await errorFromResponse('control-plane', json({ error: 'x' }, 400))).reason,
+    ).toBeUndefined();
+    const runs = await errorFromResponse(
+      'harness',
+      json({ status: 'failed', reason: 'saturated' }, 503),
+    );
+    expect(runs.code).toBe('saturated');
+    expect(runs.reason).toBeUndefined();
+  });
+});
+
 describe('classify', () => {
   const err = (
     source: 'control-plane' | 'harness',

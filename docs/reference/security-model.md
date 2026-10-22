@@ -93,6 +93,19 @@ Compose, a cluster service on Kubernetes). Container sandbox ids contain dashes,
 holding it can attach under any id that is not currently attached and advertise its own tier label, and would then
 receive the executions routed to that id _(inferred)_.
 
+With `MOCA_ATTACH_PUBLIC_KEYS` set, the `moca.dev/workload` and `moca.dev/owner` labels are trusted: the relay sets them
+only from a signed `moca-attach+jwt` attach token, and strips them from every `Hello` admitted by a relay token. The
+token is per workload: it admits only ids `<wl>-<ordinal>` with the ordinal below its `n`, and its `exp` is required;
+the relay refuses an expired one and closes an attach stream when its token expires. Model code inside a workload
+sandbox can read that workload's token, so it can register an absent ordinal of the same workload until `exp`; that
+reaches no other workload or user. The tier and capability labels a sandbox sends are still not trusted. Selection
+keeps workload runs on sandboxes whose workload and owner labels both match the run's, keeps other runs off them,
+and the relay refuses an Exec whose `workload` does not match its sandbox's. That
+check catches routing bugs, not a compromised worker: the worker fills in the field
+([workload sandboxes spec §3.3](../specs/2026-10-16-workload-sandboxes-design.md)). The relay ignores a sandbox
+caller's `workload` field, so its Exec is refused on every workload sandbox: by design, sandbox
+callers cannot reach workload sandboxes.
+
 ## Model credentials
 
 1. A user stores a credential (`PUT /v1/credentials/{name}`). The API is write-only: nothing reads a value back.

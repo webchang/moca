@@ -554,7 +554,26 @@ else
 fi
 for i in ${aff_sids[@]+"${!aff_sids[@]}"}; do
   # shellcheck disable=SC2016 # $HOSTNAME is the sandbox's: it must expand there, not here
-  turn "where1-$i" "${aff_sids[$i]}" "$(ask K8S-SMOKE-WHERE-1 'sleep 2; echo "where=$HOSTNAME"')" &
+  (
+    # Asked once, into a variable: the retry below must send the same command, and the mock
+    # scripts exactly the one ask (tests/smoke.test.sh syncs every ask line with mock-anthropic.mjs).
+    where1="$(ask K8S-SMOKE-WHERE-1 'sleep 2; echo "where=$HOSTNAME"')"
+    turn "where1-$i" "${aff_sids[$i]}" "$where1" && exit 0
+    # The burst is four turns of ONE subject on a pool whose trial size fits them exactly (W=2,
+    # S=4, so the per-subject cap is 2 per worker): routing's estimate is optimistic and a
+    # worker's stale `load` report can lower it after the next hand-off -- over-admission the
+    # supervisor accepts by design (§3.9) and counts -- so a burst can hand one worker a third
+    # turn, which the quota refuses with 429 subject_quota_exceeded: its own code, sent with
+    # Retry-After, precisely so a client can tell "you are over your share" from "the host is
+    # full" and back off. Back off and retry that code alone, twice (a lease frees in 2 s);
+    # any other failure, or a third refusal, fails the claim as before.
+    for _ in 1 2; do
+      grep -q subject_quota_exceeded "$OUT/where1-$i.sse" || exit 1
+      sleep 2
+      turn "where1-$i" "${aff_sids[$i]}" "$where1" && exit 0
+    done
+    exit 1
+  ) &
   aff_pids+=("$!")
 done
 for p in ${aff_pids[@]+"${aff_pids[@]}"}; do wait "$p" || aff_ok=0; done

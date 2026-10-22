@@ -124,6 +124,27 @@ export class RedisResultStore implements RedisLike {
     await this.open();
     return this.client.get(key);
   }
+  async del(key: string): Promise<unknown> {
+    await this.open();
+    return this.client.del(key);
+  }
+  /** Atomic read-and-remove (Redis 6.2+; every deployment pins redis:7). The run-lease reaper
+   * claims orphaned markers with it, so concurrent sweepers cannot double-finalize one run. */
+  async getdel(key: string): Promise<string | null> {
+    await this.open();
+    return this.client.getDel(key);
+  }
+  /** Every key matching a glob pattern, via SCAN — never KEYS, which blocks the data-plane
+   * Redis for the whole keyspace. The run-lease reaper is the only caller. */
+  async keys(pattern: string): Promise<string[]> {
+    await this.open();
+    const found: string[] = [];
+    // redis@6's scanIterator yields a PAGE of keys per iteration, not one key.
+    for await (const page of this.client.scanIterator({ MATCH: pattern, COUNT: 500 })) {
+      found.push(...page);
+    }
+    return found;
+  }
   /** Run a Lua script atomically. The workload lifecycle uses it for compare-and-set transitions. */
   async eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown> {
     await this.open();

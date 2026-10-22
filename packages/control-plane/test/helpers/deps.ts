@@ -3,6 +3,7 @@ import { bundleKey } from '@moca/config-bundle';
 import { InMemoryCredentialStore, parseCredentialBody } from '../../src/credential-store.js';
 import type { CpConfig, CpDeps, RequestCtx } from '../../src/handlers.js';
 import { OwnershipIndex } from '../../src/ownership.js';
+import { MemorySandboxStore } from '../../src/sandbox-store.js';
 import { MemoryRefreshStore, type AuditFields } from '../../src/refresh-store.js';
 import { makeSigner, publicKeyFromBase64, type TokenClaims } from '../../src/token.js';
 import { fakeBundleRedis, fakeRedis } from './fake-redis.js';
@@ -19,6 +20,8 @@ export type TestDeps = CpDeps & {
   refreshAudit: AuditFields[];
   /** ...and its separate stream for refusals of a token nobody issued. */
   refreshAnonAudit: AuditFields[];
+  /** Captured audit log lines; land here instead of stdout under tests. */
+  logLines: Array<Record<string, unknown>>;
 };
 
 /**
@@ -51,6 +54,25 @@ export function makeDeps(
     sandboxTiers: null,
     bundleSubjectBytes: 16 * 1024 * 1024,
     bundleTotalBytes: 64 * 1024 * 1024,
+    sandbox: {
+      templates: [
+        {
+          id: 'default',
+          worker: 'sbx_default',
+          description: 'bash, git, Python 3',
+          tools: ['bash', 'git', 'python3'],
+        },
+        { id: 'node22', worker: 'sbx_node22', description: 'Node 22', tools: ['node'] },
+      ],
+      allowedSubjects: ['github:1234', 'github:9999'],
+      lifetimeS: 7 * 86_400,
+      retentionS: 14 * 86_400,
+      tokenTtlS: 900,
+      maxPerSubject: 3,
+      maxTotal: 40,
+      issuer: 'sbx-control-plane',
+      execEndpoint: 'sbx-exec.apps.example.invalid:443',
+    },
     ...configOver,
   };
   const refresh = new MemoryRefreshStore({
@@ -58,10 +80,12 @@ export function makeDeps(
     maxTtlS: config.refreshMaxTtlSeconds,
     graceS: config.refreshReuseGraceSeconds,
   });
+  const logLines: Array<Record<string, unknown>> = [];
   const base: TestDeps = {
     index: new OwnershipIndex(fake.redis),
     credentials: new InMemoryCredentialStore(),
     bundles: fakeBundleRedis(),
+    sandboxes: new MemorySandboxStore(),
     identity: new StubIdentity({ subject: 'github:1234', displayName: 'Alice', roles: [] }),
     signer,
     refresh,
@@ -73,6 +97,8 @@ export function makeDeps(
     config,
     now: () => NOW_MS,
     newId: () => 'sid-fixed',
+    log: (line) => logLines.push(line),
+    logLines,
   };
   // A caller-supplied `index` brings its own fake, so `streams` must follow it or an audit assertion
   // would read the wrong map.

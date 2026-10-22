@@ -97,7 +97,18 @@ message End       { uint64 req_id = 1; sint32 exit_code = 2; bool truncated = 3;
 message ExecError { uint64 req_id = 1; string message = 2; }
 
 // ---- harness ↔ relay (SandboxExec) ----
-message ExecRequest { string sandbox_id = 1; Exec exec = 2; }   // sandbox_id from the lease
+message ExecRequest {
+  string sandbox_id = 1;   // from the lease
+  Exec   exec       = 2;
+
+  // workload is the workload key (`w-<32 hex>`) the run names, or empty for a run on the shared
+  // pool (workload sandboxes spec §3.3). ADDITIVE, and read by the relay alone: it is not part of
+  // Exec, so a worker never sees it. A relay with attach public keys refuses an Exec to a sandbox
+  // whose trusted moca.dev/workload label differs from it, and a non-empty value on a sandbox with
+  // no such label. A relay without them ignores it. Defense in depth against routing bugs, not a
+  // boundary: the worker that fills it in is still the trust root for routing.
+  string workload = 3;
+}
 message ExecEvent   { oneof event { Chunk chunk = 1; End end = 2; ExecError error = 3; } }
 message AbortRequest  { string sandbox_id = 1; uint64 req_id = 2; }
 message AbortResponse {}
