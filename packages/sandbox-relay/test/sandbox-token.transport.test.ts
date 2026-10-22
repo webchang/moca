@@ -4,6 +4,7 @@ import { SANDBOX_TOKEN_TYP, mintAttachToken } from '@moca/control-plane';
 import { makeAttachVerifier, makeExecAuth, startRelay } from '../src/main.js';
 import {
   HARNESS,
+  ISS,
   K,
   abort,
   b64u,
@@ -579,5 +580,44 @@ describe('harness callers are unchanged beside sandbox keys (SBX0 §3.1)', () =>
     const res = await exec(`127.0.0.1:${r.execPort}`, { token: token() }).done;
     expect(res.code).toBe(status.UNAUTHENTICATED);
     expect(lines).toEqual([]);
+  });
+});
+
+describe('per-client tokens beside sandbox tokens (MOCA_RELAY_CLIENT_TOKENS + SBX0)', () => {
+  const CLIENT = 'alice-client-token-0123456789abcdef'; // notsecret
+
+  it('admits each on its own terms on one relay, and neither as the other', async () => {
+    const r = await relay({ MOCA_RELAY_CLIENT_TOKENS: `sbx_default:sbx-alice-:${CLIENT}` });
+    const w = await worker(r.attach, 'sbx_default');
+    // The sandbox token: its own wrk and wsk, with an audit line.
+    expect((await exec(r.exec, { token: token() }).done).code).toBe(status.OK);
+    // The client token: any key under its prefix on its worker, with no audit line.
+    const lines = r.lines.length;
+    expect((await exec(r.exec, { token: CLIENT, wsk: 'sbx-alice-x' }).done).code).toBe(status.OK);
+    expect(r.lines).toHaveLength(lines);
+    // Each keeps its own bounds: the client outside its prefix, the sandbox token off its wsk.
+    expect((await exec(r.exec, { token: CLIENT, wsk: 'sbx-aaaa' }).done).code).toBe(
+      status.PERMISSION_DENIED,
+    );
+    expect((await exec(r.exec, { token: token(), wsk: 'sbx-alice-x' }).done).code).toBe(
+      status.PERMISSION_DENIED,
+    );
+    expect(w.execs).toHaveLength(2);
+  });
+
+  it('client tokens alone do not boot the relay', () => {
+    expect(() => makeExecAuth({ MOCA_RELAY_CLIENT_TOKENS: `w:p-:${CLIENT}` })).toThrow(
+      /MOCA_RELAY_EXEC_TOKEN or SH_SANDBOX_TOKEN_PUBLIC_KEYS/,
+    );
+  });
+
+  it('a malformed MOCA_RELAY_CLIENT_TOKENS fails the boot on a keyset-only relay too', () => {
+    expect(() =>
+      makeExecAuth({
+        SH_SANDBOX_TOKEN_PUBLIC_KEYS: K.keyset,
+        SH_SANDBOX_TOKEN_ISSUER: ISS,
+        MOCA_RELAY_CLIENT_TOKENS: 'w:p-:short',
+      }),
+    ).toThrow(/MOCA_RELAY_CLIENT_TOKENS entry 1/);
   });
 });

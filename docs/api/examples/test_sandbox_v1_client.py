@@ -407,6 +407,18 @@ class FromEnvTest(unittest.TestCase):
                "SBX_TOKEN": "one-off"}
         self.assertEqual(Sandbox.from_env(env)._tokens.get(), "one-off")
 
+    def test_a_relay_client_token_from_a_file_over_plaintext(self):
+        # MOCA_RELAY_CLIENT_TOKENS: a static, non-JWT token, read from SBX_TOKEN_FILE, SBX_TLS=0.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".token", delete=False) as f:
+            f.write("alice-client-token-0123456789abcdef\n")
+        env = {"SBX_ADDR": "localhost:9444", "SBX_TLS": "0", "SBX_SANDBOX_ID": "moca_microvm_0",
+               "SBX_WORKSPACE_KEY": "sbx-alice-demo", "SBX_TOKEN_FILE": f.name}
+        s = Sandbox.from_env(env)
+        self.assertEqual(s._tokens.get(), "alice-client-token-0123456789abcdef")
+        md, timeout, capped = s._prepare(600)
+        self.assertEqual((timeout, capped), (600, False))
+
 
 class SbxCliTest(unittest.TestCase):
     def run_sbx(self, *scripts):
