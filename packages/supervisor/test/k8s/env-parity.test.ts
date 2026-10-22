@@ -30,6 +30,10 @@ const NOT_ENV_ON_K8S: Record<string, string> = {
     'SBX0 only: set by overlays/ocp-sbx (the sandbox front door); a MOCA relay has no sandbox callers',
   SH_SANDBOX_MAX_INFLIGHT:
     'SBX0 only: set by overlays/ocp-sbx (the sandbox front door); a MOCA relay has no sandbox callers',
+  // The VM rig's demo-grade direct-client tokens (client-tokens.ts): set by hand in relay.env on a
+  // rig with an SSH tunnel; no manifest sets them, and deploy/sbx's overlay test forbids them on ocp-sbx.
+  MOCA_RELAY_CLIENT_TOKENS:
+    'VM rig only: demo-grade per-client tokens set by hand; no manifest sets them (ocp-sbx forbids them)',
   // An operator's debug switch, off unless set by hand; no manifest sets it, ocp-sbx included.
   SH_SANDBOX_AUDIT_COMMANDS:
     'SBX0 only: an operator debug flag (commands in audit lines), off unless set by hand; no manifest sets it',
