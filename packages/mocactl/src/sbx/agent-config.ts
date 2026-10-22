@@ -126,6 +126,12 @@ const SETTINGS = '.claude/settings.json';
 const SETTINGS_LOCAL = '.claude/settings.local.json';
 const MANIFEST = '.sbx/agent-config.json';
 const WRITE_HINT = 'edit it by hand, or run mocactl sbx up --no-agent-config';
+/**
+ * Claude Code's own wording for the option that accepts the server, so what we tell the user to
+ * pick reads the same as what they see. Its prompt also offers "Use this and all future MCP
+ * servers in this project", which works too; the highlighted default declines (#577).
+ */
+export const CLAUDE_PROMPT_PICK = 'Use this MCP server';
 /** For an edit this module could not make safely: nothing was written. */
 const EDIT_HINT =
   'nothing was changed; edit it by hand (and please report it), or use --no-agent-config / --keep-config';
@@ -1237,7 +1243,17 @@ export function checkAgentConfig(root: string): string[] {
     [SETTINGS_LOCAL, local],
   ] as const) {
     if (rejectsServer(data)) {
-      problems.push(`Claude Code: ${file} disabledMcpjsonServers rejects the ${SERVER} MCP server`);
+      // Name the fix: `up` cannot make it, because it never writes settings.local.json and
+      // refuses to merge over either rejection (writeAgentConfig's ConfigConflict).
+      problems.push(
+        `Claude Code: ${file} disabledMcpjsonServers rejects the ${SERVER} MCP server, so the ` +
+          `agent has neither the sandbox's tools nor its own; ${
+            file === SETTINGS_LOCAL
+              ? `delete ${SETTINGS_LOCAL} (mocactl sbx up never writes it) and answer ` +
+                `"${CLAUDE_PROMPT_PICK}" the next time Claude Code asks`
+              : `remove ${SERVER} from disabledMcpjsonServers in ${SETTINGS}`
+          }`,
+      );
     }
   }
   if (!isOpencodeServer(at(oc, ['mcp', SERVER]))) {

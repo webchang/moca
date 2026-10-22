@@ -24,12 +24,16 @@ type recordingBinder struct {
 	mu            sync.Mutex
 	events        []string
 	registerErr   error
+	unregisterErr error
 	onRegister    func()
 	onUnregister  func()
 	registeredSID string
+	// registerCtxErr and registerHasDL capture the ctx Register saw, after onRegister ran.
+	registerCtxErr error
+	registerHasDL  bool
 }
 
-func (b *recordingBinder) Register(_ context.Context, vmID, sid string, grant []byte, ln *os.File) error {
+func (b *recordingBinder) Register(ctx context.Context, vmID, sid string, grant []byte, ln *os.File) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.events = append(b.events, "register:"+vmID)
@@ -40,6 +44,8 @@ func (b *recordingBinder) Register(_ context.Context, vmID, sid string, grant []
 	if b.onRegister != nil {
 		b.onRegister()
 	}
+	b.registerCtxErr = ctx.Err()
+	_, b.registerHasDL = ctx.Deadline()
 	return b.registerErr
 }
 
@@ -50,7 +56,7 @@ func (b *recordingBinder) Unregister(_ context.Context, vmID string) error {
 	if b.onUnregister != nil {
 		b.onUnregister()
 	}
-	return nil
+	return b.unregisterErr
 }
 
 func (b *recordingBinder) log() []string {
@@ -157,12 +163,34 @@ func TestEgressSocketIsBoundBeforeTheJailerStarts(t *testing.T) {
 	if strings.TrimSpace(string(got)) != "yes" {
 		t.Fatalf("jailer saw the egress socket as %q, want yes", got)
 	}
-	ev := b.log()
-	if len(ev) == 0 || ev[0] != "register:vm-2" {
-		t.Fatalf("events = %v, want register first", ev)
+	// Restore fails after Register succeeded, so cleanup must hand the VM back exactly once and
+	// then unlink the socket.
+	if ev, want := b.log(), []string{"register:vm-2", "unregister:vm-2"}; strings.Join(ev, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", ev, want)
+	}
+	if _, statErr := os.Lstat(egressSock(base, "vm-2")); !os.IsNotExist(statErr) {
+		t.Errorf("egress socket survived the failed restore: %v", statErr)
 	}
 	if b.registeredSID != "sess-1" {
 		t.Errorf("registered session %q, want the RestoreRequest key", b.registeredSID)
+	}
+}
+
+// A cold acquire restores under the Exec request's own ctx. Cancelling it must not reach the
+// control call, or one aborted Exec would cost the shared control connection (I1).
+func TestEgressRegisterIsDetachedFromTheCallersCancel(t *testing.T) {
+	b := &recordingBinder{registerErr: errors.New("stop here")}
+	lc, base, _ := egressLauncher(t, b)
+	seedSnapshot(t, base)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.onRegister = cancel // the Exec is abandoned while Register is in flight
+	_, _ = lc.Restore(ctx, RestoreRequest{ID: "vm-6", Key: "sess-1", WorkspaceDir: base, GuestRAMBytes: 256 << 20})
+	if b.registerCtxErr != nil {
+		t.Errorf("Register's ctx was cancelled with the caller's (%v); it must be detached", b.registerCtxErr)
+	}
+	if !b.registerHasDL {
+		t.Error("Register's ctx has no deadline; egressControlTimeout must still bound it")
 	}
 }
 
@@ -212,6 +240,39 @@ func TestGateEgressTeardownOrdering(t *testing.T) {
 	}
 	if _, statErr := os.Stat(jail); !os.IsNotExist(statErr) {
 		t.Errorf("jail survives Destroy: %v", statErr)
+	}
+}
+
+func TestEgressUnregisterFailureDoesNotFailDestroy(t *testing.T) {
+	base, err := os.MkdirTemp("/tmp", "fcuf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	jail := filepath.Join(base, "root")
+	if err := os.MkdirAll(filepath.Join(jail, "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(jail, "run", "v.sock_1025")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "60")
+	fcIsolateProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	b := &recordingBinder{unregisterErr: errors.New("moca-egress unreachable")}
+	vm := &firecrackerVM{id: "vm-5", cmd: cmd, jailRoot: jail, egress: b, egressLn: ln}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy = %v; an Unregister failure is harmless and must only be logged", err)
+	}
+	if ev := b.log(); len(ev) != 1 || ev[0] != "unregister:vm-5" {
+		t.Errorf("events = %v, want exactly one unregister", ev)
+	}
+	if _, statErr := os.Lstat(sock); !os.IsNotExist(statErr) {
+		t.Errorf("socket path survives Destroy: %v", statErr)
 	}
 }
 

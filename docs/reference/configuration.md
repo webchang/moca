@@ -294,7 +294,8 @@ header is authoritative.
 - **Compose file interpolation (`docker-compose.yml`):** `SH_SANDBOX_IMAGE`, `SH_PORT`, `SH_CP_PORT`,
   `MOCA_RELAY_EXEC_PORT`, `MOCA_RELAY_BRAIN_IP`, `MOCA_BRAIN_SUBNET`, `COMPOSE_PROFILES`.
 - **Kubernetes `setup.sh`:** `SH_P4_SANDBOX_IDS`, `SH_SANDBOX_EGRESS_EXCEPT`, `SH_ROUTE_DOMAIN`,
-  `SH_SINGLE_NAMESPACE`, `SH_WAIT_SECONDS`.
+  `SH_SINGLE_NAMESPACE`, `SH_WAIT_SECONDS`, `SH_PUBLIC_HARNESS_URL` (port-forward-reached targets
+  only: overrides the default `http://127.0.0.1:8080`).
 
 ## Legacy: Knative-only variables
 

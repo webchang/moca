@@ -7,14 +7,17 @@ which also took over the writable-workspace threads of #517 (context for delegat
 **Builds on (reuse, no redesign):** the `/workloads` lifecycle
 (`packages/knative-server/src/workloads.ts`);
 [per-subject claim names](2026-10-15-per-subject-claim-names-design.md) (#543, per-subject claim
-names for #358) and its companion
-[rossoctl/context-service#59](https://github.com/rossoctl/context-service/issues/59) (caller-named
-claims); [rossoctl/context-service#40](https://github.com/rossoctl/context-service/issues/40) (a
-trusted call that resolves a Context into its PVC);
+names for #358);
 [P6 on Kubernetes](2026-10-02-p6-on-kubernetes-slice1-design.md) and its tiers and affinity
 ([slice 3](2026-10-04-p6-on-kubernetes-slice3-design.md));
 [MI1](2026-09-28-moca-multi-user-isolation-design.md) (multi-user isolation).
 **Amends (on acceptance):** MI1 §2.3, §9.1 and §13 (§9).
+**Storage decision (2026-10-22):** MOCA owns each workload's PVC (§5, §11 item 3). Context Service
+is used exactly as in phase 1, so
+[rossoctl/context-service#40](https://github.com/rossoctl/context-service/issues/40) (trusted
+resolve-attachment) and
+[rossoctl/context-service#59](https://github.com/rossoctl/context-service/issues/59) (caller-named
+claims) are no longer on phase 2's path.
 
 ## 1. Problem
 
@@ -76,7 +79,7 @@ writable copy. That leaves three gaps:
    registration.
 4. A workload can mount its Context read-only, or writable for delegated tasks, with no per-run
    copy.
-5. `DELETE /workloads/{id}` removes the sandboxes, their token Secret, the Context and its PVC, and
+5. `DELETE /workloads/{id}` removes the sandboxes, their token Secret and PVC, and the Context, and
    leaves no orphans when a step fails.
 6. Phase 1 workloads, created without the new fields, behave exactly as today.
 
@@ -86,37 +89,36 @@ writable copy. That leaves three gaps:
 
 1. **Create the workload:** the client calls `POST /workloads` with `sandboxes` and
    `workspace.mount`, and uploads the bundle with the grant, as in phase 1. The worker creates the
-   Context and its PVC in `moca-sandbox` (`POST /internal/v1/contexts`).
+   Context (`POST /internal/v1/contexts`), as in phase 1.
 2. **Activate:** `POST /workloads/{id}/activate` freezes the revision and moves the record to
    `provisioning`.
 3. **Request sandboxes:** the worker calls `PUT /internal/v1/workloads/{name}/{generation}` on
    `moca-provisioner` with its service token and the caller's API token; the provisioner derives
    `wl` from the verified owner, name and generation.
-4. **Find the storage:** the provisioner resolves the Context into its PVC through
-   context-service#40's trusted resolve-attachment call, which requires `attach` for the owner and
-   returns `{namespace, claimName, backend, accessMode}`.
+4. **Create the storage:** the provisioner creates PVC `<wl>` in `moca-sandbox`, sized and classed
+   from the request (§5.1).
 5. **Create the sandboxes:** through the Kubernetes API, the provisioner creates StatefulSet `<wl>`,
    headless Service `<wl>` and Secret `<wl>-attach` (the attach token, mounted as a file) in
    `moca-sandbox`.
-6. **Mount the context:** the sandbox pods `<wl>-<n>` mount the Context PVC at `/workspace/context`:
-   read-only at `subPath: .context-service/materialized/<revision>`, or writable at
-   `subPath: moca-workspace`, seeded once by an init container.
+6. **Seed and mount:** once, an init container fills the PVC from the frozen bundle, which the
+   worker downloads from Context Service's export as phase 1 delivery does and hands to the
+   provisioner (§5.2). The sandbox pods `<wl>-<n>` mount the PVC at `/workspace/context`:
+   read-only at `subPath: revision/<revision>`, or writable at `subPath: moca-workspace`.
 7. **Register with the relay:** each pod attaches to the relay with `Hello` + attach token; the
    relay stamps the trusted `moca.dev/workload` and `moca.dev/owner` labels, whatever `Hello` sent.
    Once `count` sandboxes are registered the record is `ready`.
 8. **Run a task:** `POST /v1/runs` names the workload; selection keeps only records whose
    `moca.dev/workload` and `moca.dev/owner` match, and the worker runs the task with
    `SandboxExec.Exec` carrying the `workload` field, which the relay checks.
-9. **Delete:** `DELETE /workloads/{id}` removes the sandboxes first
+9. **Delete:** `DELETE /workloads/{id}` removes the sandboxes and their PVC
    (`DELETE /internal/v1/workloads/{name}/{generation}`, `200` once no pod remains), then the
-   Context and its managed PVC (`DELETE /internal/v1/namespaces/{ns}/contexts/{name}`), because Context Service
-   refuses to delete a mounted claim.
+   Context (`DELETE /internal/v1/namespaces/{ns}/contexts/{name}`), as in phase 1.
 
 In short: a new `moca-provisioner` (§4, ADR-0043), the only MOCA component with Kubernetes
 permissions in the sandbox namespace, creates each workload's sandbox pods at activation (§6). It
-signs a token from which the relay sets the pods' workload and owner labels (§3), and mounts the
-workload's Context PVC, resolved through context-service#40 (§5). `POST /workloads` gains two
-optional fields (§7).
+signs a token from which the relay sets the pods' workload and owner labels (§3), and creates and
+mounts a PVC of the workload's own, seeded from its Context's frozen revision (§5).
+`POST /workloads` gains two optional fields (§7).
 
 ## 3. Trusted workload labels
 
@@ -128,7 +130,7 @@ header has `alg: EdDSA`, `typ: moca-attach+jwt` and a `kid`, with these claims, 
 | Claim | Meaning                                                                            |
 | ----- | ---------------------------------------------------------------------------------- |
 | `iss` | `moca-provisioner`                                                                 |
-| `aud` | `moca-relay-attach`, so it never passes as a session, API or sandbox token         |
+| `aud` | `moca-relay-attach`, never a session, API or sandbox token (seed use: §5.2)        |
 | `wl`  | the workload key: the record's existing Context name, `w-<32 hex>` per reservation |
 | `own` | the owner scope: `recordScope(owner)`, the hash the record key already uses        |
 | `gen` | the workload generation, so a re-created workload gets a different binding         |
@@ -221,11 +223,12 @@ grants (MI1 §4.2 I2). Until then the worker remains the trust root for routing,
 | `secrets`                | create, get, list, update, delete | the workload's attach token, re-minted       |
 | `services`               | create, get, delete               | the StatefulSet's headless governing Service |
 | `pods`                   | get, list                         | readiness, and the reconciler's view         |
-| `persistentvolumeclaims` | get                               | check that a resolved claim exists           |
+| `persistentvolumeclaims` | get                               | until PR 3; see §5.1 for its additions       |
 
 No create on bare pods. The governing Service is headless with no ports, as the shared pool's is:
 a workload sandbox accepts no connections. The provisioner has no rights outside `moca-sandbox`,
-and none on PVCs beyond `get`: Context Service creates and deletes the claim. The control plane,
+and in PR 2 none on PVCs beyond `get`. PR 3 adds create and delete, since the provisioner owns
+the workload's PVC (§5.1, 2026-10-22). The control plane,
 supervisor and relay stay without a Kubernetes token.
 
 Its internal API is reached only by the supervisor's workers (NetworkPolicy):
@@ -234,6 +237,7 @@ Its internal API is reached only by the supervisor's workers (NetworkPolicy):
 PUT    /internal/v1/workloads/{name}/{generation}   # create or update; idempotent by (wl, gen)
 GET    /internal/v1/workloads/{name}/{generation}   # replicas wanted and ready
 DELETE /internal/v1/workloads/{name}/{generation}   # delete; 200 once no pod of it remains
+PUT    /internal/v1/workloads/{name}/{generation}/bundle   # the frozen bundle to seed from (§5.2)
 ```
 
 The `PUT` body carries `count`, `tier`, `mount` and the frozen revision; no request carries a
@@ -281,74 +285,117 @@ are named `<wl>-<n>` (at most 36 characters), which is also their `SANDBOX_ID`.
 
 ## 5. Storage
 
-### 5.1 Where the PVC lives
+Decided 2026-10-22 (§11 item 3): MOCA owns each workload's PVC. Context Service is used exactly as
+in phase 1 (upload grant, upload, freeze, export of the frozen revision) and is not changed.
 
-A pod can mount only a PVC in its own namespace, so a workload's Context must live in
-`moca-sandbox`. Context Service already places a Context in the namespace the request names, and
-its ClusterRole already covers that namespace. On Kubernetes, `CONTEXT_SERVICE_NAMESPACE` becomes
-`moca-sandbox`, for phase 1 workloads too, which read their bundle through the API and do not care
-where the PVC is. Context Service's helper pods then run in `moca-sandbox`; they must pass its
-`restricted` Pod Security level (to verify in PR 3), and the namespace's default-deny NetworkPolicy
-does not affect them, because upload and export stream over `pods/exec`, not the pod network.
+### 5.1 The workload's PVC
 
-### 5.2 Resolution and authorization
+A pod can mount only a PVC in its own namespace, so the provisioner creates the workload's PVC in
+`moca-sandbox`, alongside the StatefulSet: PVC `<wl>`, labelled and annotated as the StatefulSet
+is, sized by `workspace.size` and classed by `workspace.storageClass` within the caps of §6.3. Its
+access mode is `ReadWriteOnce`, or `ReadWriteMany` for a class the allowlist marks `rwx` (§5.4).
+The pods mount it as a plain `persistentVolumeClaim` volume, not through `volumeClaimTemplates`,
+which the admission policy refuses (§4.1).
 
-At provisioning time the provisioner calls context-service#40's trusted resolve-attachment
-operation with its own service credential and the owner as subject. Context Service requires
-`attach` on the Context for that subject and returns `{namespace, claimName, backend, accessMode}`;
-another user's Context answers the same not-found as anywhere else. The provisioner refuses a
-`namespace` other than `moca-sandbox`.
+Context Service's side does not move: the Context, the managed PVC `createContext` asks for, its
+helper pods and `CONTEXT_SERVICE_NAMESPACE` stay as they are, and no pod mounts that PVC. A phase 2
+workload therefore holds its revision twice, once in each PVC, and a `writable` one three times:
+Context Service's PVC, `revision/<revision>` and `moca-workspace`. `workspace.size` must cover the
+bundle's inflated size once for `read-only`, and twice plus the run's own writes for `writable`; the
+worker refuses a size below that with `400 workspace_size_too_small`, before any seed can hit
+`ENOSPC`.
 
-This builds on #543 and #59; it does not compete with them. A workload's own managed Context PVC
-is authorized because the workload's owner owns its Context. A bring-your-own claim (#59: the
-caller names a slug, Context Service derives `moca-<scope>-<slug>` from the caller's subject and
-attaches it) resolves through the same call, so the provisioner never sees a caller-supplied PVC
-name. Whoever pre-creates a BYO claim now creates it in `moca-sandbox`.
+**What PR 3 adds to the provisioner's permissions.** The Role gains create, get and delete on
+`persistentvolumeclaims` in `moca-sandbox`. The admission policy (§4.1) gains PVCs: the
+provisioner may create or delete only a PVC named `^w-[0-9a-f]{32}$` whose StorageClass is on the
+allowlist, and a workload pod may mount no PVC but its own `<wl>`.
+
+### 5.2 Seeding
+
+The PVC is filled once, at provisioning, from the Context's frozen revision, through the same bundle
+export phase 1 delivery uses. The worker downloads the bundle as phase 1 does
+(`GET /internal/v1/namespaces/{ns}/contexts/{name}/revisions/{sha256}/bundle`, with phase 1's size,
+inflate and entry ceilings) and hands it to the provisioner with
+`PUT /internal/v1/workloads/{name}/{generation}/bundle` before the `PUT` that creates the
+StatefulSet. The provisioner holds it in memory until the seed has run, within
+`MOCA_PROVISIONER_SEED_BUDGET_BYTES` (default 1 GiB, about four bundles at phase 1's 256 MiB
+ceiling) across all workloads waiting to seed. A `PUT …/bundle` that would exceed it answers
+`503 seed_budget_full` with `Retry-After`, and the worker's activate answers the same, so a burst of
+activations queues on the client instead of growing the provisioner's memory. The init container
+fetches it from the provisioner's seed port (`GET /seed/v1/bundle`) with the workload's attach token
+(`SANDBOX_TOKEN_FILE`) as its bearer, and the token's `wl` and `gen` pick the bundle. So the
+provisioner needs no Context Service credential, and the bytes come from the same trusted export as
+in phase 1.
+
+This adds one NetworkPolicy pair: workload pods may reach the provisioner's seed port, which serves
+only that `GET`. The seed port is a separate listener on its own port (8081), so the NetworkPolicy
+that keeps `/internal/v1` to the supervisor's workers still holds: workload pods reach 8081 only,
+and nothing on 8081 routes to `/internal/v1`. **The attach token gains a second audience here.** The
+seed port accepts it as its bearer, checking `typ`, `iss`, `aud: moca-relay-attach`, `exp` and its
+own key, and only there; no other provisioner route accepts it. That widens the token's use, which
+is acceptable: its only extra power is reading its own workload's bundle. Model code shares the
+pod's network and holds the token, so it can fetch that bundle, which it can read anyway once
+seeded. A provisioner restart before the seed loses the bundle. The seed port then answers
+`404 seed_bundle_missing`, the init container keeps failing, and the provisioner's `GET` reports
+`seed: bundle_missing`, which the worker surfaces on `GET /workloads/{id}` as `provisioning` with
+`error: seed_bundle_missing`. The retry is client-driven: the next `POST /workloads/{id}/activate`
+sends the bundle again, and the error clears once the workload is `ready`.
+
+The PVC's layout:
+
+| Path                   | Holds                                           | Written by                |
+| ---------------------- | ----------------------------------------------- | ------------------------- |
+| `revision/<revision>/` | the frozen revision, extracted, read-only       | the seed, once            |
+| `moca-workspace/`      | a writable copy of the revision, writable mount | the seed, then model code |
 
 ### 5.3 Mount modes
 
 | `workspace.mount` | Volume                | Mounted at `/workspace/context`                                      |
 | ----------------- | --------------------- | -------------------------------------------------------------------- |
-| `read-only`       | PVC, `readOnly: true` | `subPath: .context-service/materialized/<revision>`, read-only       |
+| `read-only`       | PVC, `readOnly: true` | `subPath: revision/<revision>`, read-only                            |
 | `writable`        | PVC, read-write       | `subPath: moca-workspace`, read-write, seeded once from the revision |
 
 The run's working directory is the mount, rooted at its `workspace/` directory under the same rule
 `context-overlay.ts` uses today.
 
-**Writable mounts never expose `.context-service/`.** The frozen revision's id is the digest of
-exactly what export streams. A writable mount of the revision directory, or of the claim root,
-would let model code change a revision behind its id or rewrite revision history. So "writes stop
-being copies" holds per run, not per workload: an init container (MOCA's image, not model code)
-copies the frozen revision into `moca-workspace/` once, and every later run writes that tree in
-place. The main container mounts only `moca-workspace`.
+**Writable mounts never expose `revision/`.** The tree under `revision/<revision>/` is what the
+Context Service revision id names. A writable mount of it, or of the claim root, would let model
+code change a revision behind its id. So "writes stop being copies" holds per run, not per
+workload: an init container (MOCA's image, not model code) copies the revision into
+`moca-workspace/` once, and every later run writes that tree in place. The main container mounts
+only `moca-workspace`.
 
-**The seed cannot be steered into `.context-service/`.** Model code can write `moca-workspace/`,
-delete things there and plant symlinks such as `a -> ../.context-service/materialized/<rev>/a`.
-Three rules keep a later seed from following them:
+**The seed cannot be steered into `revision/`.** Model code can write `moca-workspace/`, delete
+things there and plant symlinks such as `a -> ../revision/<rev>/a`. Three rules keep a later seed
+from following them:
 
-- **No claim root in the init container.** It mounts the revision read-only through its own
-  `subPath: .context-service/materialized/<revision>`, and `moca-workspace` as a separate
-  read-write mount. Nothing under `.context-service/` is writable in any container, and a symlink
-  in `moca-workspace` resolves inside the container's own mounts, never to the claim root.
+- **No container mounts both trees writable, or the claim root.** The seed runs as two init
+  containers. The first mounts `subPath: revision` read-write, and no `moca-workspace`; it
+  extracts the bundle into `revision/<revision>/` and removes write permission. The second, for a
+  writable mount only, mounts `subPath: revision/<revision>` read-only and `moca-workspace` as a
+  separate read-write mount. A symlink in `moca-workspace` resolves inside the container's own
+  mounts, never to the claim root.
 - **The seeded flag is not a file.** The provisioner creates the StatefulSet with the pod-template
-  annotation `moca.dev/seed-revision=<revision>`, which the init container reads through the
-  downward API; without it, the init container does nothing. Once the first pod's init container
-  has completed (the provisioner reads pod status), the provisioner removes the annotation. The
-  StatefulSet uses `updateStrategy: OnDelete`, so that patch restarts no pod, and pods that restart
-  later come back without it. Model code cannot delete its way to a re-seed.
-- **Seed into a temp dir, never into existing content.** The init container refuses to seed when
-  `moca-workspace` holds anything except a leftover temp dir of its own, which it removes. It copies
-  into a fresh `mkdtemp` directory under the mount without following symlinks, then renames the
-  entries into place, so a crash mid-seed leaves no half-seeded tree that looks complete.
+  annotation `moca.dev/seed-revision=<revision>`, which the init containers read through the
+  downward API; without it, they do nothing. Once the first pod's init containers have completed
+  (the provisioner reads pod status), the provisioner removes the annotation and drops the held
+  bundle. The StatefulSet uses `updateStrategy: OnDelete`, so that patch restarts no pod, and pods
+  that restart later come back without it. Model code cannot delete its way to a re-seed.
+- **Seed into a temp dir, never into existing content.** Each init container refuses to seed when
+  its target (`revision/<revision>`, or `moca-workspace`) holds anything except a leftover temp dir
+  of its own, which it removes. It extracts or copies into a fresh `mkdtemp` directory without
+  following symlinks, then renames into place, so a crash mid-seed leaves no half-seeded tree that
+  looks complete. The rename is the completed marker: a target that exists is fully seeded.
+- **Only ordinal 0 seeds.** With `count > 1` the StatefulSet's pods start in parallel, all with
+  the annotation, so the init containers seed only in pod `<wl>-0` (its ordinal comes from the pod
+  name through the downward API). Every other pod's init container waits until both targets exist,
+  then exits 0; it never writes. One writer means no mutual exclusion is needed, on RWO or RWX, and
+  a pod that finds its targets already seeded (a restart while the annotation is still set) also
+  exits 0 without writing.
 
-This puts MOCA's writes outside `.context-service/` on a claim Context Service owns. The #40
-companion must state that the claim outside `.context-service/` belongs to the attacher. On a BYO
-claim, #59 promises that pre-existing content at the claim's root is never read; mounting only
-`moca-workspace/` keeps that promise.
-
-**What writes do not become.** Nothing turns the writable tree back into a revision: #59
-deliberately does not build "import the claim's tree as a revision". The tree lives as long as the
-workload, is not exported, and is gone at `DELETE`. Snapshot and provenance are open (§10).
+**What writes do not become.** Nothing turns the writable tree back into a revision. The tree lives
+as long as the workload, is not exported, and is gone at `DELETE`. Snapshot and provenance are
+open (§10).
 
 ### 5.4 ReadWriteOnce vs ReadWriteMany
 
@@ -359,16 +406,11 @@ RWO lets one node attach a volume; pods on that node share it. RWX lets any node
   so all of a workload's pods schedule onto one node. A full node then leaves pods Pending, and
   `GET` reports fewer ready sandboxes.
 - **Several sandboxes, RWX.** Spreads across nodes. Allowed only when the workload's StorageClass is
-  marked RWX-capable in the operator's allowlist (§6.3), and MOCA then passes `ReadWriteMany`
-  instead of today's hard-coded `ReadWriteOnce`.
+  marked RWX-capable in the operator's allowlist (§6.3); the provisioner then creates the PVC
+  `ReadWriteMany`.
 - **Writable with several sandboxes** shares one tree between them. Concurrent writers are the
   workload's own concern; MOCA adds no locking.
-- **Context Service's helper pods.** The upload helper writes the PVC before activation, and
-  sandboxes are created only at activation (§6.1), so upload never meets a mounted RWO claim. The
-  export helper serves phase 1 bundle delivery, which a mounted workload does not use. A later
-  `contextctl` export of a mounted RWO claim from another node would hang Pending until it times
-  out; the #40 companion should give helper pods node affinity to the claim's node, or refuse.
-- **`ReadWriteOncePod`** is not supported: it would block the helpers outright.
+- **`ReadWriteOncePod`** is not used: it would keep a workload to one sandbox.
 
 ## 6. Lifecycle
 
@@ -378,11 +420,12 @@ The proposal ordered create as record, Context and PVC, sandboxes, ready. The ex
 puts upload and freeze between the Context and anything that can mount it, so phase 2 provisions
 at **activation**:
 
-1. `POST /workloads` reserves the record (`creating`), creates the Context and PVC, returns the
-   upload grant (`awaiting_upload`). Unchanged.
+1. `POST /workloads` reserves the record (`creating`), creates the Context, returns the upload
+   grant (`awaiting_upload`). Unchanged.
 2. The client uploads the bundle with the grant. Unchanged.
 3. `POST /workloads/{id}/activate` freezes the revision (unchanged), then, for a workload with
-   `sandboxes`, moves to the new status `provisioning` and calls `PUT` on the provisioner.
+   `sandboxes`, moves to the new status `provisioning`, hands the provisioner the bundle and calls
+   `PUT`; the provisioner creates the PVC and the StatefulSet, whose init containers seed it (§5.2).
 4. The record moves to `ready` once the relay has records for `count` sandboxes of `wl`, read from
    `sh:sandbox:records` on `GET` and on each activate retry.
 
@@ -392,9 +435,11 @@ Freeze cannot be undone, so a failed provisioning leaves the record in `provisio
 
 `DELETE /workloads/{id}` moves to `deleting`, then:
 
-1. Provisioner `DELETE` removes the StatefulSet, Service and Secret, and answers once no pod
-   remains. Order matters: Context Service refuses to delete a mounted claim (`409 in_use`).
-2. The Context, and with it a managed PVC, is deleted (a BYO claim is left, per #59).
+1. Provisioner `DELETE` removes the StatefulSet, Service, Secret and PVC, and answers once no pod
+   remains.
+2. The Context is deleted, as in phase 1. Nothing of Context Service's is mounted, so the two
+   steps have no ordering constraint between services; this order only keeps sandboxes from
+   outliving their record's Context.
 3. The record moves to `deleted`.
 
 Each step tolerates "already gone", so a retried delete finishes what a failed one started.
@@ -402,8 +447,8 @@ Each step tolerates "already gone", so a retried delete finishes what a failed o
 ### 6.2 The reconciler
 
 A loop in the provisioner, every `MOCA_PROVISIONER_RECONCILE_S` (default 300). It lists the
-workload StatefulSets, Services and Secrets in `moca-sandbox` and reads each one's record key from
-its annotation, reading Redis with the deployment's one credential (there are no ACL users,
+workload StatefulSets, Services, Secrets and PVCs in `moca-sandbox` and reads each one's record key
+from its annotation, reading Redis with the deployment's one credential (there are no ACL users,
 §3.1). It deletes the objects when the record is missing, `deleted`, or of another generation, and
 the objects are older than a 10-minute grace. The same loop re-mints attach tokens nearing expiry
 (§3.1) and removes `moca.dev/seed-revision` once seeding is done (§5.3).
@@ -425,7 +470,7 @@ does not trust the worker's arithmetic:
 **The namespace backstop.** A ResourceQuota in `moca-sandbox` caps pods, `requests.storage` and
 PVC count for the whole namespace, and sets `<class>.storageclass.storage.k8s.io/requests.storage:
 0` for classes outside the allowlist. The StorageClass allowlist then holds even if a request
-bypasses MOCA's check, for example through Context Service's own public API.
+bypasses MOCA's check, for example from a compromised provisioner.
 
 ## 7. API
 
@@ -448,9 +493,10 @@ shared pool, unchanged; `CREATE_FIELDS` and `WORKSPACE_FIELDS` still refuse ever
   `400 sandbox_tier_unavailable` until a host-side provisioner exists.
 - `workspace.mount` is `read-only` (the default) or `writable`, and only with `sandboxes`;
   otherwise `400 workspace_mount_requires_sandboxes`. A phase 1 workload keeps copy delivery.
-- No `workspace.persistent`: every workload already has a PVC (§1.1). What phase 2 adds is whether
-  dedicated sandboxes mount it.
-- `workspace.claimName` (#543) combines unchanged. The run-level `writable` of #532 still gives a
+- No `workspace.persistent`: a workload with `sandboxes` always gets its own PVC (§5.1), and
+  `workspace.size` and `workspace.storageClass` size and class it.
+- `workspace.claimName` (#543) still names only Context Service's claim, which no workload sandbox
+  mounts. The run-level `writable` of #532 still gives a
   `read-only` workload a per-run copy, on its own sandbox; on a `writable` workload it is a no-op.
 - `GET /workloads/{id}` adds `sandboxes: {count, tier, ready}` and the new statuses
   `provisioning`. `mocactl workloads create` gains `--sandboxes <n>` and `--mount <mode>`; the
@@ -469,8 +515,10 @@ shared pool, unchanged; `CREATE_FIELDS` and `WORKSPACE_FIELDS` still refuse ever
    owner, token minting and re-minting, and caps, `sandboxes` on
    `POST /workloads`, `provisioning`, and the delete order. Context still arrives by copy, now onto
    the workload's own sandboxes. This PR alone delivers acceptance 2 and 3.
-3. **The context-service#40 companion and the mount.** The resolve call, the namespace move,
-   `workspace.mount`, the init-container seed, and the RWO/RWX rules. Acceptance 4.
+3. **The workload's PVC and the mount.** The provisioner creates and deletes PVC `<wl>`; the bundle
+   hand-off and the init-container seed into `revision/<revision>/` and `moca-workspace/`;
+   `workspace.mount` and its subPaths; the RWO/RWX rules; and the Role's PVC verbs and the
+   admission policy's PVC rules (§5.1). No Context Service change. Acceptance 4.
 4. **The Alice/Bob Kind demo and the reconciler.** Two users, two workloads, a cross-user read
    attempt that fails, delete leaving nothing behind, and the reconciler with its tests.
    Acceptance 1 and 5.
@@ -499,8 +547,8 @@ on this path for phase 2 workloads.
   compromised worker can delete or forge a record so that the reconciler deletes another
   workload's objects. That is denial of service only: the reconciler creates nothing and mints
   nothing.
-- **Context Service's trust in MOCA.** It takes the subject from `X-Context-Subject` and from the
-  provisioner's resolve call. A compromised provisioner can attach any Context to any pod in
+- **Storage under a compromised provisioner.** It owns every workload's PVC, so it can mount any
+  of them, in a pod named for that workload, or delete it. That stays inside
   `moca-sandbox`.
 - **Egress.** Workload sandboxes keep the shared pool's public internet egress (MI1 R8 until S5),
   so model code can still send out what it can read: its own owner's data.
@@ -540,8 +588,9 @@ Ours:
    They share one owner, so this crosses no boundary, but on a `writable` workload they share one
    tree. Serialize writable runs per workload, or leave it to the caller?
 8. **The MI1 §13 amendment.** Amend in place (§9) or supersede the bullet with a new MI1 revision?
-9. **Existing Contexts after the namespace move (§5.1).** Workloads created before it keep their
-   PVC in the old namespace and cannot be mounted. Is re-creating them acceptable?
+
+(A ninth question, about Contexts left behind by moving Context Service's namespace, went away when
+MOCA took over the workload's PVC: nothing moves.)
 
 ## 11. Future simplifications
 
@@ -555,7 +604,8 @@ each needs deeper work to confirm it is simpler without losing something we need
    workload would drop the count and ordinal rules, but fan-out needs more than one. The other
    direction is letting a workload scale its sandboxes with demand. Needs validation either way.
 3. **MOCA owns the workload's PVC.** Context Service only fills it with the revision. No
-   resolve-attachment call (§5.2) and no cross-service delete order (§6.1).
+   resolve-attachment call and no cross-service delete order (§6.1). **Chosen for PR 3
+   (2026-10-22)**; §5 is written this way.
 4. **Context Service as a format and library.** MOCA imports pack, validate and materialize instead
    of calling a separate service on the request path. `contextctl` stays a standalone tool.
 
@@ -571,12 +621,17 @@ each needs deeper work to confirm it is simpler without losing something we need
 - Provisioner: caps on both sides, idempotent `PUT`, delete waits for pods, the owner comes from the
   verified user token and `wl` is derived from it (Alice's token cannot touch Bob's `wl`), tokens
   are re-minted before expiry, and a Kind check that its ServiceAccount cannot touch `moca`.
-- Storage: a read-only mount refuses writes, a writable mount never shows `.context-service/`, and
-  resolving another user's Context fails closed.
-- Re-seed: model code deletes the tree's contents and plants symlinks into
-  `../.context-service/materialized/<rev>/`; after a pod restart the revision directory's digest is
-  unchanged, no seed ran (the annotation is gone), and a seed into a non-empty `moca-workspace`
-  is refused. The Kind demo (PR 4) is the acceptance gate.
+- Storage: a read-only mount refuses writes, a writable mount never shows `revision/`, an init
+  container cannot fetch another workload's bundle, and the admission policy refuses a PVC with
+  another name or class and a pod that mounts another workload's PVC.
+- Re-seed: model code deletes the tree's contents and plants symlinks into `../revision/<rev>/`;
+  after a pod restart the revision tree is unchanged, no seed ran (the annotation is gone), and a
+  seed into a non-empty `moca-workspace` is refused. The Kind demo (PR 4) is the acceptance gate.
+- Seed: with `count: 2`, only `<wl>-0` writes and `<wl>-1` exits 0 once both targets exist; a full
+  seed budget answers `503 seed_budget_full`; after a provisioner restart, `GET /workloads/{id}`
+  shows `error: seed_bundle_missing` until the next activate; the seed port refuses a session or
+  sandbox token and another workload's attach token, and `/internal/v1` is unreachable from a
+  workload pod.
 
 ---
 

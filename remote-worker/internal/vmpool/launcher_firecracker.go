@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -354,10 +355,13 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		}
 		// SIGKILL, then Unregister, then unlink (P4.1 §6): nothing the dead guest could still
 		// have in flight may reach a registration that is gone, and the path is unlinked last.
+		// An Unregister failure is logged, not joined into errs: it is harmless (the server
+		// unbinds everything a lost control connection owned) and must not read as a failed
+		// teardown.
 		if egressRegistered {
-			uctx, ucancel := context.WithTimeout(context.Background(), egressControlTimeout)
+			uctx, ucancel := context.WithTimeout(context.WithoutCancel(ctx), egressControlTimeout)
 			if err := l.opts.Egress.Unregister(uctx, req.ID); err != nil {
-				errs = append(errs, fmt.Errorf("egress unregister %s: %w", req.ID, err))
+				log.Printf("vmpool: egress unregister %s during restore cleanup: %v", req.ID, err)
 			}
 			ucancel()
 		}
@@ -414,7 +418,10 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: egress listener fd: %w", req.ID, err), cleanup())
 		}
-		rctx, rcancel := context.WithTimeout(ctx, egressControlTimeout)
+		// Detached from ctx: on a cold acquire ctx is the Exec request's own, and a Register
+		// abandoned mid-flight costs the shared control connection (which the client then
+		// heals). Its own timeout still bounds the call.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), egressControlTimeout)
 		regErr := l.opts.Egress.Register(rctx, req.ID, req.Key, nil, f)
 		rcancel()
 		_ = f.Close()
@@ -1248,13 +1255,15 @@ func (v *firecrackerVM) Reap() error {
 	// SIGKILL (already sent) -> Unregister -> unlink (P4.1 §6). Unregistering only after the VMM is
 	// reaped means no live guest can still be mid-connect against a registration being torn down;
 	// closing the listener (which unlinks the path) only after Unregister means moca-egress never
-	// holds a descriptor for a path that has vanished first. An Unregister failure is reported but
-	// must not skip the unlink or the jail removal below: a leaked path is worse than a leaked error.
+	// holds a descriptor for a path that has vanished first. An Unregister failure is logged, not
+	// counted as a destroy failure: it is harmless (moca-egress unbinds everything a lost control
+	// connection owned, and the client never replays a VM it has forgotten), and it must not skip
+	// the unlink or the jail removal below.
 	if v.egressLn != nil {
 		if v.egress != nil {
 			uctx, ucancel := context.WithTimeout(context.Background(), egressControlTimeout)
 			if err := v.egress.Unregister(uctx, v.id); err != nil {
-				errs = append(errs, fmt.Errorf("egress unregister %s: %w", v.id, err))
+				log.Printf("vmpool: egress unregister %s during destroy: %v", v.id, err)
 			}
 			ucancel()
 		}

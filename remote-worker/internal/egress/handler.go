@@ -1,0 +1,257 @@
+package egress
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"strconv"
+	"time"
+)
+
+const (
+	// maxHeaderBytes bounds one request's line and headers; http.ReadRequest
+	// itself has no limit.
+	maxHeaderBytes = 1 << 20
+	// headerTimeout bounds how long a request's headers, or an idle
+	// keep-alive gap, may take. It frees a conn slot held by a silent guest.
+	headerTimeout = 60 * time.Second
+	// drainLimit and drainTimeout bound the read after a refusal, which lets
+	// a client that already sent its request see the refusal, not an RST.
+	drainLimit   = 64 << 10
+	drainTimeout = time.Second
+)
+
+// refusalBytes renders a named refusal as a complete raw HTTP/1.1 response.
+func refusalBytes(status int, code, host string) []byte {
+	body := code + ": " + host + "\n"
+	return []byte(fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nX-Moca-Egress-Error: %s\r\n"+
+		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), code, len(body), body))
+}
+
+// writeAndClose writes b, half-closes, drains briefly and closes c.
+func writeAndClose(c net.Conn, b []byte) {
+	_ = c.SetWriteDeadline(time.Now().Add(drainTimeout))
+	_, _ = c.Write(b)
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+	_ = c.SetReadDeadline(time.Now().Add(drainTimeout))
+	_, _ = io.Copy(io.Discard, io.LimitReader(c, drainLimit))
+	_ = c.Close()
+}
+
+// limitedReader caps bytes read through it until reset; it bounds headers
+// while letting bodies through.
+type limitedReader struct {
+	r io.Reader
+	n int64 // < 0 means unlimited
+}
+
+func (l *limitedReader) Read(b []byte) (int, error) {
+	if l.n == 0 {
+		return 0, errors.New("egress: request header too large")
+	}
+	if l.n > 0 && int64(len(b)) > l.n {
+		b = b[:l.n]
+	}
+	n, err := l.r.Read(b)
+	if l.n > 0 {
+		l.n -= int64(n)
+	}
+	return n, err
+}
+
+// target is the destination of one request, before any check.
+type target struct {
+	connect bool
+	host    string // normalised when ok
+	port    uint16
+	display string // the host as named in refusals and events
+	bad     bool   // malformed or a rejected form
+}
+
+func parseTarget(r *http.Request) target {
+	if r.Method == http.MethodConnect {
+		t := target{connect: true, display: hostOnly(r.Host)}
+		h, p, err := net.SplitHostPort(r.Host)
+		if err != nil || r.URL.Path != "" || r.URL.Scheme != "" {
+			t.bad = true
+			return t
+		}
+		return t.resolve(h, p)
+	}
+	if !r.URL.IsAbs() || r.URL.Scheme != "http" || r.URL.Host == "" {
+		return target{display: hostOnly(r.Host), bad: true}
+	}
+	t := target{display: hostOnly(r.URL.Hostname())}
+	p := r.URL.Port()
+	if p == "" {
+		p = "80"
+	}
+	return t.resolve(r.URL.Hostname(), p)
+}
+
+func (t target) resolve(h, p string) target {
+	n, err := strconv.ParseUint(p, 10, 16)
+	hn, herr := NormalizeHost(h)
+	if err != nil || n == 0 || herr != nil {
+		t.bad = true
+		return t
+	}
+	t.host, t.port, t.display = hn, uint16(n), hn
+	return t
+}
+
+// hostOnly names the host of a rejected request for its refusal and event.
+// It is guest-controlled, so anything that does not normalise is "-".
+func hostOnly(hp string) string {
+	if h, _, err := net.SplitHostPort(hp); err == nil {
+		hp = h
+	}
+	if h, err := NormalizeHost(hp); err == nil && len(h) <= 253 {
+		return h
+	}
+	return "-"
+}
+
+// serve reads requests from the guest until the conn ends.
+func (pc *proxyConn) serve() {
+	defer pc.finish()
+	lr := &limitedReader{r: pc.c, n: maxHeaderBytes}
+	br := bufio.NewReader(lr)
+	for {
+		lr.n = maxHeaderBytes
+		_ = pc.c.SetReadDeadline(time.Now().Add(headerTimeout))
+		r, err := http.ReadRequest(br)
+		if err != nil {
+			// A clean end between requests, an abort or an idle timeout is
+			// not a request; anything else is a malformed one.
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || pc.ctx.Err() != nil || isTimeout(err) {
+				return
+			}
+			pc.refuse(Event{Status: 400, Decision: DecisionBadRequest}, "-")
+			return
+		}
+		lr.n = -1
+		_ = pc.c.SetReadDeadline(time.Time{})
+		if !pc.handle(r, br) {
+			return
+		}
+	}
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// refuse writes a named refusal, emits its one event and ends the conn.
+func (pc *proxyConn) refuse(e Event, host string) {
+	if e.Host == "" {
+		e.Host = host
+	}
+	pc.emit(e, true)
+	writeAndClose(pc.c, refusalBytes(e.Status, e.Decision, host))
+}
+
+// handle runs one request through the MI1 §8.5 order. It reports whether the
+// conn may carry another request.
+func (pc *proxyConn) handle(r *http.Request, br *bufio.Reader) bool {
+	t := parseTarget(r)
+	ev := Event{Host: t.display, Method: r.Method}
+	if !t.connect && r.URL != nil {
+		ev.Path = RedactPath(r.URL)
+	}
+	pc.setTarget(r.Method, t.display)
+	refuse := func(status int, decision string) bool {
+		ev.Status, ev.Decision = status, decision
+		pc.refuse(ev, t.display)
+		return false
+	}
+	if !pc.p.countRequest(pc.caller.SessionID) {
+		return refuse(http.StatusTooManyRequests, DecisionRequestCap)
+	}
+	if t.bad || r.ProtoMajor != 1 || r.ProtoMinor != 1 {
+		return refuse(http.StatusBadRequest, DecisionBadRequest)
+	}
+	if !Allowed(pc.p.cfg.Allow, t.host, t.port, t.connect) {
+		return refuse(http.StatusForbidden, DecisionDestinationDenied)
+	}
+	addrs, decision := pc.resolveAndCheck(t.host)
+	switch decision {
+	case DecisionDestinationPrivate:
+		return refuse(http.StatusForbidden, decision)
+	case DecisionUpstreamUnreachable:
+		return refuse(http.StatusBadGateway, decision)
+	}
+	if pc.p.cfg.Credentials.Intercept(pc.caller, t.host) {
+		// I5: a host that needs a credential is never tunnelled or forwarded
+		// without one, and this slice has none.
+		return refuse(http.StatusServiceUnavailable, DecisionCredentialUnavailable)
+	}
+	up, err := pc.dial(addrs, t.port)
+	if err != nil {
+		return refuse(http.StatusBadGateway, DecisionUpstreamUnreachable)
+	}
+	ev.DialAddr = up.RemoteAddr().String()
+	if !pc.setUpstream(up) {
+		_ = up.Close()
+		return false
+	}
+	if t.connect {
+		pc.tunnel(up, br, ev)
+		return false
+	}
+	return pc.forward(r, up, ev)
+}
+
+// resolveAndCheck resolves host exactly once (an IP literal skips DNS) and
+// checks every answer. A single failing answer refuses the destination.
+func (pc *proxyConn) resolveAndCheck(host string) ([]netip.Addr, string) {
+	var addrs []netip.Addr
+	if a, err := netip.ParseAddr(host); err == nil {
+		addrs = []netip.Addr{a}
+	} else {
+		ctx, cancel := context.WithTimeout(pc.ctx, pc.p.cfg.DialTimeout)
+		addrs, err = pc.p.cfg.Resolver.LookupNetIP(ctx, "ip", host)
+		cancel()
+		if err != nil || len(addrs) == 0 {
+			return nil, DecisionUpstreamUnreachable
+		}
+	}
+	var local []netip.Addr
+	if f := pc.p.cfg.LocalAddrs; f != nil {
+		l, err := f()
+		if err != nil {
+			// The host's own addresses are unknown: fail closed.
+			return nil, DecisionDestinationPrivate
+		}
+		local = l
+	}
+	for _, a := range addrs {
+		if err := CheckAddr(a, pc.p.cfg.PermitCIDRs, local); err != nil {
+			return nil, DecisionDestinationPrivate
+		}
+	}
+	return addrs, ""
+}
+
+// dial connects to the checked addresses in order.
+func (pc *proxyConn) dial(addrs []netip.Addr, port uint16) (net.Conn, error) {
+	d := net.Dialer{Timeout: pc.p.cfg.DialTimeout}
+	var errs []error
+	for _, a := range addrs {
+		// Dial the address exactly as CheckAddr judged it: unmapped, no zone.
+		c, err := d.DialContext(pc.ctx, "tcp", netip.AddrPortFrom(a.Unmap().WithZone(""), port).String())
+		if err == nil {
+			return c, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
+}

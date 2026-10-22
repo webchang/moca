@@ -37,10 +37,14 @@ func requireKVM(t *testing.T) {
 	}
 }
 
-func fcLauncher(t *testing.T) Launcher {
+func fcLauncher(t *testing.T) Launcher { return fcLauncherWith(t, nil) }
+
+// fcLauncherWith is fcLauncher with a hook to adjust the options (e.g. set Egress) before the
+// launcher is built, so a gate that needs one extra option does not duplicate this body.
+func fcLauncherWith(t *testing.T, mod func(*FirecrackerOptions)) Launcher {
 	t.Helper()
 	snapshotDir := envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311")
-	lc, err := NewFirecrackerLauncher(FirecrackerOptions{
+	opts := FirecrackerOptions{
 		SnapshotDir:         snapshotDir,
 		JailerBin:           envOr("SH_JAILER_BIN", "/usr/bin/jailer"),
 		FirecrackerBin:      envOr("SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
@@ -49,7 +53,11 @@ func fcLauncher(t *testing.T) Launcher {
 		GID:                 os.Getgid(),
 		WorkspaceImageBytes: 2 << 30,
 		VsockPort:           1024,
-	})
+	}
+	if mod != nil {
+		mod(&opts)
+	}
+	lc, err := NewFirecrackerLauncher(opts)
 	if err != nil {
 		t.Fatalf("NewFirecrackerLauncher: %v", err)
 	}

@@ -248,7 +248,17 @@ func TestGateNoVMReuse(t *testing.T) {
 // prefixes rather than full credential shapes: the point is to catch a token that was
 // alive in the guest when the snapshot was taken, and the prefix is the part that is
 // stable across whatever the token's body happens to be.
-var credentialPatterns = []string{"AKIA", "ghp_", "-----BEGIN"}
+//
+// "-----BEGIN" is narrowed to the PEM types that carry key material. A bare "-----BEGIN" fires
+// on any snapshot built since #415: check_git_identity runs git in the guest before the
+// snapshot, which pages git's own string table into memory, and that table holds the armour
+// headers it emits when signing ("-----BEGIN SSH SIGNATURE-----", "-----BEGIN PGP
+// SIGNATURE-----"). Those are format strings, not secrets, and the interception CA's public
+// certificate (P4.1 T6, a later slice) would be "-----BEGIN CERTIFICATE-----" -- equally not
+// a secret. A private key is.
+var credentialPatterns = []string{"AKIA", "ghp_", "-----BEGIN PRIVATE KEY", "-----BEGIN RSA PRIVATE KEY",
+	"-----BEGIN EC PRIVATE KEY", "-----BEGIN OPENSSH PRIVATE KEY", "-----BEGIN ENCRYPTED PRIVATE KEY",
+	"-----BEGIN PGP PRIVATE KEY BLOCK"}
 
 // scanForCredentials returns every pattern present in b, including the extra values the
 // caller wants treated as credentials (the live SANDBOX_TOKEN, on a rig that exports it).

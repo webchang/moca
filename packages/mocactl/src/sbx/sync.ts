@@ -3,7 +3,12 @@ import { join, resolve } from 'node:path';
 import { ApiError, TOKEN_CODES } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
-import { ConfigConflict, takeBackAgentConfig, writeAgentConfig } from './agent-config.js';
+import {
+  CLAUDE_PROMPT_PICK,
+  ConfigConflict,
+  takeBackAgentConfig,
+  writeAgentConfig,
+} from './agent-config.js';
 import type { SbxSandbox } from './api.js';
 import { failed, SBX_EXIT, type SbxCtx } from './commands.js';
 import {
@@ -322,7 +327,17 @@ export async function cmdUp(
   if (!f.noAgentConfig) {
     try {
       const { changed } = writeAgentConfig(root);
-      if (changed.length) c.io.err(`configured Claude Code and OpenCode: ${changed.join(', ')}`);
+      if (changed.length) {
+        c.io.err(`configured Claude Code and OpenCode: ${changed.join(', ')}`);
+        // enabledMcpjsonServers does not suppress the prompt on a first session (#577), and its
+        // highlighted default declines, which leaves the agent with no tools at all. Say so here:
+        // by the time it appears, this output is the only place the recovery was ever named.
+        c.io.err(
+          `start claude in ${root} (not a subdirectory); the first session asks about the ` +
+            `sandbox MCP server, and the highlighted default declines — choose ` +
+            `"${CLAUDE_PROMPT_PICK}", or mocactl sbx doctor tells you how to undo it`,
+        );
+      }
     } catch (err) {
       say(
         c,

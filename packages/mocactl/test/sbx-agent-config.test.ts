@@ -920,6 +920,15 @@ describe('agent configuration (SBX0 §6.3)', () => {
       /Claude Code.*settings\.local\.json.*disabledMcpjsonServers/,
     ],
     [
+      'the server rejected in settings.json',
+      (d: string) => {
+        const s = json(d, '.claude/settings.json');
+        s.disabledMcpjsonServers = ['sandbox'];
+        writeFileSync(join(d, '.claude/settings.json'), JSON.stringify(s));
+      },
+      /settings\.json disabledMcpjsonServers.*remove sandbox from disabledMcpjsonServers/,
+    ],
+    [
       'the rules block removed',
       (d: string) => writeFileSync(join(d, 'AGENTS.md'), '# none\n'),
       /AGENTS\.md/,
@@ -951,6 +960,26 @@ describe('agent configuration (SBX0 §6.3)', () => {
     writeAgentConfig(d);
     spoil(d);
     expect(checkAgentConfig(d).join('\n')).toMatch(re);
+  });
+
+  // #577: the toolless state `up` refuses to create, which a user reaches by pressing Enter at
+  // Claude Code's prompt. `up` cannot undo it (it never writes settings.local.json, and
+  // writeAgentConfig refuses to merge over the rejection), so doctor must carry the recovery.
+  it('names deleting settings.local.json, the one fix for the toolless state', () => {
+    const d = dir();
+    writeAgentConfig(d);
+    writeFileSync(
+      join(d, '.claude/settings.local.json'),
+      JSON.stringify({ disabledMcpjsonServers: ['sandbox'] }),
+    );
+    const found = checkAgentConfig(d).filter((p) => p.includes('settings.local.json'));
+    expect(found).toHaveLength(1);
+    expect(found[0]).toContain('delete .claude/settings.local.json');
+    expect(found[0]).toContain('Use this MCP server');
+    // The consequence, so the line reads as a problem and not as a note about a key.
+    expect(found[0]).toMatch(/neither the sandbox's tools nor its own/);
+    // And `up` is still refused, so the fix doctor names is the only one there is.
+    expect(conflictOf(() => writeAgentConfig(d)).message).toMatch(/disabledMcpjsonServers/);
   });
 });
 

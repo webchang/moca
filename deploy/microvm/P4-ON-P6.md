@@ -98,7 +98,8 @@ worker gone, a session created in the `microvm` tier has no sandbox to run in.
 - **Firecracker and the jailer** at `/usr/local/bin/firecracker` and `/usr/local/bin/jailer`, where
   the unit expects them. The verified run used Firecracker v1.17.0 from its release tarball.
 - **Go** on root's `PATH`. `build-snapshot.sh` builds the guest agent, and `setup-microvm.sh` builds
-  the worker, unless `MICROVM_BIN` names a prebuilt one.
+  the worker and `moca-egress`, unless `MICROVM_BIN` and `MOCA_EGRESS_BIN` name prebuilt ones. To build
+  the proxy by hand: `cd remote-worker && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w' ./cmd/moca-egress`.
 - **A checkout that includes #375**, the harness fix for a new session's first turn. On a checkout
   from before it, every tool call in a new session's first `/turn` fails on this tier with
   `invalid-workspace-key: workspace_key "anon:<uuid>" must match …`, and turn 1's work lands in a
@@ -176,6 +177,9 @@ refused. It also checks that `sh-relay.service` is installed and that the golden
 | File                                                                                                | Contents                                                                                                                                                                                                                                       |
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/usr/local/bin/microvm-worker`                                                                     | built from `remote-worker/cmd/microvm-worker` (or `MICROVM_BIN`)                                                                                                                                                                               |
+| `/usr/local/bin/moca-egress`                                                                        | built from `remote-worker/cmd/moca-egress` (or `MOCA_EGRESS_BIN`)                                                                                                                                                                              |
+| `/etc/systemd/system/moca-egress.service`                                                           | the shipped file, verbatim                                                                                                                                                                                                                     |
+| `/etc/serverless-harness/moca-egress.env` (0644)                                                    | `MOCA_EGRESS_ALLOW=`, written only if absent (see "Guest egress")                                                                                                                                                                              |
 | `/etc/systemd/system/microvm-worker.service`, `microvm-vms.slice`                                   | the shipped files, verbatim                                                                                                                                                                                                                    |
 | `/etc/serverless-harness/microvm-worker.env` (0600)                                                 | `RELAY_ADDR=127.0.0.1:<SH_RELAY_PORT>`, `SANDBOX_ID`, `SANDBOX_TOKEN`, `SH_WORKSPACE_IDLE=8h`                                                                                                                                                  |
 | `/etc/serverless-harness/microvm-relay.env` (0600)                                                  | `SH_RELAY_TOKEN_<sandbox id>=<the same token>`                                                                                                                                                                                                 |
@@ -506,11 +510,47 @@ Verified on 2026-09-30:
 - **Cloud Hypervisor, density and throughput (#256, #261), a host reboot, and any host other than
   the one above.**
 
+## Guest egress (P4.1, #277)
+
+`setup-microvm.sh` installs and starts `moca-egress` before the worker. The path is guest
+`127.0.0.1:3128` -> vsock port 1025 -> `<jail>/run/v.sock_1025` -> `moca-egress`, which allows only the
+hosts in its allowlist and refuses everything else with a named error, never a timeout. The worker
+registers each VM's listener over `/run/moca-egress/control.sock` (the worker runs as root; the
+proxy's `DynamicUser` needs no group). While `moca-egress` is down, restores fail closed.
+
+- **If it is down when the worker starts:** the worker's startup probe fails, and systemd retries the
+  worker only within its start limit (5 per 300 s). A `moca-egress` that keeps exiting (for example a
+  bad `moca-egress.env`) reaches `failed` too, after 5 starts in 120 s. `setup-microvm.sh` waits for
+  the control socket and fails naming `journalctl -u moca-egress` if it never appears. By hand, after
+  fixing the cause: `systemctl restart moca-egress`, then `systemctl reset-failed microvm-worker`, then
+  `systemctl start microvm-worker`. Re-running `setup-microvm.sh` does the same.
+
+- **Snapshot:** a golden snapshot built before P4.1 has no guest egress listener. Rebuild it with
+  `build-snapshot.sh` for egress to work.
+- **Allowlist:** `MOCA_EGRESS_ALLOW` in `/etc/serverless-harness/moca-egress.env`, seeded with
+  `api.github.com,github.com,codeload.github.com,objects.githubusercontent.com` (or from
+  `MOCA_EGRESS_ALLOW` in the installer's environment, on the first write only). A re-run never
+  overwrites the file. To change it, edit the file, then `systemctl restart moca-egress`. The restart
+  severs open tunnels (the guest must retry). The worker's control client notices the restart on its
+  own and re-registers every live VM within seconds, with no Exec needed; a guest that connects in
+  that gap waits in the socket backlog and is served once the VM is re-registered.
+- **Audit:** one JSON line per request (host, method, path without query, status, `bytes_up`,
+  `bytes_down`, `dial_addr`, decision) in `journalctl -u moca-egress`.
+- **Not in this slice:** no credentials (the guest's `GH_TOKEN` is the placeholder `moca-placeholder`),
+  no TLS interception, no cert-pinning escape hatch, and `MOCA_TENANCY=multi` is refused at boot.
+  Because nothing swaps the placeholder yet, tools that send `GH_TOKEN`/`GITHUB_TOKEN` to GitHub (`gh`,
+  `curl -H "Authorization: ..."`) get `401`, even on endpoints that work anonymously. `git` is
+  unaffected: its credential helper answers only a challenge.
+- **No bypass:** the VM has no NIC, so the proxy is the only way out (T7).
+- **Cloud Hypervisor:** egress is Firecracker-only and the worker refuses to start on
+  `SH_VMM=cloud-hypervisor` with `MOCA_EGRESS_CONTROL_SOCK` set. Drop it with a unit drop-in
+  (`[Service]` then `Environment=MOCA_EGRESS_CONTROL_SOCK=`) on such a host.
+
 ## Limits — say these plainly
 
-- **No guest network.** A microVM has no NIC, no DNS and no NAT, so `curl` and `git` to the internet
-  fail inside it, even though `curl` is in the image (#277; guest egress is P4.1). Demo P4 on local
-  content: a repository created or copied into the workspace.
+- **No guest network.** A microVM has no NIC, no DNS and no NAT, so `curl` and `git` reach only the
+  allowlist in "Guest egress" above, through the proxy, and carry no credentials. Demo P4 on local
+  content or on allowlisted hosts.
 - **No grant binding.** Any holder of the relay's exec token can target any `workspace_key`
   (MI1 S4).
 - **A fresh VM per tool call** (#274). Destroying the VM dominates Exec latency (#307).

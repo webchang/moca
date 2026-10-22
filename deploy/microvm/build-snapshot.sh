@@ -614,8 +614,9 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # inherits the agent's env, which is init's env; there is no per-Exec env), so the proxy
 # settings point at the agent's in-guest listener, which relays over vsock to the
 # host-side moca-egress. GH_TOKEN/GITHUB_TOKEN are an INERT placeholder (D7): they only
-# make clients attempt auth; moca-egress swaps in the real credential on the host. No
-# secret is ever baked here, and the placeholder matches no credential pattern.
+# make clients attempt auth. Nothing swaps them yet; moca-egress will swap in the real
+# credential on the host from MI1 S2. No secret is ever baked here, and the placeholder
+# matches no credential pattern.
 export HTTPS_PROXY=http://127.0.0.1:3128
 export https_proxy=http://127.0.0.1:3128
 export HTTP_PROXY=http://127.0.0.1:3128
@@ -654,8 +655,8 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
   fi
   chmod 0555 "$STAGE/rootfs-tree/sbin/init"
 
-  # P4.1 egress: git over the proxy needs a credential to attempt; moca-egress replaces
-  # it on the host. The rootfs is mounted read-only, so this must land in the STAGED tree
+  # P4.1 egress: git over the proxy needs a credential to attempt. It is an inert
+  # placeholder; nothing replaces it until MI1 S2, when moca-egress will on the host. The rootfs is mounted read-only, so this must land in the STAGED tree
   # (not the host's /etc) before mkfs. Appended, because the image may already carry an
   # /etc/gitconfig (the identity, see check_git_identity); the leading newline guards a
   # file that lacks a trailing one.

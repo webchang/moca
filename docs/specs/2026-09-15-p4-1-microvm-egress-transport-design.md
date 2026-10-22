@@ -1,19 +1,22 @@
 # P4.1 — MicroVM egress transport: reaching Z5's credentialed-egress proxy from a Firecracker guest — Design
 
-**Status:** design (proposed) · **Track:** P (sub-slice of P4) · **Date:** 2026-09-15
+**Status:** design (proposed) · implementing (2026-10-21 amendment) · **Track:** P (sub-slice of P4) · **Date:** 2026-09-15
 **Consumes:** [Z5 — Generalized credentialed egress](2026-06-19-m13-generalized-credentialed-egress-design.md),
 [RC1 — AuthBridge egress control-plane PoC](2026-07-10-authbridge-egress-control-plane-poc-design.md) Profile B
 **Extends:** [P4 — MicroVM sandbox tier](2026-09-09-p4-microvm-sandbox-design.md)
 **Touches:** Z1 (identity spine) — partially, and behind an interface · MU2 (`sandbox-egress` credential delivery)
 
-> **Amendment, 2026-10-21 — the transport-first slice.** Seven decisions, none reversing the design.
+> **Amendment, 2026-10-21 — the transport-first slice.** Eight decisions, none replacing a Z5 decision.
 >
 > 1. §12.2 is decided: the proxy is `moca-egress` ([MI1](2026-09-28-moca-multi-user-isolation-design.md)
->    D4, §2.4, §14). Rossoctl/moca#277 is implemented as MI1 S4's transport and core, without S2.
+>    D4, §2.4, §14). rossoctl/moca#277 is implemented as MI1 S4's transport and core, without S2.
 > 2. Scope of this slice: no grants, no token endpoint, no TLS interception, no CA in the rootfs, no
 >    placeholder swap. Allowlisted hosts are tunnelled unauthenticated, and `CredentialPolicy` is the seam
 >    S2 fills. `MOCA_TENANCY=multi` is refused by `moca-egress`. #277's CA and swap acceptance items stay
->    open until the interception slice.
+>    open until the interception slice. Until S2, tools that send the baked `GH_TOKEN`/`GITHUB_TOKEN`
+>    placeholder (`moca-placeholder`) to GitHub get `401`, even on endpoints that work anonymously. `git`
+>    is unaffected, because its helper only answers a challenge. The placeholder is kept because T5 and
+>    MI1 D7 mandate it, and the snapshot is rebuilt for the CA in the interception slice anyway.
 > 3. E13 is not a gate. Its design requirements are adopted: the listener is pre-bound by `vmpool`, with
 >    `listen()` returned before restore, never a process per connection; a refused vsock dial is a named
 >    error in the guest; scale gates are distributions, not single runs. Source: rossoctl/moca-experiments
@@ -27,6 +30,10 @@
 > 7. Standby admission requires `moca-egress`'s `Register` ack when egress is configured. A `moca-egress`
 >    outage therefore stops new standbys as well as egress, which is the fail-closed reading of §6. Ready
 >    standbys are unaffected.
+> 8. The audit event splits MI1 §8.5's `bytes` into `bytes_up` (guest to upstream) and `bytes_down`
+>    (upstream to guest), and adds `dial_addr`, the address actually dialled, which is the evidence for
+>    resolve-once. The conformance suite (`remote-worker/egress/conformance`) pins both, so MI1 §8.5 owes
+>    a matching amendment.
 
 ## 1. What this is, and what it is not
 

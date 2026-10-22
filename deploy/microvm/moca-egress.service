@@ -1,0 +1,80 @@
+# deploy/microvm/moca-egress.service
+#
+# Runs cmd/moca-egress (remote-worker/cmd/moca-egress): the host-side egress proxy for the P4
+# microVM tier (P4.1, rossoctl/moca#277). A guest reaches it as 127.0.0.1:3128 -> vsock 1025 ->
+# <jail>/run/v.sock_1025; the worker hands each VM's listening socket over the control socket below.
+#
+# WHY A DynamicUser NEEDS NO GROUP SHARING: moca-egress creates the control socket and chmods it 0600,
+# so only its owner (the dynamic user) can connect by mode. microvm-worker.service has no User=, so it
+# runs as root, and root bypasses file permissions; the server's peer check (SO_PEERCRED) admits UID 0
+# by default (MOCA_EGRESS_CONTROL_UIDS=0). RuntimeDirectoryMode=0750 is therefore enough, root
+# traverses it. If the worker ever drops root, add its UID to MOCA_EGRESS_CONTROL_UIDS and a group to
+# the runtime directory; do not loosen the socket to 0666.
+#
+# moca-egress only accepts on file descriptors it RECEIVES (SCM_RIGHTS), so the ownership of the
+# jail-side v.sock_1025 does not matter to it. It writes nothing to disk (audit goes to the journal),
+# which is what makes ProtectSystem=strict safe. DNS is UDP/TCP over inet, hence AF_INET/AF_INET6.
+#
+# Ordering is Wants= + After=, not Requires=, so a mid-run moca-egress stop or restart does not stop the
+# worker. Type=notify makes After= mean "the control socket is bound": moca-egress sends READY=1 only
+# after NewServer listened, so the worker's startup probe (a Register) never races an absent socket.
+#
+# Retries are BOUNDED, here and in the worker. A moca-egress that exits at boot (a typo in
+# MOCA_EGRESS_ALLOW) reaches `failed` after StartLimitBurst starts, and so does the worker, whose
+# startup probe then cannot Register (its own limit is 5 starts per 300 s). Fixing the config is then:
+#   systemctl restart moca-egress && systemctl reset-failed microvm-worker && systemctl start microvm-worker
+# setup-microvm.sh does both on a re-run, and it waits for the control socket before starting the
+# worker, failing with `journalctl -u moca-egress` named if it never appears.
+#
+# A mid-run outage only fails new standbys CLOSED per restore (P4.1 amendment item 7: a restore whose
+# egress registration fails is refused), so no VM ever runs with an unregistered proxy; ready
+# standbys keep their sockets. On restart, the worker's control client notices the lost connection
+# on its own and re-registers every live VM within seconds; open tunnels are severed.
+#
+# SH_VMM=cloud-hypervisor: the worker refuses egress on CHV by name, so such a host must drop
+# MOCA_EGRESS_CONTROL_SOCK from microvm-worker.service with a drop-in (see P4-ON-P6.md).
+
+[Unit]
+Description=moca-egress: allowlisted egress proxy for the microVM tier (moca P4.1)
+Documentation=https://github.com/rossoctl/moca
+After=network-online.target
+Wants=network-online.target
+# Explicit, not systemd's DefaultStartLimit* (5 starts per 10 s), which a 1 s RestartSec trips in ~5 s:
+# 5 starts per 120 s rides out a transient failure, and a broken config still lands in `failed`
+# within half a minute rather than flapping. Both keys belong in [Unit] (systemd ignores them in
+# [Service]; see microvm-worker.service).
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=notify
+DynamicUser=yes
+RuntimeDirectory=moca-egress
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/serverless-harness/moca-egress.env
+ExecStart=/usr/local/bin/moca-egress
+Restart=always
+RestartSec=3s
+# READY=1 must arrive within this, or the start fails (and counts against StartLimitBurst).
+TimeoutStartSec=30s
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+# AF_NETLINK: net.InterfaceAddrs reads the host's own addresses over rtnetlink for the
+# private-destination check; without it every request would be refused as destination_private.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

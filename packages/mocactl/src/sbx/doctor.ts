@@ -181,7 +181,9 @@ function configCheck(root: string): DoctorCheck {
         name: 'agent config',
         ok: false,
         detail: problems.join('; '),
-        fix: `${UP} merges it again (anything it names as a conflict is for you to fix by hand)`,
+        // A problem that states its own remedy is one `up` cannot make (a conflict it refuses to
+        // merge over, or settings.local.json, which it never writes): do that by hand instead.
+        fix: `${UP} merges it again; where a problem above names its own fix, make that one by hand`,
       }
     : {
         name: 'agent config',

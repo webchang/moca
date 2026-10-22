@@ -376,6 +376,27 @@ describe('mocactl sbx up and rm: the agent configuration (SBX0 §6.3, plan Revie
     expect(h.err()).not.toContain('configured Claude Code');
   });
 
+  // #577: enabledMcpjsonServers does not suppress Claude Code's prompt, whose default declines
+  // and leaves the agent with no tools. `up`'s output is the only place that is said in time.
+  it('warns that the first claude asks, that the default declines, and where to start it', async () => {
+    const h = harness();
+    expect(await h.run(['up'])).toBe(0);
+    const err = h.err();
+    expect(err).toContain('"Use this MCP server"');
+    expect(err).toContain('the highlighted default declines');
+    expect(err).toContain(`start claude in ${h.r}`);
+    expect(err).toContain('not a subdirectory');
+    // Said with the configuration it refers to: nothing written, nothing to warn about.
+    expect(await h.run(['up'])).toBe(0);
+    expect(h.err()).not.toContain('Use this MCP server');
+  });
+
+  it('says nothing about the prompt with --no-agent-config, which wires up no server', async () => {
+    const h = harness();
+    expect(await h.run(['up', '--no-agent-config'])).toBe(0);
+    expect(h.err()).not.toContain('Use this MCP server');
+  });
+
   it("keeps the developer's files: other servers, allow entries, CLAUDE.md byte for byte", async () => {
     const h = harness();
     const mcp =

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"testing"
@@ -266,15 +267,10 @@ func TestControlDisconnectUnregistersItsBindings(t *testing.T) {
 	}
 }
 
-func TestClientReplaysRegistrationsAfterServerRestart(t *testing.T) {
-	dir := shortDir(t)
-	ctlPath := filepath.Join(dir, "c.sock")
-	h1 := newRecorder()
-	h1.closeOnUnregister = true // proves the client's dup keeps the socket alive
-	s1 := startServer(t, ctlPath, []int{os.Getuid()}, h1)
-	c := NewClient(ctlPath)
-	defer c.Close()
-
+// restartWithGap registers vm-1, drops the caller's copy of its listener, stops the server
+// and dials vm-1's socket while nobody serves it. It returns the gap connection.
+func restartWithGap(t *testing.T, dir, ctlPath string, c *Client, s1 *Server, h1 *recorder) net.Conn {
+	t.Helper()
 	vmPath, ul, f := vmListener(t, dir, "vm.sock")
 	if err := c.Register(ctx(t), "vm-1", "run-a", nil, f); err != nil {
 		t.Fatal(err)
@@ -296,7 +292,73 @@ func TestClientReplaysRegistrationsAfterServerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial during gap: %v", err)
 	}
-	defer gap.Close()
+	t.Cleanup(func() { gap.Close() })
+	return gap
+}
+
+// acceptOne accepts on ln within the test's patience.
+func acceptOne(t *testing.T, ln net.Listener) {
+	t.Helper()
+	type res struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan res, 1)
+	go func() { cn, err := ln.Accept(); ch <- res{cn, err} }()
+	r := recv(t, ch)
+	if r.err != nil {
+		t.Fatalf("accept: %v", r.err)
+	}
+	r.conn.Close()
+}
+
+// recvWithin is recv with an explicit bound.
+func recvWithin[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatalf("timed out after %s waiting for %s", d, what)
+		panic("unreachable")
+	}
+}
+
+// A restart (systemctl restart moca-egress) is healed by the client on its own: vmpool may be
+// idle for minutes, and a guest dialling in meanwhile must not hang in the backlog.
+func TestClientReplaysWithoutFurtherCallsAfterServerRestart(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h1 := newRecorder()
+	h1.closeOnUnregister = true // proves the client's dup keeps the socket alive
+	s1 := startServer(t, ctlPath, []int{os.Getuid()}, h1)
+	c := NewClient(ctlPath)
+	defer c.Close()
+	restartWithGap(t, dir, ctlPath, c, s1, h1)
+
+	// The new server comes up only after the client has already failed a few redials.
+	time.Sleep(300 * time.Millisecond)
+	h2 := newRecorder()
+	startServer(t, ctlPath, []int{os.Getuid()}, h2)
+	// No client call from here on.
+	call := recvWithin(t, h2.regs, 2500*time.Millisecond, "the automatic replay")
+	if call.vmID != "vm-1" || call.sid != "run-a" {
+		t.Fatalf("replayed %q %q", call.vmID, call.sid)
+	}
+	acceptOne(t, call.ln) // the gap connection
+}
+
+// A call made after a restart still works and does not double-register what the heal loop
+// may already have replayed.
+func TestClientReplaysRegistrationsAfterServerRestart(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h1 := newRecorder()
+	h1.closeOnUnregister = true
+	s1 := startServer(t, ctlPath, []int{os.Getuid()}, h1)
+	c := NewClient(ctlPath)
+	defer c.Close()
+	restartWithGap(t, dir, ctlPath, c, s1, h1)
 
 	h2 := newRecorder()
 	startServer(t, ctlPath, []int{os.Getuid()}, h2)
@@ -307,17 +369,168 @@ func TestClientReplaysRegistrationsAfterServerRestart(t *testing.T) {
 	if call.vmID != "vm-1" || call.sid != "run-a" {
 		t.Fatalf("replayed %q %q", call.vmID, call.sid)
 	}
-	type res struct {
-		conn net.Conn
-		err  error
+	select {
+	case v := <-h2.regs:
+		t.Fatalf("vm-1 replayed twice (second: %q)", v.vmID)
+	case <-time.After(300 * time.Millisecond):
 	}
-	ch := make(chan res, 1)
-	go func() { cn, err := call.ln.Accept(); ch <- res{cn, err} }()
-	r := recv(t, ch)
-	if r.err != nil {
-		t.Fatalf("accept: %v", r.err)
+	acceptOne(t, call.ln)
+}
+
+// I1: a call whose ctx is already done when it is made is refused before it touches the shared
+// connection, so it costs the other VMs on the host nothing -- vm-1 is never unbound at all.
+// (Cancellation DURING a call, which does drop the connection and relies on the heal loop, is
+// TestCallTimingOutMidFlightHealsTheConnection.)
+func TestAlreadyCancelledCallNeverTouchesTheConnection(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h := newRecorder()
+	startServer(t, ctlPath, []int{os.Getuid()}, h)
+	c := NewClient(ctlPath)
+	defer c.Close()
+
+	vmPath, _, f1 := vmListener(t, dir, "vm1.sock")
+	if err := c.Register(ctx(t), "vm-1", "s", nil, f1); err != nil {
+		t.Fatal(err)
 	}
-	r.conn.Close()
+	recv(t, h.regs)
+
+	_, _, f2 := vmListener(t, dir, "vm2.sock")
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.Register(cancelled, "vm-2", "s", nil, f2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Register with a cancelled ctx = %v, want context.Canceled", err)
+	}
+
+	// Nothing at all reaches the server: no unbind of vm-1, no bind of vm-2.
+	select {
+	case vm := <-h.unregs:
+		t.Fatalf("a call cancelled before it was made unbound %q", vm)
+	case r := <-h.regs:
+		t.Fatalf("a call cancelled before it was made bound %q", r.vmID)
+	case <-time.After(500 * time.Millisecond):
+	}
+	h.mu.Lock()
+	ln := h.listeners["vm-1"]
+	h.mu.Unlock()
+	conn, err := net.Dial("unix", vmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	acceptOne(t, ln)
+}
+
+// A call whose ctx expires with the reply still pending loses the connection (the stream is
+// out of step), and the client heals on its own: the server ends up holding vm-1 again.
+func TestCallTimingOutMidFlightHealsTheConnection(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h := &slowRecorder{recorder: newRecorder(), slow: map[string]time.Duration{"vm-2": 500 * time.Millisecond}}
+	startServer(t, ctlPath, []int{os.Getuid()}, h)
+	c := NewClient(ctlPath)
+	defer c.Close()
+
+	_, _, f1 := vmListener(t, dir, "vm1.sock")
+	if err := c.Register(ctx(t), "vm-1", "s", nil, f1); err != nil {
+		t.Fatal(err)
+	}
+	recv(t, h.regs)
+
+	_, _, f2 := vmListener(t, dir, "vm2.sock")
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := c.Register(short, "vm-2", "s", nil, f2); err == nil {
+		t.Fatal("Register outlived its ctx")
+	}
+	// The server finishes vm-2 (the handler was already running), sees the connection gone,
+	// and unbinds both; then the heal loop re-registers vm-1 and only vm-1.
+	//
+	// Wait for that unbind first: until it lands the handler still holds the ORIGINAL vm-1,
+	// and a check made then would pass even with no heal at all. Then judge by the handler's
+	// own binding table rather than by replaying its regs/unregs channels -- those are two
+	// channels, so a select can take "reg vm-1" before the "unreg vm-1" that preceded it.
+	waitUnreg := func(want string) {
+		t.Helper()
+		deadline := time.After(3 * time.Second)
+		for {
+			select {
+			case vm := <-h.unregs:
+				if vm == want {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("the dropped connection never unbound %s", want)
+			}
+		}
+	}
+	waitUnreg("vm-1")
+	deadline := time.Now().Add(3 * time.Second)
+	var held []string
+	for {
+		held = h.held()
+		if len(held) == 1 && held[0] == "vm-1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the drop the server holds %v, want exactly [vm-1] (re-registered by the heal loop)", held)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// And it stays that way: no late Unregister undoes the heal.
+	time.Sleep(300 * time.Millisecond)
+	if held = h.held(); len(held) != 1 || held[0] != "vm-1" {
+		t.Fatalf("after settling the server holds %v, want exactly [vm-1]", held)
+	}
+}
+
+// held is the set of VMs the handler currently has bound, sorted.
+func (r *recorder) held() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.listeners))
+	for vm := range r.listeners {
+		out = append(out, vm)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// slowRecorder delays Register for the listed VMs.
+type slowRecorder struct {
+	*recorder
+	slow map[string]time.Duration
+}
+
+func (r *slowRecorder) Register(vmID, sid string, grant []byte, ln net.Listener) error {
+	time.Sleep(r.slow[vmID])
+	return r.recorder.Register(vmID, sid, grant, ln)
+}
+
+// Close stops a heal loop that is retrying against a server that never comes back.
+func TestCloseStopsTheHealLoop(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h := newRecorder()
+	s := startServer(t, ctlPath, []int{os.Getuid()}, h)
+	c := NewClient(ctlPath)
+	_, _, f := vmListener(t, dir, "vm.sock")
+	if err := c.Register(ctx(t), "vm-1", "s", nil, f); err != nil {
+		t.Fatal(err)
+	}
+	recv(t, h.regs)
+	s.Close()
+	recv(t, h.unregs)
+	time.Sleep(250 * time.Millisecond) // let the loop make an attempt or two
+	done := make(chan struct{})
+	go func() { _ = c.Close(); close(done) }()
+	recvWithin(t, done, 3*time.Second, "Close to stop the heal loop")
+	c.mu.Lock()
+	healing := c.healing
+	c.mu.Unlock()
+	if healing {
+		t.Fatal("heal loop still marked running after Close")
+	}
 }
 
 func TestOversizeFrameIsRefused(t *testing.T) {

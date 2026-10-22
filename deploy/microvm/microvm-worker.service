@@ -44,6 +44,16 @@ Description=microvm-worker: ephemeral microVM sandbox tier (moca P4)
 Documentation=https://github.com/rossoctl/moca
 After=network-online.target
 Wants=network-online.target
+# P4.1 egress proxy. Wants=, not Requires=: a mid-run moca-egress stop or restart does not stop the
+# worker; while it is down, new standbys fail closed per restore (a VM is never restored without its
+# egress registration). At worker start it is different: the startup probe performs a Register, so a
+# moca-egress that is down then fails the worker. Restart=on-failure retries it, but only within the
+# start limit below (5 per 300 s); past that the worker stays `failed` until
+# `systemctl reset-failed microvm-worker` (setup-microvm.sh does that on a re-run). moca-egress is
+# Type=notify, so After= already waits for its control socket. Started first by setup-microvm.sh;
+# see moca-egress.service.
+After=moca-egress.service
+Wants=moca-egress.service
 # Spec §6: "KVM unavailable at startup ... Fail the unit at start with an explicit
 # message; never fall back to running commands on the host." AssertPathExists fails
 # the unit before ExecStart even runs, which is a stronger, earlier form of that
@@ -150,6 +160,10 @@ Environment=SH_GUEST_RAM_MB=256
 Environment=SH_MAX_RUNS=64
 Environment=SH_MAX_COMMITTED_MB=24576
 Environment=SH_MEMORY_RESERVE_MB=4096
+# The egress control socket (moca-egress.service's RuntimeDirectory). Setting it makes every restore
+# register the VM's egress listener and FAIL if that registration fails. SH_VMM=cloud-hypervisor
+# refuses to start with it set (egress is Firecracker-only): drop it with a unit drop-in there.
+Environment=MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock
 
 [Install]
 WantedBy=multi-user.target

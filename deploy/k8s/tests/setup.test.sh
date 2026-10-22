@@ -397,6 +397,53 @@ grep -q '^  - ../../overlays/kind$' "$MOCK_STATE/applied-kustomization.yaml" || 
 expect_out 'port-forward svc/moca-supervisor 8080:8080'
 pass 'kind: generated overlay applied; control plane held at 0 without a client id; access printed'
 
+reset_state
+(export SH_PUBLIC_HARNESS_URL=http://127.0.0.1:18080; expect_ok --target kind --skip-build)
+[[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:18080 ]] ||
+  fail 'kind: SH_PUBLIC_HARNESS_URL did not override the derived URL'
+expect_out 'port-forward svc/moca-supervisor 18080:8080'
+# Sticky: a plain re-run without the variable keeps the stored URL (the whole point of the fix).
+expect_ok --target kind --skip-build
+[[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:18080 ]] ||
+  fail 'kind: a plain re-run reverted the stored URL to the default'
+expect_out 'port-forward svc/moca-supervisor 18080:8080'
+# Set-but-empty clears back to the default.
+(export SH_PUBLIC_HARNESS_URL=; expect_ok --target kind --skip-build)
+[[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:8080 ]] ||
+  fail 'kind: SH_PUBLIC_HARNESS_URL= did not clear the stored override'
+pass 'kind: SH_PUBLIC_HARNESS_URL is sticky; a re-run keeps it, set-but-empty clears it'
+
+reset_state
+for bad in not-a-url https://127.0.0.1:8080 http://127.0.0.1 http://127.0.0.1:8080/path; do
+  (export SH_PUBLIC_HARNESS_URL="$bad"; expect_fail --target kind --skip-build)
+  expect_out 'must be http://HOST:PORT'
+done
+pass 'kind: non-URL, https, missing port, and path all refused up front'
+
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_PUBLIC_HARNESS_URL=http://127.0.0.1:18080; expect_ok --target ocp-single)
+[[ "$(jq -r '.data.SH_PUBLIC_HARNESS_URL' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == http://127.0.0.1:18080 ]] ||
+  fail 'ocp-single without Routes: SH_PUBLIC_HARNESS_URL did not reach the ConfigMap'
+expect_out 'port-forward svc/moca-supervisor 18080:8080'
+pass 'ocp-single without Routes: SH_PUBLIC_HARNESS_URL overrides, and the printed port-forward matches'
+
+reset_state
+# A preinstalled TLS Secret, as the ocp-single-with-Routes tests below also stage.
+jq -nc '{apiVersion: "v1", kind: "Secret", metadata: {name: "op-cert", namespace: "moca-single"},
+  type: "kubernetes.io/tls", data: {"tls.crt": "Y3J0", "tls.key": "a2V5"}}' >"$MOCK_STATE/moca-single__Secret__op-cert.json"
+# Given this run alongside SH_ROUTE_DOMAIN -- refused once load_setup_inputs resolves the domain.
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_ROUTE_DOMAIN=example.test SH_PUBLIC_HARNESS_URL=http://127.0.0.1:18080;
+  expect_fail --target ocp-single --tls-secret op-cert)
+expect_out 'meaningless when Routes are on'
+# Stored SH_ROUTE_DOMAIN -- seed moca-setup directly so a failing seeder would not confuse the
+# diagnostic -- no env override, same refusal.
+jq -nc '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "moca-setup", namespace: "moca-single"},
+  data: {SH_ROUTE_DOMAIN: "example.test"}}' >"$MOCK_STATE/moca-single__ConfigMap__moca-setup.json"
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_PUBLIC_HARNESS_URL=http://127.0.0.1:18080;
+  expect_fail --target ocp-single)
+expect_out 'meaningless when Routes are on'
+pass 'ocp-single with Routes: SH_PUBLIC_HARNESS_URL is refused, given or stored SH_ROUTE_DOMAIN'
+
 # hash_of DEPLOYMENT: every settings hash the generated overlay stamps on DEPLOYMENT's pod template,
 # one per line (nothing when there is none). A Deployment may have several patch entries (ocp-single
 # adds an env patch for the supervisor), so every entry targeting it is read.
@@ -896,7 +943,11 @@ jq -e -r '.data.SH_TLS_SECRET' "$MOCK_STATE/moca-single__ConfigMap__moca-setup.j
 jq -e 'has("SH_ROUTE_DOMAIN") or .data.SH_ROUTE_DOMAIN' "$MOCK_STATE/moca-single__ConfigMap__moca-setup.json" >/dev/null 2>&1 ||
   pass 'SH_ROUTE_DOMAIN= cleared the recorded domain'
 expect_out 'kubectl -n moca-single port-forward'
-pass 'ocp-single: SH_ROUTE_DOMAIN and --tls-secret are sticky; empty turns Routes off'
+# The Routes-on run stored the Route URL in moca-settings; the Routes-off re-run must not reuse it.
+# Discovery would otherwise advertise a dead Route host and the printed port extraction would miss.
+[[ "$(jq -r '.data.SH_PUBLIC_HARNESS_URL' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == http://127.0.0.1:8080 ]] ||
+  fail 'ocp-single Routes-off transition reused the stored https Route URL for SH_PUBLIC_HARNESS_URL'
+pass 'ocp-single: SH_ROUTE_DOMAIN and --tls-secret are sticky; empty turns Routes off (and resets the harness URL)'
 
 reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_ROUTE_DOMAIN=Example.Test; expect_fail --target ocp-single)

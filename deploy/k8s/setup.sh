@@ -22,7 +22,9 @@
 # SH_MODEL_CATALOG_HOSTS (every target: comma-separated bare hostnames the control plane's model
 # catalog may contact besides api.anthropic.com and the default inference endpoint; empty, the
 # default, allows only those; a URL, port or path is refused -- the control plane would refuse to
-# boot on it), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
+# boot on it), SH_PUBLIC_HARNESS_URL (port-forward-reached targets only: override the default
+# http://127.0.0.1:8080 when 8080 conflicts on the host; the URL's port is also the printed
+# port-forward's local port), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
@@ -174,6 +176,16 @@ parse_args() {
   SH_SANDBOX_COUNT="${SH_SANDBOX_COUNT:-}"
   [[ -z "$SH_SANDBOX_COUNT" || "$SH_SANDBOX_COUNT" =~ ^[0-9]{1,4}$ ]] ||
     die "SH_SANDBOX_COUNT='$SH_SANDBOX_COUNT' must be a whole number of at most 4 digits (0 runs no container sandboxes)"
+  # SH_PUBLIC_HARNESS_URL overrides the derived URL on port-forward-reached targets. Only the shape
+  # is checked here (plain HTTP over a port-forward is byte-stream, so https/path are refused);
+  # whether this stack has Routes (which make the override meaningless) is checked in
+  # load_setup_inputs, after ROUTE_DOMAIN is resolved sticky.
+  if [[ -n "${SH_PUBLIC_HARNESS_URL-}" ]]; then
+    [[ "$SH_PUBLIC_HARNESS_URL" =~ ^http://[^/[:space:]]+:[0-9]{1,5}/?$ ]] ||
+      die "SH_PUBLIC_HARNESS_URL='$SH_PUBLIC_HARNESS_URL' must be http://HOST:PORT (plain HTTP, no path; https and routed targets are not supported)"
+    is_kind || [[ "$TARGET" == ocp-single ]] ||
+      die "SH_PUBLIC_HARNESS_URL applies only to port-forward-reached stacks (kind, kind-ci, ocp-single); got --target $TARGET"
+  fi
   # The token lifetimes: validated here when given; a stored one is checked in write_settings.
   local ttl
   for ttl in SH_API_TOKEN_TTL_SECONDS SH_SESSION_TOKEN_TTL_SECONDS; do
@@ -462,6 +474,10 @@ load_setup_inputs() {
     if [[ -n "${SH_ROUTE_DOMAIN+x}" ]]; then ROUTE_DOMAIN="$SH_ROUTE_DOMAIN"; else ROUTE_DOMAIN="$(cm_value "$json" SH_ROUTE_DOMAIN)"; fi
     [[ -z "$ROUTE_DOMAIN" || "$ROUTE_DOMAIN" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$ ]] ||
       die "moca-setup holds SH_ROUTE_DOMAIN='$ROUTE_DOMAIN': re-run with SH_ROUTE_DOMAIN set to a DNS name or empty (Routes off)"
+    # Resolved here (not in parse_args) so a stored SH_ROUTE_DOMAIN also triggers the refusal.
+    if [[ -n "${SH_PUBLIC_HARNESS_URL-}" && -n "$ROUTE_DOMAIN" ]]; then
+      die "SH_PUBLIC_HARNESS_URL is meaningless when Routes are on (SH_ROUTE_DOMAIN='$ROUTE_DOMAIN'): the Route host is the harness URL. Unset SH_PUBLIC_HARNESS_URL, or set SH_ROUTE_DOMAIN='' to turn Routes off."
+    fi
     data="$(jq -nc --argjson d "$data" --arg dom "$ROUTE_DOMAIN" '($d + {SH_ROUTE_DOMAIN: $dom}) | with_entries(select(.value != ""))')"
     # --tls-secret is sticky too: with Routes kept on (SH_ROUTE_DOMAIN unset), a re-run without
     # the flag must not fall back to a self-signed certificate over the operator's Secret.
@@ -698,13 +714,30 @@ route_hosts() {
 CLIENT_ID=''
 client_id() { printf '%s' "$CLIENT_ID"; }
 
+# Memoised across the write_settings + print_access callers so the stored-URL lookup only
+# issues one kubectl get per run. Cleared on each public_harness_url call that resolves
+# fresh, which only happens the first time per setup.
+PUBLIC_HARNESS_URL=''
 public_harness_url() {
-  if is_kind; then echo 'http://127.0.0.1:8080'
-  elif [[ "$TARGET" == ocp-single ]]; then
-    # Routes are opt-in (README §12.5): with a domain, the supervisor's passthrough Route is the
-    # public URL; without one, the port-forward localhost one.
-    if [[ -n "$ROUTE_DOMAIN" ]]; then echo "https://moca.$ROUTE_DOMAIN"; else echo 'http://127.0.0.1:8080'; fi
-  else echo "https://$SUP_HOST"; fi
+  [[ -z "$PUBLIC_HARNESS_URL" ]] || { printf '%s' "$PUBLIC_HARNESS_URL"; return; }
+  # On port-forward-reached stacks: a given SH_PUBLIC_HARNESS_URL wins (set-but-empty clears back
+  # to the default -- the same unset/set-empty convention as every other sticky input); otherwise
+  # the stored value in moca-settings; otherwise the default. parse_args validates a given value.
+  # A stored value is accepted only if it still has the port-forward shape: a run that had Routes
+  # on would have stored the Route URL, and reusing that on a Routes-off re-run would advertise a
+  # dead host and break the printed port extraction.
+  if is_kind || [[ "$TARGET" == ocp-single && -z "$ROUTE_DOMAIN" ]]; then
+    if [[ -n "${SH_PUBLIC_HARNESS_URL+x}" ]]; then
+      PUBLIC_HARNESS_URL="${SH_PUBLIC_HARNESS_URL:-http://127.0.0.1:8080}"
+    else
+      local stored
+      stored="$(cm_value "$(configmap_json moca-settings)" SH_PUBLIC_HARNESS_URL)"
+      [[ "$stored" =~ ^http://[^/[:space:]]+:[0-9]{1,5}/?$ ]] || stored=''
+      PUBLIC_HARNESS_URL="${stored:-http://127.0.0.1:8080}"
+    fi
+  elif [[ "$TARGET" == ocp-single ]]; then PUBLIC_HARNESS_URL="https://moca.$ROUTE_DOMAIN"
+  else PUBLIC_HARNESS_URL="https://$SUP_HOST"; fi
+  printf '%s' "$PUBLIC_HARNESS_URL"
 }
 
 # sha256: stdin's SHA-256, hex. sha256sum (Linux, coreutils) or shasum (macOS), whichever is present.
@@ -718,14 +751,16 @@ sha256() {
 # remembers "changed" between runs, so a run that writes new settings and then fails cannot lose the
 # roll -- the next run renders the same new hash.
 #
-# Sticky: each input variable that is UNSET keeps the value moca-settings already holds; one that is
-# set, even to empty (SH_ADMIN_SUBJECTS=), replaces it. SH_PUBLIC_HARNESS_URL is not an input: it is
-# derived from the target (and the Route host) on every run; nor are SH_SANDBOX_TIERS and
-# SH_SANDBOX_DEFAULT_TIER, which derive_tiers derives from the stack (its sticky input lives in
-# moca-setup). They are written even when '' so every stack hashes the same nine keys; an empty
-# token lifetime is the control plane's default, and an empty catalog allow-list its own.
+# Sticky: each input variable that is UNSET keeps the value moca-settings already holds; one that
+# is set, even to empty (SH_ADMIN_SUBJECTS=), replaces it. SH_PUBLIC_HARNESS_URL is an input on
+# port-forward-reached targets (public_harness_url); on Route-reached stacks it is derived from
+# the Route host every run (load_setup_inputs refuses a given value once ROUTE_DOMAIN resolves on).
+# SH_SANDBOX_TIERS and SH_SANDBOX_DEFAULT_TIER are derived too, by derive_tiers from the stack
+# (its sticky input lives in moca-setup). They are written even when '' so every stack hashes the
+# same nine keys; an empty token lifetime is the control plane's default, and an empty catalog
+# allow-list its own.
 write_settings() {
-  local before after admins fb api_ttl session_ttl catalog_hosts
+  local before after admins fb api_ttl session_ttl catalog_hosts url
   before="$(configmap_json moca-settings)"
   if [[ -n "${SH_GITHUB_CLIENT_ID+x}" ]]; then CLIENT_ID="$SH_GITHUB_CLIENT_ID"; else CLIENT_ID="$(cm_value "$before" SH_GITHUB_CLIENT_ID)"; fi
   if [[ -z "$CLIENT_ID" && "$TARGET" == kind-ci ]]; then
@@ -738,6 +773,9 @@ write_settings() {
   if [[ -n "${SH_API_TOKEN_TTL_SECONDS+x}" ]]; then api_ttl="$SH_API_TOKEN_TTL_SECONDS"; else api_ttl="$(cm_value "$before" SH_API_TOKEN_TTL_SECONDS)"; fi
   if [[ -n "${SH_SESSION_TOKEN_TTL_SECONDS+x}" ]]; then session_ttl="$SH_SESSION_TOKEN_TTL_SECONDS"; else session_ttl="$(cm_value "$before" SH_SESSION_TOKEN_TTL_SECONDS)"; fi
   if [[ -n "${SH_MODEL_CATALOG_HOSTS+x}" ]]; then catalog_hosts="$SH_MODEL_CATALOG_HOSTS"; else catalog_hosts="$(cm_value "$before" SH_MODEL_CATALOG_HOSTS)"; fi
+  # SH_PUBLIC_HARNESS_URL is sticky on port-forward-reached stacks (public_harness_url reads
+  # moca-settings when the env var is unset); Route-reached stacks always derive from the Route host.
+  url="$(public_harness_url)"
   # A given value was checked in parse_args; a stored one names where it came from, and how to clear it.
   valid_ttl "$api_ttl" ||
     die "moca-settings holds SH_API_TOKEN_TTL_SECONDS='$api_ttl': re-run with it set to a whole number of seconds, or set but empty (SH_API_TOKEN_TTL_SECONDS=) for the default"
@@ -750,7 +788,7 @@ write_settings() {
     log "WARNING: SH_API_TOKEN_TTL_SECONDS=$api_ttl is over 7 days: every API token a login mints stays valid that long"
   ((${session_ttl:-0} <= 604800)) ||
     log "WARNING: SH_SESSION_TOKEN_TTL_SECONDS=$session_ttl is over 7 days: every session token stays valid that long"
-  after="$(jq -ncS --arg id "$CLIENT_ID" --arg admins "$admins" --arg url "$(public_harness_url)" \
+  after="$(jq -ncS --arg id "$CLIENT_ID" --arg admins "$admins" --arg url "$url" \
     --arg fb "$fb" --arg tiers "$TIERS" --arg dtier "$DEFAULT_TIER" --arg api_ttl "$api_ttl" --arg session_ttl "$session_ttl" \
     --arg catalog_hosts "$catalog_hosts" \
     '{SH_GITHUB_CLIENT_ID: $id, SH_ADMIN_SUBJECTS: $admins, SH_PUBLIC_HARNESS_URL: $url, SH_ALLOW_OPERATOR_FALLBACK: $fb,
@@ -1186,10 +1224,13 @@ wait_records() {
 }
 
 print_access() {
+  # The local port of the supervisor's port-forward: honor SH_PUBLIC_HARNESS_URL's port when given.
+  local sup_port=8080
+  [[ "$(public_harness_url)" =~ :([0-9]+)/?$ ]] && sup_port="${BASH_REMATCH[1]}"
   if is_kind; then
     cat >&2 <<EOF
 P6 is up on kind (context $KIND_CONTEXT). Reach it with two port-forwards:
-  kubectl --context $KIND_CONTEXT -n $NS port-forward svc/moca-supervisor 8080:8080
+  kubectl --context $KIND_CONTEXT -n $NS port-forward svc/moca-supervisor $sup_port:8080
   kubectl --context $KIND_CONTEXT -n $NS port-forward svc/moca-control-plane 8090:8080
 then:  mocactl --control-plane-url http://127.0.0.1:8090 login
 EOF
@@ -1205,7 +1246,7 @@ EOF
     else
       cat >&2 <<EOF
 P6 is up on OpenShift, namespace $NS (single-namespace dev/test target; no Routes). Reach it by port-forward:
-  kubectl -n $NS port-forward svc/moca-supervisor 8080:8080
+  kubectl -n $NS port-forward svc/moca-supervisor $sup_port:8080
   kubectl -n $NS port-forward svc/moca-control-plane 8090:8080
 then:  mocactl --control-plane-url http://127.0.0.1:8090 login
 EOF

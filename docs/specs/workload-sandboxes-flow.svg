@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1460" height="880" viewBox="0 0 1460 880" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title id="title">MOCA per-workload sandboxes (/workloads phase 2)</title>
-  <desc id="desc">A client creates a workload with sandboxes and uploads its context as in phase 1, then activates it. The supervisor's worker calls moca-provisioner, which resolves the workload's Context PVC through Context Service (context-service#40) and creates the workload's StatefulSet, headless Service and attach-token Secret in the moca-sandbox namespace. The sandbox pods mount the Context PVC read-only or as a seeded moca-workspace, and attach to the relay with Hello and the attach token; the relay stamps trusted moca.dev/workload and moca.dev/owner labels. A run naming the workload selects only that workload's sandboxes and executes through SandboxExec.Exec. Delete removes the sandboxes first, then the Context.</desc>
+  <desc id="desc">A client creates a workload with sandboxes and uploads its context as in phase 1, then activates it. The supervisor's worker calls moca-provisioner, which creates the workload's own PVC, StatefulSet, headless Service and attach-token Secret in the moca-sandbox namespace. An init container seeds the PVC once from the Context's frozen bundle, which the worker exported from Context Service as in phase 1. The sandbox pods mount the PVC read-only at revision/&lt;revision&gt; or writable at moca-workspace, and attach to the relay with Hello and the attach token; the relay stamps trusted moca.dev/workload and moca.dev/owner labels. A run naming the workload selects only that workload's sandboxes and executes through SandboxExec.Exec. Delete removes the sandboxes and their PVC, then the Context.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
@@ -39,7 +39,7 @@
   <!-- Context Service -->
   <rect class="box" x="1120" y="95" width="320" height="140" rx="10" fill="#eaf7ee" stroke="#3c8d5a"/>
   <text class="title" x="1280" y="160" text-anchor="middle">Context Service</text>
-  <text class="sub" x="1280" y="180" text-anchor="middle">owns Contexts and their PVCs</text>
+  <text class="sub" x="1280" y="180" text-anchor="middle">Contexts, upload, freeze, export, as in phase 1</text>
 
   <!-- Provisioner -->
   <rect class="box" x="1120" y="300" width="320" height="140" rx="10" fill="#e6f5f5" stroke="#2a8c8c"/>
@@ -68,20 +68,21 @@
   <text class="note" x="1171" y="778" text-anchor="middle">headless Service</text>
   <text class="api" x="1171" y="798" text-anchor="middle">&lt;wl&gt;</text>
 
-  <!-- Context PVC, in moca-sandbox, owned by Context Service -->
-  <path class="box" d="M1285,612 v60 a72,11 0 0,0 144,0 v-60" fill="#eaf7ee" stroke="#3c8d5a"/>
-  <ellipse class="box" cx="1357" cy="612" rx="72" ry="11" fill="#eaf7ee" stroke="#3c8d5a"/>
-  <text class="title" x="1357" y="647" text-anchor="middle" style="font-size: 14px;">Context PVC</text>
-  <text class="api" x="1357" y="666" text-anchor="middle">context-&lt;name&gt;</text>
+  <!-- Workload PVC, in moca-sandbox, created by the provisioner -->
+  <path class="box" d="M1285,612 v60 a72,11 0 0,0 144,0 v-60" fill="#e6f5f5" stroke="#2a8c8c"/>
+  <ellipse class="box" cx="1357" cy="612" rx="72" ry="11" fill="#e6f5f5" stroke="#2a8c8c"/>
+  <text class="title" x="1357" y="647" text-anchor="middle" style="font-size: 14px;">PVC</text>
+  <text class="api" x="1357" y="666" text-anchor="middle">&lt;wl&gt;</text>
 
   <!-- 6 mount -->
   <line class="line" x1="1225" y1="640" x2="1283" y2="640"/>
   <g class="step"><circle cx="1252" cy="640" r="10"/><text x="1252" y="640">6</text></g>
   <text class="sub" x="1262" y="718">read-only, subPath</text>
-  <text class="api" x="1262" y="734">…/materialized/&lt;revision&gt;</text>
+  <text class="api" x="1262" y="734">revision/&lt;revision&gt;</text>
   <text class="sub" x="1262" y="764">or writable, subPath</text>
   <text class="api" x="1262" y="780">moca-workspace</text>
   <text class="sub" x="1262" y="797">init container seeds it once</text>
+  <text class="sub" x="1262" y="813">from the worker's bundle</text>
 
   <!-- 1 create + upload -->
   <line class="line" x1="200" y1="130" x2="458" y2="130"/>
@@ -93,7 +94,7 @@
   <line class="line" x1="740" y1="130" x2="1118" y2="130"/>
   <g class="step"><circle cx="762" cy="130" r="10"/><text x="762" y="130">1</text></g>
   <text class="api" x="780" y="124">POST /internal/v1/contexts</text>
-  <text class="sub" x="780" y="146">Context and PVC, in moca-sandbox</text>
+  <text class="sub" x="780" y="146">the Context, as in phase 1</text>
 
   <!-- 2 activate -->
   <line class="line" x1="200" y1="215" x2="458" y2="215"/>
@@ -105,20 +106,20 @@
   <line class="line" x1="740" y1="200" x2="1118" y2="200"/>
   <g class="step"><circle cx="762" cy="200" r="10"/><text x="762" y="200">9</text></g>
   <text class="api" x="780" y="194">DELETE /internal{ctx}</text>
-  <text class="sub" x="780" y="216">then the Context and its managed PVC</text>
+  <text class="sub" x="780" y="216">then the Context</text>
 
   <!-- 3 provision -->
   <line class="line" x1="740" y1="340" x2="1118" y2="340"/>
   <g class="step"><circle cx="762" cy="340" r="10"/><text x="762" y="340">3</text></g>
   <text class="api" x="780" y="334">PUT /internal/v1/workloads/{name}/{generation}</text>
-  <text class="sub" x="780" y="356">service token + caller's API token;</text>
-  <text class="sub" x="780" y="372">derives wl from owner, name, generation</text>
+  <text class="sub" x="780" y="356">service token + caller's API token; first PUT …/bundle,</text>
+  <text class="sub" x="780" y="372">the frozen bundle exported from Context Service</text>
 
   <!-- 9a delete sandboxes -->
   <line class="line" x1="740" y1="405" x2="1118" y2="405"/>
   <g class="step"><circle cx="762" cy="405" r="10"/><text x="762" y="405">9</text></g>
   <text class="api" x="780" y="399">DELETE /internal/v1/workloads/{name}/{generation}</text>
-  <text class="sub" x="780" y="421">sandboxes first: 200 once no pod remains</text>
+  <text class="sub" x="780" y="421">sandboxes and PVC: 200 once no pod remains</text>
 
   <!-- 8 run -->
   <line class="line" x1="200" y1="300" x2="458" y2="300"/>
@@ -130,22 +131,20 @@
   <line class="line" x1="200" y1="385" x2="458" y2="385"/>
   <g class="step"><circle cx="222" cy="385" r="10"/><text x="222" y="385">9</text></g>
   <text class="api" x="240" y="379">DELETE /workloads/{id}</text>
-  <text class="sub" x="240" y="401">sandboxes, then the Context</text>
+  <text class="sub" x="240" y="401">sandboxes, PVC, then the Context</text>
 
-  <!-- 4 resolve PVC -->
-  <line class="line" x1="1160" y1="300" x2="1160" y2="237"/>
-  <g class="step"><circle cx="1160" cy="278" r="10"/><text x="1160" y="278">4</text></g>
-  <text class="api" x="1180" y="249">resolve attachment (context-service#40)</text>
-  <text class="sub" x="1180" y="264">needs attach for the owner; returns</text>
-  <text class="api" x="1180" y="279">{namespace, claimName,</text>
-  <text class="api" x="1180" y="293">backend, accessMode}</text>
+  <!-- 4 create PVC, then 5 create objects -->
+  <polyline class="line" points="1400,440 1400,600"/>
+  <g class="step"><circle cx="1400" cy="462" r="10"/><text x="1400" y="462">4</text></g>
+  <text class="api" x="1390" y="484" text-anchor="end">create PVC &lt;wl&gt;</text>
+  <text class="sub" x="1390" y="500" text-anchor="end">size, class</text>
 
   <!-- 5 create objects -->
   <line class="line" x1="1160" y1="440" x2="1160" y2="518"/>
   <g class="step"><circle cx="1160" cy="462" r="10"/><text x="1160" y="462">5</text></g>
-  <text class="api" x="1180" y="466">create StatefulSet, Service, Secret</text>
-  <text class="sub" x="1180" y="484">Kubernetes API; attach token in</text>
-  <text class="sub" x="1180" y="500">the Secret, mounted as a file</text>
+  <text class="api" x="1146" y="466" text-anchor="end">create StatefulSet, Service, Secret</text>
+  <text class="sub" x="1146" y="484" text-anchor="end">Kubernetes API; attach token in</text>
+  <text class="sub" x="1146" y="500" text-anchor="end">the Secret, mounted as a file</text>
 
   <!-- 8 select + exec, worker to relay -->
   <line class="line" x1="480" y1="470" x2="480" y2="608"/>

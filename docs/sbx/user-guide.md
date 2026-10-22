@@ -101,8 +101,11 @@ or
 opencode
 ```
 
-Claude Code may ask once to approve the project's `sandbox` MCP server: approve it. If it asks
-whether you trust the folder, accept that too. Then ask for work as usual ("the tests fail, fix them"). The agent's tools are now `sandbox`'s
+Start it in the repository root, not a subdirectory. Claude Code asks once to approve the
+project's `sandbox` MCP server: choose **"Use this MCP server"** — the highlighted default
+declines and leaves the agent with no tools at all
+([below](#the-first-claude-asks-about-the-sandbox-server)). If it asks whether you trust the
+folder, accept that too. Then ask for work as usual ("the tests fail, fix them"). The agent's tools are now `sandbox`'s
 (`bash`, `read`, `write`, `edit`, `grep`, `find`, `ls` and `sandbox_info`); its local tools are
 denied.
 
@@ -175,14 +178,25 @@ Choose **"Use this MCP server"**. The highlighted default is the last line, so p
 declines, and declining writes `disabledMcpjsonServers: ["sandbox"]` into
 `.claude/settings.local.json`. Together with the local tools denied in `.claude/settings.json`
 that leaves the agent with no tools at all — and the marker suppresses the question on the next
-run, so the state is easy to mistake for a broken sandbox. `mocactl sbx doctor` reports it:
+run, so the state is easy to mistake for a broken sandbox. `mocactl sbx doctor` reports it, with
+the recovery:
 
 ```
-Claude Code: .claude/settings.local.json disabledMcpjsonServers rejects the sandbox MCP server
+Claude Code: .claude/settings.local.json disabledMcpjsonServers rejects the sandbox MCP server,
+so the agent has neither the sandbox's tools nor its own; delete .claude/settings.local.json
+(mocactl sbx up never writes it) and answer "Use this MCP server" the next time Claude Code asks
 ```
 
-To recover, delete `.claude/settings.local.json` (`up` never writes it) and start `claude` again.
-Why the prompt appears at all despite `enabledMcpjsonServers` is
+`enabledMcpjsonServers` is necessary but not sufficient: Claude Code also asks you to trust the
+folder, and it suppresses the MCP question only once **both** hold. That trust lives in
+`~/.claude.json`, outside your working tree, and only your answer to the prompt puts it there —
+so a first session asks, whatever `up` writes. Accept the folder trust and the server once, and
+neither returns.
+
+Both answers are recorded against the directory you started `claude` **in**, while `.mcp.json` is
+found by searching upwards. Start Claude Code from the repository root, where `up` wrote the two
+files: from a subdirectory the server is still found and still asks, every session, because the
+approval you gave at the root does not apply there. Tracked as
 [#577](https://github.com/rossoctl/moca/issues/577).
 
 **To undo it**, delete the sandbox:

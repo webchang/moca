@@ -8,7 +8,7 @@
 #
 # Prerequisites: P6 installed and running; /dev/kvm; Firecracker + jailer in /usr/local/bin; a golden
 # snapshot at $MICROVM_SNAPSHOT_DIR (build-rootfs.sh, then build-snapshot.sh -- see P4-ON-P6.md);
-# Go, unless MICROVM_BIN names a prebuilt binary.
+# Go, unless MICROVM_BIN (and MOCA_EGRESS_BIN) name prebuilt binaries.
 #
 # A HOST WITH CONTAINER SANDBOXES TOO (P6.3, docs/specs/2026-10-04-p6-on-kubernetes-slice3-design.md
 # §7) is made tiered rather than refused: when any sh-sandbox-* container exists, running or stopped,
@@ -26,10 +26,13 @@
 # cluster is the token authority), and MICROVM_SANDBOX_ID comes from it. No relay drop-in, no podman,
 # no installed P6 needed. The one local change: tier files an earlier mixed run wrote are removed, and
 # the installed units try-restarted, since this host's own P6 is container-only once its only microVM
-# worker attaches elsewhere. Running again without --remote switches back.
+# worker attaches elsewhere. moca-egress (P4.1) is installed and started in both modes, since the
+# worker unit references it. Running again without --remote switches back.
 #
 # Env overrides: SH_UNIT_DIR, SH_ENV_DIR, SH_BIN_DIR, MICROVM_SANDBOX_ID, MICROVM_WORKSPACE_IDLE,
-# MICROVM_SNAPSHOT_DIR, MICROVM_BIN, MICROVM_ATTACH_TIMEOUT, MICROVM_ATTACH_SETTLE (--remote: seconds
+# MICROVM_SNAPSHOT_DIR, MICROVM_BIN, MOCA_EGRESS_BIN, MOCA_EGRESS_ALLOW (seeds a NEW moca-egress.env
+# only), MOCA_EGRESS_READY_TIMEOUT (seconds to wait for its control socket, default 30),
+# MICROVM_ATTACH_TIMEOUT, MICROVM_ATTACH_SETTLE (--remote: seconds
 # an attach must hold before it counts, at least 1) -- defaults below -- and
 # MICROVM_MAX_COMMITTED_MB (unset by default): a VM-memory budget in MiB for a host smaller than the
 # shipped unit's 24 GiB, written as a drop-in that also lowers the unit's AssertMemory to match -- and
@@ -43,6 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 : "${SH_UNIT_DIR:=/etc/systemd/system}"
 : "${SH_ENV_DIR:=/etc/serverless-harness}"
+: "${DEFAULT_EGRESS_ALLOW:=api.github.com,github.com,codeload.github.com,objects.githubusercontent.com}"
 : "${SH_BIN_DIR:=/usr/local/bin}"
 SANDBOX_ID_GIVEN="${MICROVM_SANDBOX_ID+x}" # --remote refuses a given id that disagrees with the bundle
 : "${MICROVM_SANDBOX_ID:=moca_microvm_0}"
@@ -50,6 +54,10 @@ SANDBOX_ID_GIVEN="${MICROVM_SANDBOX_ID+x}" # --remote refuses a given id that di
 : "${MICROVM_SNAPSHOT_DIR:=/srv/snapshots/default}"
 : "${MICROVM_ATTACH_TIMEOUT:=60}"
 : "${MICROVM_ATTACH_SETTLE:=5}"
+# moca-egress's control socket (MOCA_EGRESS_CONTROL_SOCK in microvm-worker.service) and how long to
+# wait for it after starting the unit: overridable only so the tests can point it at a temp dir.
+: "${MOCA_EGRESS_SOCKET:=/run/moca-egress/control.sock}"
+: "${MOCA_EGRESS_READY_TIMEOUT:=30}"
 
 RELAY_DROPIN="50-moca-microvm.conf"
 WORKER_DROPIN="50-moca-p6.conf"
@@ -151,6 +159,8 @@ preflight() {
   fi
   [[ "$MICROVM_ATTACH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "MICROVM_ATTACH_TIMEOUT='$MICROVM_ATTACH_TIMEOUT' must be a whole number of seconds, at least 1"
+  [[ "$MOCA_EGRESS_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
+    die "MOCA_EGRESS_READY_TIMEOUT='$MOCA_EGRESS_READY_TIMEOUT' must be a whole number of seconds, at least 1"
   # At least 1: the hold must outlast the worker's first reconnect backoff (at most 750ms), or a
   # rejected token's attached -> stream ended -> attached cycle could fall outside the window.
   [[ "$MICROVM_ATTACH_SETTLE" =~ ^[1-9][0-9]*$ ]] ||
@@ -291,8 +301,35 @@ install_worker_binary() {
   rm -rf "$stage"
 }
 
+# install_egress_binary: moca-egress (P4.1), built or taken from MOCA_EGRESS_BIN exactly as the worker is.
+install_egress_binary() {
+  local stage; stage="$(mktemp -d)"
+  if [[ -n "${MOCA_EGRESS_BIN:-}" ]]; then
+    cp "$MOCA_EGRESS_BIN" "$stage/moca-egress"
+  else
+    log "building moca-egress from $REPO_ROOT/remote-worker"
+    (cd "$REPO_ROOT/remote-worker" &&
+      CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$stage/moca-egress" ./cmd/moca-egress)
+  fi
+  install_if_changed "$stage/moca-egress" "$SH_BIN_DIR/moca-egress" 0755
+  rm -rf "$stage"
+}
+
+# install_egress_env: the allowlist, written ONLY when absent so an operator's edit survives a re-run.
+# MOCA_EGRESS_ALLOW from the environment seeds a fresh file; it never overrides an existing one. No
+# secret lives here, so 0644 (the unit's DynamicUser reads it via systemd, as root, regardless).
+install_egress_env() {
+  local env="$SH_ENV_DIR/moca-egress.env" stage; stage="$(mktemp -d)"
+  if [[ ! -e "$env" ]]; then
+    printf 'MOCA_EGRESS_ALLOW=%s\n' "${MOCA_EGRESS_ALLOW:-$DEFAULT_EGRESS_ALLOW}" >"$stage/moca-egress.env"
+    install_if_changed "$stage/moca-egress.env" "$env" 0644
+  fi
+  rm -rf "$stage"
+}
+
 install_units() {
   local stage; stage="$(mktemp -d)"
+  install_if_changed "$SCRIPT_DIR/moca-egress.service" "$SH_UNIT_DIR/moca-egress.service" 0644
   install_if_changed "$SCRIPT_DIR/microvm-worker.service" "$SH_UNIT_DIR/microvm-worker.service" 0644
   install_if_changed "$SCRIPT_DIR/microvm-vms.slice" "$SH_UNIT_DIR/microvm-vms.slice" 0644
   if [[ -n "$REMOTE_BUNDLE" ]]; then
@@ -431,7 +468,7 @@ changed_any() { # changed_any <path>...: true iff one of them is in CHANGED
 
 apply() {
   local relay_restart=0
-  if changed_any "$SH_UNIT_DIR/microvm-worker.service" "$SH_UNIT_DIR/microvm-vms.slice" \
+  if changed_any "$SH_UNIT_DIR/microvm-worker.service" "$SH_UNIT_DIR/microvm-vms.slice" "$SH_UNIT_DIR/moca-egress.service" \
     "$SH_UNIT_DIR/sh-relay.service.d/$RELAY_DROPIN" "$SH_UNIT_DIR/microvm-worker.service.d/$WORKER_DROPIN" \
     "$SH_UNIT_DIR/microvm-worker.service.d/$REMOTE_DROPIN" "$SH_UNIT_DIR/microvm-worker.service.d/$MEMORY_DROPIN" \
     "$SH_UNIT_DIR/sh-supervisor.service.d/$TIERS_DROPIN" "$SH_UNIT_DIR/sh-control-plane.service.d/$TIERS_DROPIN"; then
@@ -456,6 +493,21 @@ apply() {
     [[ ! -f "$SH_UNIT_DIR/sh-control-plane.service" ]] || systemctl try-restart sh-control-plane.service
     [[ ! -f "$SH_UNIT_DIR/sh-supervisor.service" ]] || systemctl try-restart sh-supervisor.service
   fi
+  # moca-egress first: the worker registers each VM's egress listener with it. A restart (not a
+  # stop/start) is enough, the worker's control client re-registers live VMs on reconnect.
+  # The restart severs in-flight guest connections (open tunnels die); new ones work at once.
+  systemctl enable moca-egress.service
+  # A Type=notify start that exits or times out before READY=1 -- a bad moca-egress.env -- makes
+  # systemctl itself fail, so it gets the same hint as a socket that never appears.
+  local egress_hint="the reason is in: journalctl -u moca-egress (often a bad $SH_ENV_DIR/moca-egress.env). Fix it and re-run"
+  if changed_any "$SH_BIN_DIR/moca-egress" "$SH_UNIT_DIR/moca-egress.service" "$SH_ENV_DIR/moca-egress.env"; then
+    systemctl reset-failed moca-egress.service || true
+    systemctl restart moca-egress.service || die "moca-egress failed to start; $egress_hint"
+  elif ! systemctl is-active --quiet moca-egress.service; then
+    systemctl reset-failed moca-egress.service || true
+    systemctl start moca-egress.service || die "moca-egress failed to start; $egress_hint"
+  fi
+  wait_egress_ready
   systemctl enable microvm-worker.service
   if ((relay_restart)) || changed_any "$SH_BIN_DIR/microvm-worker" "$SH_UNIT_DIR/microvm-worker.service" \
     "$SH_UNIT_DIR/microvm-vms.slice" "$SH_UNIT_DIR/microvm-worker.service.d/$WORKER_DROPIN" \
@@ -471,6 +523,21 @@ apply() {
     systemctl reset-failed microvm-worker.service || true
     start_worker
   fi
+}
+
+# wait_egress_ready: the worker's startup probe Registers over moca-egress's control socket, so a
+# moca-egress that exits at boot (a bad moca-egress.env) would otherwise surface much later, as the
+# worker failing to attach, with this script pointing at the wrong unit. The unit is Type=notify, so
+# a successful start already means the socket is bound; this wait is the belt to that, and it is
+# what names moca-egress when the start did not succeed.
+wait_egress_ready() {
+  local deadline=$((SECONDS + MOCA_EGRESS_READY_TIMEOUT))
+  until [[ -S "$MOCA_EGRESS_SOCKET" ]]; do
+    if ((SECONDS >= deadline)); then
+      die "moca-egress did not bind $MOCA_EGRESS_SOCKET within ${MOCA_EGRESS_READY_TIMEOUT}s, so the worker could not register its VMs; the reason is in: journalctl -u moca-egress (often a bad $SH_ENV_DIR/moca-egress.env). Fix it and re-run"
+    fi
+    sleep 1
+  done
 }
 
 # start_worker drops the worker's presence record BEFORE starting it, so verify_attached can only
@@ -553,6 +620,8 @@ main() {
   parse_args "$@"
   preflight
   install_worker_binary
+  install_egress_binary
+  install_egress_env
   install_units
   if [[ -n "$REMOTE_BUNDLE" ]]; then install_env_remote; else install_env; fi
   # --remote: MIXED is 0 (preflight), so this removes what an earlier mixed local run wrote.

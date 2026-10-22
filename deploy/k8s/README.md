@@ -111,11 +111,12 @@ export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
 mocactl login
 ```
 
-The control plane advertises the harness as `http://127.0.0.1:8080`, so the supervisor's forward
-must use local port 8080. `mocactl`
-runs from a checkout ([`packages/mocactl/QUICKSTART.md`](../../packages/mocactl/QUICKSTART.md)). The
-GitHub OAuth app needs **Enable Device Flow** ticked ([`deploy/vm/README.md`](../vm/README.md), "The
-GitHub OAuth app").
+The control plane advertises the harness as `http://127.0.0.1:8080` by default, so the supervisor's
+forward must use local port 8080. If 8080 conflicts with another local service, override it with
+`SH_PUBLIC_HARNESS_URL` at setup time (see §2's sticky settings). `mocactl` runs from a checkout
+([`packages/mocactl/QUICKSTART.md`](../../packages/mocactl/QUICKSTART.md)). The GitHub OAuth app
+needs **Enable Device Flow** ticked ([`deploy/vm/README.md`](../vm/README.md), "The GitHub OAuth
+app").
 
 **Without `SH_GITHUB_CLIENT_ID`,** the control plane is installed with 0 replicas, because nobody
 can log in without one, and `setup.sh` says so. It is rendered that way, not scaled down later, so
@@ -162,6 +163,13 @@ re-running with just that one:
   degrades to `model_catalog_unavailable`). Empty, the default, allows only those two. A scheme,
   port or path in an entry is refused here, matching the control plane's own boot check. A change
   rolls the control plane.
+- `SH_PUBLIC_HARNESS_URL` (kind and `--target ocp-single` without Routes) overrides the default
+  `http://127.0.0.1:8080` the control plane advertises via `GET /v1/discovery`; set it when 8080
+  conflicts with another local service. The port in the URL also becomes the printed `kubectl
+port-forward svc/moca-supervisor` local port. Must be `http://HOST:PORT` (no `https`, no path).
+  Sticky like the other inputs here: a plain re-run keeps the stored value;
+  `SH_PUBLIC_HARNESS_URL=` returns to `http://127.0.0.1:8080`. Refused when Routes are on
+  (`SH_ROUTE_DOMAIN` non-empty), where the Route host is authoritative.
 - `SH_SANDBOX_COUNT`, and on OpenShift `--image` and `--sandbox-image`, live in the ConfigMap
   `moca-setup` (namespace `moca`, nothing secret in it). A given value replaces the stored one.
   To go back to a default, pass it explicitly (`SH_SANDBOX_COUNT=2`,

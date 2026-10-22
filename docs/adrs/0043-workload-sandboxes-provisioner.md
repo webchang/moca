@@ -27,14 +27,16 @@ sandbox namespace, and is where a workload's owner and its storage meet.
 We will add **`moca-provisioner`**, its own Deployment in the `moca` namespace. It is the only MOCA
 component with Kubernetes permissions in `moca-sandbox`: one Role to create and delete a
 workload's StatefulSet, its headless Service and its attach-token Secret, and to read pods and
-PVCs. It creates no PVCs; Context Service does.
+PVCs. Amended 2026-10-22: it also creates and deletes each workload's PVC (spec §5), which Context
+Service no longer provides for phase 2.
 
 - Workers call its internal API with a service token, and forward the caller's API token. The
   provisioner verifies that token itself and takes the owner from it.
 - It signs each workload's attach token with its own Ed25519 key. The relay verifies the token with
   public keys and sets `moca.dev/workload` and `moca.dev/owner` from it, never from `Hello`.
-- It resolves the workload's PVC through rossoctl/context-service#40, which checks `attach` for the
-  owner.
+- It seeds that PVC from the Context's frozen revision, exported by Context Service as in phase 1.
+  It no longer resolves a Context Service claim, so rossoctl/context-service#40 is off phase 2's
+  path.
 - It runs the orphan reconciler.
 
 The control plane, the supervisor and the relay stay without Kubernetes permissions.
@@ -64,8 +66,7 @@ The control plane, the supervisor and the relay stay without Kubernetes permissi
   second.
 - Negative / accepted cost: it provisions only the container tier. P4 (microVM) hosts sit outside
   the cluster and need a host-side provisioner.
-- Follow-up owed: the context-service#40 companion, including ownership of the claim outside
-  `.context-service/`; the MI1 §2.3, §9.1 and §13 amendments; and the relay's Exec check
+- Follow-up owed: the MI1 §2.3, §9.1 and §13 amendments; and the relay's Exec check
   becoming a real boundary once MI1 S2 grants name the user.
 
 ---
