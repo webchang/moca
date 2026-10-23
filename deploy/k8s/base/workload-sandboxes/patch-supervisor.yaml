@@ -1,0 +1,16 @@
+# The workers call the provisioner with its service token and the caller's own API token (spec
+# §4.1). With MOCA_PROVISIONER_URL set, POST /workloads accepts `sandboxes`.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: moca-supervisor, namespace: moca }
+spec:
+  template:
+    spec:
+      containers:
+        - name: supervisor
+          env:
+            - { name: MOCA_PROVISIONER_URL, value: 'http://moca-provisioner.moca.svc:8080' }
+            - name: MOCA_PROVISIONER_TOKEN
+              valueFrom: { secretKeyRef: { name: moca-provisioner, key: MOCA_PROVISIONER_TOKEN } }
+            # Spec §6.3: the workers' half of the per-workload cap; the provisioner enforces it too.
+            - { name: MOCA_WORKLOAD_MAX_SANDBOXES, value: '2' }

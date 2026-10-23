@@ -28,14 +28,17 @@ export {
 } from './sandbox-token.js';
 export {
   ATTACH_CLOCK_LEEWAY_S,
+  ATTACH_OWNER_RE,
   ATTACH_TOKEN_AUDIENCE,
   ATTACH_TOKEN_ISSUER,
   ATTACH_TOKEN_TYP,
+  ATTACH_WORKLOAD_RE,
   mintAttachToken,
   verifyAttachToken,
   type AttachMintInput,
   type AttachTokenClaims,
 } from './attach-token.js';
+export { ownerScopeFor, workloadKeyFor, workloadRecordKey } from './workload-key.js';
 export { KEK_BYTES, credentialAad, keksFromBase64, open, seal, type Opened } from './envelope.js';
 export {
   CREDENTIAL_NAME_RE,

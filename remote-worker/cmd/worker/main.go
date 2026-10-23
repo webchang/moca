@@ -122,8 +122,9 @@ func sweepInterval(idle time.Duration) time.Duration {
 //
 // With SANDBOX_TOKEN_FILE set, the token is that file's contents (surrounding whitespace trimmed),
 // re-read on every dial and reconnect: a workload's attach token is a mounted Secret that the
-// kubelet refreshes in place when the provisioner re-mints it (workload sandboxes spec §3.1), and
-// the relay closes the stream when the old token expires, so the redial picks up the new one.
+// kubelet refreshes in place when the provisioner re-mints it (workload sandboxes spec §3.1).
+// rotateWhenIdle reconnects with the new one at an idle moment; the relay's close at the old
+// token's exp is the backstop.
 // Unset, it is SANDBOX_TOKEN (default "dev-token"), read once, exactly as before.
 func tokenSource(get func(string) string, readFile func(string) ([]byte, error)) func() (string, error) {
 	path := get("SANDBOX_TOKEN_FILE")
@@ -185,6 +186,65 @@ func attachOnce(
 	start := time.Now()
 	err = serve(attachCtx, stream)
 	return nil, err, time.Since(start)
+}
+
+// rotationPoll is how often an attached worker re-reads SANDBOX_TOKEN_FILE for a rotated token.
+// The provisioner re-mints with half the token's lifetime left, so this needs no precision.
+const rotationPoll = 10 * time.Second
+
+// rotateWhenIdle wraps attach so that, once the token file holds a different token from the one a
+// stream attached with, the stream is ended at the first moment no Exec is in flight (workload
+// sandboxes spec §3.1). The loop then re-dials with the new token, well before the relay's hard
+// close at the old token's exp. A file that cannot be read keeps the stream: the redial would fail
+// on it too.
+//
+// The cancel is on the stream's OWN context, which is what tears a stream down (Serve's
+// precondition); attachOnce's ctx is its parent, so SIGTERM still reaches it.
+func rotateWhenIdle(
+	attach func(context.Context) (pb.SandboxWorker_AttachClient, error),
+	token func() (string, error),
+	idle func() bool,
+	every time.Duration,
+) func(context.Context) (pb.SandboxWorker_AttachClient, error) {
+	return func(ctx context.Context) (pb.SandboxWorker_AttachClient, error) {
+		var bearer string
+		if md, ok := metadata.FromOutgoingContext(ctx); ok {
+			if v := md.Get("authorization"); len(v) == 1 {
+				bearer = strings.TrimPrefix(v[0], "Bearer ")
+			}
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		st, err := attach(streamCtx)
+		if err != nil || st == nil {
+			cancel()
+			return st, err
+		}
+		go func() {
+			defer cancel()
+			t := time.NewTicker(every)
+			defer t.Stop()
+			rotated := false
+			for {
+				select {
+				case <-st.Context().Done():
+					return
+				case <-t.C:
+				}
+				if !rotated {
+					next, err := token()
+					rotated = err == nil && next != bearer
+					if rotated {
+						log.Printf("worker: the token file changed; reconnecting at the next idle moment")
+					}
+				}
+				if rotated && idle() {
+					log.Printf("worker: idle; reconnecting with the rotated token")
+					return
+				}
+			}
+		}()
+		return st, nil
+	}
 }
 
 func nextBackoff(d time.Duration) time.Duration { return min(d*2, backoffMax) }
@@ -264,10 +324,15 @@ func main() {
 		relayAddr, cfg.SandboxID, useTLS, cfg.MaxConcurrent, cfg.Capabilities, cfg.Labels,
 		runner.Root, runner.Idle)
 
+	attach := func(c context.Context) (pb.SandboxWorker_AttachClient, error) { return client.Attach(c) }
+	// Only a token file rotates; SANDBOX_TOKEN is read once.
+	if os.Getenv("SANDBOX_TOKEN_FILE") != "" {
+		attach = rotateWhenIdle(attach, token, sess.Idle, rotationPoll)
+	}
+
 	backoff := backoffMin
 	for ctx.Err() == nil {
-		tokenErr, err, lasted := attachOnce(ctx, token,
-			func(c context.Context) (pb.SandboxWorker_AttachClient, error) { return client.Attach(c) },
+		tokenErr, err, lasted := attachOnce(ctx, token, attach,
 			func(c context.Context, st pb.SandboxWorker_AttachClient) error { return sess.Serve(c, st) })
 		// Reset on a session that actually LASTED, not merely on Attach
 		// returning a stream. Attach succeeds before the relay has authorized

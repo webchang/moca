@@ -429,7 +429,8 @@ paths:
         or for any async run, it is refused with 501 workload_runs_unavailable rather than run on
         the default pool; a synchronous one without a token is 401 token_required.
         `contextWritable: true` gives that run its own writable copy of the context instead,
-        discarded when the run ends.
+        discarded when the run ends. A workload created with `sandboxes` runs only on its own
+        sandboxes, never on the shared pool.
       security:
         - sessionToken: []
       requestBody:
@@ -475,7 +476,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: workload_not_ready — the named workload has not been activated.
+          description: workload_not_ready — the named workload is not ready (not yet activated, or its own sandboxes are still provisioning).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -492,10 +493,12 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            Retryable, from either of two causes — note the two body shapes. Saturation: still
+            Retryable, from one of three causes — note the two body shapes. Saturation: still
             no pool capacity after the bounded wait; the body is the LeafResult failed/saturated
             branch, NOT an Error, and is never persisted. Or credential_unavailable — the
-            control-plane exchange failed (an Error body).
+            control-plane exchange failed (an Error body). Or workload_sandbox_unavailable — the
+            run names a workload with sandboxes of its own and none of them is attached (an
+            Error body, never persisted); it never falls back to the shared pool.
           headers:
             Retry-After:
               schema: { type: integer }

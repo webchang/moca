@@ -1,0 +1,13 @@
+# The relay verifies attach tokens with the provisioner's PUBLIC key only (spec §3.1), and from then
+# on trusts the workload and owner labels from a token alone.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sandbox-relay, namespace: moca }
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox-relay
+          env:
+            - name: MOCA_ATTACH_PUBLIC_KEYS
+              valueFrom: { secretKeyRef: { name: moca-provisioner, key: MOCA_ATTACH_PUBLIC_KEYS } }

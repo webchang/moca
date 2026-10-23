@@ -173,3 +173,66 @@ export const MAX_EXEC_MESSAGE_BYTES = 16 * 1024 * 1024; // 16 MiB
  * test/grpc-relay-transport.test.ts), so none can drift back.
  */
 export const DEFAULT_EXEC_TIMEOUT_S = 30 * 60; // 30 minutes
+
+/**
+ * The worker's ExecError messages that mean "this host is at capacity", not "your
+ * command failed" (#452).
+ *
+ * WHY A PREFIX MATCH ON PROSE IS THE ONLY OPTION HERE. There is no "busy" frame in the
+ * wire contract — remote-worker/internal/vmpool/errors.go says exactly that, and draws
+ * the consequence: "a refusal can only be an error". So a refusal travels as
+ * `ExecError{req_id, message}`, the same frame a failed command uses, and the message
+ * is the entire signal. That is a wire-contract gap and this regex is the workaround
+ * for it, not a design; the durable fix is a typed refusal on the wire, at which point
+ * this goes away.
+ *
+ * The three prefixes, and where each is built:
+ *
+ *  - `memory-budget:`   vmpool `RefuseMemoryBudget` — committing one more VM would
+ *                       cross `MaxCommittedBytes - MemoryReserveBytes` (budget.go)
+ *  - `max-runs:`        vmpool `RefuseMaxRuns` — the backstop under the lease cap
+ *  - `busy: queue full` the session loop's own refusal (session/loop.go)
+ *
+ * The first two are `RefusalError.Error()`'s `"<reason>: <detail>"` rendering, so the
+ * colon is part of the contract rather than incidental. PINNED AGAINST THE GO SOURCE by
+ * test/refusal-vocabulary-coupling.test.ts, in the same house idiom DEFAULT_OUTPUT_CAP
+ * uses for `BufferCap` — change one and change the other.
+ *
+ * `@moca/sandbox-client` carries this vocabulary as its own `TEMPLATE_BUSY`
+ * (exec-conn.ts), where it was first established. It is DUPLICATED rather than imported
+ * because neither this package nor `@moca/harness` depends on that one, and adding the
+ * dependency to share a three-branch regex would couple this transport seam to the
+ * relay client's whole surface. The coupling test is what keeps the copies honest: both
+ * are pinned to the same Go constants, so the Go source is the single definition and
+ * neither copy is the other's authority.
+ */
+export const CAPACITY_REFUSAL = /^(?:memory-budget:|max-runs:|busy: queue full)/;
+
+/**
+ * Thrown by a transport when the worker REFUSED an exec for capacity rather than
+ * failing it (#452). Carries no extra data — its whole payload is its identity.
+ *
+ * THE NAME IS THE CONTRACT, not a label. `knative-server`'s `turnErrorStatus` maps
+ * errors to HTTP status by `err.name`, deliberately: `instanceof` is only sound within
+ * one package instance, which is false whenever a test mocks a harness module wholesale
+ * (server.test.ts does). A test there also pins that a saturation-shaped MESSAGE still
+ * yields 500 — so prose must never be the signal above this seam, which is exactly why
+ * this class exists. It converts the one place where prose IS the signal
+ * (CAPACITY_REFUSAL, at the wire) into a type the rest of the stack can carry.
+ *
+ * It does NOT extend `SandboxPoolSaturatedError`. That means "no sandbox could be
+ * leased", is raised in select-sandbox.ts before any exec, and is caught at lease time
+ * in all three leaf paths. This means "a leased sandbox's host refused the work" and
+ * arrives mid-turn, long after those catches have been passed. Sharing a type would
+ * route it through `catch` blocks unreachable from here while implying the two are
+ * interchangeable. What they genuinely share is the OUTCOME — 503 with `Retry-After` —
+ * and that is expressed by both names sitting in server.ts's NO_CAPACITY set.
+ */
+export class SandboxCapacityRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    // Set explicitly rather than left to the constructor name: `name` is what the
+    // status mapper reads, and a minifier renames the class.
+    this.name = 'SandboxCapacityRefusedError';
+  }
+}

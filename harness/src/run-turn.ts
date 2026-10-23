@@ -18,7 +18,9 @@ import { BufferedRedisBackend } from './buffered-redis-backend.js';
 import { flushExtension } from './flush-extension.js';
 import { randomUUID } from 'node:crypto';
 import {
+  createCapacityLatch,
   k8sSandboxExtension,
+  SandboxCapacityRefusedError,
   type K8sSandboxConfig,
   type SandboxTransport,
 } from '@moca/k8s-sandbox';
@@ -54,6 +56,11 @@ import { recordModelSwitch } from './model-switch-record.js';
 // session waiting for its own briefly-absent sandbox). harness/package.json exposes no ./select-sandbox
 // subpath, and this is the module those callers already import.
 export { SandboxPoolSaturatedError, SandboxPoolEmptyError, SandboxAffinityPendingError };
+// Fourth transient, and the one that arrives LATEST: the three above are raised at lease
+// time, before any exec, while this one comes from a sandbox that was leased successfully
+// and whose host then refused the work mid-turn (#452). Same 503 + Retry-After outcome,
+// which is why it belongs in this export list rather than only in k8s-sandbox's.
+export { SandboxCapacityRefusedError };
 // Same reason: a promoted session's turn can fail with it, and server.ts maps it to 410.
 export { BundleNotFoundError } from '@moca/config-bundle';
 
@@ -990,9 +997,13 @@ async function executeTurnCore(
       : 'NULL (tools run LOCAL)';
     console.error(`[sandbox] resolved config: ${how}`);
   }
+  // One latch per turn, never shared: a replica serves many turns concurrently against
+  // different hosts, and a module-level flag would fail one session's turn because some
+  // other session's host filled up (#452).
+  const capacity = createCapacityLatch();
   const extensionFactories = [
     flushExtension(backend),
-    k8sSandboxExtension(sandbox),
+    k8sSandboxExtension({ ...sandbox, capacity }),
     checkpointExtension(store, sessionManager),
     toolChoiceExtension(),
     promptCacheExtension(),
@@ -1073,6 +1084,18 @@ async function executeTurnCore(
   }
 
   await backend.flush();
+
+  // AFTER the flush, deliberately. The turn really did happen — entries, tool results and
+  // the partial assistant message are all part of this session's history, and a session
+  // whose checkpoint is missing the turn that hit the ceiling cannot be resumed cleanly
+  // once the host has room again. So: persist, then fail.
+  //
+  // THROWN, not folded into stopReason. A capacity refusal is not this turn's outcome, it
+  // is the absence of one: the caller must answer 503 with Retry-After and the SAME prompt
+  // must be retryable, which a `{ stopReason: 'error' }` result does not express — every
+  // reader of that treats the turn as spent (#452). Pi's own loop cannot do this for us,
+  // because a tool throw becomes `isError: true` content and the loop continues.
+  capacity.throwIfRefused();
 
   // Best-effort per-turn cumulative token usage; a usage hiccup must never fail a completed turn.
   let usage: LeafUsage | undefined;

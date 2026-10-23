@@ -158,6 +158,9 @@ export function isGitPath(p: string): boolean {
 const AGENT_DIRS: Record<string, string> = {
   '.claude': 'Claude Code settings, hooks and commands',
   '.opencode': 'OpenCode configuration and plugins',
+  '.codex': 'Codex CLI configuration, which can start MCP servers',
+  '.agents': "Codex CLI's repo skills, whose scripts it runs on this machine",
+  '.pi': 'Pi extensions, skills and prompts, which it loads as code from the project',
   '.husky': 'git hooks',
 };
 const AGENT_FILES: Record<string, string> = {
@@ -170,8 +173,12 @@ const VSCODE_FILES: Record<string, string> = {
   'tasks.json': 'VS Code tasks, which can run when the folder opens',
   'settings.json': 'VS Code settings, which can name programs to run',
 };
-/** The prompt files an agent reads: warned about, not refused (they are text, not executables). */
-const PROMPT_FILES = new Set(['claude.md', 'agents.md']);
+/**
+ * The prompt files an agent reads: warned about, not refused (they are text, not executables).
+ * `AGENTS.override.md` is Codex CLI's: it is read in preference to `AGENTS.md`, so a new one
+ * silently replaces the instructions an agent session reads (#592).
+ */
+const PROMPT_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md']);
 
 const foldedIn = (seg: string, names: Record<string, string>): string | undefined =>
   folds(seg)

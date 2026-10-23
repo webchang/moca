@@ -1,0 +1,14 @@
+# OpenShift DNS answers on 5353 behind the 53 Service port. Without this a workload sandbox cannot
+# resolve sandbox-relay-attach.moca.svc and never attaches.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-openshift-dns-workload-sandbox, namespace: moca-sandbox }
+spec:
+  podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: openshift-dns } }
+      ports:
+        - { protocol: UDP, port: 5353 }
+        - { protocol: TCP, port: 5353 }

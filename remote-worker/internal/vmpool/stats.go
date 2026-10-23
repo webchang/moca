@@ -38,6 +38,21 @@ type Stats struct {
 	// figure is a caller-side fact, not a pool fault — most likely a relay that omits
 	// the field — and it is the only visibility on it after the first log line.
 	TimeoutsClamped uint64
+	// BudgetEvictions counts standbys shed by evictForBudgetLocked: user-visible memory
+	// refusals (#452) that were turned into somebody else's cold acquire instead.
+	//
+	// READ IT AGAINST Refusals[RefuseMemoryBudget], because only the pair distinguishes
+	// the two states. Evictions rising while that stays flat is the mechanism absorbing
+	// the pressure. BOTH rising together means eviction has run out of idle standbys to
+	// take, and MICROVM_MAX_COMMITTED_MB is genuinely too small for the number of
+	// distinct sessions this host sees — the sizing question #452 is about, which no
+	// amount of eviction answers.
+	//
+	// It is also the cost line for the trade, stated honestly: each eviction is a cold
+	// acquire a quiet session pays on its next turn. Large here against a small
+	// ColdAcquires[ColdParked] means this is churning standbys rather than relieving
+	// anything.
+	BudgetEvictions uint64
 }
 
 // counters is the mutable half. A mutex over two small maps rather than atomics
@@ -52,6 +67,7 @@ type counters struct {
 	destroyFailures   uint64
 	barrierUnobs      uint64
 	timeoutsClamped   uint64
+	budgetEvictions   uint64
 }
 
 func newCounters() *counters {
@@ -74,6 +90,11 @@ func (c *counters) barrierUnobserved() { c.mu.Lock(); c.barrierUnobs++; c.mu.Unl
 
 func (c *counters) timeoutClamped() { c.mu.Lock(); c.timeoutsClamped++; c.mu.Unlock() }
 
+// evicted is called with pool.mu HELD (evictForBudgetLocked). Safe, and the only
+// counter that is: counters has its own mutex and never reaches back into the pool, so
+// the two locks are always taken in this order and never the other.
+func (c *counters) evicted() { c.mu.Lock(); c.budgetEvictions++; c.mu.Unlock() }
+
 func (c *counters) snapshot(into *Stats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -83,6 +104,7 @@ func (c *counters) snapshot(into *Stats) {
 	into.DestroyFailures = c.destroyFailures
 	into.BarrierUnobserved = c.barrierUnobs
 	into.TimeoutsClamped = c.timeoutsClamped
+	into.BudgetEvictions = c.budgetEvictions
 	into.ColdAcquires = make(map[ColdCause]uint64, len(c.cold))
 	for k, v := range c.cold {
 		into.ColdAcquires[k] = v

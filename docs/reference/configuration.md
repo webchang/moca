@@ -129,21 +129,58 @@ these variables; see [the migration guide](../migrating-from-knative.md#configur
 Enabled only when `MOCA_CONTEXT_WORKLOADS_ENABLED=1` and `CONTEXT_SERVICE_URL` is set; otherwise
 `/workloads` returns 501. See [`docs/context-service.md`](../context-service.md).
 
-| Variable                                                    | Default                    | Notes                                            |
-| ----------------------------------------------------------- | -------------------------- | ------------------------------------------------ |
-| `MOCA_CONTEXT_WORKLOADS_ENABLED`                            | off                        | Feature switch                                   |
-| `CONTEXT_SERVICE_URL`                                       | none                       |                                                  |
-| `CONTEXT_SERVICE_PUBLIC_URL`                                | none                       | Required for workloads; HTTPS except on loopback |
-| `CONTEXT_SERVICE_TOKEN`                                     | none                       | **Secret.** Required for workloads               |
-| `CONTEXT_SERVICE_NAMESPACE` (falls back to `POD_NAMESPACE`) | `default`                  |                                                  |
-| `CONTEXT_SERVICE_TIMEOUT_MS`                                | `5000`                     |                                                  |
-| `MOCA_CONTEXT_MAX_STORAGE_GIB`                              | `10`                       |                                                  |
-| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER`                      | `5`                        |                                                  |
-| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`                         | `86400`                    | TTL of the deleted-workload record               |
-| `MOCA_CONTEXT_STORAGE_CLASSES`                              | empty (any class rejected) |                                                  |
+| Variable                                                    | Default                    | Notes                                                                                                           |
+| ----------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `MOCA_CONTEXT_WORKLOADS_ENABLED`                            | off                        | Feature switch                                                                                                  |
+| `CONTEXT_SERVICE_URL`                                       | none                       |                                                                                                                 |
+| `CONTEXT_SERVICE_PUBLIC_URL`                                | none                       | Required for workloads; HTTPS except on loopback                                                                |
+| `CONTEXT_SERVICE_TOKEN`                                     | none                       | **Secret.** Required for workloads                                                                              |
+| `CONTEXT_SERVICE_NAMESPACE` (falls back to `POD_NAMESPACE`) | `default`                  |                                                                                                                 |
+| `CONTEXT_SERVICE_TIMEOUT_MS`                                | `5000`                     |                                                                                                                 |
+| `MOCA_CONTEXT_MAX_STORAGE_GIB`                              | `10`                       |                                                                                                                 |
+| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER`                      | `5`                        |                                                                                                                 |
+| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`                         | `86400`                    | TTL of the deleted-workload record                                                                              |
+| `MOCA_CONTEXT_ROLLBACK_RETRY_ATTEMPTS`                      | `3`                        | Create-rollback cleanup attempts (including the first) while Context Service is unreachable; `1` means no retry |
+| `MOCA_CONTEXT_ROLLBACK_RETRY_BACKOFF_MS`                    | `500`                      | Backoff between those attempts                                                                                  |
+| `MOCA_CONTEXT_STORAGE_CLASSES`                              | empty (any class rejected) |                                                                                                                 |
 
 These settings are checked per request, not at boot: a missing `CONTEXT_SERVICE_TOKEN` or URL returns
 500 `workloads_misconfigured`.
+
+Workloads with sandboxes of their own (phase 2, [`docs/context-service.md`](../context-service.md),
+"Own sandboxes"), off unless `MOCA_PROVISIONER_URL` is set:
+
+| Variable                          | Default     | Notes                                                                        |
+| --------------------------------- | ----------- | ---------------------------------------------------------------------------- |
+| `MOCA_PROVISIONER_URL`            | unset (off) | moca-provisioner's internal API. Set, `POST /workloads` accepts `sandboxes`  |
+| `MOCA_PROVISIONER_TOKEN`          | none        | **Secret.** Required with the URL (`500 workloads_misconfigured` otherwise)  |
+| `MOCA_PROVISIONER_TIMEOUT_MS`     | `15000`     | Per-request timeout                                                          |
+| `MOCA_PROVISIONER_DELETE_WAIT_MS` | `60000`     | How long `DELETE` waits for the workload's pods to go before answering `202` |
+| `MOCA_WORKLOAD_MAX_SANDBOXES`     | `2`         | Largest `sandboxes.count`; the provisioner checks it again                   |
+
+## moca-provisioner (`packages/provisioner`)
+
+The only MOCA component with Kubernetes permissions in the sandbox namespace
+([ADR-0043](../adrs/0043-workload-sandboxes-provisioner.md)). Secrets are files under
+`CREDENTIALS_DIRECTORY`, or env vars of the same name.
+
+| Variable                       | Default        | Notes                                                                                                                |
+| ------------------------------ | -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `MOCA_ATTACH_PRIVATE_KEY`      | none           | **Secret, required.** Ed25519 key that signs attach tokens; its public half is the relay's `MOCA_ATTACH_PUBLIC_KEYS` |
+| `MOCA_PROVISIONER_TOKEN`       | none           | **Secret, required.** The workers' service token                                                                     |
+| `SH_SESSION_TOKEN_PUBLIC_KEYS` | none           | Required. Verifies the API token a worker forwards                                                                   |
+| `MOCA_SANDBOX_NAMESPACE`       | `moca-sandbox` | The one namespace it acts in                                                                                         |
+| `MOCA_PROVISIONER_PORT`        | `8080`         |                                                                                                                      |
+| `MOCA_WORKLOAD_MAX_SANDBOXES`  | `2`            | `count` per workload                                                                                                 |
+| `MOCA_OWNER_MAX_SANDBOXES`     | `4`            | An owner's replicas across all workloads                                                                             |
+| `MOCA_ATTACH_TOKEN_TTL_S`      | `86400`        | Attach-token lifetime; re-minted when less than half remains                                                         |
+| `MOCA_PROVISIONER_RECONCILE_S` | `300`          | How often it checks tokens for re-minting                                                                            |
+
+The pod template is the PodTemplate `moca-workload-sandbox` in the sandbox namespace
+(`deploy/k8s/base/workload-sandboxes/template.yaml`: the shared pool's image, resources, relay address
+and security settings, with no Secret); the provisioner adds the attach token as a file. It runs as
+exactly one replica (`replicas: 1`, `Recreate`): the per-owner cap is serialized in the process, so a
+second replica could let two concurrent requests both pass it.
 
 ## Sandbox relay
 
@@ -216,18 +253,18 @@ path, the query or the secret.
 
 ### Container sandbox (`remote-worker/cmd/worker`)
 
-| Variable                         | Default            | Notes                                                                                                                                                                                                                  |
-| -------------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RELAY_ADDR`                     | `localhost:8443`   | The relay's attach address                                                                                                                                                                                             |
-| `SANDBOX_TOKEN`                  | `dev-token`        | **Secret.** Equals the relay's `SH_RELAY_TOKEN` (or its per-sandbox token). Do not leave the default                                                                                                                   |
-| `SANDBOX_TOKEN_FILE`             | unset              | A file holding the token; when set it replaces `SANDBOX_TOKEN`, and is re-read on every dial and reconnect, so a rotated mounted Secret (a workload's attach token) is picked up. Unreadable or empty at boot is fatal |
-| `RELAY_TLS`, `RELAY_CA_FILE`     | off                | TLS to the relay; a garbage `RELAY_TLS` is fatal                                                                                                                                                                       |
-| `SANDBOX_ID`                     | `sbx-laptop-1`     | Unique per sandbox                                                                                                                                                                                                     |
-| `SANDBOX_TIER`                   | `container`        | Advertised as the `moca.dev/tier` label. If set but blank, no label: a tiered harness excludes the worker                                                                                                              |
-| `WORKER_MAX_CONCURRENT`          | `4`                | Concurrency slots; garbage or non-positive falls back                                                                                                                                                                  |
-| `SANDBOX_IMAGE`, `SANDBOX_TRUST` | empty, `untrusted` | Labels                                                                                                                                                                                                                 |
-| `SH_WORKSPACE_ROOT`              | built-in default   | Absolute path                                                                                                                                                                                                          |
-| `SH_WORKSPACE_IDLE`              | built-in default   | Go duration; idle time after which a session workspace is deleted                                                                                                                                                      |
+| Variable                         | Default            | Notes                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RELAY_ADDR`                     | `localhost:8443`   | The relay's attach address                                                                                                                                                                                                                                                                                                |
+| `SANDBOX_TOKEN`                  | `dev-token`        | **Secret.** Equals the relay's `SH_RELAY_TOKEN` (or its per-sandbox token). Do not leave the default                                                                                                                                                                                                                      |
+| `SANDBOX_TOKEN_FILE`             | unset              | A file holding the token; when set it replaces `SANDBOX_TOKEN`, and is re-read on every dial and reconnect, so a rotated mounted Secret (a workload's attach token) is picked up. When the file changes, the worker reconnects with it at its next idle moment (no command running). Unreadable or empty at boot is fatal |
+| `RELAY_TLS`, `RELAY_CA_FILE`     | off                | TLS to the relay; a garbage `RELAY_TLS` is fatal                                                                                                                                                                                                                                                                          |
+| `SANDBOX_ID`                     | `sbx-laptop-1`     | Unique per sandbox                                                                                                                                                                                                                                                                                                        |
+| `SANDBOX_TIER`                   | `container`        | Advertised as the `moca.dev/tier` label. If set but blank, no label: a tiered harness excludes the worker                                                                                                                                                                                                                 |
+| `WORKER_MAX_CONCURRENT`          | `4`                | Concurrency slots; garbage or non-positive falls back                                                                                                                                                                                                                                                                     |
+| `SANDBOX_IMAGE`, `SANDBOX_TRUST` | empty, `untrusted` | Labels                                                                                                                                                                                                                                                                                                                    |
+| `SH_WORKSPACE_ROOT`              | built-in default   | Absolute path                                                                                                                                                                                                                                                                                                             |
+| `SH_WORKSPACE_IDLE`              | built-in default   | Go duration; idle time after which a session workspace is deleted                                                                                                                                                                                                                                                         |
 
 Commands run in a sandbox do not inherit the worker's own settings. The exact names `SANDBOX_TOKEN`,
 `RELAY_ADDR`, `RELAY_TLS`, `RELAY_CA_FILE`, `SANDBOX_ID`, `SANDBOX_IMAGE`, `SANDBOX_TRUST` and

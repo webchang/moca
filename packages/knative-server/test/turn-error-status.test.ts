@@ -3,6 +3,7 @@ import {
   SandboxPoolSaturatedError,
   SandboxPoolEmptyError,
   SandboxAffinityPendingError,
+  SandboxCapacityRefusedError,
   BundleNotFoundError,
 } from '@moca/harness/run-turn';
 import { turnErrorStatus, turnErrorHeaders, turnErrorCode } from '../src/server.js';
@@ -33,6 +34,25 @@ describe('turnErrorStatus', () => {
     expect(turnErrorStatus(new SandboxAffinityPendingError('m-0', 5_000))).toBe(503);
   });
 
+  it('maps a mid-turn host capacity refusal to 503 as well (#452)', () => {
+    // The odd one out among the four: the three above are raised while ACQUIRING a sandbox,
+    // this one by a sandbox already leased, whose host refused the exec on its memory or
+    // MaxRuns ceiling. It used to reach here as a plain Error and answer 500 — or, worse,
+    // never reach here at all, because Pi's loop turned it into tool content and /turn
+    // answered 200 with the host's admission arithmetic quoted back as the model's reply.
+    expect(
+      turnErrorStatus(new SandboxCapacityRefusedError('memory-budget: committing 301989888 more')),
+    ).toBe(503);
+  });
+
+  it('advertises Retry-After and sandbox_unavailable for a capacity refusal', () => {
+    // 503 alone would be a client telling itself when to come back. Both halves matter, and
+    // they are what makes the SAME prompt retryable after the host frees up.
+    const err = new SandboxCapacityRefusedError('max-runs: 8 runs already resident');
+    expect(turnErrorHeaders(turnErrorStatus(err), err)).toMatchObject({ 'Retry-After': '5' });
+    expect(turnErrorCode(turnErrorStatus(err))).toBe('sandbox_unavailable');
+  });
+
   it('keeps the legacy 404 for a missing session', () => {
     expect(turnErrorStatus(new Error('no session in backend'))).toBe(404);
   });
@@ -55,6 +75,12 @@ describe('turnErrorStatus', () => {
     // silently degrading to 500 in production.
     expect(new SandboxPoolSaturatedError('app=sandbox').name).toBe('SandboxPoolSaturatedError');
     expect(new SandboxPoolEmptyError('app=sandbox').name).toBe('SandboxPoolEmptyError');
+    // This one sets `name` in its own constructor for exactly this reason: it crosses a
+    // package boundary (k8s-sandbox → harness → here), so `instanceof` is unsound and the
+    // string is the whole contract (#452).
+    expect(new SandboxCapacityRefusedError('memory-budget: x').name).toBe(
+      'SandboxCapacityRefusedError',
+    );
   });
 });
 

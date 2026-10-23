@@ -158,6 +158,87 @@ the next user's task. `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES` keeps unused revisio
 saves a transfer for repeated runs at the cost of leaving that context on the sandbox for the
 period.
 
+## Own sandboxes (phase 2)
+
+A workload can get sandboxes of its own instead of the shared pool
+([#476](https://github.com/rossoctl/moca/issues/476), per-workload sandboxes; design in
+[`specs/2026-10-16-workload-sandboxes-design.md`](specs/2026-10-16-workload-sandboxes-design.md),
+decision in [ADR-0043](adrs/0043-workload-sandboxes-provisioner.md)). It is off by default: it needs
+`moca-provisioner` and `MOCA_PROVISIONER_URL` on the workers (on Kubernetes,
+`SH_WORKLOAD_SANDBOXES=1 deploy/k8s/setup.sh ...`). Without it, `sandboxes` is refused as any
+unknown field is (`400 workload_field_not_allowed`), and everything above is unchanged.
+
+`POST /workloads` takes `"sandboxes": {"count": 1, "tier": "container"}`. `count` is 1 to
+`MOCA_WORKLOAD_MAX_SANDBOXES` (default 2, `400 sandboxes_count_invalid` otherwise). `tier` is
+`container`, the default; `microvm` answers `400 sandbox_tier_unavailable`, because microVM hosts sit
+outside the cluster.
+
+1. **Activate** freezes the revision as before, then the record moves to `provisioning` and Moca asks
+   the provisioner for the sandboxes. The answer is `202` with `status: provisioning`.
+1. The provisioner creates a StatefulSet, a headless Service and a Secret holding a signed attach
+   token, all named after the workload's derived Context name, in `moca-sandbox`. The pods start
+   from the PodTemplate `moca-workload-sandbox` (below). They attach to the relay with that token,
+   and the relay labels their records with the workload and its owner from the token alone.
+1. **`GET`** (or a repeat activate) counts the workload's attached sandboxes and moves the record to
+   `ready` once all `count` are there. Until then runs answer `409 workload_not_ready`. `GET` shows
+   `sandboxes: {count, tier, ready}`.
+1. **Runs** execute only on the workload's own sandboxes, of the same owner. The context still
+   arrives by copy, as above, now onto those sandboxes. When none is attached (a pod restarting),
+   the run answers `503 workload_sandbox_unavailable` with `Retry-After`; it never falls back to the
+   shared pool. A worker that can never serve it (no relay sandbox pool) fails the run instead.
+1. **Delete** removes the sandboxes first and waits until no pod remains, then deletes the Context
+   and the record. If pods are still terminating after `MOCA_PROVISIONER_DELETE_WAIT_MS` (default
+   60 s), it answers `202` with `status: deleting`, and a repeated `DELETE` finishes it.
+
+A failed provisioning leaves the record in `provisioning` with an `error` field, since a frozen
+revision cannot be unfrozen; a repeat activate with the same revision retries. The `error` goes once
+the record is `ready`, so a request that timed out but did create the sandboxes leaves no trace. The
+provisioner's refusals pass through on activate:
+
+| Answer                             | Meaning                                                                                                                              | Way out                                                     |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| `429 owner_sandbox_quota_exceeded` | The owner's sandboxes across all workloads would exceed `MOCA_OWNER_MAX_SANDBOXES` (default 4). Has `Retry-After`.                   | Delete another workload, then repeat the activate           |
+| `400 sandboxes_count_exceeded`     | `count` is above the provisioner's `MOCA_WORKLOAD_MAX_SANDBOXES`, which is lower than the workers'. An operator mismatch.            | `DELETE`, then re-create                                    |
+| `400` (other `sandbox*` codes)     | The provisioner refused the request itself (`sandbox_tier_unavailable`, `sandboxes_count_invalid`, ...).                             | `DELETE`, then re-create                                    |
+| `409 workload_object_conflict`     | An object under the workload's derived name in `moca-sandbox` is not this workload's.                                                | An operator removes it                                      |
+| `422 workload_refused`             | The cluster refused the workload's objects: the admission policy (an operator's PodTemplate outside its rules) or an invalid object. | An operator fixes the PodTemplate, then repeat, or `DELETE` |
+| `502 provisioner_error`            | The provisioner could not be reached, or Kubernetes failed behind it.                                                                | Repeat the activate                                         |
+
+A refusal no repeat can fix leaves the record `provisioning` with that `error`: the revision is
+frozen, so `DELETE` (which removes whatever was created) is the way out.
+
+The worker presents its service token (`MOCA_PROVISIONER_TOKEN`) and forwards the caller's API token.
+The provisioner verifies that token itself and derives the workload's names from its owner, so a
+worker can provision only for users whose tokens it holds. The attach token lasts
+`MOCA_ATTACH_TOKEN_TTL_S` (default a day) and is re-minted once half of that is left; the sandbox
+reconnects with the new one when no command is running.
+
+**What the provisioner can do.** Its Role covers StatefulSets, Services and Secrets in
+`moca-sandbox`, but it never reads a Secret: it writes each workload's token blind and keeps the
+token's expiry on the StatefulSet (`moca.dev/attach-exp`). A ValidatingAdmissionPolicy (Kubernetes
+1.30 or newer) holds what it writes to workload names (`w-<32 hex>`, `w-<32 hex>-attach`), to a
+headless, port-less Service selecting only the workload's own pods, and to a pod whose volumes are
+only `emptyDir`, `configMap`, `downwardAPI` and its own token Secret, that runs as
+`moca-workload-sandbox` with no service-account token, and uses no host namespace or privileged
+container. Its egress is the Kubernetes API
+server's addresses only, which `setup.sh` reads from the `kubernetes` Service. It runs as exactly one
+replica: the per-owner cap, and the order of one owner's activations, deletes and token re-mints, are
+serialized inside the process. Never scale it: a second replica makes the cap advisory. A request
+that only keeps or lowers a workload's `count` is never refused by the cap.
+
+**The pod template.** The PodTemplate `moca-workload-sandbox` in `moca-sandbox`
+(`deploy/k8s/base/workload-sandboxes/template.yaml`) is what every workload sandbox starts from: the
+shared pool's image, resources, relay address and hardening, without its relay token. Patch it in an
+overlay like any other manifest; the admission policy holds the result to the rules above. It is read
+when a workload's StatefulSet is created, so a change reaches workloads created after it.
+
+**Turning it off.** `SH_WORKLOAD_SANDBOXES=` removes the provisioner and its objects, and is refused
+while any workload's sandboxes exist: delete those workloads first, or pass
+`--delete-workload-sandboxes` to delete their StatefulSets, Services and Secrets with it. It
+stops the provisioner before it checks, so no activate can add sandboxes in between. The
+workload records stay: their runs answer `503 workload_sandbox_unavailable`, and deleting them needs
+the feature on again, so prefer deleting the workloads first.
+
 ## Names are per user
 
 Each user has their own names: two users can each own `demo`. Another user's workload is
@@ -171,26 +252,28 @@ Context's owner.
 
 ## Settings
 
-| Variable                                 | Meaning                                                                 |
-| ---------------------------------------- | ----------------------------------------------------------------------- |
-| `MOCA_CONTEXT_WORKLOADS_ENABLED`         | `1` turns the routes on, together with `CONTEXT_SERVICE_URL`            |
-| `CONTEXT_SERVICE_URL`                    | Internal base URL of Context Service                                    |
-| `CONTEXT_SERVICE_TOKEN`                  | Bearer Context Service accepts for its trusted routes                   |
-| `CONTEXT_SERVICE_PUBLIC_URL`             | Base URL clients upload to; HTTPS, or HTTP on loopback only             |
-| `CONTEXT_SERVICE_NAMESPACE`              | Context namespace; defaults to `POD_NAMESPACE`, then `default`          |
-| `CONTEXT_SERVICE_TIMEOUT_MS`             | Per-request timeout, default `5000`                                     |
-| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER`   | Live workloads per user, default `5`                                    |
-| `MOCA_CONTEXT_MAX_STORAGE_GIB`           | Largest `workspace.size`, default `10`                                  |
-| `MOCA_CONTEXT_STORAGE_CLASSES`           | Comma-separated StorageClasses a caller may name; empty allows none     |
-| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`      | How long `GET` still reports a deleted workload, default `86400`        |
-| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`          | Largest bundle a run downloads, default `268435456` (256 MiB)           |
-| `MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES` | Most a bundle may inflate to, default `1342177280` (1.25 GiB)           |
-| `MOCA_CONTEXT_BUNDLE_MAX_ENTRIES`        | Most entries a bundle may hold, default `10000`                         |
-| `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`        | Moca's in-memory bundle cache, default `67108864` (64 MiB)              |
-| `MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES`     | Bytes all downloads in flight may buffer, default `536870912` (512 MiB) |
-| `MOCA_CONTEXT_EXPORT_TIMEOUT_MS`         | Timeout for one bundle download, default `300000`                       |
-| `MOCA_CONTEXT_CACHE_SECRET`              | Secret for the sandbox cache names; random per process if unset         |
-| `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES`    | Minutes an unused revision stays on a sandbox, default `0`              |
+| Variable                                 | Meaning                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MOCA_CONTEXT_WORKLOADS_ENABLED`         | `1` turns the routes on, together with `CONTEXT_SERVICE_URL`                                                                                                                                                                                                                                                                                                                                                  |
+| `CONTEXT_SERVICE_URL`                    | Internal base URL of Context Service                                                                                                                                                                                                                                                                                                                                                                          |
+| `CONTEXT_SERVICE_TOKEN`                  | Bearer Context Service accepts for its trusted routes                                                                                                                                                                                                                                                                                                                                                         |
+| `CONTEXT_SERVICE_PUBLIC_URL`             | Base URL clients upload to; HTTPS, or HTTP on loopback only                                                                                                                                                                                                                                                                                                                                                   |
+| `CONTEXT_SERVICE_NAMESPACE`              | Context namespace; defaults to `POD_NAMESPACE`, then `default`                                                                                                                                                                                                                                                                                                                                                |
+| `CONTEXT_SERVICE_TIMEOUT_MS`             | Per-request timeout, default `5000`                                                                                                                                                                                                                                                                                                                                                                           |
+| `MOCA_CONTEXT_MAX_WORKLOADS_PER_OWNER`   | Live workloads per user, default `5`                                                                                                                                                                                                                                                                                                                                                                          |
+| `MOCA_CONTEXT_MAX_STORAGE_GIB`           | Largest `workspace.size`, default `10`                                                                                                                                                                                                                                                                                                                                                                        |
+| `MOCA_CONTEXT_STORAGE_CLASSES`           | Comma-separated StorageClasses a caller may name; empty allows none                                                                                                                                                                                                                                                                                                                                           |
+| `MOCA_WORKLOAD_DELETED_TTL_SECONDS`      | How long `GET` still reports a deleted workload, default `86400`                                                                                                                                                                                                                                                                                                                                              |
+| `MOCA_CONTEXT_ROLLBACK_RETRY_ATTEMPTS`   | Attempts at the create-rollback's Context Service cleanup, including the first, while Context Service is unreachable, default `3` (so up to 2 retries after the first attempt). `1` means no retry. Each attempt can take up to `CONTEXT_SERVICE_TIMEOUT_MS`; against a black-holed Context Service, a failed create answers in roughly `attempts × CONTEXT_SERVICE_TIMEOUT_MS + (attempts - 1) × backoff` ms |
+| `MOCA_CONTEXT_ROLLBACK_RETRY_BACKOFF_MS` | Backoff between those attempts, default `500`                                                                                                                                                                                                                                                                                                                                                                 |
+| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`          | Largest bundle a run downloads, default `268435456` (256 MiB)                                                                                                                                                                                                                                                                                                                                                 |
+| `MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES` | Most a bundle may inflate to, default `1342177280` (1.25 GiB)                                                                                                                                                                                                                                                                                                                                                 |
+| `MOCA_CONTEXT_BUNDLE_MAX_ENTRIES`        | Most entries a bundle may hold, default `10000`                                                                                                                                                                                                                                                                                                                                                               |
+| `MOCA_CONTEXT_BUNDLE_CACHE_BYTES`        | Moca's in-memory bundle cache, default `67108864` (64 MiB)                                                                                                                                                                                                                                                                                                                                                    |
+| `MOCA_CONTEXT_DOWNLOAD_BUDGET_BYTES`     | Bytes all downloads in flight may buffer, default `536870912` (512 MiB)                                                                                                                                                                                                                                                                                                                                       |
+| `MOCA_CONTEXT_EXPORT_TIMEOUT_MS`         | Timeout for one bundle download, default `300000`                                                                                                                                                                                                                                                                                                                                                             |
+| `MOCA_CONTEXT_CACHE_SECRET`              | Secret for the sandbox cache names; random per process if unset                                                                                                                                                                                                                                                                                                                                               |
+| `MOCA_CONTEXT_SANDBOX_RETAIN_MINUTES`    | Minutes an unused revision stays on a sandbox, default `0`                                                                                                                                                                                                                                                                                                                                                    |
 
 A missing token or an unsafe public URL answers `500 workloads_misconfigured`.
 

@@ -1,0 +1,34 @@
+# The pod every workload sandbox starts from (spec §4.2). moca-provisioner reads it when it creates a
+# workload's StatefulSet, and adds only the binding: the labels, SANDBOX_ID, SANDBOX_TIER, and the
+# workload's attach token as a file (SANDBOX_TOKEN_FILE at /run/moca-attach/token). Patch it like any
+# other manifest; it starts as base/sandbox.yaml's container without the shared relay token.
+# admission-policy.yaml refuses a StatefulSet that strays from the safety rules, whatever this says.
+#
+# Read at create only: a change reaches workloads created after it, not the running ones.
+apiVersion: v1
+kind: PodTemplate
+metadata: { name: moca-workload-sandbox, namespace: moca-sandbox }
+template:
+  metadata: { labels: { app: moca-workload-sandbox } }
+  spec:
+    serviceAccountName: moca-workload-sandbox
+    automountServiceAccountToken: false
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001 # the image's USER; /workspace and /home/sandbox are 1001:0, mode 775
+      runAsGroup: 0
+      fsGroup: 0
+      seccompProfile: { type: RuntimeDefault }
+    containers:
+      - name: sandbox
+        image: moca-remote-worker
+        env:
+          - { name: RELAY_ADDR, value: 'sandbox-relay-attach.moca.svc:9443' }
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: [ALL] }
+          # Writable root on purpose, as the shared pool's: agent tools run here.
+          readOnlyRootFilesystem: false
+        resources:
+          requests: { cpu: 10m, memory: 64Mi }
+          limits: { memory: 512Mi }

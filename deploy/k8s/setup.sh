@@ -4,6 +4,7 @@
 #   deploy/k8s/setup.sh --target kind|kind-ci|ocp|ocp-single [--image IMG] [--sandbox-image IMG]
 #                       [--build|--skip-build] [--tls-cert FILE --tls-key FILE]
 #                       [--relay-tls-cert FILE --relay-tls-key FILE] [--tls-secret NAME]
+#                       [--delete-workload-sandboxes]
 #
 # Environment: KIND_CLUSTER (kind only: the cluster name, default moca), SH_GITHUB_CLIENT_ID,
 # SH_ADMIN_SUBJECTS, SH_ALLOW_OPERATOR_FALLBACK (default false),
@@ -24,13 +25,17 @@
 # default, allows only those; a URL, port or path is refused -- the control plane would refuse to
 # boot on it), SH_PUBLIC_HARNESS_URL (port-forward-reached targets only: override the default
 # http://127.0.0.1:8080 when 8080 conflicts on the host; the URL's port is also the printed
-# port-forward's local port), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
+# port-forward's local port), SH_WORKLOAD_SANDBOXES=1 (kind, kind-ci and ocp: run moca-provisioner,
+# so a workload created with `sandboxes` gets sandboxes of its own; workload sandboxes spec §4; off
+# when unset or empty. Turning it off is refused while a workload's sandboxes exist -- delete those
+# workloads first, or pass --delete-workload-sandboxes to delete their StatefulSets, Services and
+# Secrets with it), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
-# SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT, SH_MODEL_CATALOG_HOSTS and, on
-# ocp-single, SH_ROUTE_DOMAIN and --tls-secret it is not given; an explicitly empty variable
-# (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
+# SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT, SH_MODEL_CATALOG_HOSTS,
+# SH_WORKLOAD_SANDBOXES and, on ocp-single, SH_ROUTE_DOMAIN and --tls-secret it is not given; an
+# explicitly empty variable (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
 # a command line -- values travel through pipes and through the environment of the one jq that
 # writes each Secret.
 set -euo pipefail
@@ -77,6 +82,16 @@ EGRESS_EXCEPT_GIVEN=''
 # --tls-secret: a preinstalled kubernetes.io/tls Secret to serve the supervisor's Route with,
 # instead of --tls-cert or a generated self-signed one. ocp-single only, and only with Routes.
 TLS_SECRET=''
+# SH_WORKLOAD_SANDBOXES (spec §4): 1 runs moca-provisioner, '' does not. Sticky, resolved in
+# load_setup_inputs; WORKLOAD_SANDBOXES_GIVEN: the variable was set (even to empty).
+WORKLOAD_SANDBOXES=''
+WORKLOAD_SANDBOXES_GIVEN=''
+# --delete-workload-sandboxes: turning SH_WORKLOAD_SANDBOXES off also deletes the workloads'
+# sandboxes, instead of refusing while any exist.
+DELETE_WORKLOAD_SANDBOXES=''
+# The provisioner's egress to the Kubernetes API server (kube_api_egress), as a NetworkPolicy
+# egress list in JSON; set only with SH_WORKLOAD_SANDBOXES=1.
+KUBE_API_EGRESS=''
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() {
@@ -102,6 +117,7 @@ parse_args() {
     --relay-tls-cert) need_value "$1" $# "${2-}"; RELAY_TLS_CERT="$2"; shift 2 ;;
     --relay-tls-key) need_value "$1" $# "${2-}"; RELAY_TLS_KEY="$2"; shift 2 ;;
     --tls-secret) need_value "$1" $# "${2-}"; TLS_SECRET="$2"; shift 2 ;;
+    --delete-workload-sandboxes) DELETE_WORKLOAD_SANDBOXES=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -196,6 +212,15 @@ parse_args() {
   # must be refused here instead of crashlooping it after the apply.
   valid_catalog_hosts "${SH_MODEL_CATALOG_HOSTS-}" ||
     die "SH_MODEL_CATALOG_HOSTS='${SH_MODEL_CATALOG_HOSTS-}' must be comma-separated bare hostnames (no scheme, port or path), or empty"
+  WORKLOAD_SANDBOXES_GIVEN="${SH_WORKLOAD_SANDBOXES+x}"
+  case "${SH_WORKLOAD_SANDBOXES-}" in
+  '' | 1) WORKLOAD_SANDBOXES="${SH_WORKLOAD_SANDBOXES-}" ;;
+  *) die "SH_WORKLOAD_SANDBOXES='$SH_WORKLOAD_SANDBOXES' must be 1 (on) or empty (off)" ;;
+  esac
+  # ocp-single puts the sandboxes in the namespace with everything else, so a workload's pods would
+  # share it with the supervisor's Secrets: the provisioner's isolation needs the sandbox namespace.
+  [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp-single ]] ||
+    die 'SH_WORKLOAD_SANDBOXES=1 needs a separate sandbox namespace: use --target kind, kind-ci or ocp'
   SH_WAIT_SECONDS="${SH_WAIT_SECONDS:-120}"
 }
 
@@ -461,6 +486,18 @@ load_setup_inputs() {
       '{SH_SANDBOX_COUNT: $n, IMAGE: $i, SANDBOX_IMAGE: $s, SH_P4_SANDBOX_IDS: $p, SH_SANDBOX_DEFAULT_TIER: $t}
         | with_entries(select(.value != ""))')"
   fi
+  local was_workload_sandboxes
+  was_workload_sandboxes="$(cm_value "$json" SH_WORKLOAD_SANDBOXES)"
+  [[ -n "$WORKLOAD_SANDBOXES_GIVEN" ]] || WORKLOAD_SANDBOXES="$was_workload_sandboxes"
+  [[ "$WORKLOAD_SANDBOXES" == '' || "$WORKLOAD_SANDBOXES" == 1 ]] ||
+    die "moca-setup holds SH_WORKLOAD_SANDBOXES='$WORKLOAD_SANDBOXES': re-run with it set to 1 or empty"
+  [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp-single ]] ||
+    die 'moca-setup holds SH_WORKLOAD_SANDBOXES=1, which --target ocp-single cannot run: re-run with SH_WORKLOAD_SANDBOXES='
+  # Before moca-setup records the change, so a refusal leaves the feature on and a re-run checks again.
+  [[ "$was_workload_sandboxes" != 1 || "$WORKLOAD_SANDBOXES" == 1 ]] || disable_workload_sandboxes
+  [[ "$WORKLOAD_SANDBOXES" != 1 ]] || kube_api_egress
+  data="$(jq -nc --argjson d "$data" --arg w "$WORKLOAD_SANDBOXES" \
+    '($d + {SH_WORKLOAD_SANDBOXES: $w}) | with_entries(select(.value != ""))')"
   # The extra sandbox egress exceptions apply on every target, Kind too (#446).
   [[ -n "$EGRESS_EXCEPT_GIVEN" ]] || EGRESS_EXCEPT="$(normalize_egress_except "$(cm_value "$json" SH_SANDBOX_EGRESS_EXCEPT)")"
   data="$(jq -nc --argjson d "$data" --arg e "${EGRESS_EXCEPT// /,}" \
@@ -672,11 +709,113 @@ ensure_mu1_secret() {
   )
 }
 
+# moca-provisioner's Secret (spec §3.1, §4.1), only with SH_WORKLOAD_SANDBOXES=1: its Ed25519 attach
+# key (MOCA_ATTACH_PRIVATE_KEY) and the public half the relay verifies with (MOCA_ATTACH_PUBLIC_KEYS),
+# from the same key generator as moca-mu1's signing key -- an attach key is a different key of the
+# same kind -- and the workers' service token. Kept once made, like every other Secret here; turning
+# the feature off leaves it, unreferenced.
+ensure_provisioner_secret() {
+  [[ "$WORKLOAD_SANDBOXES" == 1 ]] || return 0
+  local json priv pub svc
+  json="$(secret_json moca-provisioner "$NS")"
+  priv="$(json_value "$json" MOCA_ATTACH_PRIVATE_KEY)"
+  pub="$(json_value "$json" MOCA_ATTACH_PUBLIC_KEYS)"
+  svc="$(json_value "$json" MOCA_PROVISIONER_TOKEN)"
+  json=''
+  if { [[ -n "$priv" ]] && [[ -z "$pub" ]]; } || { [[ -z "$priv" ]] && [[ -n "$pub" ]]; }; then
+    die 'moca-provisioner holds half an attach keypair: delete both MOCA_ATTACH_ keys and re-run to generate a matching pair'
+  fi
+  [[ -n "$svc" ]] || { log 'generating MOCA_PROVISIONER_TOKEN'; svc="$(rand_hex)"; }
+  if [[ -z "$priv" ]]; then
+    log 'generating the attach-token signing key (in the harness image)'
+    GENKEYS_OUT="$(genkeys)" || die "could not run the key generator in $(harness_ref)"
+    priv="$(generated_value SH_SESSION_TOKEN_PRIVATE_KEY '[A-Za-z0-9+/]+=*')"
+    pub="$(generated_value SH_SESSION_TOKEN_PUBLIC_KEYS '[0-9a-f]{16}:[A-Za-z0-9+/]+=*')"
+    GENKEYS_OUT=''
+  fi
+  (
+    export S_0="$priv" S_1="$pub" S_2="$svc"
+    apply_secret moca-provisioner "$NS" MOCA_ATTACH_PRIVATE_KEY MOCA_ATTACH_PUBLIC_KEYS MOCA_PROVISIONER_TOKEN
+  )
+}
+
+# Turning SH_WORKLOAD_SANDBOXES off (load_setup_inputs, only when it was on). A workload's
+# StatefulSet left behind would keep its pods attached with nothing to delete them, so this refuses
+# while any exist, unless --delete-workload-sandboxes asked for them to go too. The provisioner is
+# stopped first, so no activate can create sandboxes between the check and the delete; a refusal
+# starts it again. The check and the delete use one selector. Then it removes the component's own
+# objects: `apply -k` without the component would leave them running. The Secret moca-provisioner
+# stays, unreferenced, as every generated Secret does.
+WORKLOAD_SELECTOR='app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner'
+disable_workload_sandboxes() {
+  local sets waited=0
+  if [[ -n "$(kc get deployment moca-provisioner -n "$NS" --ignore-not-found -o name)" ]]; then
+    log 'SH_WORKLOAD_SANDBOXES off: stopping moca-provisioner before checking for workload sandboxes'
+    kc scale deployment/moca-provisioner -n "$NS" --replicas=0 >/dev/null
+    while [[ -n "$(kc get pods -n "$NS" -l app=moca-provisioner -o name)" ]]; do
+      [[ "$waited" -lt "$SH_WAIT_SECONDS" ]] ||
+        die "moca-provisioner's pod is still running ${SH_WAIT_SECONDS}s after scaling it to 0: see 'kubectl -n $NS get pods -l app=moca-provisioner'"
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+  sets="$(kc get statefulsets -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" -o name)"
+  if [[ -n "$sets" ]]; then
+    if [[ -z "$DELETE_WORKLOAD_SANDBOXES" ]]; then
+      kc scale deployment/moca-provisioner -n "$NS" --replicas=1 >/dev/null ||
+        log 'WARNING: could not start moca-provisioner again; re-run with SH_WORKLOAD_SANDBOXES=1'
+      die "SH_WORKLOAD_SANDBOXES is being turned off, but workload sandboxes still exist in $SBX_NS ($(grep -c . <<<"$sets") StatefulSet(s) labelled $WORKLOAD_SELECTOR). Delete those workloads first (DELETE /workloads/{id}, or mocactl workloads delete ID), or re-run with --delete-workload-sandboxes to delete their StatefulSets, Services and Secrets"
+    fi
+    log "--delete-workload-sandboxes: deleting every workload's sandboxes in $SBX_NS"
+    kc delete statefulsets,services,secrets -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" --ignore-not-found >/dev/null
+  fi
+  log 'SH_WORKLOAD_SANDBOXES off: removing moca-provisioner and its policies'
+  kc delete -n "$NS" deployment/moca-provisioner service/moca-provisioner \
+    networkpolicy/moca-provisioner serviceaccount/moca-provisioner --ignore-not-found >/dev/null
+  kc delete -n "$SBX_NS" role/moca-provisioner rolebinding/moca-provisioner \
+    serviceaccount/moca-workload-sandbox podtemplate/moca-workload-sandbox \
+    networkpolicy/moca-workload-sandbox networkpolicy/allow-dns-workload-sandbox \
+    networkpolicy/allow-openshift-dns-workload-sandbox \
+    resourcequota/moca-sandbox --ignore-not-found >/dev/null
+  kc delete validatingadmissionpolicybinding/moca-provisioner \
+    validatingadmissionpolicy/moca-provisioner --ignore-not-found >/dev/null
+}
+
+# The provisioner's egress (workload-sandboxes/provisioner.yaml): the Kubernetes API server and
+# nothing else, by address. Its in-cluster address is the `kubernetes` Service's ClusterIP (what
+# KUBERNETES_SERVICE_HOST names) and, after kube-proxy's DNAT, the addresses in its EndpointSlices;
+# CNIs differ in which of the two a NetworkPolicy sees, so both are allowed, each on its own port.
+# Unreadable or empty is refused: falling back to 0.0.0.0/0 would undo the point. Also checks the
+# admission policy's API (Kubernetes 1.30 or newer), which apply_stack would otherwise fail on.
+kube_api_egress() {
+  local svc slices apis
+  # A failed read (auth, an unreachable API server) is not a missing API: kubectl's error shows.
+  apis="$(kc get --raw /apis/admissionregistration.k8s.io/v1)" ||
+    die 'SH_WORKLOAD_SANDBOXES=1: could not ask the API server which admission APIs it serves (kubectl'"'"'s error is above)'
+  jq -e '[.resources[].name] | index("validatingadmissionpolicies")' <<<"$apis" >/dev/null ||
+    die 'SH_WORKLOAD_SANDBOXES=1 needs ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1: Kubernetes 1.30 or newer, OpenShift 4.17 or newer), which this cluster does not serve'
+  svc="$(kc get service kubernetes -n default -o json)" ||
+    die 'SH_WORKLOAD_SANDBOXES=1: could not read Service default/kubernetes, which the provisioner'"'"'s egress policy is built from'
+  slices="$(kc get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json)" ||
+    die 'SH_WORKLOAD_SANDBOXES=1: could not read the EndpointSlices of Service default/kubernetes, which the provisioner'"'"'s egress policy is built from'
+  KUBE_API_EGRESS="$(jq -nc --argjson svc "$svc" --argjson sl "$slices" '
+    def peer: {ipBlock: {cidr: (if test(":") then "\(.)/128" else "\(.)/32" end)}};
+    [ { to: [$svc.spec.clusterIPs // [$svc.spec.clusterIP] | .[] | select(. != null and . != "None") | peer],
+        ports: [$svc.spec.ports[] | {protocol: (.protocol // "TCP"), port: .port}] },
+      { to: [$sl.items[].endpoints[]?.addresses[] | peer] | unique,
+        ports: [$sl.items[].ports[]? | {protocol: (.protocol // "TCP"), port: .port}] | unique } ]
+    | map(select((.to | length) > 0 and (.ports | length) > 0))')"
+  [[ "$(jq length <<<"$KUBE_API_EGRESS")" == 2 ]] ||
+    die 'SH_WORKLOAD_SANDBOXES=1: Service default/kubernetes has no ClusterIP or no endpoint addresses to build the provisioner'"'"'s egress policy from'
+  log "provisioner egress: the Kubernetes API at $(jq -r '[.[].to[].ipBlock.cidr] | join(", ")' <<<"$KUBE_API_EGRESS")"
+}
+
 ensure_secrets() {
   ensure_relay_secrets
   ensure_p4_tokens
   ensure_redis_secret
   ensure_mu1_secret
+  ensure_provisioner_secret
 }
 
 # --- Settings, TLS, SCC, the generated overlay, apply, wait (spec §4.1 steps 5-7) -----------------
@@ -1033,10 +1172,15 @@ write_p4_bundles() {
 grant_scc() {
   [[ "$TARGET" == ocp ]] || return 0
   local sa
-  for sa in moca-supervisor sandbox-relay redis moca-control-plane; do
+  local sas='moca-supervisor sandbox-relay redis moca-control-plane'
+  [[ "$WORKLOAD_SANDBOXES" != 1 ]] || sas="$sas moca-provisioner"
+  for sa in $sas; do
     oc adm policy add-scc-to-user nonroot-v2 -z "$sa" -n "$NS" >/dev/null
   done
   oc adm policy add-scc-to-user nonroot-v2 -z moca-sandbox -n "$SBX_NS" >/dev/null
+  # Workload sandboxes run the shared pool's UID 1001 under their own ServiceAccount.
+  [[ "$WORKLOAD_SANDBOXES" != 1 ]] ||
+    oc adm policy add-scc-to-user nonroot-v2 -z moca-workload-sandbox -n "$SBX_NS" >/dev/null
 }
 
 # image_entry FROM REF: a kustomize images: entry rewriting FROM to REF (tag or digest).
@@ -1077,13 +1221,18 @@ write_overlay() {
   {
     printf '# GENERATED by deploy/k8s/setup.sh on every run. Do not edit; gitignored.\n'
     printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../../overlays/%s\n' "$TARGET"
-    # P6.2 (spec §4.6): the relay's external path, only with P4 hosts; with none, slice 1's render.
-    [[ -z "$P4_IDS" ]] || printf 'components:\n  - ../../overlays/ocp/p4-relay\n'
-    # ocp-single's Routes (README §12.5), only when SH_ROUTE_DOMAIN opted in; with none, the
-    # port-forward render §12 describes. ocp-single refuses P4 IDs, so the two components never
-    # coexist and each printf is the only writer of the components: block.
-    if [[ "$TARGET" == ocp-single && -n "$ROUTE_DOMAIN" ]]; then
-      printf 'components:\n  - ../../overlays/ocp-single/routes\n'
+    # The components: block, each entry only when its feature is on; with none, no block at all.
+    # P6.2 (spec §4.6): the relay's external path, only with P4 hosts. ocp-single's Routes (README
+    # §12.5), only when SH_ROUTE_DOMAIN opted in. Workload sandboxes (workload sandboxes spec §4),
+    # only with SH_WORKLOAD_SANDBOXES=1, and on ocp their openshift-dns rule with them.
+    local components=()
+    [[ -z "$P4_IDS" ]] || components+=(../../overlays/ocp/p4-relay)
+    [[ "$TARGET" != ocp-single || -z "$ROUTE_DOMAIN" ]] || components+=(../../overlays/ocp-single/routes)
+    [[ "$WORKLOAD_SANDBOXES" != 1 ]] || components+=(../../base/workload-sandboxes)
+    [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp ]] || components+=(../../overlays/ocp/workload-sandboxes)
+    if [[ ${#components[@]} -gt 0 ]]; then
+      printf 'components:\n'
+      printf '  - %s\n' "${components[@]}"
     fi
     printf 'patches:\n'
     # base/control-plane.yaml's pod template has no annotations, so "add" creates the map.
@@ -1100,15 +1249,32 @@ write_overlay() {
       printf '      - { op: add, path: /spec/template/metadata/annotations, value: { %s } }\n' "$sandbox_ann"
       printf '  - target: { kind: Deployment, name: sandbox-relay }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/image-id: "%s" } }\n' "$HARNESS_IMAGE_ID"
     fi
+    # Workload sandboxes (the component's objects, which no base or target transformer reaches):
+    # the namespace's pod quota, the shared pool plus 32 workload sandboxes so it never refuses the
+    # shared pool; the provisioner's egress, the API server's addresses (kube_api_egress); and on
+    # kind, the same image IDs as the shared pool and relay, so a rebuilt image rolls the
+    # provisioner and reaches workload sandboxes created after it.
+    if [[ "$WORKLOAD_SANDBOXES" == 1 ]]; then
+      printf '  - target: { kind: ResourceQuota, name: moca-sandbox }\n    patch: |-\n      - { op: replace, path: /spec/hard/pods, value: "%s" }\n' "$((SH_SANDBOX_COUNT + 32))"
+      printf '  - target: { kind: NetworkPolicy, name: moca-provisioner }\n    patch: |-\n      - { op: replace, path: /spec/egress, value: %s }\n' "$KUBE_API_EGRESS"
+      if is_kind; then
+        printf '  - target: { kind: Deployment, name: moca-provisioner }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/image-id: "%s" } }\n' "$HARNESS_IMAGE_ID"
+        printf '  - target: { kind: PodTemplate, name: moca-workload-sandbox }\n    patch: |-\n      - { op: add, path: /template/metadata/annotations, value: { %s } }\n' "$sandbox_ann"
+      fi
+    fi
     # SH_SANDBOX_EGRESS_EXCEPT (#446): appended to the sandbox internet rule's except list, which is
     # egress[1] in the base and in ocp-single's patch-policies.yaml. The test op makes kustomize
     # fail loudly, rather than patch the wrong rule, if that ever moves.
+    # Workload sandboxes get the shared pool's egress, exceptions included.
     if [[ -n "$EGRESS_EXCEPT" ]]; then
-      printf '  - target: { kind: NetworkPolicy, name: moca-sandbox }\n    patch: |-\n'
-      printf '      - { op: test, path: /spec/egress/1/to/0/ipBlock/cidr, value: 0.0.0.0/0 }\n'
-      local cidr
-      for cidr in $EGRESS_EXCEPT; do
-        printf '      - { op: add, path: /spec/egress/1/to/0/ipBlock/except/-, value: %s }\n' "$cidr"
+      local cidr policy policies=moca-sandbox
+      [[ "$WORKLOAD_SANDBOXES" != 1 ]] || policies="$policies moca-workload-sandbox"
+      for policy in $policies; do
+        printf '  - target: { kind: NetworkPolicy, name: %s }\n    patch: |-\n' "$policy"
+        printf '      - { op: test, path: /spec/egress/1/to/0/ipBlock/cidr, value: 0.0.0.0/0 }\n'
+        for cidr in $EGRESS_EXCEPT; do
+          printf '      - { op: add, path: /spec/egress/1/to/0/ipBlock/except/-, value: %s }\n' "$cidr"
+        done
       done
     fi
     if [[ "$TARGET" == ocp ]]; then
@@ -1172,6 +1338,14 @@ write_overlay() {
         [[ -z "$SANDBOX_IMAGE" ]] || image_entry ghcr.io/rossoctl/moca-remote-worker "$SANDBOX_IMAGE"
       fi
     fi
+    # The component's images are the base's (ghcr.io/rossoctl/...:latest); on kind they become the
+    # loaded dev.local tags here, as overlays/kind does for the base. ocp's images: above already
+    # covers them.
+    if is_kind && [[ "$WORKLOAD_SANDBOXES" == 1 ]]; then
+      printf 'images:\n'
+      image_entry ghcr.io/rossoctl/moca "$LOCAL_HARNESS"
+      image_entry ghcr.io/rossoctl/moca-remote-worker "$LOCAL_SANDBOX"
+    fi
   } >"$GEN_DIR/kustomization.yaml"
 }
 
@@ -1202,6 +1376,7 @@ wait_ready() {
   done
   [[ -z "$(client_id)" ]] || kc rollout status deployment/moca-control-plane -n "$NS" --timeout=300s
   [[ "$SH_SANDBOX_COUNT" == 0 ]] || kc rollout status statefulset/moca-sandbox -n "$SBX_NS" --timeout=300s
+  [[ "$WORKLOAD_SANDBOXES" != 1 ]] || kc rollout status deployment/moca-provisioner -n "$NS" --timeout=300s
 }
 
 # The install is not done until the relay has mirrored every sandbox into sh:sandbox:records -- that

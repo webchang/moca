@@ -1187,3 +1187,50 @@ func TestSignalledExitIsNotCached(t *testing.T) {
 		t.Errorf("runner calls = %d, want 2: the signalled exit was cached", n)
 	}
 }
+
+// Idle is what main.go's token rotation waits for (workload sandboxes spec §3.1): false from an
+// Exec's admission until its terminal frame, true again after.
+func TestIdleTracksExecsInFlight(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{})}
+	s := session.New(testConfig(), r)
+	if !s.Idle() {
+		t.Fatal("a new session is not idle")
+	}
+	serve(t, s, st)
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+	st.exec(&pb.Exec{ReqId: 1, Command: "sleep", Streaming: true})
+	waitFor(t, "the exec to start", func() bool { return r.count() == 1 })
+	if s.Idle() {
+		t.Error("idle with an Exec running")
+	}
+	close(r.block)
+	waitFor(t, "terminal frame", func() bool { return terminalFor(st.sent(), 1) != nil })
+	waitFor(t, "idle after the terminal frame", s.Idle)
+}
+
+// A rotation must not drop a terminal frame still queued for the relay: Idle stays false after
+// the Exec has finished until its End has actually been sent, not merely queued.
+func TestIdleWaitsForTheTerminalFrameToBeSent(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{chunks: 3}
+	s := session.New(testConfig(), r)
+	serve(t, s, st)
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+	// Park every Send from here on: the Exec's frames queue up behind the drain.
+	st.gateSendAfter(0)
+	t.Cleanup(st.releaseGate)
+	st.exec(&pb.Exec{ReqId: 1, Command: "echo", Streaming: true})
+	waitFor(t, "the exec to run", func() bool { return r.count() == 1 })
+	// Long enough for runOne to return and queue its terminal frame.
+	time.Sleep(100 * time.Millisecond)
+	if terminalFor(st.sent(), 1) != nil {
+		t.Fatal("the terminal frame was sent through a parked Send")
+	}
+	if s.Idle() {
+		t.Fatal("idle while the Exec's terminal frame is still queued: a rotation would drop it")
+	}
+	st.releaseGate()
+	waitFor(t, "terminal frame", func() bool { return terminalFor(st.sent(), 1) != nil })
+	waitFor(t, "idle once it is sent", s.Idle)
+}

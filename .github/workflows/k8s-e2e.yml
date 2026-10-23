@@ -59,6 +59,14 @@ jobs:
           mkdir -p /tmp/k8s-logs
           K8S_LIVE_SMOKE=1 deploy/k8s/smoke.sh --target kind-ci 2>&1 | tee /tmp/k8s-logs/smoke.log
 
+      # After the smoke, so the default stack is what the smoke ran on. Re-running setup.sh with the
+      # feature on applies the workload-sandboxes component (images already loaded); the script then
+      # has the API server evaluate the admission policy with server-side dry runs.
+      - name: Workload sandboxes admission policy
+        run: |
+          SH_WORKLOAD_SANDBOXES=1 deploy/k8s/setup.sh --target kind-ci --skip-build
+          deploy/k8s/tests/workload-admission.sh --context kind-moca
+
       - name: Collect cluster state
         if: failure()
         run: |

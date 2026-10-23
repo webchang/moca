@@ -449,6 +449,12 @@ const NO_CAPACITY = new Set([
   'SandboxPoolEmptyError',
   // P6.3: the session's own sandbox is briefly absent. Same advice: retry after Retry-After.
   'SandboxAffinityPendingError',
+  // #452: the sandbox WAS leased and its host refused the exec on a memory or MaxRuns
+  // ceiling. The odd one out — the three above are raised before a turn starts, this one
+  // mid-turn — but the advice is identical, and 503 is what makes the same prompt retryable
+  // instead of answering 200 with the host's admission arithmetic quoted back as the
+  // model's reply.
+  'SandboxCapacityRefusedError',
 ]);
 
 export function turnErrorStatus(err: unknown): number {
@@ -1029,7 +1035,7 @@ async function resolveRunWorkload(
     res.writeHead(workload.status, JSON_HEADERS).end(JSON.stringify({ error: workload.error }));
     return null;
   }
-  const { contextName, revision, cacheScope } = workload;
+  const { contextName, revision, cacheScope, sandboxes } = workload;
   return {
     ...body,
     internalContext: {
@@ -1037,6 +1043,8 @@ async function resolveRunWorkload(
       cacheScope,
       loadBundle: () => downloadContextBundle(contextName, revision, owner),
       writable: body.contextWritable === true,
+      // A workload with sandboxes of its own runs only on them (workload sandboxes spec §3.3).
+      ...(sandboxes ?? {}),
     },
   };
 }
@@ -1120,6 +1128,17 @@ async function handleRunLeafParsed(
       await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
       delay = Math.min(delay * 2, cfg.maxBackoffMs);
       result = await runLeaf(body, buildConfig(auth));
+    }
+
+    if (result.status === 'failed' && result.reason === 'workload_sandbox_unavailable') {
+      // The workload's own sandboxes are absent (starting, restarting, or not yet attached), and a
+      // workload run never falls back to the shared pool (spec §3.3). Retryable, never persisted.
+      console.error('[runs] workload sandbox unavailable:', forLog(result.message ?? ''));
+      finalize({ status: 'failed', reason: 'workload_sandbox_unavailable' });
+      res
+        .writeHead(503, { ...JSON_HEADERS, 'Retry-After': String(cfg.retryAfterS) })
+        .end(JSON.stringify({ error: 'workload_sandbox_unavailable' }));
+      return;
     }
 
     if (isSaturated(result)) {

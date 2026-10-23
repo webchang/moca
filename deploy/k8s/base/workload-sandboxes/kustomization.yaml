@@ -1,0 +1,56 @@
+# Workload sandboxes on (workload sandboxes spec §4, ADR-0043). A Component, not part of the base:
+# setup.sh's generated overlay lists it only with SH_WORKLOAD_SANDBOXES=1, and every object of the
+# feature is here, so a stack without it renders exactly as before -- byte for byte.
+#
+#   provisioner.yaml       moca-provisioner: ServiceAccount, Role, Deployment, Service and its
+#                          NetworkPolicy; the workload sandboxes' ServiceAccount, NetworkPolicy and
+#                          the namespace's pod quota
+#   template.yaml          the PodTemplate every workload sandbox starts from (operators patch it)
+#   admission-policy.yaml  what the provisioner may write, enforced by the API server
+#   network-policy.yaml    DNS for workload sandboxes
+#
+# The component sits under the target's overlay, so the base's and target's image transformers never
+# see it: setup.sh's generated overlay carries the target's image rewrites (images:, below the
+# component) and its kind image-id annotations for the provisioner and the PodTemplate too.
+#
+# Needs the Secret moca-provisioner in moca (setup.sh generates it): MOCA_ATTACH_PRIVATE_KEY and
+# MOCA_PROVISIONER_TOKEN for the provisioner, MOCA_ATTACH_PUBLIC_KEYS for the relay, and
+# MOCA_PROVISIONER_TOKEN again for the supervisor's workers.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - provisioner.yaml
+  - template.yaml
+  - admission-policy.yaml
+  - network-policy.yaml
+# The base's placeholders, as base/kustomization.yaml maps them; the generated overlay's images:
+# then maps these on to the target's (dev.local on kind, --image on ocp).
+images:
+  - name: moca-harness
+    newName: ghcr.io/rossoctl/moca
+    newTag: latest
+  - name: moca-remote-worker
+    newName: ghcr.io/rossoctl/moca-remote-worker
+    newTag: latest
+patches:
+  - path: patch-relay.yaml
+  - path: patch-supervisor.yaml
+  # Workload sandboxes attach to the relay like the shared pool's.
+  - target: { kind: NetworkPolicy, name: sandbox-relay, namespace: moca }
+    patch: |-
+      - op: test
+        path: /spec/ingress/0/ports/0/port
+        value: 9443
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: moca-sandbox } }
+          podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  # The supervisor's workers call the provisioner.
+  - target: { kind: NetworkPolicy, name: moca-supervisor, namespace: moca }
+    patch: |-
+      - op: add
+        path: /spec/egress/-
+        value:
+          to: [{ podSelector: { matchLabels: { app: moca-provisioner } } }]
+          ports: [{ protocol: TCP, port: 8080 }]

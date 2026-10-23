@@ -1,7 +1,9 @@
 import {
+  CAPACITY_REFUSAL,
   DEFAULT_EXEC_TIMEOUT_S,
   DEFAULT_OUTPUT_CAP,
   OUTPUT_TRUNCATED_MARKER,
+  SandboxCapacityRefusedError,
   type SandboxTransport,
 } from './transport.js';
 import { makeReqIdSource } from './req-id.js';
@@ -169,7 +171,26 @@ export function GrpcRelayTransport(
             resolve({ stdout: Buffer.concat(stdout), exitCode: code, truncated: false }),
           );
         } else if (ev.error) {
-          finish(() => reject(new Error(ev.error!.message)));
+          // A CAPACITY REFUSAL IS NOT A COMMAND FAILURE (#452). Both arrive in this one
+          // frame because the wire has no "busy" form (CAPACITY_REFUSAL explains why),
+          // so this is the only place the two can still be told apart — and the only
+          // place the message is still the signal. Above here it is a type.
+          //
+          // Rejecting with a plain Error made `memory-budget: committing 301989888 more
+          // bytes ...` the bash tool's OUTPUT: operations.ts hands it to Pi's bash.ts,
+          // which bare-rethrows anything that is not 'aborted'/'timeout:', and Pi's
+          // agent loop turns a tool throw into `isError: true` content and KEEPS GOING.
+          // So the model read the host's admission-control arithmetic as its command's
+          // result, the turn ended `end_turn`, and the 503 the harness has machinery for
+          // was never produced.
+          const message = ev.error.message;
+          finish(() =>
+            reject(
+              CAPACITY_REFUSAL.test(message)
+                ? new SandboxCapacityRefusedError(message)
+                : new Error(message),
+            ),
+          );
         }
       });
       call.on('error', (err: Error) => finish(() => reject(err)));

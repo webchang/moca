@@ -458,7 +458,9 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 			}
 		}
 
-		if err := p.admitLocked(false); err != nil {
+		// admitOrEvictLocked, not admitLocked: this refusal reaches a transcript, so a
+		// coldest idle standby is shed to make room before one is returned (#452).
+		if err := p.admitOrEvictLocked(false); err != nil {
 			p.mu.Unlock()
 			return nil, nil, "", p.countRefusal(err)
 		}
@@ -576,7 +578,10 @@ func (p *pool) runLocked(key string) (*runPool, bool, error) {
 	if rp := p.runs[key]; rp != nil {
 		return rp, false, nil
 	}
-	if err := p.admitLocked(true); err != nil {
+	// admitOrEvictLocked, not admitLocked: a new workspace_key on a full host is #452's
+	// own repro ("create more distinct P4 sessions than the budget holds VMs"), and its
+	// refusal reaches a transcript, so a coldest idle standby is shed first.
+	if err := p.admitOrEvictLocked(true); err != nil {
 		return nil, false, err
 	}
 	dir, err := p.workspaceDir(key)

@@ -63,7 +63,11 @@ The control plane, the supervisor and the relay stay without Kubernetes permissi
 - Negative / accepted cost: one more Deployment, signing key and internal endpoint to operate.
 - Negative / accepted cost: a compromised provisioner can create pods in `moca-sandbox` and attach
   any Context there. A ResourceQuota bounds the first; nothing but its small surface bounds the
-  second.
+  second. It cannot read Secrets (its Role has no get or list on them), and a
+  ValidatingAdmissionPolicy holds the pods it creates to their own token Secret, their own
+  ServiceAccount and no host access, so it cannot borrow the shared pool's token or another
+  identity. That policy needs Kubernetes 1.30 or newer.
+- Negative / accepted cost: one replica only; the owner cap is serialized in process.
 - Negative / accepted cost: it provisions only the container tier. P4 (microVM) hosts sit outside
   the cluster and need a host-side provisioner.
 - Follow-up owed: the MI1 §2.3, §9.1 and §13 amendments; and the relay's Exec check

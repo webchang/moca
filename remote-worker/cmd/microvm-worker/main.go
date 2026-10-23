@@ -463,6 +463,12 @@ type diagStats struct {
 	ReapsInline       uint64 `json:"reapsInline"`
 	BarrierUnobserved uint64 `json:"barrierUnobserved"`
 	TimeoutsClamped   uint64 `json:"timeoutsClamped"`
+	// Only meaningful NEXT TO refusals["memory-budget"], which is why it is exposed here
+	// rather than left as an internal counter: this number alone cannot distinguish
+	// "eviction is absorbing the pressure" from "eviction has run out of idle standbys
+	// and the budget is genuinely too small" (#452). Stats.BudgetEvictions has the
+	// reading instructions.
+	BudgetEvictions uint64 `json:"budgetEvictions"`
 }
 
 func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
@@ -483,6 +489,7 @@ func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
 		ReapsInline:          st.ReapsInline,
 		BarrierUnobserved:    st.BarrierUnobserved,
 		TimeoutsClamped:      st.TimeoutsClamped,
+		BudgetEvictions:      st.BudgetEvictions,
 	}
 	for k, v := range st.ColdAcquires {
 		out.ColdAcquires[string(k)] = v

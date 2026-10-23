@@ -1,0 +1,180 @@
+# moca-provisioner (workload sandboxes spec §4, ADR-0043): the only MOCA component with Kubernetes
+# permissions in moca-sandbox. It creates each workload's StatefulSet, headless Service and
+# attach-token Secret there, and nothing else anywhere. Part of the workload-sandboxes component
+# only, so a stack without SH_WORKLOAD_SANDBOXES=1 has none of it.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: moca-provisioner, namespace: moca }
+---
+# Spec §4.1's table, verb for verb. No create on bare pods, nothing on PVCs beyond get, no rights
+# outside moca-sandbox. No get or list on Secrets: it writes its workloads' attach tokens blind
+# (create, or an unconditional update) and can never read one, so not moca-relay-attach either.
+# What its object names and pod specs may be is admission-policy.yaml's, whatever this Role allows.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: moca-provisioner, namespace: moca-sandbox }
+rules:
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [create, get, list, patch, delete]
+  - apiGroups: ['']
+    resources: [secrets]
+    verbs: [create, update, delete]
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [create, get, delete]
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: ['']
+    resources: [persistentvolumeclaims]
+    verbs: [get]
+  # The operator's workload sandbox pod template (template.yaml), and nothing else of its kind.
+  - apiGroups: ['']
+    resources: [podtemplates]
+    resourceNames: [moca-workload-sandbox]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: moca-provisioner, namespace: moca-sandbox }
+subjects:
+  - { kind: ServiceAccount, name: moca-provisioner, namespace: moca }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: moca-provisioner
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: moca-provisioner, namespace: moca }
+spec:
+  # !!! EXACTLY ONE REPLICA, ALWAYS, AND Recreate. Do not scale this (kubectl scale, an HPA, an
+  # overlay). The owner cap (MOCA_OWNER_MAX_SANDBOXES) and the ordering of one owner's PUT, DELETE
+  # and re-mint are serialized per owner inside this one process (spec §6.3). Two replicas -- or two
+  # pods during a rolling update -- would each pass the cap on the same count, making it advisory,
+  # and could let a DELETE interleave with a PUT and leave a workload's sandboxes behind. Nothing
+  # enforces this at runtime.
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: moca-provisioner } }
+  template:
+    metadata: { labels: { app: moca-provisioner } }
+    spec:
+      serviceAccountName: moca-provisioner
+      # Its Role, above, is the only thing this token is good for.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: provisioner
+          image: moca-harness
+          workingDir: /app/packages/provisioner
+          command: [node, --import, tsx, src/main.ts]
+          env:
+            - { name: HOME, value: /tmp }
+            - { name: MOCA_PROVISIONER_PORT, value: '8080' }
+            - { name: MOCA_SANDBOX_NAMESPACE, value: moca-sandbox }
+            # Caps (spec §6.3), enforced here as well as by the workers.
+            - { name: MOCA_WORKLOAD_MAX_SANDBOXES, value: '2' }
+            - { name: MOCA_OWNER_MAX_SANDBOXES, value: '4' }
+            - { name: MOCA_ATTACH_TOKEN_TTL_S, value: '86400' }
+            - { name: MOCA_PROVISIONER_RECONCILE_S, value: '300' }
+            # The control plane's public keys, to verify the API token a worker forwards.
+            - name: SH_SESSION_TOKEN_PUBLIC_KEYS
+              valueFrom: { secretKeyRef: { name: moca-mu1, key: SH_SESSION_TOKEN_PUBLIC_KEYS } }
+            - { name: CREDENTIALS_DIRECTORY, value: /run/credentials }
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: credentials, mountPath: /run/credentials, readOnly: true }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - name: credentials
+          secret:
+            secretName: moca-provisioner
+            # The signing key and the service token only: the public half goes to the relay.
+            items:
+              - { key: MOCA_ATTACH_PRIVATE_KEY, path: MOCA_ATTACH_PRIVATE_KEY }
+              - { key: MOCA_PROVISIONER_TOKEN, path: MOCA_PROVISIONER_TOKEN }
+            defaultMode: 256 # 0400
+---
+apiVersion: v1
+kind: Service
+metadata: { name: moca-provisioner, namespace: moca }
+spec:
+  selector: { app: moca-provisioner }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: moca-provisioner, namespace: moca }
+spec:
+  podSelector: { matchLabels: { app: moca-provisioner } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only the supervisor's workers call the internal API (spec §4.1).
+    - from: [{ podSelector: { matchLabels: { app: moca-supervisor } } }]
+      ports: [{ protocol: TCP, port: 8080 }]
+  # The Kubernetes API server only. Its addresses are the cluster's, so setup.sh's generated overlay
+  # replaces this with the `kubernetes` Service's ClusterIP and its EndpointSlice addresses and ports
+  # (setup.sh kube_api_egress), and refuses to install if it cannot read them. Rendered without
+  # setup.sh, the provisioner reaches nothing: it fails closed, never open to 0.0.0.0/0.
+  egress: []
+---
+# The workload sandboxes' own ServiceAccount (spec §4.2): no token, no binding. The admission policy
+# holds every workload pod to it.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: moca-workload-sandbox, namespace: moca-sandbox }
+automountServiceAccountToken: false
+---
+# Workload sandboxes (spec §4.2): the shared pool's egress -- the relay's attach port and the public
+# internet without private ranges -- so one workload's pods cannot reach another's. Selects pods
+# only the provisioner creates.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: moca-workload-sandbox, namespace: moca-sandbox }
+spec:
+  podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: moca } }
+          podSelector: { matchLabels: { app: sandbox-relay } }
+      ports:
+        - { protocol: TCP, port: 9443 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+---
+# The namespace backstop (spec §6.3): pods, for the shared pool plus workload sandboxes. setup.sh's
+# generated overlay sets it to SH_SANDBOX_COUNT + 32, so the shared pool is never what it refuses.
+# Storage and claim counts join it when Contexts move into moca-sandbox (spec §5.1, the mount PR):
+# until then no PVC lives here.
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: moca-sandbox, namespace: moca-sandbox }
+spec:
+  hard:
+    pods: '34'

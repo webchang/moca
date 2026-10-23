@@ -1,0 +1,14 @@
+# DNS for workload sandboxes, which resolve the relay's attach Service as the shared pool does.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns-workload-sandbox, namespace: moca-sandbox }
+spec:
+  podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }

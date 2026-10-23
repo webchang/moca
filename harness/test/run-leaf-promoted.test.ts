@@ -35,10 +35,18 @@ const { k8sSandboxExtensionMock, kubectlTransportMock } = vi.hoisted(() => ({
     close: vi.fn(async () => {}),
   })),
 }));
-vi.mock('@moca/k8s-sandbox', () => ({
-  k8sSandboxExtension: (...args: unknown[]) => k8sSandboxExtensionMock(...args),
-  KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
-}));
+// Spread the real module: run-leaf.ts also imports createCapacityLatch and
+// SandboxCapacityRefusedError from here (#452), and a factory listing only the two
+// overrides leaves those undefined — which fails as an `instanceof undefined` TypeError
+// inside a catch block rather than as a recognisable missing mock.
+vi.mock('@moca/k8s-sandbox', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@moca/k8s-sandbox')>();
+  return {
+    ...actual,
+    k8sSandboxExtension: (...args: unknown[]) => k8sSandboxExtensionMock(...args),
+    KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
+  };
+});
 
 import { runLeaf, type LeafEnvelope, type LeafResult } from '../src/run-leaf.js';
 

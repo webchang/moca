@@ -1,6 +1,12 @@
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { CpError, statusFor } from '@moca/control-plane';
+import {
+  CpError,
+  ownerScopeFor,
+  statusFor,
+  workloadKeyFor,
+  workloadRecordKey,
+} from '@moca/control-plane';
 import {
   assertContextServiceSettings,
   contextServiceConfigured,
@@ -10,8 +16,18 @@ import {
   deleteContext,
   evictContextBundles,
   freezeContext,
+  retryWhileUnreachable,
   type ContextStorage,
 } from './context-service.js';
+import { recordsKey } from '@moca/harness/pool-records';
+import { OWNER_LABEL, WORKLOAD_LABEL } from '@moca/harness/sandbox-affinity';
+import {
+  assertProvisionerSettings,
+  deleteSandboxes,
+  provisionerConfigured,
+  ProvisionerError,
+  provisionSandboxes,
+} from './provisioner-client.js';
 import { authenticateApiCaller, type TurnAuthDeps } from './turn-auth.js';
 
 /**
@@ -23,6 +39,10 @@ import { authenticateApiCaller, type TurnAuthDeps } from './turn-auth.js';
  * Names are scoped per owner (the first half of rossoctl/moca#358, per-user PVC authorization): the
  * record key includes a hash of the owner, so two users may both own `demo`, and another user's
  * workload is indistinguishable from a missing one.
+ *
+ * A workload created with `sandboxes` (phase 2, workload sandboxes spec §6.1) also gets sandboxes of
+ * its own from moca-provisioner at activation, and its runs execute only there. That needs
+ * MOCA_PROVISIONER_URL; without it, `sandboxes` is refused like any unknown field.
  */
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -33,9 +53,21 @@ const REVISION = /^[a-f0-9]{64}$/;
 // Context Service requires an uploaded bundle's type to match its Context's.
 const CONTEXT_TYPES = new Set(['workspace', 'state', 'memory', 'knowledge', 'artifacts']);
 const CREATE_FIELDS = new Set(['name', 'contextType', 'workspace']);
+/** Accepted only with the provisioner configured: off by default. */
+const SANDBOXES_FIELD = 'sandboxes';
+const SANDBOX_FIELDS = new Set(['count', 'tier']);
 const WORKSPACE_FIELDS = new Set(['size', 'storageClass']);
+/** Retry-After on a passed-through `429 owner_sandbox_quota_exceeded`. */
+const PROVISIONER_RETRY_AFTER_S = 30;
 
-type WorkloadStatus = 'creating' | 'awaiting_upload' | 'ready' | 'deleting' | 'deleted';
+type WorkloadStatus =
+  'creating' | 'awaiting_upload' | 'provisioning' | 'ready' | 'deleting' | 'deleted';
+
+/** A phase 2 workload's own sandboxes (spec §7). Absent on a phase 1 workload. */
+interface WorkloadSandboxes {
+  count: number;
+  tier: 'container';
+}
 
 interface WorkloadRecord {
   name: string;
@@ -49,6 +81,9 @@ interface WorkloadRecord {
   contextType: string;
   workspace: ContextStorage;
   revision?: string;
+  sandboxes?: WorkloadSandboxes;
+  /** Why the last provisioning attempt failed; cleared when one succeeds. */
+  error?: string;
 }
 
 /** The subset of the Redis result store the lifecycle uses. */
@@ -70,12 +105,9 @@ export function workloadsEnabled(): boolean {
   return process.env.MOCA_CONTEXT_WORKLOADS_ENABLED === '1' && contextServiceConfigured();
 }
 
-const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
-/** Scopes the owner's Redis keys. Anyone who knows the owner can compute it, which is fine there. */
-const recordScope = (owner: string) => sha256(owner).slice(0, 32);
-// `sh:wl:`, not `sh:workload:`: the upgrade note's cleanup of legacy records (`sh:workload:*`, see
-// docs/context-service.md) must never match a live workload.
-const recordKey = (owner: string, name: string) => `sh:wl:${recordScope(owner)}:${name}`;
+/** Scopes the owner's Redis keys (shared with moca-provisioner, @moca/control-plane workload-key.ts). */
+const recordScope = ownerScopeFor;
+const recordKey = workloadRecordKey;
 const quotaKey = (owner: string) => `sh:wl-quota:${recordScope(owner)}`;
 let cacheSecret: string | Buffer | undefined;
 
@@ -90,9 +122,11 @@ export function sandboxCacheScope(owner: string): string {
   return createHmac('sha256', cacheSecret).update(owner).digest('hex').slice(0, 32);
 }
 
-/** Unique per owner, name and reservation, so a rollback can never delete a newer Context. */
-const contextNameFor = (owner: string, name: string, generation: string) =>
-  `w-${sha256(`${owner}\0${name}\0${generation}`).slice(0, 32)}`;
+/**
+ * Unique per owner, name and reservation, so a rollback can never delete a newer Context. It is also
+ * the workload key moca-provisioner names the workload's sandboxes by (spec §3.1).
+ */
+const contextNameFor = workloadKeyFor;
 
 function positiveIntEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10);
@@ -151,14 +185,61 @@ async function findWorkload(
   return raw ? (JSON.parse(raw) as WorkloadRecord) : null;
 }
 
-function publicView(record: WorkloadRecord) {
+/** `ready` is the number of the workload's sandboxes attached to the relay, when it was counted. */
+function publicView(record: WorkloadRecord, ready?: number) {
   return {
     workloadId: record.name,
     status: record.status,
     contextType: record.contextType,
     workspace: record.workspace,
     ...(record.revision ? { revision: record.revision } : {}),
+    ...(record.sandboxes
+      ? {
+          sandboxes: {
+            ...record.sandboxes,
+            ready: ready ?? (record.status === 'ready' ? record.sandboxes.count : 0),
+          },
+        }
+      : {}),
+    ...(record.error ? { error: record.error } : {}),
   };
+}
+
+// The workload's sandboxes the relay has a presence record for. Their workload and owner labels come
+// from the signed attach token (spec §3.2), so a shared-pool sandbox cannot be counted here.
+const COUNT_ATTACHED = `
+local n = 0
+for _, v in ipairs(redis.call('HVALS', KEYS[1])) do
+  local ok, r = pcall(cjson.decode, v)
+  if ok and type(r) == 'table' and type(r.labels) == 'table'
+    and r.labels[ARGV[1]] == ARGV[3] and r.labels[ARGV[2]] == ARGV[4] then n = n + 1 end
+end
+return n`;
+
+async function countAttached(store: WorkloadStore, record: WorkloadRecord): Promise<number> {
+  return Number(
+    await store.eval(COUNT_ATTACHED, {
+      keys: [recordsKey()],
+      arguments: [WORKLOAD_LABEL, OWNER_LABEL, record.contextName, recordScope(record.owner)],
+    }),
+  );
+}
+
+/** The workload's own sandboxes, or the 400 code to refuse the create with. */
+function sandboxesSpec(value: unknown): WorkloadSandboxes | string {
+  if (!isObject(value) || Object.keys(value).some((key) => !SANDBOX_FIELDS.has(key))) {
+    return 'sandboxes_field_not_allowed';
+  }
+  // Container only: the provisioner creates pods in the cluster, and P4 hosts sit outside it.
+  const tier = value.tier ?? 'container';
+  if (tier === 'microvm') return 'sandbox_tier_unavailable';
+  if (tier !== 'container') return 'sandbox_tier_invalid';
+  const count = value.count ?? 1;
+  const max = positiveIntEnv('MOCA_WORKLOAD_MAX_SANDBOXES', 2);
+  if (!Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > max) {
+    return 'sandboxes_count_invalid';
+  }
+  return { count: count as number, tier };
 }
 
 function send(res: ServerResponse, status: number, body?: unknown): void {
@@ -225,6 +306,21 @@ function sendFailure(res: ServerResponse, operation: string, err: unknown): void
   console.error(`workload ${operation} failed:`, err);
   if (err instanceof WorkloadStateChangedError) {
     send(res, 409, { error: 'workload_state_changed' });
+  } else if (err instanceof ProvisionerError && err.code && err.status === 429) {
+    // The owner's cap across workloads (spec §6.3): it frees once the owner deletes a workload.
+    res
+      .writeHead(429, { ...JSON_HEADERS, 'Retry-After': String(PROVISIONER_RETRY_AFTER_S) })
+      .end(JSON.stringify({ error: err.code }));
+  } else if (
+    err instanceof ProvisionerError &&
+    err.code &&
+    (err.status === 400 || err.status === 409 || err.status === 422)
+  ) {
+    // The provisioner's own caps and conflicts, and the cluster refusing the objects (422
+    // workload_refused): the caller's or the operator's to act on, not an outage.
+    send(res, err.status, { error: err.code });
+  } else if (err instanceof ProvisionerError) {
+    send(res, 502, { error: 'provisioner_error' });
   } else if (err instanceof ContextServiceError && err.status === 409) {
     send(res, 409, { error: err.code ?? 'context_conflict' });
   } else if (err instanceof ContextServiceError) {
@@ -241,7 +337,9 @@ async function createWorkload(
   res: ServerResponse,
 ): Promise<void> {
   if (!isObject(body)) return send(res, 400, { error: 'workload_invalid' });
-  if (Object.keys(body).some((key) => !CREATE_FIELDS.has(key))) {
+  const allowed = (key: string) =>
+    CREATE_FIELDS.has(key) || (key === SANDBOXES_FIELD && provisionerConfigured());
+  if (Object.keys(body).some((key) => !allowed(key))) {
     return send(res, 400, { error: 'workload_field_not_allowed' });
   }
   const name = body.name ?? `wl-${randomUUID().slice(0, 8)}`;
@@ -258,6 +356,8 @@ async function createWorkload(
   }
   const storage = contextStorage(workspace);
   if (typeof storage === 'string') return send(res, 400, { error: storage });
+  const sandboxes = body.sandboxes === undefined ? undefined : sandboxesSpec(body.sandboxes);
+  if (typeof sandboxes === 'string') return send(res, 400, { error: sandboxes });
 
   const generation = randomUUID();
   const reserved: WorkloadRecord = {
@@ -268,6 +368,7 @@ async function createWorkload(
     status: 'creating',
     contextType,
     workspace: storage,
+    ...(sandboxes ? { sandboxes } : {}),
   };
   const reservation = String(
     await store.eval(RESERVE, {
@@ -306,12 +407,18 @@ async function createWorkload(
 async function rollbackCreate(store: WorkloadStore, reserved: WorkloadRecord): Promise<void> {
   try {
     let cleaned = true;
-    await deleteContext(reserved.contextName, reserved.owner).catch((err: unknown) => {
+    // Retry only while Context Service is unreachable (no HTTP response). A reply that already
+    // says "gone" or any 4xx/5xx with a status is terminal — it tells us the server saw us and
+    // decided. The retry absorbs transient blips (pod restart, momentary network loss).
+    await retryWhileUnreachable(() => deleteContext(reserved.contextName, reserved.owner), {
+      attempts: positiveIntEnv('MOCA_CONTEXT_ROLLBACK_RETRY_ATTEMPTS', 3),
+      backoffMs: positiveIntEnv('MOCA_CONTEXT_ROLLBACK_RETRY_BACKOFF_MS', 500),
+    }).catch((err: unknown) => {
       cleaned = false;
       // The Context name is derived and does not reveal the owner; log it so an operator can
       // delete the Context if no record is left for a retry to act on.
       console.error(
-        `workload create rollback could not delete Context ${reserved.contextName}:`,
+        `workload create rollback could not delete Context ${reserved.contextName} after retries:`,
         err,
       );
     });
@@ -338,6 +445,7 @@ async function activateWorkload(
   body: unknown,
   record: WorkloadRecord | null,
   store: WorkloadStore,
+  userToken: string,
   res: ServerResponse,
 ): Promise<void> {
   const revision = isObject(body) ? body.revision : undefined;
@@ -346,10 +454,11 @@ async function activateWorkload(
   }
   if (!record || record.status === 'deleted')
     return send(res, 404, { error: 'workload_not_found' });
-  if (record.status === 'ready') {
-    return record.revision === revision
-      ? send(res, 200, publicView(record))
-      : send(res, 409, { error: 'workload_already_active' });
+  if (record.status === 'ready' || record.status === 'provisioning') {
+    if (record.revision !== revision) return send(res, 409, { error: 'workload_already_active' });
+    if (record.status === 'ready') return send(res, 200, publicView(record));
+    // A repeat activation retries provisioning, which is idempotent (spec §6.1).
+    return provision(record, store, userToken, res);
   }
   if (record.status !== 'awaiting_upload') {
     return send(res, 409, { error: 'workload_not_activatable' });
@@ -359,7 +468,15 @@ async function activateWorkload(
     if (context.contextId !== record.contextId || context.frozenRevision !== revision) {
       throw new ContextServiceError('Context Service froze a different Context or revision');
     }
-    const ready: WorkloadRecord = { ...record, status: 'ready', revision };
+    if (record.sandboxes) {
+      // Freeze cannot be undone, so the record keeps the revision from here on, whatever happens
+      // to provisioning.
+      const provisioning: WorkloadRecord = { ...record, status: 'provisioning', revision };
+      if (!(await transition(store, record, provisioning))) throw new WorkloadStateChangedError();
+      return provision(provisioning, store, userToken, res);
+    }
+    const { error: _stale, ...rest } = record;
+    const ready: WorkloadRecord = { ...rest, status: 'ready', revision };
     if (!(await transition(store, record, ready))) throw new WorkloadStateChangedError();
     send(res, 200, publicView(ready));
   } catch (err) {
@@ -367,9 +484,89 @@ async function activateWorkload(
   }
 }
 
+/**
+ * Ask the provisioner for the workload's sandboxes, then answer `200 ready` once the relay has a
+ * record for each of them, or `202 provisioning` until then (GET and a repeat activate check again).
+ * A failure stays on the record as `error`, and the record stays `provisioning` for a retry. A
+ * refusal no retry can fix (a 400 such as `sandboxes_count_exceeded`, or `422 workload_refused`)
+ * stays the same way: the revision is frozen, so DELETE is the way out (docs/context-service.md).
+ */
+async function provision(
+  record: WorkloadRecord,
+  store: WorkloadStore,
+  userToken: string,
+  res: ServerResponse,
+): Promise<void> {
+  const sandboxes = record.sandboxes!;
+  try {
+    assertProvisionerSettings();
+    await provisionSandboxes(
+      { name: record.name, generation: record.generation, userToken },
+      { count: sandboxes.count, tier: sandboxes.tier, revision: record.revision! },
+    );
+  } catch (err) {
+    const error =
+      err instanceof ProvisionerError ? (err.code ?? 'provisioner_error') : 'internal_error';
+    // Best effort: the refusal below is the answer whether or not the error is recorded.
+    await transition(store, record, { ...record, error }).catch(() => false);
+    return sendFailure(res, 'provision', err);
+  }
+  try {
+    const { error: _cleared, ...current } = record;
+    const [view, status] = await settleProvisioning(store, current as WorkloadRecord, record);
+    send(res, status, view);
+  } catch (err) {
+    sendFailure(res, 'provision', err);
+  }
+}
+
+/**
+ * Move a `provisioning` record to `ready` once all its sandboxes have attached. `from` is the stored
+ * record the compare-and-set expects; `next` is what to keep when not every sandbox is there yet.
+ */
+async function settleProvisioning(
+  store: WorkloadStore,
+  next: WorkloadRecord,
+  from: WorkloadRecord = next,
+): Promise<[ReturnType<typeof publicView>, number]> {
+  const ready = await countAttached(store, next);
+  if (ready >= next.sandboxes!.count) {
+    // A ready workload carries no error: an earlier failed PUT is history once every sandbox is up.
+    const { error: _stale, ...rest } = next;
+    const active: WorkloadRecord = { ...rest, status: 'ready' };
+    if (!(await transition(store, from, active))) throw new WorkloadStateChangedError();
+    return [publicView(active), 200];
+  }
+  if (from.error !== next.error && !(await transition(store, from, next))) {
+    throw new WorkloadStateChangedError();
+  }
+  return [publicView(next, ready), 202];
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Delete the workload's sandboxes and wait, up to MOCA_PROVISIONER_DELETE_WAIT_MS, until no pod of
+ * it remains. False when pods are still terminating after that: the caller answers 202 and the
+ * owner's next DELETE continues.
+ */
+async function sandboxesGone(record: WorkloadRecord, userToken: string): Promise<boolean> {
+  assertProvisionerSettings();
+  if (!provisionerConfigured())
+    throw new Error('MOCA_PROVISIONER_URL is required to delete sandboxes');
+  const ref = { name: record.name, generation: record.generation, userToken };
+  const deadline = Date.now() + positiveIntEnv('MOCA_PROVISIONER_DELETE_WAIT_MS', 60_000);
+  for (;;) {
+    if (await deleteSandboxes(ref)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(1000);
+  }
+}
+
 async function deleteWorkload(
   record: WorkloadRecord | null,
   store: WorkloadStore,
+  userToken: string,
   res: ServerResponse,
 ): Promise<void> {
   if (!record || record.status === 'deleted')
@@ -379,6 +576,11 @@ async function deleteWorkload(
     const deleting: WorkloadRecord = { ...record, status: 'deleting' };
     if (record.status !== 'deleting' && !(await transition(store, record, deleting))) {
       throw new WorkloadStateChangedError();
+    }
+    // Sandboxes first, and only then the Context: Context Service refuses to delete a claim a pod
+    // still mounts (spec §6.1). Each step tolerates "already gone", so a retry finishes the rest.
+    if (record.sandboxes && !(await sandboxesGone(record, userToken))) {
+      return send(res, 202, publicView(deleting));
     }
     // Even while `creating`: the create may already have made the Context. An absent one is fine.
     await deleteContext(record.contextName, record.owner);
@@ -398,7 +600,13 @@ async function deleteWorkload(
 
 /** What a run needs from a workload, or the refusal to answer with. */
 export type WorkloadRun =
-  | { contextName: string; revision: string; cacheScope: string }
+  | {
+      contextName: string;
+      revision: string;
+      cacheScope: string;
+      /** Set for a workload with sandboxes of its own: the run selects only those (spec §3.3). */
+      sandboxes?: { workload: string; ownerScope: string };
+    }
   | { status: number; error: 'workload_not_found' | 'workload_not_ready' };
 
 /**
@@ -422,6 +630,9 @@ export async function resolveWorkloadRun(
     contextName: record.contextName,
     revision: record.revision,
     cacheScope: sandboxCacheScope(owner),
+    ...(record.sandboxes
+      ? { sandboxes: { workload: record.contextName, ownerScope: recordScope(owner) } }
+      : {}),
   };
 }
 
@@ -460,6 +671,7 @@ export async function handleWorkloads(
   }
   try {
     assertContextServiceSettings();
+    assertProvisionerSettings();
   } catch (err) {
     console.error('workloads are misconfigured:', err);
     return send(res, 500, { error: 'workloads_misconfigured' });
@@ -485,16 +697,41 @@ export async function handleWorkloads(
   }
   // Only the caller's own records are ever read, so another user's name looks absent.
   const record = NAME.test(name) ? await findWorkload(store, owner, name) : null;
+  // Forwarded to the provisioner, which verifies it itself and takes the owner from it (spec §4.1).
+  const userToken = bearerOf(req);
   switch (route) {
     case 'get':
-      return record
-        ? send(res, 200, publicView(record))
-        : send(res, 404, { error: 'workload_not_found' });
+      return getWorkload(record, store, res);
     case 'uploads':
       return createUpload(record, res);
     case 'activate':
-      return activateWorkload(body, record, store, res);
+      return activateWorkload(body, record, store, userToken, res);
     case 'delete':
-      return deleteWorkload(record, store, res);
+      return deleteWorkload(record, store, userToken, res);
+  }
+}
+
+/** The presented bearer; authenticateApiCaller has already verified it. */
+function bearerOf(req: IncomingMessage): string {
+  const raw = req.headers.authorization;
+  return (Array.isArray(raw) ? raw[0] : raw)?.replace(/^bearer\s+/i, '').trim() ?? '';
+}
+
+/**
+ * A `provisioning` record is moved to `ready` here once all its sandboxes have attached (spec §6.1
+ * step 4), by the same compare-and-set as every other transition. Nothing else is ever written.
+ */
+async function getWorkload(
+  record: WorkloadRecord | null,
+  store: WorkloadStore,
+  res: ServerResponse,
+): Promise<void> {
+  if (!record) return send(res, 404, { error: 'workload_not_found' });
+  if (record.status !== 'provisioning') return send(res, 200, publicView(record));
+  try {
+    const [view] = await settleProvisioning(store, record);
+    send(res, 200, view);
+  } catch (err) {
+    sendFailure(res, 'get', err);
   }
 }

@@ -40,10 +40,18 @@ const { kubectlTransportMock, execMock } = vi.hoisted(() => {
     })),
   };
 });
-vi.mock('@moca/k8s-sandbox', () => ({
-  k8sSandboxExtension: () => () => {},
-  KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
-}));
+// Spread the real module: run-leaf.ts also imports createCapacityLatch and
+// SandboxCapacityRefusedError from here (#452), and a factory listing only the two
+// overrides leaves those undefined — which fails as an `instanceof undefined` TypeError
+// inside a catch block rather than as a recognisable missing mock.
+vi.mock('@moca/k8s-sandbox', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@moca/k8s-sandbox')>();
+  return {
+    ...actual,
+    k8sSandboxExtension: () => () => {},
+    KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
+  };
+});
 
 // Keep RedisSessionBackend construction cheap and side-effect free; the body of realProduceSolve
 // won't reach any read/write path once attachPromotedConfig throws.

@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/rossoctl/moca/gen/go/sandbox/v1"
@@ -96,6 +97,23 @@ type Session struct {
 	cfg    Config
 	runner wexec.Runner
 	cache  *Cache
+	// inflight counts admitted Execs whose terminal frame has not been sent, across every
+	// connection, so main.go can rotate its attach token at an idle moment (Idle).
+	inflight atomic.Int64
+	// unsent counts frames put on a connection's outbound queue that its sender has not yet
+	// handed to Send. An Exec's terminal frame is queued before inflight drops, so Idle reads
+	// inflight first and then this: a terminal frame still behind chunks keeps the session busy.
+	unsent atomic.Int64
+}
+
+// Idle reports that no admitted Exec is queued or running, and that every frame queued for the
+// relay -- an Exec's terminal frame above all -- has been sent. main.go reconnects with a rotated
+// token file only then (workload sandboxes spec §3.1), so a rotation cuts no Exec short. An Exec
+// that arrives between this check and the reconnect fails with "worker disconnected", as any
+// reconnect's would.
+func (s *Session) Idle() bool {
+	// This order, not the reverse: see unsent.
+	return s.inflight.Load() == 0 && s.unsent.Load() == 0
 }
 
 func New(cfg Config, r wexec.Runner) *Session {
@@ -337,12 +355,14 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 				// Keep draining rather than returning: if this goroutine exited early,
 				// every later blocking enqueue below would block forever once the
 				// buffer filled, and wg.Wait() in Serve would never reach zero.
+				s.unsent.Add(-1)
 				continue
 			}
 			if err := st.Send(of.frame); err != nil {
 				failed = true
 				cancelConn()
 			}
+			s.unsent.Add(-1)
 		}
 	}()
 
@@ -377,6 +397,8 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 		// residency is low, and a producer holding a slot then finds the channel
 		// full. That starves chunk producers in favour of terminal frames, which is
 		// the intended priority — producers are exactly the ones allowed to block.
+		// Counted before it is queued, so the sender's decrement can never come first.
+		s.unsent.Add(1)
 		select {
 		case outbound <- outFrame{frame: f}:
 			return
@@ -385,6 +407,7 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 		select {
 		case outbound <- outFrame{frame: f}:
 		case <-connCtx.Done():
+			s.unsent.Add(-1)
 			<-chunkSlots // hand the slot back; nothing will ever drain this frame
 		}
 	}
@@ -407,10 +430,12 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 	// means the reserve ITSELF has not drained, i.e. egress is wedged rather than
 	// merely behind, which the caller handles by giving up on the connection.
 	trySend := func(f *pb.WorkerFrame) bool {
+		s.unsent.Add(1)
 		select {
 		case outbound <- outFrame{frame: f, reserved: true}:
 			return true
 		default:
+			s.unsent.Add(-1)
 			log.Printf("session: WARNING the terminal-frame reserve (%d slots) is undrained, so the "+
 				"terminal frame for req_id %d cannot be queued; treating egress as wedged and "+
 				"dropping the connection so the harness re-dials", TerminalReserve, reqIDOf(f))
@@ -450,10 +475,12 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 				if sl == nil {
 					// Defensive only: the sole path that removes a slot before dequeue
 					// is accept's queue-full branch, and that branch never enqueues.
+					s.inflight.Add(-1)
 					continue
 				}
 				s.runOne(sl.ctx, enqueue, e)
 				c.reg.finish(e.GetReqId())
+				s.inflight.Add(-1)
 			}
 		}()
 	}
@@ -612,9 +639,12 @@ func (s *Session) enqueueAdmitted(
 			"(req_id is only probabilistically unique across replicas — see spec §3.1)", reqID)
 	}
 
+	// Counted before the send, so a pool goroutine that finishes it at once cannot go below zero.
+	s.inflight.Add(1)
 	select {
 	case c.queue <- e:
 	default:
+		s.inflight.Add(-1)
 		// remove, not finish: this caller still holds cancel and calls it outside the
 		// lock, which is the scope this branch has always had.
 		c.reg.remove(reqID)

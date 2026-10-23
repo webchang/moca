@@ -153,7 +153,8 @@ export const ROUTES: RouteSpec[] = [
     operationId: 'activateWorkload',
     auth: 'subject',
     surface: 'internal',
-    summary: 'Freeze the uploaded revision; the workload becomes ready',
+    summary:
+      'Freeze the uploaded revision; the workload becomes ready (202 provisioning while its own sandboxes start)',
   },
   {
     method: 'GET',
@@ -169,6 +170,7 @@ export const ROUTES: RouteSpec[] = [
     operationId: 'deleteWorkload',
     auth: 'subject',
     surface: 'internal',
-    summary: 'Delete a workload and its Context',
+    summary:
+      'Delete a workload: its own sandboxes first (202 deleting while pods terminate), then its Context',
   },
 ];

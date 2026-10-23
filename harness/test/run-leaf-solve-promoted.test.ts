@@ -27,10 +27,20 @@ const { kubectlTransportMock } = vi.hoisted(() => ({
     close: vi.fn(async () => {}),
   })),
 }));
-vi.mock('@moca/k8s-sandbox', () => ({
-  k8sSandboxExtension: () => () => {},
-  KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
-}));
+// Spread the real module: run-leaf.ts also imports createCapacityLatch and
+// SandboxCapacityRefusedError from here (#452), and a factory listing only the two
+// overrides leaves those undefined — which fails as an `instanceof undefined` TypeError
+// inside a catch block rather than as a recognisable missing mock. The
+// SandboxPoolSaturatedError mocked above comes from a DIFFERENT module (@moca/sandbox-client)
+// and is unaffected.
+vi.mock('@moca/k8s-sandbox', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@moca/k8s-sandbox')>();
+  return {
+    ...actual,
+    k8sSandboxExtension: () => () => {},
+    KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
+  };
+});
 
 import {
   runSolveLeaf,

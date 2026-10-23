@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -270,5 +271,76 @@ func TestAttachOnceServesWithTheBearer(t *testing.T) {
 	}
 	if len(auth) != 1 || auth[0] != "Bearer tok" {
 		t.Errorf("authorization = %v", auth)
+	}
+}
+
+// fakeStream is an attach stream whose only behaviour is its context, as gRPC's is: cancelling the
+// context it was created from ends it.
+type fakeStream struct {
+	pb.SandboxWorker_AttachClient
+	ctx context.Context
+}
+
+func (f fakeStream) Context() context.Context { return f.ctx }
+
+func attachWith(bearer string) context.Context {
+	return metadata.AppendToOutgoingContext(context.Background(), "authorization", "Bearer "+bearer)
+}
+
+func fakeAttach(c context.Context) (pb.SandboxWorker_AttachClient, error) {
+	return fakeStream{ctx: c}, nil
+}
+
+// A rotated token file ends the stream only once no Exec is in flight (spec §3.1).
+func TestRotateWhenIdleWaitsForIdleThenEndsTheStream(t *testing.T) {
+	var mu sync.Mutex
+	current, idle := "old", false
+	token := func() (string, error) { mu.Lock(); defer mu.Unlock(); return current, nil }
+	isIdle := func() bool { mu.Lock(); defer mu.Unlock(); return idle }
+	st, err := rotateWhenIdle(fakeAttach, token, isIdle, 5*time.Millisecond)(attachWith("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if st.Context().Err() != nil {
+		t.Fatal("the stream ended while the token was unchanged")
+	}
+	mu.Lock()
+	current = "new"
+	mu.Unlock()
+	time.Sleep(30 * time.Millisecond)
+	if st.Context().Err() != nil {
+		t.Fatal("the stream ended with an Exec in flight")
+	}
+	mu.Lock()
+	idle = true
+	mu.Unlock()
+	select {
+	case <-st.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("a rotated token at an idle moment did not end the stream")
+	}
+}
+
+// An unreadable file keeps the stream: the redial would fail on it too.
+func TestRotateWhenIdleKeepsTheStreamOnAnUnreadableFile(t *testing.T) {
+	token := func() (string, error) { return "", errors.New("gone") }
+	st, _ := rotateWhenIdle(fakeAttach, token, func() bool { return true }, 5*time.Millisecond)(attachWith("old"))
+	time.Sleep(30 * time.Millisecond)
+	if st.Context().Err() != nil {
+		t.Error("an unreadable token file ended the stream")
+	}
+}
+
+// The parent's cancel (SIGTERM) still reaches the stream.
+func TestRotateWhenIdleStreamFollowsItsParent(t *testing.T) {
+	parent, cancel := context.WithCancel(attachWith("old"))
+	st, _ := rotateWhenIdle(fakeAttach, func() (string, error) { return "old", nil },
+		func() bool { return true }, time.Hour)(parent)
+	cancel()
+	select {
+	case <-st.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("cancelling the parent did not end the stream")
 	}
 }

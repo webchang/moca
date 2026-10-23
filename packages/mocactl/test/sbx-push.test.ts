@@ -984,6 +984,15 @@ describe('pull --apply never writes local agent configuration or hooks (final re
     'opencode.json',
     'opencode.jsonc',
     '.opencode/plugin/x.ts',
+    '.codex/config.toml',
+    '.codex/AGENTS.md',
+    '.codex/skills/x/SKILL.md',
+    '.agents/skills/x/SKILL.md',
+    '.agents/skills/x/run.sh',
+    '.pi/extensions/x.ts',
+    '.pi/extensions/x/index.ts',
+    '.pi/skills/x/SKILL.md',
+    '.pi/prompts/x.md',
     '.vscode/tasks.json',
     '.vscode/settings.json',
     '.husky/pre-commit',
@@ -998,6 +1007,10 @@ describe('pull --apply never writes local agent configuration or hooks (final re
     '.VSCode/Tasks.json',
     '.ＨUSKY/pre-push',
     '.EnvRC',
+    '.CODEX/config.toml',
+    '.ＣODEX/config.toml',
+    '.PI/extensions/x.ts',
+    '.Ｐi/extensions/x.ts',
     // Windows aliases (#554 review): trailing dots and spaces, a backslash separator, 8.3 names.
     '.claude./settings.json',
     '.envrc ',
@@ -1037,12 +1050,24 @@ describe('pull --apply never writes local agent configuration or hooks (final re
     for (const p of [
       '.claude',
       '.opencode',
+      '.codex',
+      '.agents',
+      '.pi',
       '.husky',
       '.ſbx',
       'src/mcp.json',
       '.mcp.json.bak',
       'docs/claude/x.md',
       '.claudex/x',
+      '.codexrc',
+      'docs/codex/x.md',
+      'agents/skills/x/SKILL.md',
+      '.agentsrc',
+      'docs/agents/x.md',
+      '.pirc',
+      'pi/extensions/x.ts',
+      'pi-fork/src/index.ts',
+      'docs/pi/x.md',
       'opencode.json5',
       '.vscode',
       '.vscode/extensions.json',
@@ -1057,7 +1082,15 @@ describe('pull --apply never writes local agent configuration or hooks (final re
       'AGENTS.md',
     ]) {
       // A bare directory name is matched too (a file or link where the directory goes).
-      const want = ['.claude', '.opencode', '.husky', '.vscode'].includes(p);
+      const want = [
+        '.claude',
+        '.opencode',
+        '.codex',
+        '.agents',
+        '.pi',
+        '.husky',
+        '.vscode',
+      ].includes(p);
       expect(isAgentConfigPath(p), p).toBe(want);
     }
   });
@@ -1172,6 +1205,19 @@ describe('pull --apply never writes local agent configuration or hooks (final re
     expect(warns[0]).not.toMatch(/AGENTS\.md/);
     expect(warns[0]).toMatch(/outside the sbx block/);
     expect(warns[0]).toMatch(/git diff/);
+  });
+
+  it('warns for an AGENTS.override.md the patch creates: Codex reads it instead of AGENTS.md', async () => {
+    const r = repo();
+    writeFileSync(join(r, 'AGENTS.md'), 'agents\n');
+    const { ws, exec } = await pushed(r);
+    writeFileSync(join(ws, 'AGENTS.override.md'), 'read me instead\n');
+    const warns: string[] = [];
+    await applyPatch(r, await capturePatch(exec), { warn: (s) => warns.push(s) });
+    expect(warns.join('\n')).toMatch(/AGENTS\.override\.md/);
+    expect(warns.join('\n')).toMatch(/outside the sbx block/);
+    // Text, not an executable: applied, like the other prompt files.
+    expect(readFileSync(join(r, 'AGENTS.override.md'), 'utf8')).toBe('read me instead\n');
   });
 
   it('warns for a CLAUDE.md the patch creates or deletes, at any depth', async () => {

@@ -41,16 +41,60 @@ export interface ContextStorage {
  * refuses. Local misconfiguration and Redis failures are plain errors.
  */
 export class ContextServiceError extends Error {
+  /**
+   * Whether the call never got an HTTP response at all (network error, timeout, connection
+   * refused). Set only in `request()`'s fetch-catch; semantic failures on an answered reply
+   * (`'Context Service returned an invalid …'`, bundle validation, etc.) leave it `false`, so a
+   * future `retryWhileUnreachable` caller cannot accidentally retry a reply the server already
+   * decided on.
+   */
+  readonly unreachable: boolean;
+
   constructor(
     message: string,
     /** The HTTP status Context Service answered, when it answered. */
     readonly status?: number,
     /** Context Service's `error` code, when it sent one. */
     readonly code?: string,
+    options: { unreachable?: boolean } = {},
   ) {
     super(message);
     this.name = 'ContextServiceError';
+    this.unreachable = options.unreachable ?? false;
   }
+
+  /** True when the Context Service call never got a response (vs got an error response). */
+  isUnreachable(): boolean {
+    return this.unreachable;
+  }
+}
+
+const retrySleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Retry `fn` on `ContextServiceError` that marks Context Service as unreachable (no HTTP response
+ * ever arrived). An error response from Context Service, even 5xx with a code, is not retried: it
+ * means the server is reachable and the problem is semantic. Caller-visible errors (bad input,
+ * local misconfiguration) are not retried either.
+ */
+export async function retryWhileUnreachable<T>(
+  fn: () => Promise<T>,
+  { attempts, backoffMs }: { attempts: number; backoffMs: number },
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!(err instanceof ContextServiceError) || !err.isUnreachable() || i === attempts - 1) {
+        throw err;
+      }
+      await retrySleep(backoffMs);
+    }
+  }
+  // Loop always returns or throws; this is unreachable but keeps TypeScript happy.
+  throw lastErr;
 }
 
 export function contextServiceConfigured(): boolean {
@@ -119,7 +163,12 @@ async function request(
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(timeout),
   }).catch((err: unknown) => {
-    throw new ContextServiceError(`Context Service is unreachable: ${String(err)}`);
+    throw new ContextServiceError(
+      `Context Service is unreachable: ${String(err)}`,
+      undefined,
+      undefined,
+      { unreachable: true },
+    );
   });
   if (response.ok || acceptedStatuses.includes(response.status)) return response;
   const failure = (await response.json().catch(() => ({}))) as { error?: unknown };

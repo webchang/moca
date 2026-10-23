@@ -2,7 +2,11 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { runConformance, type FakeBehavior, type TransportFactory } from './conformance.js';
 import { GrpcRelayTransport, type ExecClientLike } from '../src/grpc-relay-transport.js';
-import { DEFAULT_EXEC_TIMEOUT_S, OUTPUT_TRUNCATED_MARKER } from '../src/transport.js';
+import {
+  DEFAULT_EXEC_TIMEOUT_S,
+  OUTPUT_TRUNCATED_MARKER,
+  SandboxCapacityRefusedError,
+} from '../src/transport.js';
 import {
   Stream,
   type AbortRequest,
@@ -286,5 +290,62 @@ describe('GrpcRelayTransport workload (workload sandboxes spec §3.3)', () => {
     const { client, requests } = captureRequests();
     await GrpcRelayTransport('sbx-1', client).exec('true');
     expect(requests[0]?.workload).toBe('');
+  });
+});
+
+/**
+ * #452. An ExecError frame carries BOTH "your command failed" and "this host is at
+ * capacity", because the wire has no separate refusal form. This transport is the last
+ * place they can be told apart, and these cases pin that it does.
+ *
+ * manualClient, not fakeClient: FakeBehavior scripts chunks and an End, and cannot emit
+ * an `error` frame at all — which is exactly why the defect survived the conformance
+ * battery.
+ */
+describe('GrpcRelayTransport capacity refusals (#452)', () => {
+  const emitError = async (message: string) => {
+    const { client, emit, reqId } = manualClient();
+    const t = GrpcRelayTransport('sbx-1', client as never);
+    const p = t.exec('pytest -x');
+    await Promise.resolve(); // let exec() register its handlers
+    emit({ error: { reqId: reqId()!, message } } as ExecEvent);
+    return p;
+  };
+
+  // The message in the original report, verbatim in shape: vmpool's RefusalError
+  // rendering of RefuseMemoryBudget.
+  it('rejects a memory-budget refusal as SandboxCapacityRefusedError', async () => {
+    const p = emitError(
+      'memory-budget: committing 301989888 more bytes would reach 4328521728 against a budget of 4294967296',
+    );
+    await expect(p).rejects.toBeInstanceOf(SandboxCapacityRefusedError);
+    // The NAME is what knative-server maps to 503, so assert it and not just the class:
+    // `instanceof` is unsound across package instances there (see the class doc), and a
+    // minifier renames the constructor.
+    await expect(p).rejects.toMatchObject({ name: 'SandboxCapacityRefusedError' });
+  });
+
+  it('rejects a max-runs refusal and the session loop\'s "busy" refusal the same way', async () => {
+    await expect(
+      emitError('max-runs: 8 runs already resident, MaxRuns is 8'),
+    ).rejects.toBeInstanceOf(SandboxCapacityRefusedError);
+    await expect(emitError('busy: queue full')).rejects.toBeInstanceOf(SandboxCapacityRefusedError);
+  });
+
+  it('leaves an ordinary command failure a plain Error', async () => {
+    // THE HALF THAT MATTERS AS MUCH. Classifying too widely would answer 503 +
+    // Retry-After for a command that will fail identically on every retry, converting a
+    // reported failure into an unbounded retry loop.
+    const p = emitError('exit status 1: no such file or directory');
+    await expect(p).rejects.toThrow('exit status 1: no such file or directory');
+    await expect(p).rejects.not.toBeInstanceOf(SandboxCapacityRefusedError);
+  });
+
+  it('preserves the refusal message for the operator', async () => {
+    // The model never sees this (the turn ends), but a human reading the 503's server log
+    // needs the arithmetic — it is what says whether MICROVM_MAX_COMMITTED_MB is the knob
+    // or whether the host is genuinely busy.
+    const message = 'memory-budget: committing 301989888 more bytes would reach 4328521728';
+    await expect(emitError(message)).rejects.toThrow(message);
   });
 });

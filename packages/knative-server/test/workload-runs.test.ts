@@ -40,7 +40,13 @@ let base: string;
 let alice: string;
 let bob: string;
 
-async function seed(owner: string, name: string, status: string, revision?: string) {
+async function seed(
+  owner: string,
+  name: string,
+  status: string,
+  revision?: string,
+  extra: Record<string, unknown> = {},
+) {
   const contextName = `w-${randomUUID().replaceAll('-', '')}`;
   await redis.set(
     `sh:wl:${scope(owner)}:${name}`,
@@ -54,6 +60,7 @@ async function seed(owner: string, name: string, status: string, revision?: stri
       contextType: 'workspace',
       workspace: { size: '1Gi' },
       ...(revision ? { revision } : {}),
+      ...extra,
     }),
   );
   return contextName;
@@ -333,5 +340,59 @@ describe('a run on a workload', () => {
       status: 400,
       body: { error: 'context_writable_invalid' },
     });
+  });
+});
+
+describe('a run on a workload with sandboxes of its own (spec §3.3)', () => {
+  const sandboxes = { sandboxes: { count: 1, tier: 'container' } };
+
+  it('names the workload key and owner scope, so selection keeps the run on its sandboxes', async () => {
+    const contextName = await seed(alice, 'demo', 'ready', REVISION, sandboxes);
+    const body = prompt('demo');
+    expect((await run(alice, body)).status).toBe(200);
+    // A terminal run is persisted: what the 503 case below must not do.
+    expect(await redis.keys(`leaf:result:*${String(body.sessionId)}*`)).toHaveLength(1);
+    const env = runLeaf.mock.calls[0]![0];
+    expect(env.internalContext).toMatchObject({ workload: contextName, ownerScope: scope(alice) });
+  });
+
+  it('leaves both out for a phase 1 workload, which stays on the shared pool', async () => {
+    await seed(alice, 'demo', 'ready', REVISION);
+    expect((await run(alice, prompt('demo'))).status).toBe(200);
+    const ctx = runLeaf.mock.calls[0]![0].internalContext;
+    expect(ctx).not.toHaveProperty('workload');
+    expect(ctx).not.toHaveProperty('ownerScope');
+  });
+
+  it('answers 409 workload_not_ready while provisioning', async () => {
+    await seed(alice, 'demo', 'provisioning', REVISION, sandboxes);
+    expect(await run(alice, prompt('demo'))).toEqual({
+      status: 409,
+      body: { error: 'workload_not_ready' },
+    });
+    expect(runLeaf).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 workload_sandbox_unavailable, never persisting a result, when none is attached', async () => {
+    await seed(alice, 'demo', 'ready', REVISION, sandboxes);
+    runLeaf.mockReset().mockResolvedValue({
+      status: 'failed',
+      reason: 'workload_sandbox_unavailable',
+      message: "workload 'w-x': no sandbox of this workload is attached",
+    });
+    const body = prompt('demo');
+    const response = await fetch(`${base}/runs`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${sessionToken(alice, String(body.sessionId))}`,
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).toMatch(/^[0-9]+$/);
+    expect(await response.json()).toEqual({ error: 'workload_sandbox_unavailable' });
+    expect(runLeaf).toHaveBeenCalledTimes(1);
+    expect(await redis.keys(`leaf:result:*${String(body.sessionId)}*`)).toEqual([]);
   });
 });

@@ -16,6 +16,9 @@ const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const signer = makeSigner(privateKey.export({ format: 'pem', type: 'pkcs8' }).toString());
 const apiToken = (sub: string) =>
   signer.mint({ sub, tenant: sub, roles: [], scope: ['api'], ttlSeconds: 300 });
+/** One token per caller, so a test can check the exact token the worker forwarded. */
+const tokens = new Map<string, string>();
+const tokenOf = (sub: string) => tokens.get(sub) ?? tokens.set(sub, apiToken(sub)).get(sub)!;
 
 interface FakeContext {
   contextId: string;
@@ -37,6 +40,11 @@ class FakeContextService {
   private holds = new Map<string, { when: 'before' | 'after'; released: Promise<void> }>();
   /** One-shot: the next request to this operation fails with this status. */
   failures = new Map<string, number>();
+  /**
+   * The next N requests to this operation drop the socket before responding, so the harness sees
+   * them as unreachable (fetch rejection, no HTTP status). The counter decrements per hit.
+   */
+  unreachable = new Map<string, number>();
   server = http.createServer((req, res) => void this.handle(req, res));
 
   hold(operation: string, when: 'before' | 'after' = 'before'): () => void {
@@ -88,6 +96,13 @@ class FakeContextService {
       if (value === undefined) res.writeHead(status).end();
       else res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
     };
+    const remaining = this.unreachable.get(operation) ?? 0;
+    if (remaining > 0) {
+      if (remaining === 1) this.unreachable.delete(operation);
+      else this.unreachable.set(operation, remaining - 1);
+      req.socket.destroy();
+      return;
+    }
     const failure = this.failures.get(operation);
     if (failure) {
       this.failures.delete(operation);
@@ -196,7 +211,7 @@ async function call(method: string, path: string, owner?: string | null, body?: 
     method,
     headers: {
       'content-type': 'application/json',
-      ...(owner ? { authorization: `Bearer ${apiToken(owner)}` } : {}),
+      ...(owner ? { authorization: `Bearer ${tokenOf(owner)}` } : {}),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
@@ -477,6 +492,51 @@ describe('quota', () => {
     expect(await quotaOf(alice)).toBe(0);
     expect(cs.contexts.size).toBe(0);
   });
+
+  // A transient Context Service unreachability during the rollback's deleteContext would
+  // otherwise leave the record in `deleting` with its quota slot held, invisibly to the owner.
+  // The retry inside rollbackCreate absorbs the blip and lets the record reach `deleted`.
+  it('absorbs a transient Context Service blip during rollback and frees the quota', async () => {
+    vi.stubEnv('MOCA_CONTEXT_ROLLBACK_RETRY_ATTEMPTS', '3');
+    vi.stubEnv('MOCA_CONTEXT_ROLLBACK_RETRY_BACKOFF_MS', '10');
+    cs.failures.set('grant', 500); // force the create to fail → rollback runs
+    cs.unreachable.set('delete', 2); // first two rollback-delete attempts are unreachable
+    expect(await create(alice, 'blip')).toEqual({
+      status: 502,
+      body: { error: 'context_service_error' },
+    });
+    // The third rollback-delete got through: record is deleted, quota released.
+    expect((await call('GET', '/workloads/blip', alice)).body).toMatchObject({ status: 'deleted' });
+    expect(await quotaOf(alice)).toBe(0);
+    expect(cs.ownedBy(alice)).toHaveLength(0);
+    // Pin the budget: exactly 3 rollback-delete attempts (ATTEMPTS=3). An off-by-one in the loop
+    // or a regression to "attempts + 1" would fail here.
+    expect(cs.calls.filter((c) => c.method === 'DELETE').length).toBe(3);
+  });
+
+  // A sustained Context Service outage must not paper over the failure. The record stays
+  // `deleting` so the owner-driven DELETE still finishes the cleanup once Context Service is back.
+  it('leaves the record deleting when the Context Service stays unreachable past the retry budget', async () => {
+    vi.stubEnv('MOCA_CONTEXT_ROLLBACK_RETRY_ATTEMPTS', '3');
+    vi.stubEnv('MOCA_CONTEXT_ROLLBACK_RETRY_BACKOFF_MS', '10');
+    cs.failures.set('grant', 500);
+    cs.unreachable.set('delete', 10); // more unreachables than retries: outage outlasts the budget
+    expect(await create(alice, 'stuck')).toEqual({
+      status: 502,
+      body: { error: 'context_service_error' },
+    });
+    expect((await call('GET', '/workloads/stuck', alice)).body).toMatchObject({
+      status: 'deleting',
+    });
+    expect(await quotaOf(alice)).toBe(1);
+    // Pin the budget: exactly 3 rollback-delete attempts, no more.
+    expect(cs.calls.filter((c) => c.method === 'DELETE').length).toBe(3);
+    // Context Service recovers (unreachable counter still positive but we clear it); owner's
+    // DELETE finishes the pending cleanup and frees the quota.
+    cs.unreachable.delete('delete');
+    expect((await call('DELETE', '/workloads/stuck', alice)).status).toBe(204);
+    expect(await quotaOf(alice)).toBe(0);
+  });
 });
 
 describe('lifecycle races', () => {
@@ -575,5 +635,302 @@ describe('lifecycle races', () => {
     });
     expect(cs.contexts.size).toBe(0);
     expect(await quotaOf(alice)).toBe(0);
+  });
+});
+
+/** moca-provisioner, reduced to what the worker observes: both credentials, and its answers. */
+class FakeProvisioner {
+  calls: { method: string; path: string; auth: string; user: string; body: unknown }[] = [];
+  /** Pods every DELETE reports as still terminating. */
+  podsLeft = 0;
+  /** One-shot: the next PUT fails with this status and code. */
+  failPut?: { status: number; error: string };
+  /** When set, a PUT holds until it resolves: a slow API server behind the provisioner. */
+  putGate?: Promise<void>;
+  /** Every request, in arrival order: the real provisioner runs one owner's requests one at a time. */
+  private queue: Promise<void> = Promise.resolve();
+  /** What happened, in order, as the provisioner finished it. */
+  done: string[] = [];
+  server = http.createServer((req, res) => {
+    const run = this.queue.then(() => this.handle(req, res));
+    this.queue = run.catch(() => undefined);
+  });
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.method === 'PUT' && this.putGate) await this.putGate;
+    this.done.push(req.method ?? '');
+    this.calls.push({
+      method: req.method ?? '',
+      path: req.url ?? '',
+      auth: String(req.headers.authorization),
+      user: String(req.headers['x-moca-user-token']),
+      body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined,
+    });
+    const reply = (status: number, body: unknown): void => {
+      res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+    };
+    if (req.method === 'PUT') {
+      const fail = this.failPut;
+      this.failPut = undefined;
+      return fail ? reply(fail.status, { error: fail.error }) : reply(200, { ready: 0 });
+    }
+    return reply(this.podsLeft ? 202 : 200, { remaining: this.podsLeft });
+  }
+}
+
+describe('a workload with sandboxes of its own (phase 2)', () => {
+  let prov: FakeProvisioner;
+  const scope = (owner: string) => createHash('sha256').update(owner).digest('hex').slice(0, 32);
+  const attachRecord = (owner: string, wl: string, i: number) =>
+    redis.hSet(
+      'sh:sandbox:records',
+      `${wl}-${i}`,
+      JSON.stringify({
+        sandboxId: `${wl}-${i}`,
+        labels: { 'moca.dev/workload': wl, 'moca.dev/owner': scope(owner) },
+        capabilities: [],
+        capacityMax: 4,
+        transport: 'grpc',
+      }),
+    );
+  const wlOf = (owner: string) => cs.ownedBy(owner)[0]![0];
+
+  beforeEach(async () => {
+    prov = new FakeProvisioner();
+    await new Promise<void>((resolve) => prov.server.listen(0, '127.0.0.1', resolve));
+    vi.stubEnv(
+      'MOCA_PROVISIONER_URL',
+      `http://127.0.0.1:${(prov.server.address() as { port: number }).port}`,
+    );
+    vi.stubEnv('MOCA_PROVISIONER_TOKEN', 'prov-service-token'); // notsecret
+    vi.stubEnv('MOCA_PROVISIONER_DELETE_WAIT_MS', '1');
+  });
+  afterEach(() => new Promise<void>((resolve) => prov.server.close(() => resolve())));
+
+  it('is refused like any unknown field when no provisioner is configured', async () => {
+    vi.stubEnv('MOCA_PROVISIONER_URL', '');
+    expect(await create(alice, 'demo', { sandboxes: { count: 1 } })).toEqual({
+      status: 400,
+      body: { error: 'workload_field_not_allowed' },
+    });
+    expect(cs.calls).toEqual([]);
+  });
+
+  it('refuses bad counts, unknown fields and microvm before reserving anything', async () => {
+    for (const [sandboxes, error] of [
+      [{ count: 3 }, 'sandboxes_count_invalid'],
+      [{ count: 0 }, 'sandboxes_count_invalid'],
+      [{ count: '1' }, 'sandboxes_count_invalid'],
+      [{ count: 1, tier: 'microvm' }, 'sandbox_tier_unavailable'],
+      [{ count: 1, tier: 'gpu' }, 'sandbox_tier_invalid'],
+      [{ count: 1, image: 'x' }, 'sandboxes_field_not_allowed'],
+      [[], 'sandboxes_field_not_allowed'],
+    ] as const) {
+      expect(await create(alice, 'demo', { sandboxes })).toEqual({ status: 400, body: { error } });
+    }
+    expect(cs.calls).toEqual([]);
+    expect(await quotaOf(alice)).toBe(0);
+  });
+
+  it('activates into provisioning, becomes ready once every sandbox attached, and reports them', async () => {
+    const created = await create(alice, 'demo', { sandboxes: { count: 2 } });
+    expect(created.body).toMatchObject({
+      status: 'awaiting_upload',
+      sandboxes: { count: 2, tier: 'container', ready: 0 },
+    });
+    cs.upload(alice);
+    const activated = await call('POST', '/workloads/demo/activate', alice, { revision: REVISION });
+    expect(activated).toMatchObject({
+      status: 202,
+      body: { status: 'provisioning', revision: REVISION, sandboxes: { count: 2, ready: 0 } },
+    });
+    // Both credentials, and no workload key: the provisioner derives it from the user's token.
+    const [put] = prov.calls;
+    expect(put).toMatchObject({
+      method: 'PUT',
+      auth: 'Bearer prov-service-token',
+      body: { count: 2, tier: 'container', revision: REVISION },
+    });
+    expect(put!.path).toMatch(/^\/internal\/v1\/workloads\/demo\/[0-9a-f-]{36}$/);
+    // Alice's own API token, verbatim: the provisioner takes the owner from it.
+    expect(put!.user).toBe(tokenOf(alice));
+    expect(JSON.stringify(put)).not.toContain(wlOf(alice));
+
+    await attachRecord(alice, wlOf(alice), 0);
+    // A record of the right workload but another owner is not counted (spec §3.3).
+    await redis.hSet(
+      'sh:sandbox:records',
+      `${wlOf(alice)}-1`,
+      JSON.stringify({
+        sandboxId: `${wlOf(alice)}-1`,
+        labels: { 'moca.dev/workload': wlOf(alice), 'moca.dev/owner': scope(bob) },
+      }),
+    );
+    expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+      status: 'provisioning',
+      sandboxes: { ready: 1 },
+    });
+    await attachRecord(alice, wlOf(alice), 1);
+    expect(await call('GET', '/workloads/demo', alice)).toMatchObject({
+      status: 200,
+      body: { status: 'ready', sandboxes: { count: 2, ready: 2 } },
+    });
+    await redis.hDel('sh:sandbox:records', [`${wlOf(alice)}-0`, `${wlOf(alice)}-1`]);
+  });
+
+  it('keeps a failed provisioning on the record, and a repeat activate retries it', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    prov.failPut = { status: 429, error: 'owner_sandbox_quota_exceeded' };
+    expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual({
+      status: 429,
+      body: { error: 'owner_sandbox_quota_exceeded' },
+    });
+    expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+      status: 'provisioning',
+      error: 'owner_sandbox_quota_exceeded',
+    });
+    await attachRecord(alice, wlOf(alice), 0);
+    expect(
+      await call('POST', '/workloads/demo/activate', alice, { revision: REVISION }),
+    ).toMatchObject({ status: 200, body: { status: 'ready' } });
+    const body = (await call('GET', '/workloads/demo', alice)).body;
+    expect(body).not.toHaveProperty('error');
+    expect(prov.calls.filter((c) => c.method === 'PUT')).toHaveLength(2);
+    // A different revision is still refused once frozen.
+    expect(
+      await call('POST', '/workloads/demo/activate', alice, { revision: OTHER_REVISION }),
+    ).toEqual({ status: 409, body: { error: 'workload_already_active' } });
+    await redis.hDel('sh:sandbox:records', `${wlOf(alice)}-0`);
+  });
+
+  it('drops a failed PUT error once the sandboxes attach and a GET settles it to ready', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    prov.failPut = { status: 504, error: 'kubernetes_error' };
+    expect(
+      (await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).status,
+    ).toBe(502);
+    expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+      status: 'provisioning',
+      error: 'kubernetes_error',
+    });
+    // The PUT had in fact gone through: the sandboxes attach without a second activate.
+    await attachRecord(alice, wlOf(alice), 0);
+    const got = await call('GET', '/workloads/demo', alice);
+    expect(got).toMatchObject({ status: 200, body: { status: 'ready' } });
+    expect(got.body).not.toHaveProperty('error');
+    const key = `sh:wl:${scope(alice)}:demo`;
+    const stored = JSON.parse((await redis.get(key))!);
+    expect(stored.status).toBe('ready');
+    expect(stored).not.toHaveProperty('error');
+    await redis.hDel('sh:sandbox:records', `${wlOf(alice)}-0`);
+  });
+
+  it('a provisioner outage is a 502, and the record stays provisioning', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    prov.failPut = { status: 500, error: 'internal_error' };
+    expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual({
+      status: 502,
+      body: { error: 'provisioner_error' },
+    });
+    expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+      status: 'provisioning',
+    });
+  });
+
+  it('deletes sandboxes first, the Context only once no pod remains, then the record', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    await call('POST', '/workloads/demo/activate', alice, { revision: REVISION });
+    prov.podsLeft = 1;
+    // Pods still terminating after the wait: 202, the Context untouched, the record `deleting`.
+    expect(await call('DELETE', '/workloads/demo', alice)).toMatchObject({
+      status: 202,
+      body: { status: 'deleting' },
+    });
+    expect(cs.contexts.size).toBe(1);
+    expect(cs.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    // The retry finishes once the pods are gone: sandboxes, then the Context, then the record.
+    prov.podsLeft = 0;
+    expect(await call('DELETE', '/workloads/demo', alice)).toEqual({ status: 204, body: null });
+    expect(cs.contexts.size).toBe(0);
+    expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({ status: 'deleted' });
+    expect(await quotaOf(alice)).toBe(0);
+    const deletes = prov.calls.filter((c) => c.method === 'DELETE');
+    expect(deletes.length).toBeGreaterThanOrEqual(2);
+    expect(deletes.every((c) => c.auth === 'Bearer prov-service-token')).toBe(true);
+    expect(deletes.every((c) => c.user === tokenOf(alice))).toBe(true);
+  });
+
+  it('a DELETE after a PUT the worker gave up on waits for it, and only then deletes the Context', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    vi.stubEnv('MOCA_PROVISIONER_TIMEOUT_MS', '50');
+    let release!: () => void;
+    prov.putGate = new Promise<void>((resolve) => (release = resolve));
+    // The worker times out; the provisioner is still converging the PUT.
+    expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual({
+      status: 502,
+      body: { error: 'provisioner_error' },
+    });
+    vi.stubEnv('MOCA_PROVISIONER_TIMEOUT_MS', '');
+    const deleting = call('DELETE', '/workloads/demo', alice);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Queued behind the PUT: the Context is untouched while it runs.
+    expect(cs.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    release();
+    expect(await deleting).toEqual({ status: 204, body: null });
+    // The PUT finished before the DELETE that answered `remaining: 0`.
+    expect(prov.done).toEqual(['PUT', 'DELETE']);
+    expect(cs.contexts.size).toBe(0);
+    expect(await quotaOf(alice)).toBe(0);
+  });
+
+  it('passes a 429 through with Retry-After, and a permanent refusal leaves DELETE as the way out', async () => {
+    await create(alice, 'demo', { sandboxes: { count: 1 } });
+    cs.upload(alice);
+    prov.failPut = { status: 429, error: 'owner_sandbox_quota_exceeded' };
+    const response = await fetch(`${base}/workloads/demo/activate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenOf(alice)}` },
+      body: JSON.stringify({ revision: REVISION }),
+    });
+    expect(response.status).toBe(429);
+    expect(response.headers.get('retry-after')).toMatch(/^[1-9][0-9]*$/);
+    // The provisioner's own cap below the worker's, or the cluster refusing the objects.
+    for (const fail of [
+      { status: 400, error: 'sandboxes_count_exceeded' },
+      { status: 422, error: 'workload_refused' },
+    ]) {
+      prov.failPut = fail;
+      expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual(
+        {
+          status: fail.status,
+          body: { error: fail.error },
+        },
+      );
+      expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+        status: 'provisioning',
+        error: fail.error,
+      });
+    }
+    expect((await call('DELETE', '/workloads/demo', alice)).status).toBe(204);
+    expect(await quotaOf(alice)).toBe(0);
+  });
+
+  it('a phase 1 workload never calls the provisioner, even with one configured', async () => {
+    await create(alice, 'demo');
+    cs.upload(alice);
+    expect(
+      await call('POST', '/workloads/demo/activate', alice, { revision: REVISION }),
+    ).toMatchObject({ status: 200, body: { status: 'ready' } });
+    const view = (await call('GET', '/workloads/demo', alice)).body;
+    expect(view).not.toHaveProperty('sandboxes');
+    expect((await call('DELETE', '/workloads/demo', alice)).status).toBe(204);
+    expect(prov.calls).toEqual([]);
   });
 });

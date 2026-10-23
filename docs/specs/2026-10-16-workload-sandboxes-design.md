@@ -148,12 +148,15 @@ mint one and a sandbox cannot forge one. The name `moca-attach+jwt` stays clear 
 `moca-sandbox+jwt` client token (#546, SBX0 sandbox service), which authorizes callers, not workers.
 
 **Expiry and rotation.** The provisioner re-mints a workload's token once less than half its
-lifetime remains, on its reconciler loop (§6.2), and updates the Secret. The worker re-reads the
+lifetime remains, on its reconciler loop (§6.2), and overwrites the Secret. It never reads the
+Secret back (§4.1): the token's `iat`, `exp`, `kid` and `n` are annotations on the workload's
+StatefulSet (`moca.dev/attach-iat`, `moca.dev/attach-exp`, `moca.dev/attach-kid`,
+`moca.dev/sandbox-count`), updated with each mint. The worker re-reads the
 file whenever it dials, and when the file changes it reconnects with the new token at its next
 idle moment (no Exec in flight). The relay closes an attach stream when its token's `exp` passes,
-so no stream outlives its token. Phase 2 PR 1 re-reads the file only on dial, so that close at
-`exp` is a hard cut, Execs in flight included; the idle reconnect on a file change is deferred to
-PR 2, whose re-mint must land well before `exp`.
+so no stream outlives its token. The worker polls the file while attached and, once it holds a
+different token, ends the stream at the first moment no Exec is in flight; the re-mint lands with
+half a TTL to spare, so the close at `exp` is a backstop, not the rotation path.
 Rotating the provisioner's key is the usual overlap: add the new
 `<kid>` to `MOCA_ATTACH_PUBLIC_KEYS`, switch the provisioner to it (every token is re-minted within
 half a TTL), and drop the old key one TTL later. A projected, pod-bound credential (a
@@ -217,19 +220,45 @@ grants (MI1 §4.2 I2). Until then the worker remains the trust root for routing,
 `moca-provisioner` is a small HTTP service in the `moca` namespace (`packages/provisioner`,
 `@moca/provisioner`). Its ServiceAccount is bound to one Role in `moca-sandbox`:
 
-| Resource                 | Verbs                             | Why                                          |
-| ------------------------ | --------------------------------- | -------------------------------------------- |
-| `apps/statefulsets`      | create, get, list, patch, delete  | one per workload                             |
-| `secrets`                | create, get, list, update, delete | the workload's attach token, re-minted       |
-| `services`               | create, get, delete               | the StatefulSet's headless governing Service |
-| `pods`                   | get, list                         | readiness, and the reconciler's view         |
-| `persistentvolumeclaims` | get                               | until PR 3; see §5.1 for its additions       |
+| Resource                 | Verbs                            | Why                                          |
+| ------------------------ | -------------------------------- | -------------------------------------------- |
+| `apps/statefulsets`      | create, get, list, patch, delete | one per workload                             |
+| `secrets`                | create, update, delete           | the workload's attach token, re-minted       |
+| `services`               | create, get, delete              | the StatefulSet's headless governing Service |
+| `pods`                   | get, list                        | readiness, and the reconciler's view         |
+| `persistentvolumeclaims` | get                              | until PR 3; see §5.1 for its additions       |
+| `podtemplates`           | get, on `moca-workload-sandbox`  | the operator's pod template (§4.2)           |
 
-No create on bare pods. The governing Service is headless with no ports, as the shared pool's is:
-a workload sandbox accepts no connections. The provisioner has no rights outside `moca-sandbox`,
-and in PR 2 none on PVCs beyond `get`. PR 3 adds create and delete, since the provisioner owns
-the workload's PVC (§5.1, 2026-10-22). The control plane,
-supervisor and relay stay without a Kubernetes token.
+No create on bare pods, and no read on Secrets: the provisioner writes its workloads' tokens blind
+(create, or an unconditional update) and cannot read any Secret, `moca-relay-attach` (the shared
+pool's token) included.
+
+**Admission.** Create on StatefulSets would still let a compromised provisioner run a pod that
+mounts any Secret in the namespace, or runs as another ServiceAccount. A ValidatingAdmissionPolicy
+(`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or newer), matched on the provisioner's
+ServiceAccount, refuses any StatefulSet, Service or Secret it writes or deletes in `moca-sandbox`
+unless: a StatefulSet or Service is named `^w-[0-9a-f]{32}$` and a Secret
+`^w-[0-9a-f]{32}-attach$` (Opaque); the StatefulSet and its pods are labelled
+`app: moca-workload-sandbox`; a Service is headless (`ClusterIP`, `clusterIP: None`) with no
+ports, external IPs or load-balancer fields, and selects exactly `app: moca-workload-sandbox` and
+its own `moca.dev/workload`; the pod runs as `moca-workload-sandbox` with
+`automountServiceAccountToken: false`; its volumes are only `emptyDir`, `configMap`, `downwardAPI`
+and its own `<name>-attach` Secret (an allow-list), and its only Secret reference in `secretKeyRef`
+or `envFrom` is that one too; and it has no host namespace, privileged or escalating container,
+added capability, or claim template. The Role says which verbs; the policy says which objects.
+
+**Network.** Its egress is the Kubernetes API server only: `setup.sh` fills in the `kubernetes`
+Service's ClusterIP and its EndpointSlice addresses, and refuses to enable the feature when it
+cannot read them.
+
+**One replica.** The owner cap (§6.3) counts the owner's StatefulSets and then creates one, so two
+concurrent PUTs could both pass it. The provisioner serializes PUTs per owner in process, and runs
+as exactly one replica with the `Recreate` strategy; scaling it out needs a lock in the API.
+
+The governing Service is headless with no ports, as the shared pool's is: a workload sandbox
+accepts no connections. The provisioner has no rights outside `moca-sandbox`, and in PR 2 none on
+PVCs beyond `get`. PR 3 adds create and delete, since the provisioner owns the workload's PVC (§5.1,
+2026-10-22). The control plane, supervisor and relay stay without a Kubernetes token.
 
 Its internal API is reached only by the supervisor's workers (NetworkPolicy):
 
@@ -260,13 +289,23 @@ For workload key `wl`:
 - Service `<wl>`: headless, no ports, the StatefulSet's governing Service.
 - StatefulSet `<wl>`: `replicas = sandboxes.count`, pods labelled `app: moca-workload-sandbox`,
   `moca.dev/workload`, `moca.dev/owner`, and annotated with the record key and generation. The pod
-  spec is the shared pool's (`sandbox.yaml`: non-root, `drop: ALL`, no service-account token,
-  RuntimeDefault seccomp) with resources fixed by the operator per tier. Callers choose nothing in
-  the pod spec except count, tier and mount mode.
+  spec is the PodTemplate `moca-workload-sandbox` in `moca-sandbox`, an operator's manifest that
+  starts as the shared pool's container (`sandbox.yaml`: image, resources, relay address, non-root,
+  `drop: ALL`, no service-account token, RuntimeDefault seccomp) without its relay token. The
+  provisioner adds only the binding: labels, `SANDBOX_ID`, `SANDBOX_TIER`, and the attach token
+  mounted at `/run/moca-attach/token` (`SANDBOX_TOKEN_FILE`). Callers choose nothing in the pod
+  spec except count, tier and mount mode; the admission policy (§4.1) holds the result safe
+  whatever the template says.
 - The pods get their own label so the shared StatefulSet's selector (`app: moca-sandbox`) never
-  matches them. A static NetworkPolicy for `app: moca-workload-sandbox`, installed with the base,
-  gives them the shared pool's egress: the relay's attach port and the public internet, without
-  private ranges, so one workload's pods cannot reach another's.
+  matches them. A static NetworkPolicy for `app: moca-workload-sandbox`, installed with the
+  feature, gives them the shared pool's egress: the relay's attach port and the public internet,
+  without private ranges, so one workload's pods cannot reach another's.
+
+Everything the feature adds -- the provisioner, its RBAC and policies, the template, the admission
+policy and the namespace quota -- is the Kustomize component `deploy/k8s/base/workload-sandboxes`,
+which `setup.sh` adds only with `SH_WORKLOAD_SANDBOXES=1`. Without it, every target renders exactly
+as before. Turning it off is refused while a workload StatefulSet exists, unless
+`--delete-workload-sandboxes` deletes them too.
 
 A StatefulSet, not bare pods: a pod that dies comes back with the same name, so the same sandbox
 id, and P6.3 affinity carries the workload's sessions to it (§10, restart continuity). The pods
@@ -510,8 +549,9 @@ shared pool, unchanged; `CREATE_FIELDS` and `WORKSPACE_FIELDS` still refuse ever
    two labels from shared-pool `Hello`s, the additive `workload` field and the relay's Exec check,
    and the selection filter, which matches both workload and owner. Testable with a hand-minted
    token and a static StatefulSet; changes nothing for a deployment with no attach keys.
-2. **The provisioner and its RBAC, without a PVC.** `@moca/provisioner`, the Role, NetworkPolicies
-   and ResourceQuota in `deploy/k8s/base`, the internal API with `wl` derived from the verified
+2. **The provisioner and its RBAC, without a PVC.** `@moca/provisioner`, the Role, admission
+   policy, pod template, NetworkPolicies and ResourceQuota in the opt-in component
+   `deploy/k8s/base/workload-sandboxes`, the internal API with `wl` derived from the verified
    owner, token minting and re-minting, and caps, `sandboxes` on
    `POST /workloads`, `provisioning`, and the delete order. Context still arrives by copy, now onto
    the workload's own sandboxes. This PR alone delivers acceptance 2 and 3.
@@ -550,6 +590,9 @@ on this path for phase 2 workloads.
 - **Storage under a compromised provisioner.** It owns every workload's PVC, so it can mount any
   of them, in a pod named for that workload, or delete it. That stays inside
   `moca-sandbox`.
+- **A compromised provisioner, within its policy.** It cannot read a Secret or mount another one,
+  but it can mint attach tokens for any `wl` it likes (it holds the key) and so register sandboxes
+  under any workload label, delete any workload's objects, and fill the namespace's pod quota.
 - **Egress.** Workload sandboxes keep the shared pool's public internet egress (MI1 R8 until S5),
   so model code can still send out what it can read: its own owner's data.
 - **Operators and namespace admins.** Anyone who can exec into `moca-sandbox` pods or mount its

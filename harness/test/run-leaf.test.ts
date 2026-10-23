@@ -41,10 +41,19 @@ const { k8sSandboxExtensionMock, kubectlTransportMock } = vi.hoisted(() => ({
     close: vi.fn(async () => {}),
   })),
 }));
-vi.mock('@moca/k8s-sandbox', () => ({
-  k8sSandboxExtension: (...args: unknown[]) => k8sSandboxExtensionMock(...args),
-  KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
-}));
+// Spread the real module first, for the same reason the select-sandbox mock above does:
+// run-leaf.ts also imports createCapacityLatch and SandboxCapacityRefusedError from here
+// (#452), and a factory returning only the two overrides below leaves those undefined —
+// `instanceof undefined` is a TypeError inside the catch block, which surfaces as ten
+// unrelated tests failing rather than as a missing mock.
+vi.mock('@moca/k8s-sandbox', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@moca/k8s-sandbox')>();
+  return {
+    ...actual,
+    k8sSandboxExtension: (...args: unknown[]) => k8sSandboxExtensionMock(...args),
+    KubectlTransport: (...args: unknown[]) => kubectlTransportMock(...args),
+  };
+});
 
 const { FakeRedisSessionBackend } = vi.hoisted(() => {
   class FakeRedisSessionBackend {
@@ -121,6 +130,10 @@ import {
 } from '../src/run-leaf.js';
 import type { LeafEnvelope } from '../src/run-leaf.js';
 import { SandboxPoolSaturatedError, SandboxRequiredError } from '../src/select-sandbox.js';
+// The REAL class, reaching this file through the importOriginal spread in the
+// @moca/k8s-sandbox mock above — which is what makes run-leaf's `instanceof` check against
+// it meaningful here rather than a comparison between two unrelated constructors (#452).
+import { SandboxCapacityRefusedError } from '@moca/k8s-sandbox';
 
 describe('LeafEnvelope repo ref fields', () => {
   it('accepts optional repoUrl and ref', () => {
@@ -308,6 +321,42 @@ describe('runLeaf', () => {
     expect(r.status).toBe('failed');
     if (r.status === 'failed') expect(r.reason).toBe('saturated');
   });
+
+  // #452. The OTHER no-capacity throw, and the one the original report hit. It cannot reach
+  // the catch above by the same route: SandboxPoolSaturatedError is raised at lease time,
+  // before any exec, while this arrives mid-turn from a sandbox that was leased successfully
+  // and whose host then refused the work. Same reason, because the caller's remedy is the
+  // same — wait and retry — and `reason: 'error'` would spend the run permanently on a
+  // condition that clears by itself.
+  it('returns failed:saturated for a mid-turn host capacity refusal, not failed:error', async () => {
+    const env = { sessionId: 'run/i1', item: { item_id: 'i1', file: 'f', pattern: 'p' } };
+    const produceVerdict = async () => {
+      throw new SandboxCapacityRefusedError(
+        'memory-budget: committing 301989888 more bytes would reach 4328521728 against a budget of 4294967296',
+      );
+    };
+    const r = await runLeaf(env, undefined, { produceVerdict });
+    expect(r).toMatchObject({ status: 'failed', reason: 'saturated' });
+    // The host's arithmetic survives into the result: it is what a human reading the 503's
+    // log needs to tell "size MICROVM_MAX_COMMITTED_MB higher" from "the host is just busy".
+    if (r.status === 'failed') expect(r.message).toContain('memory-budget:');
+  });
+
+  it('returns failed:saturated for a capacity refusal on a solve leaf too', async () => {
+    const env: LeafEnvelope = {
+      kind: 'solve',
+      sessionId: 'run/i1',
+      item: { item_id: 'i1', file: 'f', pattern: 'p' },
+      problemStatement: 'fix the thing',
+      repoUrl: 'https://git.example/r.git',
+      ref: 'abc123',
+    };
+    const produceSolve = async () => {
+      throw new SandboxCapacityRefusedError('max-runs: 8 runs already resident, MaxRuns is 8');
+    };
+    const r = await runLeaf(env, undefined, { produceSolve });
+    expect(r).toMatchObject({ status: 'failed', reason: 'saturated' });
+  });
 });
 
 describe('leafSessionId', () => {
@@ -354,10 +403,12 @@ describe('realProduceVerdict transport wiring (Task 9)', () => {
       expect(result.value.close).toHaveBeenCalledTimes(1);
     }
 
-    expect(k8sSandboxExtensionMock).toHaveBeenCalledWith({
-      config: FAKE_CONFIG,
-      transport: undefined,
-    });
+    // objectContaining, because the verdict path also hands the extension its per-turn
+    // capacity latch (#452) and this case is about the TRANSPORT: `transport: undefined` is
+    // still asserted explicitly, since that absence is what makes each phase build its own.
+    expect(k8sSandboxExtensionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ config: FAKE_CONFIG, transport: undefined }),
+    );
   });
 
   it('uses a request-scoped sandbox pool selector', async () => {
@@ -410,7 +461,9 @@ describe('realProduceVerdict transport wiring (Task 9)', () => {
     expect(kubectlTransportMock).not.toHaveBeenCalled();
     expect(transport.exec).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledTimes(1);
-    expect(k8sSandboxExtensionMock).toHaveBeenCalledWith({ config: FAKE_CONFIG, transport });
+    expect(k8sSandboxExtensionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ config: FAKE_CONFIG, transport }),
+    );
   });
 });
 
@@ -934,5 +987,32 @@ describe('runPromptLeaf sandbox leasing', () => {
 
     expect(r).toMatchObject({ status: 'failed', reason: 'error', message: 'turn exploded' });
     expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  // #452, on the path where it was reported. The lease SUCCEEDS here — the throw comes from
+  // inside the turn, after `executeTurn` has started — so it cannot be caught by the
+  // lease-time branch above, and before this it fell through to `reason: 'error'`: a 200 or
+  // a permanent failure for a host that just needed a moment.
+  it('maps a mid-turn host capacity refusal to failed/saturated and still releases the lease', async () => {
+    const release = vi.fn(async () => {});
+    const close = vi.fn(async () => {});
+    selectPoolSandboxMock.mockReset().mockResolvedValue({
+      config: FAKE_CONFIG,
+      transport: { exec: vi.fn(), close },
+      heartbeat: vi.fn(async () => {}),
+      release,
+    });
+    const executeTurn = vi.fn(async () => {
+      throw new SandboxCapacityRefusedError('memory-budget: committing 301989888 more bytes');
+    });
+
+    const r = await runLeaf(base, undefined, { executeTurn });
+
+    expect(r).toMatchObject({ status: 'failed', reason: 'saturated' });
+    // Releasing matters MORE here than on a generic error: the condition clears as hosts
+    // free up, and a lease held past this turn is capacity withheld from the very pool the
+    // retry will come back to.
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

@@ -244,6 +244,59 @@ On a small budget it also warns that 16 slots at standby depth 2 could commit mo
 budget allows. Two or three sessions stay far below that. For more, raise the budget or set
 `WORKER_MAX_CONCURRENT` in `microvm-worker.env`.
 
+### Size the budget for RECENTLY ACTIVE sessions, not for concurrency (#452)
+
+The warning above counts slots, which reads like a concurrency limit. The budget is not one.
+
+`MICROVM_MAX_COMMITTED_MB` bounds the memory of VMs _resident at once_, and what makes a VM resident
+is a **distinct `workspace_key`** — one per session — not a command in flight. A single command
+leaves `1 + D` VMs behind it: the one it ran on, plus `D` standbys warmed for the session's next
+command.
+
+What releases them is `StandbyIdle`, **90 seconds** with no Exec for that key, after which the
+sweep drops the session's standbys and parks the run — and a parked run holds zero VMs. So the
+budget is consumed by sessions active in roughly the last `StandbyIdle + ReclaimScanInterval`
+(~2 minutes), not by sessions that are merely open. A session idle for an hour holds **no** memory;
+what it still holds is its workspace on disk, until `SH_WORKSPACE_IDLE`.
+
+The number to divide the budget by is therefore how many sessions took a turn in the last couple of
+minutes, and the budget itself is net of the reserve:
+
+```
+recently active sessions ≈ (MICROVM_MAX_COMMITTED_MB - SH_MEMORY_RESERVE_MB)
+                           / ((guest MiB + 32) × (1 + D))
+```
+
+The `+ 32` is the per-VM cost outside guest RAM — the VMM process and its sidecars — because
+admission charges `GuestRAMBytes + VMOverheadBytes` per VM (`vmpool.PerVMBytes`). It is a constant
+(`DefaultVMOverheadBytes`), not a knob. At the verified
+settings — budget `8192` MiB, `SH_MEMORY_RESERVE_MB=4096`, `guest=256MiB`, `D=2` — that is
+(8192 − 4096) / 864 ≈ **4–5 sessions**, or about 14 VMs, which is the figure #452 reports from the
+rig. Note the reserve: on this host it is half the budget, so halving the gap between them halves
+the capacity.
+
+Past that point the worker refuses an exec rather than overcommitting, and since #452 it first sheds
+the least-recently-used **idle standby** VM and retries, so a refusal now means every resident VM
+belongs to a session with live work — a host genuinely busy rather than one holding warm standbys
+for sessions that moved on. The refusal reaches the caller as **HTTP 503 with `Retry-After`** and
+code `sandbox_unavailable`; the same prompt is retryable, and because the ceiling clears on the
+90-second sweep rather than on a human closing a tab, a retry a minute later usually succeeds.
+
+To raise the ceiling, the knobs are the budget and the standby depth:
+
+| Symptom                                     | Knob                                                                          |
+| ------------------------------------------- | ----------------------------------------------------------------------------- |
+| 503s with few sessions active               | raise `MICROVM_MAX_COMMITTED_MB`, or lower `SH_MEMORY_RESERVE_MB`             |
+| 503s under a burst of short, parallel turns | lower `SH_STANDBY_DEPTH` from `2` — fewer warm VMs per session, colder starts |
+
+`SH_WORKSPACE_IDLE` is **not** one of them. It governs the workspace on disk, and the runs it
+reclaims already hold zero VMs and do not count toward `MaxRuns` either — so lowering it frees no
+memory and only brings #338's silent workspace reset forward.
+
+Before #452, a refusal at this ceiling did not surface as a 503 at all: it was delivered to the
+model as its command's output, so a turn answered 200 with the host's memory arithmetic quoted back
+as prose. If you are reading an older worker's logs, that is what a budget ceiling looked like.
+
 ## Run a turn
 
 These are single-user, **unauthenticated** `/turn` calls, and they need `SH_REQUIRE_AUTH=false` in
@@ -509,6 +562,13 @@ Verified on 2026-09-30:
   accounts are #367's acceptance run.
 - **Cloud Hypervisor, density and throughput (#256, #261), a host reboot, and any host other than
   the one above.**
+- **The budget ceiling on this rig (#452).** Every run above stayed well inside the budget — the
+  largest used 4 Execs — so no run here ever reached the ceiling, shed a standby, or produced a 503.
+  The eviction and the 503 mapping are covered by unit tests (`remote-worker/internal/vmpool`,
+  `packages/k8s-sandbox`, `packages/knative-server`); what is **not** verified is the end-to-end
+  behaviour on a host at its ceiling. Reaching it deliberately needs ~5 sessions each taking a turn
+  inside the same 90-second `StandbyIdle` window (see the arithmetic above), or a temporarily small
+  `MICROVM_MAX_COMMITTED_MB`.
 
 ## Guest egress (P4.1, #277)
 
@@ -555,6 +615,10 @@ proxy's `DynamicUser` needs no group). While `moca-egress` is down, restores fai
   (MI1 S4).
 - **A fresh VM per tool call** (#274). Destroying the VM dominates Exec latency (#307).
 - **The silent workspace reset** (#338, above).
+- **About four or five RECENTLY ACTIVE sessions per host, at the verified settings** (#452, above).
+  The ceiling counts distinct sessions that took a turn in the last ~2 minutes, not concurrent
+  commands — each leaves `1 + D` VMs resident until the 90-second `StandbyIdle` sweep parks it. Past
+  it, turns answer 503 + `Retry-After` rather than overcommitting the host.
 - **A workspace lives on one sandbox.** A session that moves (its sandbox gone past the grace) starts on an empty workspace; nothing copies it.
 - **A `setup-vm.sh` re-run forgets every session.** It recreates `sh-redis` (`--replace`, no volume;
   `deploy/vm/setup-vm.sh`, `start_redis`). The control plane's session and ownership index goes with

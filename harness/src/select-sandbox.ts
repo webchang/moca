@@ -367,6 +367,22 @@ export class WorkloadSandboxUnavailableError extends SandboxPoolEmptyError {
 }
 
 /**
+ * Thrown when a run names a workload but this deployment could never serve it: the run carries no
+ * owner scope, or the worker has no relay sandbox pool. A misconfiguration, not "none attached right
+ * now", so deliberately NOT a SandboxPoolEmptyError: like SandboxRequiredError, a retry cannot
+ * succeed, and run-leaf maps it to a terminal `error`.
+ */
+export class WorkloadSandboxMisconfiguredError extends Error {
+  constructor(
+    readonly workload: string,
+    detail: string,
+  ) {
+    super(`workload '${forLog(workload)}': ${detail}`);
+    this.name = 'WorkloadSandboxMisconfiguredError';
+  }
+}
+
+/**
  * Thrown when a server-mode turn has no sandbox to run tools in (MI1 §5 R3). Without it, a `null`
  * sandbox config leaves Pi's built-in tools running locally in the worker process. Deliberately NOT
  * in turnErrorStatus's NO_CAPACITY set: this is a deployment that has no sandbox configured at all,
@@ -649,11 +665,11 @@ async function select(
   // Without the owner a workload run could not apply the owner half of the filter; refuse rather
   // than fall back to matching on the workload alone.
   if (workload && !ownerScope) {
-    throw new WorkloadSandboxUnavailableError(workload, 'the run names no owner scope');
+    throw new WorkloadSandboxMisconfiguredError(workload, 'the run names no owner scope');
   }
   // Workload sandboxes are relay records only; no other inventory can serve a workload run.
   const noRecords = () =>
-    new WorkloadSandboxUnavailableError(
+    new WorkloadSandboxMisconfiguredError(
       workload!,
       'workload sandboxes need the relay sandbox pool (KAGENTI_SANDBOX_POOL_SELECTOR, SH_REMOTE_SANDBOX=1)',
     );

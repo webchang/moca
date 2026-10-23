@@ -16,6 +16,7 @@
     "./run-lease": "./src/run-lease.ts",
     "./sandbox-lease": "./src/sandbox-lease.ts",
     "./sandbox-affinity": "./src/sandbox-affinity.ts",
+    "./pool-records": "./src/pool-records.ts",
     "./turn-registry": "./src/turn-registry.ts",
     "./select-sandbox": "./src/select-sandbox.ts",
     "./config-resolver": "./src/config-resolver.ts",

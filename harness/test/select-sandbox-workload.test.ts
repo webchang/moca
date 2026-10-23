@@ -3,6 +3,7 @@ import {
   selectPoolSandbox,
   SandboxAffinityPendingError,
   SandboxPoolEmptyError,
+  WorkloadSandboxMisconfiguredError,
   WorkloadSandboxUnavailableError,
   resetTierWarnings,
 } from '../src/select-sandbox.js';
@@ -228,7 +229,8 @@ describe('selectPoolSandbox: workload filter (spec §3.3)', () => {
           deps(recs, lease, { listPods: async () => ['pod-0'] }),
         ),
         JSON.stringify(e),
-      ).rejects.toBeInstanceOf(WorkloadSandboxUnavailableError);
+        // A deployment that can never serve the run: not "none attached right now".
+      ).rejects.toBeInstanceOf(WorkloadSandboxMisconfiguredError);
     }
   });
 
@@ -283,7 +285,7 @@ describe('selectPoolSandbox: workload filter (spec §3.3)', () => {
         opts({ workload: WL }),
         deps([wlRec(`${WL}-0`, WL)], lease),
       ),
-    ).rejects.toBeInstanceOf(WorkloadSandboxUnavailableError);
+    ).rejects.toBeInstanceOf(WorkloadSandboxMisconfiguredError);
     expect(acquired).toEqual([]);
   });
 });
