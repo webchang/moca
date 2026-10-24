@@ -430,7 +430,9 @@ paths:
         the default pool; a synchronous one without a token is 401 token_required.
         `contextWritable: true` gives that run its own writable copy of the context instead,
         discarded when the run ends. A workload created with `sandboxes` runs only on its own
-        sandboxes, never on the shared pool.
+        sandboxes, never on the shared pool. One created with `workspace.mount` as well has its
+        context mounted there instead of copied: the run starts in it, and `contextWritable: true`
+        gives a `read-only` mount's run its own copy and changes nothing on a `writable` one.
       security:
         - sessionToken: []
       requestBody:

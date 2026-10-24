@@ -1,9 +1,11 @@
-import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { createClient } from 'redis';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { keyIdFor, makeSigner, publicKeyToBase64 } from '@moca/control-plane';
 import { startServer } from '../src/server.js';
+import { seedBytesNeeded } from '../src/workloads.js';
 
 // The workload lifecycle against a real Redis (its Lua compare-and-set is the point) and a fake
 // Context Service that implements the trusted API's observable rules.
@@ -11,6 +13,7 @@ import { startServer } from '../src/server.js';
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const REVISION = 'a'.repeat(64);
 const OTHER_REVISION = 'b'.repeat(64);
+const MIB = 1024 * 1024;
 
 const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const signer = makeSigner(privateKey.export({ format: 'pem', type: 'pkcs8' }).toString());
@@ -45,6 +48,8 @@ class FakeContextService {
    * them as unreachable (fetch rejection, no HTTP status). The counter decrements per hit.
    */
   unreachable = new Map<string, number>();
+  /** What the trusted export serves for any frozen revision. */
+  bundle = gzipSync(Buffer.alloc(4096, 'x'));
   server = http.createServer((req, res) => void this.handle(req, res));
 
   hold(operation: string, when: 'before' | 'after' = 'before'): () => void {
@@ -75,6 +80,19 @@ class FakeContextService {
       subject,
       auth: String(req.headers.authorization),
     });
+    const exported =
+      /^\/internal\/v1\/namespaces\/moca\/contexts\/([^/]+)\/revisions\/([a-f0-9]{64})\/bundle$/.exec(
+        path,
+      );
+    if (exported) {
+      const context = this.contexts.get(decodeURIComponent(exported[1]!));
+      if (!context || context.owner !== subject || context.frozenRevision !== exported[2]) {
+        res.writeHead(404).end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/vnd.rossoctl.context' }).end(this.bundle);
+      return;
+    }
     const match = /^\/(?:internal\/)?v1\/namespaces\/moca\/contexts\/([^/]+)(\/[a-z-]+)?$/.exec(
       path,
     );
@@ -641,10 +659,16 @@ describe('lifecycle races', () => {
 /** moca-provisioner, reduced to what the worker observes: both credentials, and its answers. */
 class FakeProvisioner {
   calls: { method: string; path: string; auth: string; user: string; body: unknown }[] = [];
+  /** Bundles handed over, as received (spec §5.2). */
+  bundles: { path: string; type: string; length?: string; bytes: Buffer }[] = [];
   /** Pods every DELETE reports as still terminating. */
   podsLeft = 0;
   /** One-shot: the next PUT fails with this status and code. */
   failPut?: { status: number; error: string };
+  /** One-shot: the next bundle hand-off fails with this status and code. */
+  failBundle?: { status: number; error: string; retryAfter?: string };
+  /** What GET reports as the seed. */
+  seed?: string;
   /** When set, a PUT holds until it resolves: a slow API server behind the provisioner. */
   putGate?: Promise<void>;
   /** Every request, in arrival order: the real provisioner runs one owner's requests one at a time. */
@@ -659,6 +683,25 @@ class FakeProvisioner {
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
+    const reply = (status: number, body: unknown, headers: Record<string, string> = {}): void => {
+      res
+        .writeHead(status, { 'content-type': 'application/json', ...headers })
+        .end(JSON.stringify(body));
+    };
+    if (req.url?.endsWith('/bundle')) {
+      this.bundles.push({
+        path: req.url,
+        type: String(req.headers['content-type']),
+        length: req.headers['content-length'],
+        bytes: Buffer.concat(chunks),
+      });
+      const fail = this.failBundle;
+      this.failBundle = undefined;
+      if (fail) {
+        return reply(fail.status, { error: fail.error }, { 'retry-after': fail.retryAfter ?? '7' });
+      }
+      return reply(200, { held: true });
+    }
     if (req.method === 'PUT' && this.putGate) await this.putGate;
     this.done.push(req.method ?? '');
     this.calls.push({
@@ -668,9 +711,8 @@ class FakeProvisioner {
       user: String(req.headers['x-moca-user-token']),
       body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined,
     });
-    const reply = (status: number, body: unknown): void => {
-      res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
-    };
+    if (req.method === 'GET')
+      return reply(200, { ready: 0, ...(this.seed ? { seed: this.seed } : {}) });
     if (req.method === 'PUT') {
       const fail = this.failPut;
       this.failPut = undefined;
@@ -932,5 +974,189 @@ describe('a workload with sandboxes of its own (phase 2)', () => {
     expect(view).not.toHaveProperty('sandboxes');
     expect((await call('DELETE', '/workloads/demo', alice)).status).toBe(204);
     expect(prov.calls).toEqual([]);
+  });
+
+  describe('with workspace.mount (its own PVC, spec §5)', () => {
+    it('refuses a mount without sandboxes, a bad mode, and a size or class outside the caps', async () => {
+      vi.stubEnv('MOCA_WORKLOAD_MAX_STORAGE', '4Gi');
+      vi.stubEnv('MOCA_WORKLOAD_STORAGE_CLASSES', 'fast:rwo');
+      for (const [extra, error] of [
+        [{ workspace: { mount: 'writable' } }, 'workspace_mount_requires_sandboxes'],
+        [{ workspace: { mount: 'rw' }, sandboxes: { count: 1 } }, 'workspace_mount_invalid'],
+        [
+          { workspace: { mount: 'writable', size: '5Gi' }, sandboxes: { count: 1 } },
+          'workspace_size_invalid',
+        ],
+        [
+          { workspace: { mount: 'writable', storageClass: 'scale' }, sandboxes: { count: 1 } },
+          'storage_class_not_allowed',
+        ],
+      ] as const) {
+        expect(await create(alice, 'demo', extra), error).toEqual({ status: 400, body: { error } });
+      }
+      expect(cs.calls).toEqual([]);
+      expect(await quotaOf(alice)).toBe(0);
+    });
+
+    it('hands over the frozen bundle, then PUTs the mount and the claim, and reports them', async () => {
+      vi.stubEnv('MOCA_WORKLOAD_STORAGE_CLASSES', 'fast:rwo');
+      const created = await create(alice, 'demo', {
+        workspace: { mount: 'writable', size: '2Gi' },
+        sandboxes: { count: 1 },
+      });
+      expect(created.body).toMatchObject({
+        status: 'awaiting_upload',
+        workspace: { size: '2Gi', storageClass: 'fast', mount: 'writable' },
+        sandboxes: { count: 1, tier: 'container', ready: 0 },
+      });
+      expect(created.body.sandboxes).not.toHaveProperty('claim');
+      // Context Service gets the size, in its own default class: no pod mounts its PVC.
+      expect(cs.calls[0]).toMatchObject({ method: 'POST', path: '/internal/v1/contexts' });
+      expect([...cs.contexts.values()][0]!.storage).toEqual({
+        backend: 'pvc',
+        accessMode: 'ReadWriteOnce',
+        size: '2Gi',
+      });
+      cs.upload(alice);
+      const activated = await call('POST', '/workloads/demo/activate', alice, {
+        revision: REVISION,
+      });
+      expect(activated.status).toBe(202);
+      expect(prov.bundles).toHaveLength(1);
+      expect(prov.bundles[0]!.type).toBe('application/vnd.rossoctl.context');
+      expect(prov.bundles[0]!.bytes).toEqual(cs.bundle);
+      // Sent with its length, which the provisioner reserves its seed budget from.
+      expect(prov.bundles[0]!.length).toBe(String(cs.bundle.length));
+      expect(prov.bundles[0]!.path).toMatch(
+        /^\/internal\/v1\/workloads\/demo\/[0-9a-f-]{36}\/bundle$/,
+      );
+      expect(prov.calls.find((c) => c.method === 'PUT')!.body).toEqual({
+        count: 1,
+        tier: 'container',
+        revision: REVISION,
+        mount: 'writable',
+        storage: { size: '2Gi', storageClass: 'fast' },
+      });
+    });
+
+    it('refuses a size that cannot hold the seed: bundle plus revision (twice for writable) plus a margin', async () => {
+      // 10 MiB of x: tiny compressed. Read-only needs (c + 10 MiB) * 1.1 + 16 MiB, about 27 MiB;
+      // writable (c + 20 MiB) * 1.1 + 16 MiB, about 38 MiB.
+      expect(seedBytesNeeded(0, 10 * MIB, 'read-only')).toBe(Math.ceil(11 * MIB) + 16 * MIB);
+      expect(seedBytesNeeded(MIB, 10 * MIB, 'writable')).toBe(Math.ceil(21 * 1.1 * MIB) + 16 * MIB);
+      cs.bundle = gzipSync(Buffer.alloc(10 * MIB, 'x'));
+      await create(alice, 'demo', {
+        workspace: { mount: 'writable', size: '30Mi' },
+        sandboxes: { count: 1 },
+      });
+      cs.upload(alice);
+      expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual(
+        {
+          status: 400,
+          body: { error: 'workspace_size_too_small' },
+        },
+      );
+      expect(prov.bundles).toEqual([]);
+      expect(prov.calls.filter((c) => c.method === 'PUT')).toEqual([]);
+      expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+        status: 'provisioning',
+        error: 'workspace_size_too_small',
+      });
+      await create(bob, 'demo', {
+        workspace: { mount: 'read-only', size: '30Mi' },
+        sandboxes: { count: 1 },
+      });
+      cs.upload(bob);
+      expect(
+        (await call('POST', '/workloads/demo/activate', bob, { revision: REVISION })).status,
+      ).toBe(202);
+      // Incompressible: the compressed bundle the seed downloads onto the claim counts too, so the
+      // same 30Mi read-only no longer fits (about 38 MiB needed).
+      cs.bundle = gzipSync(randomBytes(10 * MIB));
+      const carol = `github:carol-${randomUUID()}`;
+      await create(carol, 'demo', {
+        workspace: { mount: 'read-only', size: '30Mi' },
+        sandboxes: { count: 1 },
+      });
+      cs.upload(carol);
+      expect(await call('POST', '/workloads/demo/activate', carol, { revision: REVISION })).toEqual(
+        { status: 400, body: { error: 'workspace_size_too_small' } },
+      );
+    });
+
+    it('passes a provisioner 413 through as 413 bundle_too_large, and a malformed Retry-After as 15', async () => {
+      await create(alice, 'demo', { workspace: { mount: 'read-only' }, sandboxes: { count: 1 } });
+      cs.upload(alice);
+      prov.failBundle = { status: 413, error: 'bundle_too_large' };
+      expect(await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).toEqual(
+        { status: 413, body: { error: 'bundle_too_large' } },
+      );
+      for (const retryAfter of ['soon', '99999', '-1', '1.5']) {
+        prov.failBundle = { status: 503, error: 'seed_budget_full', retryAfter };
+        const response = await fetch(`${base}/workloads/demo/activate`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${apiToken(alice)}`,
+          },
+          body: JSON.stringify({ revision: REVISION }),
+        });
+        expect(response.status, retryAfter).toBe(503);
+        expect(response.headers.get('retry-after'), retryAfter).toBe('15');
+      }
+    });
+
+    it('passes 503 seed_budget_full through with Retry-After, and the retry resends the bundle', async () => {
+      await create(alice, 'demo', { workspace: { mount: 'read-only' }, sandboxes: { count: 1 } });
+      cs.upload(alice);
+      prov.failBundle = { status: 503, error: 'seed_budget_full' };
+      const response = await fetch(`${base}/workloads/demo/activate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiToken(alice)}` },
+        body: JSON.stringify({ revision: REVISION }),
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers.get('retry-after')).toBe('7');
+      expect(await response.json()).toEqual({ error: 'seed_budget_full' });
+      expect(prov.calls.filter((c) => c.method === 'PUT')).toEqual([]);
+      expect(
+        (await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).status,
+      ).toBe(202);
+      expect(prov.bundles).toHaveLength(2);
+    });
+
+    it('shows seed_bundle_missing after a provisioner restart until an activate resends it; ready clears it', async () => {
+      await create(alice, 'demo', { workspace: { mount: 'read-only' }, sandboxes: { count: 1 } });
+      cs.upload(alice);
+      await call('POST', '/workloads/demo/activate', alice, { revision: REVISION });
+      prov.seed = 'bundle_missing';
+      expect((await call('GET', '/workloads/demo', alice)).body).toMatchObject({
+        status: 'provisioning',
+        error: 'seed_bundle_missing',
+      });
+      prov.seed = 'pending';
+      expect(
+        (await call('POST', '/workloads/demo/activate', alice, { revision: REVISION })).status,
+      ).toBe(202);
+      expect(prov.bundles).toHaveLength(2);
+      expect((await call('GET', '/workloads/demo', alice)).body).not.toHaveProperty('error');
+      await attachRecord(alice, wlOf(alice), 0);
+      const ready = await call('GET', '/workloads/demo', alice);
+      expect(ready.body).toMatchObject({ status: 'ready' });
+      expect(ready.body).not.toHaveProperty('error');
+      await redis.hDel('sh:sandbox:records', `${wlOf(alice)}-0`);
+    });
+
+    it('a workload with sandboxes but no mount hands over no bundle, as in phase 2 PR 2', async () => {
+      await create(alice, 'demo', { sandboxes: { count: 1 } });
+      cs.upload(alice);
+      await call('POST', '/workloads/demo/activate', alice, { revision: REVISION });
+      expect(prov.bundles).toEqual([]);
+      expect(prov.calls.find((c) => c.method === 'PUT')!.body).toEqual({
+        count: 1,
+        tier: 'container',
+        revision: REVISION,
+      });
+    });
   });
 });

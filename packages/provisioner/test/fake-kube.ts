@@ -14,6 +14,7 @@ export class FakeKube implements KubeApi {
     statefulsets: new Map(),
     pods: new Map(),
     podtemplates: new Map(),
+    persistentvolumeclaims: new Map(),
   };
   calls: string[] = [];
   private rv = 1;

@@ -42,6 +42,7 @@ describe('acquireTurnSandbox', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 0, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     // `context` is a required key on K8sSandboxConfig (its value may be undefined, meaning
     // "use current-context"), so a config literal that omits it is not one -- unnoticed until
@@ -242,7 +243,11 @@ describe('acquireTurnSandbox', () => {
           records,
           affinity,
           makeExecClient: () => ({}) as never,
-          makeTransport: () => ({ exec: async () => ({}) as never, close: async () => {} }),
+          makeTransport: () => ({
+            exec: async () => ({}) as never,
+            close: async () => {},
+            fastTier: 'per-call-exec' as const,
+          }),
         },
         'microvm',
       );

@@ -4,10 +4,10 @@
 #
 #   provisioner.yaml       moca-provisioner: ServiceAccount, Role, Deployment, Service and its
 #                          NetworkPolicy; the workload sandboxes' ServiceAccount, NetworkPolicy and
-#                          the namespace's pod quota
+#                          the namespace's pod and PVC quota
 #   template.yaml          the PodTemplate every workload sandbox starts from (operators patch it)
 #   admission-policy.yaml  what the provisioner may write, enforced by the API server
-#   network-policy.yaml    DNS for workload sandboxes
+#   network-policy.yaml    DNS for workload sandboxes, and their egress to the provisioner's seed port
 #
 # The component sits under the target's overlay, so the base's and target's image transformers never
 # see it: setup.sh's generated overlay carries the target's image rewrites (images:, below the

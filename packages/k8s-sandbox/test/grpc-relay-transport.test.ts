@@ -72,7 +72,14 @@ const grpcFactory: TransportFactory = (behavior, opts) => {
   };
 };
 
-runConformance('GrpcRelayTransport', grpcFactory, { producerStop: 'remote-abort', streams: true });
+runConformance('GrpcRelayTransport', grpcFactory, {
+  producerStop: 'remote-abort',
+  streams: true,
+  // `rpc Exec` is ONE command per RPC and the worker answers each with a fresh `bash -c`,
+  // so N fast ops cost N round trips and N processes (#245). This is the transport the
+  // issue is about: giving it a fast tier needs a sandbox.proto change, not a flag here.
+  fastTier: 'per-call-exec',
+});
 
 function manualClient() {
   let stream!: EventEmitter & { cancel: () => void };

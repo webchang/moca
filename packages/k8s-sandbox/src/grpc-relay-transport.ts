@@ -201,6 +201,13 @@ export function GrpcRelayTransport(
     });
 
   return {
+    // Every exec is its own `SandboxExec.Exec` RPC, which the relay bridges onto the
+    // worker's Attach stream and the worker answers with a fresh `bash -c`
+    // (remote-worker/internal/exec/runner.go). There is no long-lived shell concept on the
+    // wire — `Exec` is one command per RPC — so N fast ops cost N round trips and N
+    // processes (#245). Giving THIS transport a fast tier needs a proto change, not a
+    // parameterized argv; see the issue.
+    fastTier: 'per-call-exec',
     exec,
     async close() {
       if (closed) return; // idempotent; per-exec calls own their own stream lifecycle

@@ -28,7 +28,37 @@ function fakePi() {
 const okTransport = (close = vi.fn(async () => {})): SandboxTransport => ({
   exec: async () => ({ stdout: Buffer.from(''), exitCode: 0, truncated: false }),
   close,
+  // A hand-written transport must now choose a tier (#245). `'per-call-exec'` is the
+  // honest answer for a stub with no channel to reuse, and it is also what the real
+  // callers hand to `transport:` — the case this file's two-tier tests are about.
+  fastTier: 'per-call-exec',
 });
+
+/**
+ * A transport that records every command it is given, so a test can assert WHICH tier a
+ * tool reached rather than that some exec happened (#245). The label is carried only to
+ * make a failure message say which transport was called.
+ */
+function tagging(label: string) {
+  const calls: string[] = [];
+  const transport: SandboxTransport = {
+    exec: async (command) => {
+      calls.push(`${label}:${command}`);
+      return { stdout: Buffer.from(''), exitCode: 0, truncated: false };
+    },
+    close: vi.fn(async () => {}),
+    fastTier: 'per-call-exec',
+  };
+  return { transport, calls };
+}
+
+/** Run one of the extension's registered tools by name. */
+const exec = async (tools: unknown[], name: string, args: Record<string, unknown>) => {
+  const tool = (
+    tools as Array<{ name: string; execute: (...a: unknown[]) => Promise<unknown> }>
+  ).find((t) => t.name === name)!;
+  await tool.execute('call-1', args).catch(() => {});
+};
 
 describe('k8sSandboxExtension', () => {
   it('registers the seven pod tools and wires the lifecycle handlers', () => {
@@ -54,6 +84,89 @@ describe('k8sSandboxExtension', () => {
     expect(tools).toHaveLength(0);
   });
 
+  it('sends fast ops to the fast tier and streaming ops to the stream tier (#245)', async () => {
+    // THE DEFECT. `transport` meant BOTH tiers, so a caller with a per-call transport —
+    // run-leaf.ts, passing a leased GrpcRelayTransport — silently gave up the fast tier for
+    // every read/write/edit/ls/find. The two can now be given separately, and this pins
+    // WHICH tier each tool draws from, so a future reshuffle of the registerTool block
+    // cannot quietly move a file op onto the streaming transport or the reverse.
+    const fast = tagging('fast');
+    const stream = tagging('stream');
+    const { pi, tools } = fakePi();
+    k8sSandboxExtension({
+      config: cfg,
+      fastTransport: fast.transport,
+      streamTransport: stream.transport,
+    })(pi);
+
+    await exec(tools, 'ls', { path: '/workspace' });
+    // Counts are not asserted — `ls` legitimately issues more than one exec (an existence
+    // probe, then the listing) and that is the tool's business. What must hold is that
+    // every one of them went to the fast tier and none leaked to the stream tier.
+    expect(fast.calls.length).toBeGreaterThan(0);
+    expect(stream.calls).toHaveLength(0);
+
+    const afterLs = fast.calls.length;
+    await exec(tools, 'bash', { command: 'echo hi' });
+    expect(fast.calls).toHaveLength(afterLs); // bash must not touch the fast channel
+    expect(stream.calls.length).toBeGreaterThan(0);
+  });
+
+  it('lets the specific tier override win over the both-tiers shorthand (#245)', async () => {
+    // Order matters in the three-step fallthrough: own override, then `transport`, then the
+    // tier's default. The reverse precedence would make the new knobs unreachable for every
+    // existing caller, since all of them set `transport`.
+    const both = tagging('both');
+    const fast = tagging('fast');
+    const { pi, tools } = fakePi();
+    k8sSandboxExtension({ config: cfg, transport: both.transport, fastTransport: fast.transport })(
+      pi,
+    );
+
+    await exec(tools, 'ls', { path: '/workspace' });
+    const afterLs = both.calls.length;
+    await exec(tools, 'bash', { command: 'echo hi' });
+    // "both tiers go there, except the fast one": `ls` reached the override and left the
+    // shorthand untouched, and `bash` then reached the shorthand.
+    expect(fast.calls.length).toBeGreaterThan(0);
+    expect(afterLs).toBe(0);
+    expect(both.calls.length).toBeGreaterThan(0);
+  });
+
+  it('closes BOTH tiers on session_shutdown when they are different objects (#245)', async () => {
+    // New with the split. Closing only the fast tier was sufficient while the stream tier was
+    // either the same object or a KubectlTransport (no-op close); a streamTransport that owns
+    // something — a GrpcRelayTransport owns its gRPC channel — would leak once per session.
+    const fastClose = vi.fn(async () => {});
+    const streamClose = vi.fn(async () => {});
+    const { pi, handlers } = fakePi();
+    k8sSandboxExtension({
+      config: cfg,
+      fastTransport: okTransport(fastClose),
+      streamTransport: okTransport(streamClose),
+    })(pi);
+    await handlers.session_shutdown();
+    expect(fastClose).toHaveBeenCalledTimes(1);
+    expect(streamClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes the shorthand transport ONCE even with a capacity latch attached (#245)', async () => {
+    // The latch's `watch` allocates a FRESH wrapper per call, so post-wrap the two tiers are
+    // never identical even when `transport` named one object. A naive identity guard on the
+    // wrappers would double-close here. close() is contractually idempotent, so this is about
+    // not doing pointless work on a path that runs for every session — and about the guard
+    // meaning what it says.
+    const close = vi.fn(async () => {});
+    const { pi, handlers } = fakePi();
+    k8sSandboxExtension({
+      config: cfg,
+      transport: okTransport(close),
+      capacity: createCapacityLatch(),
+    })(pi);
+    await handlers.session_shutdown();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('never sends the harness process environment to the sandbox through the bash tool', async () => {
     const commands: string[] = [];
     const recording: SandboxTransport = {
@@ -62,6 +175,7 @@ describe('k8sSandboxExtension', () => {
         return { stdout: Buffer.from(''), exitCode: 0, truncated: false };
       },
       close: vi.fn(async () => {}),
+      fastTier: 'per-call-exec',
     };
     const saved = process.env.MI1_PLANTED_SECRET;
     process.env.MI1_PLANTED_SECRET = 'planted-value-must-not-cross'; // notsecret
@@ -93,6 +207,7 @@ describe('k8sSandboxExtension capacity latch', () => {
       throw new SandboxCapacityRefusedError('memory-budget: committing 301989888 more bytes');
     },
     close: vi.fn(async () => {}),
+    fastTier: 'per-call-exec',
   });
 
   const runBash = async (tools: unknown[]) => {
@@ -148,6 +263,7 @@ describe('k8sSandboxExtension capacity latch', () => {
         throw new Error('exit status 1');
       },
       close: vi.fn(async () => {}),
+      fastTier: 'per-call-exec',
     };
     k8sSandboxExtension({ config: cfg, transport: failing, capacity })(pi);
     await runBash(tools);
@@ -205,6 +321,7 @@ describe('k8sSandboxExtension capacity latch', () => {
         throw new SandboxCapacityRefusedError(`memory-budget: refusal ${++n}`);
       },
       close: vi.fn(async () => {}),
+      fastTier: 'per-call-exec',
     };
     k8sSandboxExtension({ config: cfg, transport, capacity })(pi);
     await runBash(tools);

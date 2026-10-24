@@ -78,4 +78,9 @@ const persistentFactory: TransportFactory = (b, opts) => {
 runConformance('persistentExecInPod', persistentFactory, {
   producerStop: 'producer-side-cap',
   streams: false,
+  // The only transport that amortizes a burst over ONE shell (#245) — and it makes that
+  // claim while declaring `streams: false`, which is exactly why the fast tier serves
+  // read/write/edit/ls/find and never bash/grep. Claimed unconditionally, including after
+  // capStageBroken latches onto the per-call fallback; see the returned object's comment.
+  fastTier: 'persistent-channel',
 });

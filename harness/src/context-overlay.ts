@@ -129,7 +129,13 @@ function sweepLines(retainMinutes: number): string[] {
     `    [ -d "${BASE}/cache/$REV" ] || [ -n "$(ls -A "${BASE}/refs/$REV" 2>/dev/null)" ] || rm -f "$USED"`,
     `  done`,
     `  rmdir "${BASE}"/refs/* 2>/dev/null || true`,
-    // A writable copy, or its staging dir, left by a harness that died. Links are left alone.
+    ...staleRunLines(),
+  ];
+}
+
+/** A writable copy, or its staging dir, left by a harness that died. Links are left alone. */
+function staleRunLines(): string[] {
+  return [
     `  for STALE in "${BASE}"/runs/* "${BASE}"/runs/.stage.*; do`,
     `    [ -d "$STALE" ] && [ ! -L "$STALE" ] && [ -n "$(find "$STALE" -maxdepth 0 -mmin +${STALE_MINUTES})" ] || continue`,
     `    chmod -R u+w "$STALE" 2>/dev/null || true; rm -rf "$STALE" 2>/dev/null || true`,
@@ -327,4 +333,69 @@ export function buildContextCleanupScript(
     ...sweepLines(retainMinutes),
     `) 9>"${LOCK}"`,
   ].join('\n');
+}
+
+/**
+ * Where a mounted workload's sandboxes have its context (workload sandboxes spec §5.3): the PVC,
+ * read-only at its revision or writable at its `moca-workspace` tree. Nothing is delivered.
+ */
+export const CONTEXT_MOUNT = '/workspace/context';
+
+/**
+ * Print the directory a run on a mounted workload starts in: the mount, rooted at its `workspace/`
+ * directory under the same rule as a copied revision (VIEW_SOURCE). With `copy` (the run-level
+ * `writable` on a read-only mount), the run gets its own writable copy of that root at its view
+ * instead, staged and renamed into place as buildContextWritableScript does, and removed by
+ * buildMountedCleanupScript. Either way it first sweeps per-run copies older than a day that a
+ * harness killed before its cleanup left under runs/ (the pod is long-lived).
+ */
+export function buildMountedContextScript(sessionId: string, copy: boolean): string {
+  const sid = sessionValue(sessionId);
+  const lines = [
+    'set -euo pipefail',
+    '# CONTEXT_MOUNTED',
+    `CACHE=${sq(CONTEXT_MOUNT)}`,
+    '[ -d "$CACHE" ]',
+    VIEW_SOURCE,
+    // The sandbox outlives its runs: per-run copies a harness killed before its cleanup left.
+    ...staleRunLines(),
+  ];
+  if (!copy) return [...lines, 'printf %s "$SRC"'].join('\n');
+  return [
+    ...lines,
+    `ROOT=${sq(contextRoot(sid))}; STAGE=${sq(writableStage(sid))}`,
+    `mkdir -p "${BASE}/runs"`,
+    `trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"' EXIT`,
+    'chmod -R u+w "$STAGE" "$ROOT" 2>/dev/null || true; rm -rf "$STAGE" "$ROOT"',
+    'cp -a "$SRC" "$STAGE"',
+    'chmod -R u+w "$STAGE"',
+    // As buildContextWritableScript: `cp -a` kept the revision's mtime, which the sweep would read
+    // as abandoned.
+    'touch "$STAGE"',
+    'mv "$STAGE" "$ROOT"',
+    'printf %s "$ROOT"',
+  ].join('\n');
+}
+
+/** Remove a run's own copy of a mounted context, if it made one. Best effort, as cleanup is. */
+export function buildMountedCleanupScript(sessionId: string): string {
+  const sid = sessionValue(sessionId);
+  return [
+    'set -u',
+    '# CONTEXT_MOUNTED_CLEANUP',
+    `ROOT=${sq(contextRoot(sid))}; STAGE=${sq(writableStage(sid))}`,
+    '{ [ -L "$ROOT" ] || chmod -R u+w "$ROOT"; chmod -R u+w "$STAGE"; } 2>/dev/null || true',
+    'rm -rf "$ROOT" "$STAGE" 2>/dev/null || true',
+  ].join('\n');
+}
+
+/** The run's view of a mounted context: its path, after any per-run copy. */
+export async function mountedContext(
+  transport: SandboxTransport,
+  sessionId: string,
+  copy: boolean,
+): Promise<string> {
+  const path = (await run(transport, buildMountedContextScript(sessionId, copy))).trim();
+  if (!path.startsWith('/')) throw new Error('context mount gave no path');
+  return path;
 }

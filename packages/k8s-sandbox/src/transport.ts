@@ -52,7 +52,39 @@ export interface SandboxTransport {
   exec: ExecInPod;
   /** Release any long-lived resource (persistent channel, connection). Idempotent. */
   close(): Promise<void>;
+  /**
+   * Whether a burst of small file ops costs ONE reused shell or N round trips (#245).
+   * See FastTier. REQUIRED for the reason `ExecResult.truncated` is: optional, a fourth
+   * transport omits it and reads as the safe-looking default, which is how this
+   * divergence existed unrecorded in the first place.
+   */
+  fastTier: FastTier;
 }
+
+/**
+ * Whether a transport amortizes a burst of small ops over ONE reused shell, or pays a
+ * round trip and a fresh process for each (#245).
+ *
+ * WHY THIS IS ON THE SEAM AND NOT A COMMENT. `truncated` is on `ExecResult` because the
+ * alternative — an optional field a fourth transport can omit — is how the #180/#185
+ * divergence survived. Fast-tier availability is the same shape of fact and was in the
+ * worse state: not even optional, just absent. `extension.ts` runs a two-tier transport
+ * precisely because file ops are the highest-frequency tool calls, and `opts.transport`
+ * overrode BOTH tiers — so on the gRPC path (`run-leaf.ts`, which passes a leased
+ * transport) the fast tier silently did not exist and every read/write/edit/ls/find
+ * became a full `SandboxExec.Exec` ending in a fresh `bash -c`. A caller above the seam
+ * could not see that, let alone choose it.
+ *
+ * `'persistent-channel'` is a CLAIM ABOUT COST, not about correctness: it says a burst of
+ * N fast ops costs one reused shell rather than N. It does not promise streaming — the
+ * one implementation that makes the claim today declares `streams: false` to the
+ * conformance battery, which is exactly why the fast tier serves `read`/`write`/`edit`/
+ * `ls`/`find` and never `bash`/`grep`.
+ *
+ * Pinned PER TRANSPORT by test/conformance.ts, in the same discipline `producerStop`
+ * uses: every implementation makes a positive claim, so a fourth cannot ship without one.
+ */
+export type FastTier = 'persistent-channel' | 'per-call-exec';
 
 /**
  * Total returned-stdout cap per exec (spec §8, "poisoned-output defense"). Enforced by

@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
   DEFAULT_EXEC_TIMEOUT_S,
   OUTPUT_TRUNCATED_MARKER,
+  type FastTier,
   type SandboxTransport,
 } from '../src/transport.js';
 
@@ -54,6 +55,24 @@ export interface TransportCapabilities {
    * case for one implementation is how the #185 asymmetry survived in the first place.
    */
   streams: boolean;
+  /**
+   * Whether a burst of small file ops costs ONE reused shell or N round trips (#245).
+   *
+   * Declared for the same reason `producerStop` is an enum rather than a boolean: every
+   * implementation must make a positive claim about itself, so a fourth transport cannot
+   * ship without one being considered. Before this existed, `persistentExecInPod` was the
+   * only transport with a fast tier and nothing recorded that — so `extension.ts`'s
+   * `opts.transport`, which overrides BOTH tiers, silently removed it on the gRPC path.
+   *
+   * Unlike `producerStop`, the battery cannot observe this from one exec: it is a claim
+   * about the COST OF N ops, and a scripted fake's process count is the factory's
+   * fiction rather than the transport's behaviour. So the battery pins the claim against
+   * `fastTier(transport)` — the value a CALLER reads to choose a tier — and the cost
+   * itself is proved per-implementation (persistent-exec.test.ts counts spawns).
+   * Asserting the declaration still earns its keep: it is what makes the value a caller
+   * reads and the value the transport claims the same fact.
+   */
+  fastTier: FastTier;
 }
 
 export interface FakeHandle {
@@ -203,6 +222,16 @@ export function runConformance(
       const p = transport.exec('sleep 999', { signal: ac.signal });
       ac.abort();
       await expect(p).rejects.toThrow('aborted');
+    });
+
+    it('declares its fast tier, matching what a caller reads off the transport', async () => {
+      // #245. The battery cannot MEASURE this from one exec — it is a claim about the cost
+      // of N ops, and a scripted fake's process count is the factory's fiction. What it
+      // can pin is that the value a caller reads is the value the transport claims, so a
+      // fourth transport cannot ship without choosing one, and a wrapper (the capacity
+      // latch wraps BOTH tiers) cannot quietly answer for the thing it wraps.
+      const { transport } = make({ stdout: [], exitCode: 0 });
+      expect(transport.fastTier).toBe(caps.fastTier);
     });
 
     it('close() resolves and is idempotent', async () => {

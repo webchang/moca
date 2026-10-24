@@ -1,13 +1,13 @@
 # moca-provisioner (workload sandboxes spec §4, ADR-0043): the only MOCA component with Kubernetes
-# permissions in moca-sandbox. It creates each workload's StatefulSet, headless Service and
-# attach-token Secret there, and nothing else anywhere. Part of the workload-sandboxes component
+# permissions in moca-sandbox. It creates each workload's StatefulSet, headless Service,
+# attach-token Secret and, for a workload with a mount, its PVC there, and nothing else anywhere. Part of the workload-sandboxes component
 # only, so a stack without SH_WORKLOAD_SANDBOXES=1 has none of it.
 apiVersion: v1
 kind: ServiceAccount
 metadata: { name: moca-provisioner, namespace: moca }
 ---
-# Spec §4.1's table, verb for verb. No create on bare pods, nothing on PVCs beyond get, no rights
-# outside moca-sandbox. No get or list on Secrets: it writes its workloads' attach tokens blind
+# Spec §4.1's table, verb for verb, with §5.1's PVC verbs: it owns each mounted workload's PVC.
+# No create on bare pods, no rights outside moca-sandbox. No get or list on Secrets: it writes its workloads' attach tokens blind
 # (create, or an unconditional update) and can never read one, so not moca-relay-attach either.
 # What its object names and pod specs may be is admission-policy.yaml's, whatever this Role allows.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -28,7 +28,7 @@ rules:
     verbs: [get, list]
   - apiGroups: ['']
     resources: [persistentvolumeclaims]
-    verbs: [get]
+    verbs: [create, get, delete]
   # The operator's workload sandbox pod template (template.yaml), and nothing else of its kind.
   - apiGroups: ['']
     resources: [podtemplates]
@@ -83,12 +83,33 @@ spec:
             - { name: MOCA_OWNER_MAX_SANDBOXES, value: '4' }
             - { name: MOCA_ATTACH_TOKEN_TTL_S, value: '86400' }
             - { name: MOCA_PROVISIONER_RECONCILE_S, value: '300' }
+            # A mounted workload's PVC (spec §5.1, §6.3): its largest size, and the StorageClasses it
+            # may use as <class>:rwo|rwx (unset: the cluster's default class, ReadWriteOnce). The
+            # admission policy holds the provisioner to the same allowlist.
+            - { name: MOCA_WORKLOAD_MAX_STORAGE, value: 10Gi }
+            - { name: MOCA_WORKLOAD_STORAGE_CLASSES, value: '' }
+            # The seed port (spec §5.2): what workload pods' init containers fetch the bundle from,
+            # and the bytes all bundles waiting to seed may hold together.
+            - { name: MOCA_PROVISIONER_SEED_PORT, value: '8081' }
+            - {
+                name: MOCA_PROVISIONER_SEED_URL,
+                value: 'http://moca-provisioner.moca.svc:8081/seed/v1/bundle',
+              }
+            - { name: MOCA_PROVISIONER_SEED_BUDGET_BYTES, value: '1073741824' }
+            # How long a bundle is held, seeded or not; the next activate resends it.
+            - { name: MOCA_PROVISIONER_SEED_HOLD_S, value: '600' }
+            # Phase 1's bundle ceilings, which the workers download with (patch-supervisor.yaml sets
+            # the same values there). KEEP THEM EQUAL: a bundle over the provisioner's size is
+            # refused, and activate answers 413 bundle_too_large. The budget is at least twice this.
+            - { name: MOCA_CONTEXT_BUNDLE_MAX_BYTES, value: '268435456' }
+            - { name: MOCA_CONTEXT_BUNDLE_MAX_ENTRIES, value: '10000' }
             # The control plane's public keys, to verify the API token a worker forwards.
             - name: SH_SESSION_TOKEN_PUBLIC_KEYS
               valueFrom: { secretKeyRef: { name: moca-mu1, key: SH_SESSION_TOKEN_PUBLIC_KEYS } }
             - { name: CREDENTIALS_DIRECTORY, value: /run/credentials }
           ports:
             - { name: http, containerPort: 8080 }
+            - { name: seed, containerPort: 8081 }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -100,9 +121,13 @@ spec:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 10
             periodSeconds: 10
+          # The memory bound: every bundle byte in the process -- held, being read (a hand-off
+          # reserves its Content-Length before reading, into one buffer of that size) or still being
+          # sent to a seed -- is within MOCA_PROVISIONER_SEED_BUDGET_BYTES (1024Mi), plus 640Mi for
+          # Node itself (heap, HTTP buffers): 1024 + 640 = 1664Mi. Raise both together.
           resources:
             requests: { cpu: 20m, memory: 192Mi }
-            limits: { memory: 384Mi }
+            limits: { memory: 1664Mi }
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
             - { name: credentials, mountPath: /run/credentials, readOnly: true }
@@ -124,6 +149,7 @@ spec:
   selector: { app: moca-provisioner }
   ports:
     - { name: http, port: 8080, targetPort: http }
+    - { name: seed, port: 8081, targetPort: seed }
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -135,6 +161,12 @@ spec:
     # Only the supervisor's workers call the internal API (spec §4.1).
     - from: [{ podSelector: { matchLabels: { app: moca-supervisor } } }]
       ports: [{ protocol: TCP, port: 8080 }]
+    # Workload sandboxes' init containers fetch their bundle from the seed port, and only that port
+    # (spec §5.2): it serves GET /seed/v1/bundle alone, never /internal/v1.
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: moca-sandbox } }
+          podSelector: { matchLabels: { app: moca-workload-sandbox } }
+      ports: [{ protocol: TCP, port: 8081 }]
   # The Kubernetes API server only. Its addresses are the cluster's, so setup.sh's generated overlay
   # replaces this with the `kubernetes` Service's ClusterIP and its EndpointSlice addresses and ports
   # (setup.sh kube_api_egress), and refuses to install if it cannot read them. Rendered without
@@ -168,13 +200,15 @@ spec:
             cidr: 0.0.0.0/0
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
 ---
-# The namespace backstop (spec §6.3): pods, for the shared pool plus workload sandboxes. setup.sh's
-# generated overlay sets it to SH_SANDBOX_COUNT + 32, so the shared pool is never what it refuses.
-# Storage and claim counts join it when Contexts move into moca-sandbox (spec §5.1, the mount PR):
-# until then no PVC lives here.
+# The namespace backstop (spec §6.3): pods, for the shared pool plus workload sandboxes, and the
+# workloads' PVCs, their count and storage. setup.sh's generated overlay sets pods to
+# SH_SANDBOX_COUNT + 32, so the shared pool is never what it refuses; the shared pool has no PVC.
+# 32 claims of at most MOCA_WORKLOAD_MAX_STORAGE (10Gi) each is 320Gi.
 apiVersion: v1
 kind: ResourceQuota
 metadata: { name: moca-sandbox, namespace: moca-sandbox }
 spec:
   hard:
     pods: '34'
+    persistentvolumeclaims: '32'
+    requests.storage: 320Gi

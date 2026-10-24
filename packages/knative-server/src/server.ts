@@ -1043,7 +1043,8 @@ async function resolveRunWorkload(
       cacheScope,
       loadBundle: () => downloadContextBundle(contextName, revision, owner),
       writable: body.contextWritable === true,
-      // A workload with sandboxes of its own runs only on them (workload sandboxes spec §3.3).
+      // A workload with sandboxes of its own runs only on them (workload sandboxes spec §3.3); with
+      // a mount, in that mount, so the bundle is never downloaded for the run (spec §5.3).
       ...(sandboxes ?? {}),
     },
   };

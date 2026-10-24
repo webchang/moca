@@ -182,27 +182,34 @@ outside the cluster.
 1. **`GET`** (or a repeat activate) counts the workload's attached sandboxes and moves the record to
    `ready` once all `count` are there. Until then runs answer `409 workload_not_ready`. `GET` shows
    `sandboxes: {count, tier, ready}`.
-1. **Runs** execute only on the workload's own sandboxes, of the same owner. The context still
-   arrives by copy, as above, now onto those sandboxes. When none is attached (a pod restarting),
+1. **Runs** execute only on the workload's own sandboxes, of the same owner. Without
+   `workspace.mount` the context still arrives by copy, as above, now onto those sandboxes; with it,
+   the run starts in the mounted PVC (below). When none is attached (a pod restarting),
    the run answers `503 workload_sandbox_unavailable` with `Retry-After`; it never falls back to the
    shared pool. A worker that can never serve it (no relay sandbox pool) fails the run instead.
-1. **Delete** removes the sandboxes first and waits until no pod remains, then deletes the Context
-   and the record. If pods are still terminating after `MOCA_PROVISIONER_DELETE_WAIT_MS` (default
-   60 s), it answers `202` with `status: deleting`, and a repeated `DELETE` finishes it.
+1. **Delete** removes the sandboxes, their Secret and PVC first and waits until no pod or PVC
+   remains, then deletes the Context and the record. If pods are still terminating after
+   `MOCA_PROVISIONER_DELETE_WAIT_MS` (default 60 s), it answers `202` with `status: deleting`, and a
+   repeated `DELETE` finishes it.
 
 A failed provisioning leaves the record in `provisioning` with an `error` field, since a frozen
 revision cannot be unfrozen; a repeat activate with the same revision retries. The `error` goes once
 the record is `ready`, so a request that timed out but did create the sandboxes leaves no trace. The
 provisioner's refusals pass through on activate:
 
-| Answer                             | Meaning                                                                                                                              | Way out                                                     |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
-| `429 owner_sandbox_quota_exceeded` | The owner's sandboxes across all workloads would exceed `MOCA_OWNER_MAX_SANDBOXES` (default 4). Has `Retry-After`.                   | Delete another workload, then repeat the activate           |
-| `400 sandboxes_count_exceeded`     | `count` is above the provisioner's `MOCA_WORKLOAD_MAX_SANDBOXES`, which is lower than the workers'. An operator mismatch.            | `DELETE`, then re-create                                    |
-| `400` (other `sandbox*` codes)     | The provisioner refused the request itself (`sandbox_tier_unavailable`, `sandboxes_count_invalid`, ...).                             | `DELETE`, then re-create                                    |
-| `409 workload_object_conflict`     | An object under the workload's derived name in `moca-sandbox` is not this workload's.                                                | An operator removes it                                      |
-| `422 workload_refused`             | The cluster refused the workload's objects: the admission policy (an operator's PodTemplate outside its rules) or an invalid object. | An operator fixes the PodTemplate, then repeat, or `DELETE` |
-| `502 provisioner_error`            | The provisioner could not be reached, or Kubernetes failed behind it.                                                                | Repeat the activate                                         |
+| Answer                                          | Meaning                                                                                                                                                                                                                                                                      | Way out                                                     |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `429 owner_sandbox_quota_exceeded`              | The owner's sandboxes across all workloads would exceed `MOCA_OWNER_MAX_SANDBOXES` (default 4). Has `Retry-After`.                                                                                                                                                           | Delete another workload, then repeat the activate           |
+| `400 sandboxes_count_exceeded`                  | `count` is above the provisioner's `MOCA_WORKLOAD_MAX_SANDBOXES`, which is lower than the workers'. An operator mismatch.                                                                                                                                                    | `DELETE`, then re-create                                    |
+| `400` (other `sandbox*` codes)                  | The provisioner refused the request itself (`sandbox_tier_unavailable`, `sandboxes_count_invalid`, ...).                                                                                                                                                                     | `DELETE`, then re-create                                    |
+| `409 workload_object_conflict`                  | An object under the workload's derived name in `moca-sandbox` is not this workload's.                                                                                                                                                                                        | An operator removes it                                      |
+| `422 workload_refused`                          | The cluster refused the workload's objects: the admission policy (an operator's PodTemplate outside its rules, or a PVC class outside its allowlist) or an invalid object.                                                                                                   | An operator fixes the PodTemplate, then repeat, or `DELETE` |
+| `400 workspace_size_too_small`                  | A mounted workload's `workspace.size` cannot hold the seed: the compressed bundle plus the revision once (`read-only`) or twice (`writable`), plus 10% and 16 MiB for the filesystem; checked by the worker before the hand-off.                                             | `DELETE`, then re-create with a larger `size`               |
+| `400` (other `workspace*` and `storage*` codes) | The provisioner refused a mounted workload's `mount` or storage (`workspace_mount_invalid`, `workspace_size_invalid`, `storage_class_not_allowed`, ...): its `MOCA_WORKLOAD_MAX_STORAGE` or `MOCA_WORKLOAD_STORAGE_CLASSES` differs from the workers'. An operator mismatch. | `DELETE`, then re-create                                    |
+| `503 seed_budget_full`                          | Every workload waiting to seed shares `MOCA_PROVISIONER_SEED_BUDGET_BYTES`, at most half of it per owner, and it (or the owner's half) is full. Has `Retry-After`.                                                                                                           | Repeat the activate                                         |
+| `413 bundle_too_large`                          | The bundle is within the workers' `MOCA_CONTEXT_BUNDLE_MAX_BYTES` but over the provisioner's. An operator mismatch: the two must be equal.                                                                                                                                   | An operator aligns them, then repeat the activate           |
+| `error: seed_bundle_missing` (on `GET`)         | Not an answer but the record's `error`: the provisioner no longer holds the bundle and pod 0 has not seeded. It restarted, or `MOCA_PROVISIONER_SEED_HOLD_S` (default 10 minutes) passed without a seed, for example with the claim Pending.                                 | Repeat the activate with the same revision                  |
+| `502 provisioner_error`                         | The provisioner could not be reached, or Kubernetes failed behind it.                                                                                                                                                                                                        | Repeat the activate                                         |
 
 A refusal no repeat can fix leaves the record `provisioning` with that `error`: the revision is
 frozen, so `DELETE` (which removes whatever was created) is the way out.
@@ -213,14 +220,17 @@ worker can provision only for users whose tokens it holds. The attach token last
 `MOCA_ATTACH_TOKEN_TTL_S` (default a day) and is re-minted once half of that is left; the sandbox
 reconnects with the new one when no command is running.
 
-**What the provisioner can do.** Its Role covers StatefulSets, Services and Secrets in
+**What the provisioner can do.** Its Role covers StatefulSets, Services, Secrets and PVCs in
 `moca-sandbox`, but it never reads a Secret: it writes each workload's token blind and keeps the
 token's expiry on the StatefulSet (`moca.dev/attach-exp`). A ValidatingAdmissionPolicy (Kubernetes
 1.30 or newer) holds what it writes to workload names (`w-<32 hex>`, `w-<32 hex>-attach`), to a
 headless, port-less Service selecting only the workload's own pods, and to a pod whose volumes are
-only `emptyDir`, `configMap`, `downwardAPI` and its own token Secret, that runs as
+only `emptyDir`, `configMap`, `downwardAPI`, its own token Secret and its own PVC, that runs as
 `moca-workload-sandbox` with no service-account token, and uses no host namespace or privileged
-container. Its egress is the Kubernetes API
+container; a PVC it creates must be named `w-<32 hex>` and use an allowlisted StorageClass
+(`SH_WORKLOAD_STORAGE_CLASSES` on Kubernetes, which `setup.sh` also gives the provisioner and the
+workers, and whose other classes the `moca-sandbox` ResourceQuota holds at zero storage). Its
+egress is the Kubernetes API
 server's addresses only, which `setup.sh` reads from the `kubernetes` Service. It runs as exactly one
 replica: the per-owner cap, and the order of one owner's activations, deletes and token re-mints, are
 serialized inside the process. Never scale it: a second replica makes the cap advisory. A request
@@ -234,10 +244,52 @@ when a workload's StatefulSet is created, so a change reaches workloads created 
 
 **Turning it off.** `SH_WORKLOAD_SANDBOXES=` removes the provisioner and its objects, and is refused
 while any workload's sandboxes exist: delete those workloads first, or pass
-`--delete-workload-sandboxes` to delete their StatefulSets, Services and Secrets with it. It
-stops the provisioner before it checks, so no activate can add sandboxes in between. The
+`--delete-workload-sandboxes` to delete their StatefulSets, Services, Secrets and PVCs with it.
+It stops the provisioner before it checks, so no activate can add sandboxes in between. The
 workload records stay: their runs answer `503 workload_sandbox_unavailable`, and deleting them needs
 the feature on again, so prefer deleting the workloads first.
+
+### A mounted context (`workspace.mount`)
+
+A workload with `sandboxes` can also get a PVC of its own, mounted into its sandboxes, instead of a
+copy per run (design §5): `"workspace": {"mount": "read-only"}` or `"writable"`, with optional
+`size` (default `1Gi`, at most `MOCA_WORKLOAD_MAX_STORAGE`, default `10Gi`) and `storageClass` (one
+of `MOCA_WORKLOAD_STORAGE_CLASSES`; unset, the first listed, or the cluster's default class).
+`mount` without `sandboxes` is `400 workspace_mount_requires_sandboxes`. Context Service is used
+exactly as above (upload, freeze, export); its own PVC is created as before, with the same size, and
+no pod mounts it.
+
+- **The PVC.** The provisioner creates PVC `<wl>` (the workload's derived name) in `moca-sandbox` at
+  activation, before the StatefulSet, and deletes it with the sandboxes. It is `ReadWriteOnce`, and
+  then every sandbox of the workload is scheduled onto one node (required pod affinity); a class
+  marked `rwx` gives `ReadWriteMany` and no affinity. `ReadWriteOncePod` is not used.
+- **The seed.** At activation the worker downloads the frozen bundle, with phase 1's limits, and
+  hands it to the provisioner (`PUT /internal/v1/workloads/{name}/{generation}/bundle`). The
+  provisioner holds it in memory, within `MOCA_PROVISIONER_SEED_BUDGET_BYTES` (default 1 GiB) across
+  every workload waiting to seed, at most half of it per owner, and for
+  `MOCA_PROVISIONER_SEED_HOLD_S` (default 10 minutes) at most; past the budget, activate answers
+  `503 seed_budget_full` with `Retry-After`. Pod `<wl>-0`'s init containers fetch it from the provisioner's seed port (8081,
+  `GET /seed/v1/bundle`, authenticated with the workload's attach token) and extract it into
+  `revision/<revision>/`, read-only; for `writable`, a second one copies that into `moca-workspace/`.
+  The other pods wait for pod 0 and never write. Once pod 0's init containers have finished, the
+  provisioner removes the `moca.dev/seed-revision` annotation from the pod template and drops the
+  bundle, so a pod that restarts later never seeds again.
+- **Size.** `size` must hold the compressed bundle (the seed downloads it onto the claim) plus its
+  inflated size once (`read-only`) or twice, plus whatever runs write (`writable`), and 10% and
+  16 MiB more for the filesystem; activate refuses a smaller one with
+  `400 workspace_size_too_small`.
+- **Runs.** The context is mounted at `/workspace/context`: `read-only` at the revision, `writable`
+  at the workload's own tree, which later runs (on any of its sandboxes) see as the last one left it.
+  A run starts there, at `workspace/` when that is the revision's only content root, as with a copy.
+  `contextWritable: true` on a `read-only` mount gives that run its own copy; on a `writable` one it
+  changes nothing. Concurrent runs of a `writable` workload share the tree; MOCA adds no locking.
+- **A provisioner restart before the seed**, or a seed that has not run within
+  `MOCA_PROVISIONER_SEED_HOLD_S`, loses the held bundle: pod 0's init container keeps failing, and
+  `GET /workloads/{id}` shows `provisioning` with `error: seed_bundle_missing`. Repeat the activate,
+  with the same revision, to resend it.
+
+Nothing turns the writable tree back into a revision, and nothing exports it; it goes with the
+workload at `DELETE`.
 
 ## Names are per user
 

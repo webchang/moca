@@ -58,6 +58,7 @@ const streams = new Map<string, ReturnType<typeof fakeAttach>>();
 const fakeTransport = {
   exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
   close: async () => {},
+  fastTier: 'per-call-exec' as const,
 };
 
 async function present(ids: string[], want: boolean) {

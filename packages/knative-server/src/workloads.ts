@@ -2,10 +2,16 @@ import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   CpError,
+  WORKLOAD_MOUNTS,
   ownerScopeFor,
+  parseStorageClasses,
+  resolveWorkloadStorage,
   statusFor,
+  storageMiB,
   workloadKeyFor,
   workloadRecordKey,
+  type WorkloadMount,
+  type WorkloadStorage,
 } from '@moca/control-plane';
 import {
   assertContextServiceSettings,
@@ -13,7 +19,9 @@ import {
   ContextServiceError,
   createContext,
   createUploadGrant,
+  bundleInflatedBytes,
   deleteContext,
+  downloadContextBundle,
   evictContextBundles,
   freezeContext,
   retryWhileUnreachable,
@@ -24,9 +32,11 @@ import { OWNER_LABEL, WORKLOAD_LABEL } from '@moca/harness/sandbox-affinity';
 import {
   assertProvisionerSettings,
   deleteSandboxes,
+  handOverBundle,
   provisionerConfigured,
   ProvisionerError,
   provisionSandboxes,
+  sandboxesSeed,
 } from './provisioner-client.js';
 import { authenticateApiCaller, type TurnAuthDeps } from './turn-auth.js';
 
@@ -42,7 +52,9 @@ import { authenticateApiCaller, type TurnAuthDeps } from './turn-auth.js';
  *
  * A workload created with `sandboxes` (phase 2, workload sandboxes spec §6.1) also gets sandboxes of
  * its own from moca-provisioner at activation, and its runs execute only there. That needs
- * MOCA_PROVISIONER_URL; without it, `sandboxes` is refused like any unknown field.
+ * MOCA_PROVISIONER_URL; without it, `sandboxes` is refused like any unknown field. With
+ * `workspace.mount` as well, the workload gets its own PVC, seeded once from the frozen revision and
+ * mounted into its sandboxes, and its runs use that mount instead of a per-run copy (spec §5).
  */
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -56,7 +68,7 @@ const CREATE_FIELDS = new Set(['name', 'contextType', 'workspace']);
 /** Accepted only with the provisioner configured: off by default. */
 const SANDBOXES_FIELD = 'sandboxes';
 const SANDBOX_FIELDS = new Set(['count', 'tier']);
-const WORKSPACE_FIELDS = new Set(['size', 'storageClass']);
+const WORKSPACE_FIELDS = new Set(['size', 'storageClass', 'mount']);
 /** Retry-After on a passed-through `429 owner_sandbox_quota_exceeded`. */
 const PROVISIONER_RETRY_AFTER_S = 30;
 
@@ -67,6 +79,10 @@ type WorkloadStatus =
 interface WorkloadSandboxes {
   count: number;
   tier: 'container';
+  /** `workspace.mount`: the workload's own PVC, mounted this way (spec §5.3). */
+  mount?: WorkloadMount;
+  /** That PVC's size and class, within MOCA_WORKLOAD_MAX_STORAGE and the class allowlist. */
+  claim?: WorkloadStorage;
 }
 
 interface WorkloadRecord {
@@ -99,6 +115,9 @@ export interface WorkloadDeps {
 
 /** A competing request (usually DELETE) changed the record first. */
 class WorkloadStateChangedError extends Error {}
+
+/** A mounted workload's `workspace.size` cannot hold its revision (spec §5.1). */
+class WorkspaceTooSmallError extends Error {}
 
 /** Off by default: both the flag and a Context Service URL are needed. */
 export function workloadsEnabled(): boolean {
@@ -187,16 +206,24 @@ async function findWorkload(
 
 /** `ready` is the number of the workload's sandboxes attached to the relay, when it was counted. */
 function publicView(record: WorkloadRecord, ready?: number) {
+  const { mount, claim, ...sandboxes } = record.sandboxes ?? { count: 0 };
   return {
     workloadId: record.name,
     status: record.status,
     contextType: record.contextType,
-    workspace: record.workspace,
+    // A mounted workload's size and class are its own PVC's.
+    workspace: mount
+      ? {
+          size: claim!.size,
+          ...(claim!.storageClass ? { storageClass: claim!.storageClass } : {}),
+          mount,
+        }
+      : record.workspace,
     ...(record.revision ? { revision: record.revision } : {}),
     ...(record.sandboxes
       ? {
           sandboxes: {
-            ...record.sandboxes,
+            ...sandboxes,
             ready: ready ?? (record.status === 'ready' ? record.sandboxes.count : 0),
           },
         }
@@ -277,6 +304,41 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/**
+ * A mounted workload's own PVC (spec §5.1, §6.3), within MOCA_WORKLOAD_MAX_STORAGE (default 10Gi)
+ * and MOCA_WORKLOAD_STORAGE_CLASSES (`<class>:rwo|rwx`, unset: the default class). The provisioner
+ * checks it again. Throws when the settings themselves are invalid.
+ */
+function workloadClaim(workspace: Record<string, unknown>): WorkloadStorage | string {
+  const max = process.env.MOCA_WORKLOAD_MAX_STORAGE?.trim() || '10Gi';
+  const maxMiB = storageMiB(max);
+  if (maxMiB === null)
+    throw new Error(`MOCA_WORKLOAD_MAX_STORAGE must be <n>Mi or <n>Gi, got "${max}"`);
+  const classes = parseStorageClasses(process.env.MOCA_WORKLOAD_STORAGE_CLASSES);
+  return resolveWorkloadStorage(
+    { size: workspace.size ?? '1Gi', storageClass: workspace.storageClass },
+    { maxMiB, classes },
+  );
+}
+
+/**
+ * What a mounted workload's PVC must hold for its seed (spec §5.1). The seed downloads the
+ * compressed bundle onto the claim and removes it only after extracting, so at its peak the claim
+ * holds the bundle and the revision, and for `writable` the revision's seeded copy as well. The
+ * revision is measured by the inflated tar stream, the only size the export carries. Then a margin
+ * for the filesystem (reserved blocks, metadata, 4 KiB blocks against tar's 512 B padding across up
+ * to MOCA_CONTEXT_BUNDLE_MAX_ENTRIES files): 10% of that, plus 16 MiB.
+ */
+export function seedBytesNeeded(
+  compressed: number,
+  inflated: number,
+  mount: WorkloadMount,
+): number {
+  const data = compressed + inflated * (mount === 'writable' ? 2 : 1);
+  return Math.ceil(data * 1.1) + SEED_MARGIN_BYTES;
+}
+const SEED_MARGIN_BYTES = 16 * 1024 * 1024;
+
 /** The storage Context Service is asked for, within this deployment's ceiling and allowlist. */
 function contextStorage(workspace: Record<string, unknown>): ContextStorage | string {
   const size = workspace.size ?? '1Gi';
@@ -306,11 +368,23 @@ function sendFailure(res: ServerResponse, operation: string, err: unknown): void
   console.error(`workload ${operation} failed:`, err);
   if (err instanceof WorkloadStateChangedError) {
     send(res, 409, { error: 'workload_state_changed' });
+  } else if (err instanceof WorkspaceTooSmallError) {
+    send(res, 400, { error: 'workspace_size_too_small' });
   } else if (err instanceof ProvisionerError && err.code && err.status === 429) {
     // The owner's cap across workloads (spec §6.3): it frees once the owner deletes a workload.
     res
       .writeHead(429, { ...JSON_HEADERS, 'Retry-After': String(PROVISIONER_RETRY_AFTER_S) })
       .end(JSON.stringify({ error: err.code }));
+  } else if (err instanceof ProvisionerError && err.code === 'seed_budget_full') {
+    // Every workload waiting to seed shares the provisioner's budget: retry later (spec §5.2). Its
+    // Retry-After passes through only as a plain number of seconds.
+    const after = err.retryAfter && /^\d{1,4}$/.test(err.retryAfter) ? err.retryAfter : '15';
+    res.setHeader('Retry-After', after);
+    send(res, 503, { error: err.code });
+  } else if (err instanceof ProvisionerError && err.status === 413) {
+    // The bundle passed the workers' MOCA_CONTEXT_BUNDLE_MAX_BYTES but not the provisioner's: an
+    // operator mismatch no repeat fixes.
+    send(res, 413, { error: 'bundle_too_large' });
   } else if (
     err instanceof ProvisionerError &&
     err.code &&
@@ -354,10 +428,32 @@ async function createWorkload(
   if (!isObject(workspace) || Object.keys(workspace).some((key) => !WORKSPACE_FIELDS.has(key))) {
     return send(res, 400, { error: 'workspace_field_not_allowed' });
   }
-  const storage = contextStorage(workspace);
+  const { mount, ...requested } = workspace;
+  let claim: WorkloadStorage | undefined;
+  if (mount !== undefined) {
+    if (!WORKLOAD_MOUNTS.includes(mount as WorkloadMount)) {
+      return send(res, 400, { error: 'workspace_mount_invalid' });
+    }
+    if (body.sandboxes === undefined) {
+      return send(res, 400, { error: 'workspace_mount_requires_sandboxes' });
+    }
+    let resolved: WorkloadStorage | string;
+    try {
+      resolved = workloadClaim(requested);
+    } catch (err) {
+      console.error('workloads are misconfigured:', err);
+      return send(res, 500, { error: 'workloads_misconfigured' });
+    }
+    if (typeof resolved === 'string') return send(res, 400, { error: resolved });
+    claim = resolved;
+  }
+  // A mounted workload's size and class are its own PVC's; its Context gets the same size in
+  // Context Service's default class, as phase 1 stores it (spec §5.1: no pod mounts that claim).
+  const storage = contextStorage(claim ? { size: requested.size } : requested);
   if (typeof storage === 'string') return send(res, 400, { error: storage });
-  const sandboxes = body.sandboxes === undefined ? undefined : sandboxesSpec(body.sandboxes);
-  if (typeof sandboxes === 'string') return send(res, 400, { error: sandboxes });
+  const spec = body.sandboxes === undefined ? undefined : sandboxesSpec(body.sandboxes);
+  if (typeof spec === 'string') return send(res, 400, { error: spec });
+  const sandboxes = spec && claim ? { ...spec, mount: mount as WorkloadMount, claim } : spec;
 
   const generation = randomUUID();
   const reserved: WorkloadRecord = {
@@ -498,15 +594,53 @@ async function provision(
   res: ServerResponse,
 ): Promise<void> {
   const sandboxes = record.sandboxes!;
+  const ref = { name: record.name, generation: record.generation, userToken };
   try {
     assertProvisionerSettings();
-    await provisionSandboxes(
-      { name: record.name, generation: record.generation, userToken },
-      { count: sandboxes.count, tier: sandboxes.tier, revision: record.revision! },
-    );
+    if (sandboxes.mount) {
+      // The bytes the PVC is seeded from (spec §5.2): phase 1's download, with its ceilings, handed
+      // to the provisioner before the PUT whose init containers fetch them. Every retry resends,
+      // which is how a provisioner restart before the seed recovers.
+      const bundle = await downloadContextBundle(
+        record.contextName,
+        record.revision!,
+        record.owner,
+      );
+      // Refuse a size the seed cannot fit before it runs out of space (spec §5.1).
+      if (
+        storageMiB(sandboxes.claim!.size)! * 1024 * 1024 <
+        seedBytesNeeded(bundle.length, await bundleInflatedBytes(bundle), sandboxes.mount)
+      ) {
+        throw new WorkspaceTooSmallError();
+      }
+      await handOverBundle(ref, bundle);
+    }
+    await provisionSandboxes(ref, {
+      count: sandboxes.count,
+      tier: sandboxes.tier,
+      revision: record.revision!,
+      // The request's size and class; the provisioner resolves the access mode itself.
+      ...(sandboxes.mount
+        ? {
+            mount: sandboxes.mount,
+            storage: {
+              size: sandboxes.claim!.size,
+              ...(sandboxes.claim!.storageClass
+                ? { storageClass: sandboxes.claim!.storageClass }
+                : {}),
+            },
+          }
+        : {}),
+    });
   } catch (err) {
     const error =
-      err instanceof ProvisionerError ? (err.code ?? 'provisioner_error') : 'internal_error';
+      err instanceof ProvisionerError
+        ? (err.code ?? 'provisioner_error')
+        : err instanceof WorkspaceTooSmallError
+          ? 'workspace_size_too_small'
+          : err instanceof ContextServiceError
+            ? 'context_service_error'
+            : 'internal_error';
     // Best effort: the refusal below is the answer whether or not the error is recorded.
     await transition(store, record, { ...record, error }).catch(() => false);
     return sendFailure(res, 'provision', err);
@@ -577,8 +711,8 @@ async function deleteWorkload(
     if (record.status !== 'deleting' && !(await transition(store, record, deleting))) {
       throw new WorkloadStateChangedError();
     }
-    // Sandboxes first, and only then the Context: Context Service refuses to delete a claim a pod
-    // still mounts (spec §6.1). Each step tolerates "already gone", so a retry finishes the rest.
+    // Sandboxes and their PVC first, then the Context, so no sandbox outlives its record's Context
+    // (spec §6.1). Each step tolerates "already gone", so a retry finishes the rest.
     if (record.sandboxes && !(await sandboxesGone(record, userToken))) {
       return send(res, 202, publicView(deleting));
     }
@@ -604,8 +738,11 @@ export type WorkloadRun =
       contextName: string;
       revision: string;
       cacheScope: string;
-      /** Set for a workload with sandboxes of its own: the run selects only those (spec §3.3). */
-      sandboxes?: { workload: string; ownerScope: string };
+      /**
+       * Set for a workload with sandboxes of its own: the run selects only those (spec §3.3). With
+       * `mount`, those sandboxes have the context mounted, and the run uses it (spec §5.3).
+       */
+      sandboxes?: { workload: string; ownerScope: string; mount?: WorkloadMount };
     }
   | { status: number; error: 'workload_not_found' | 'workload_not_ready' };
 
@@ -631,7 +768,13 @@ export async function resolveWorkloadRun(
     revision: record.revision,
     cacheScope: sandboxCacheScope(owner),
     ...(record.sandboxes
-      ? { sandboxes: { workload: record.contextName, ownerScope: recordScope(owner) } }
+      ? {
+          sandboxes: {
+            workload: record.contextName,
+            ownerScope: recordScope(owner),
+            ...(record.sandboxes.mount ? { mount: record.sandboxes.mount } : {}),
+          },
+        }
       : {}),
   };
 }
@@ -701,7 +844,7 @@ export async function handleWorkloads(
   const userToken = bearerOf(req);
   switch (route) {
     case 'get':
-      return getWorkload(record, store, res);
+      return getWorkload(record, store, userToken, res);
     case 'uploads':
       return createUpload(record, res);
     case 'activate':
@@ -718,18 +861,34 @@ function bearerOf(req: IncomingMessage): string {
 }
 
 /**
+ * A mounted workload whose provisioner lost the held bundle before the seed (a restart) shows
+ * `error: seed_bundle_missing` until the next activate resends it (spec §5.2). Best effort: an
+ * unreachable provisioner leaves the record as it is.
+ */
+async function withSeedError(record: WorkloadRecord, userToken: string): Promise<WorkloadRecord> {
+  if (!record.sandboxes?.mount || record.error === 'seed_bundle_missing') return record;
+  const seed = await sandboxesSeed({
+    name: record.name,
+    generation: record.generation,
+    userToken,
+  }).catch(() => undefined);
+  return seed === 'bundle_missing' ? { ...record, error: 'seed_bundle_missing' } : record;
+}
+
+/**
  * A `provisioning` record is moved to `ready` here once all its sandboxes have attached (spec §6.1
  * step 4), by the same compare-and-set as every other transition. Nothing else is ever written.
  */
 async function getWorkload(
   record: WorkloadRecord | null,
   store: WorkloadStore,
+  userToken: string,
   res: ServerResponse,
 ): Promise<void> {
   if (!record) return send(res, 404, { error: 'workload_not_found' });
   if (record.status !== 'provisioning') return send(res, 200, publicView(record));
   try {
-    const [view] = await settleProvisioning(store, record);
+    const [view] = await settleProvisioning(store, await withSeedError(record, userToken), record);
     send(res, 200, view);
   } catch (err) {
     sendFailure(res, 'get', err);

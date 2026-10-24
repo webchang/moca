@@ -213,6 +213,14 @@ export function persistentExecInPod(
   };
 
   return {
+    // The whole point of this transport: a burst of fast ops rides ONE `kubectl exec -i
+    // -- bash` (ADR-0003) instead of paying a handshake and a `bash` startup each (#245).
+    // Claimed unconditionally, including after `capStageBroken` latches every op onto the
+    // per-call fallback — this is a STATIC property a caller reads when CHOOSING a tier,
+    // and making it observe a runtime degradation would hand callers a value that changes
+    // under them mid-turn, which no caller could act on anyway (the tier assignment is
+    // fixed when the extension registers its tools).
+    fastTier: 'persistent-channel',
     exec,
     close: async () => {
       disposed = true;

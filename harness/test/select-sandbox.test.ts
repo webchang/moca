@@ -207,6 +207,7 @@ describe('selectPoolSandbox remote dispatch', () => {
     const fakeTransport = {
       exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     const sel = await selectPoolSandbox(env(), '/head', 'leaf-abc123', opts, {
       listPods: async () => [],
@@ -236,6 +237,7 @@ describe('selectPoolSandbox remote dispatch', () => {
     const fakeTransport = {
       exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     const sel = await selectPoolSandbox(
       env(),
@@ -311,6 +313,7 @@ describe('selectPoolSandbox: the real defaultExecClient (MI1 R5)', () => {
         return {
           exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
           close: async () => {},
+          fastTier: 'per-call-exec' as const,
         };
       },
     }).catch((e) => e);
@@ -412,6 +415,7 @@ describe('selectPoolSandbox: the real defaultExecClient (MI1 R5)', () => {
           return {
             exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
             close: async () => {},
+            fastTier: 'per-call-exec' as const,
           };
         },
       },

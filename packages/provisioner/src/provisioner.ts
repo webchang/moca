@@ -1,12 +1,24 @@
 import {
   ATTACH_OWNER_RE,
   ATTACH_WORKLOAD_RE,
+  WORKLOAD_MOUNTS,
   mintAttachToken,
   ownerScopeFor,
+  resolveWorkloadStorage,
   workloadKeyFor,
   workloadRecordKey,
+  type WorkloadMount,
+  type WorkloadStorage,
+  type WorkloadStorageCaps,
 } from '@moca/control-plane';
 import type { KubeApi, KubeObject } from './kube.js';
+import {
+  BundleStore,
+  SEED_REVISION_DIR,
+  SEED_REVISION_SCRIPT,
+  SEED_WORKSPACE_DIR,
+  SEED_WORKSPACE_SCRIPT,
+} from './seed.js';
 
 /**
  * What moca-provisioner does for one workload (workload sandboxes spec §4, ADR-0043): a Secret
@@ -14,7 +26,9 @@ import type { KubeApi, KubeObject } from './kube.js';
  * `<wl>` whose pods attach to the relay with that token. `wl` is derived here from the verified
  * owner, so a caller can only ever reach its own owner's objects.
  *
- * No PVC in this phase (spec §8 PR 2): context still arrives by copy, now onto these sandboxes.
+ * A workload with a mount (`workspace.mount`, spec §5) also gets PVC `<wl>`, seeded once from its
+ * frozen bundle by two init containers and mounted at /workspace/context. One without a mount gets
+ * no PVC, and its context arrives by copy onto these sandboxes, as in phase 1.
  *
  * It never reads a Secret (its Role has no get or list on them): what re-minting needs -- the
  * token's expiry, lifetime, signing key and `n` -- is kept as annotations on the workload's
@@ -31,6 +45,12 @@ const RECORD_KEY_ANNOTATION = 'moca.dev/record-key';
 const TIER_ANNOTATION = 'moca.dev/tier';
 const COUNT_ANNOTATION = 'moca.dev/sandbox-count';
 const REVISION_ANNOTATION = 'moca.dev/revision';
+const MOUNT_ANNOTATION = 'moca.dev/mount';
+/**
+ * On the pod template only while the claim is unseeded (spec §5.3): the init containers read it
+ * through the downward API and do nothing without it. Removed once pod `<wl>-0` has seeded.
+ */
+export const SEED_ANNOTATION = 'moca.dev/seed-revision';
 /** The attach token's expiry, issue time and signing key, on the StatefulSet (spec §3.1). */
 const EXP_ANNOTATION = 'moca.dev/attach-exp';
 const IAT_ANNOTATION = 'moca.dev/attach-iat';
@@ -42,6 +62,9 @@ const KID_ANNOTATION = 'moca.dev/attach-kid';
 export const TEMPLATE = 'moca-workload-sandbox';
 const TOKEN_KEY = 'token';
 const TOKEN_DIR = '/run/moca-attach';
+/** Where a mounted workload's context appears in its sandboxes (spec §5.3). */
+export const CONTEXT_MOUNT = '/workspace/context';
+const CONTEXT_VOLUME = 'context';
 
 /** A workload name: what workloads.ts accepts. */
 export const NAME_RE = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
@@ -59,6 +82,12 @@ export interface ProvisionerConfig {
   maxPerOwner: number;
   /** MOCA_ATTACH_TOKEN_TTL_S. A token is re-minted once less than half of it remains. */
   attachTtlS: number;
+  /** MOCA_WORKLOAD_MAX_STORAGE and MOCA_WORKLOAD_STORAGE_CLASSES: the PVC's caps (spec §6.3). */
+  storage: WorkloadStorageCaps;
+  /** MOCA_PROVISIONER_SEED_URL: what the init containers fetch the bundle from (spec §5.2). */
+  seedUrl: string;
+  /** MOCA_CONTEXT_BUNDLE_MAX_ENTRIES: phase 1's entry ceiling, applied by the seed too. */
+  maxEntries: number;
 }
 
 export interface ProvisionerDeps {
@@ -66,6 +95,8 @@ export interface ProvisionerDeps {
   /** Signs attach tokens with the provisioner's Ed25519 key (makeSigner). */
   signer: { kid: string; signJws(typ: string, claims: object): string };
   config: ProvisionerConfig;
+  /** Bundles handed over for seeding, until the seed has run (spec §5.2). */
+  bundles: BundleStore;
   /** Epoch seconds. */
   now?: () => number;
 }
@@ -80,6 +111,9 @@ export interface SandboxSpec {
   count: number;
   tier: 'container';
   revision?: string;
+  /** With `storage` and `revision`: the workload's own PVC, mounted this way (spec §5.3). */
+  mount?: WorkloadMount;
+  storage?: WorkloadStorage;
 }
 
 export interface SandboxStatus {
@@ -88,6 +122,11 @@ export interface SandboxStatus {
   count: number;
   /** Pods the StatefulSet reports Ready. The relay's records are what the worker counts. */
   ready: number;
+  /**
+   * A mounted workload's seed (spec §5.2): `pending` while its bundle is held, `bundle_missing`
+   * when it is unseeded and no bundle is held (a provisioner restart), `done` once seeded.
+   */
+  seed?: 'pending' | 'bundle_missing' | 'done';
 }
 
 /** A refusal with a stable code; `status` is the HTTP status the API answers with. */
@@ -105,13 +144,18 @@ export class ProvisionError extends Error {
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** The PUT body: `count`, `tier`, and the frozen revision. No field names a workload key. */
+const SPEC_FIELDS = ['count', 'tier', 'revision', 'mount', 'storage'];
+
+/**
+ * The PUT body: `count`, `tier`, the frozen revision, and for a mounted workload `mount` and
+ * `storage` (`size`, `storageClass`). No field names a workload key.
+ */
 export function parseSandboxSpec(body: unknown, config: ProvisionerConfig): SandboxSpec {
   if (!isObject(body)) throw new ProvisionError(400, 'sandboxes_invalid');
-  if (Object.keys(body).some((k) => !['count', 'tier', 'revision'].includes(k))) {
+  if (Object.keys(body).some((k) => !SPEC_FIELDS.includes(k))) {
     throw new ProvisionError(400, 'sandboxes_field_not_allowed');
   }
-  const { count, tier = 'container', revision } = body;
+  const { count, tier = 'container', revision, mount, storage } = body;
   if (!Number.isSafeInteger(count) || (count as number) < 1) {
     throw new ProvisionError(400, 'sandboxes_count_invalid');
   }
@@ -125,7 +169,30 @@ export function parseSandboxSpec(body: unknown, config: ProvisionerConfig): Sand
   if (revision !== undefined && (typeof revision !== 'string' || !REVISION_RE.test(revision))) {
     throw new ProvisionError(400, 'revision_invalid');
   }
-  return { count: count as number, tier, ...(revision ? { revision } : {}) };
+  if (mount === undefined) {
+    if (storage !== undefined) throw new ProvisionError(400, 'workspace_mount_invalid');
+    return { count: count as number, tier, ...(revision ? { revision } : {}) };
+  }
+  if (!WORKLOAD_MOUNTS.includes(mount as WorkloadMount) || !revision) {
+    throw new ProvisionError(400, 'workspace_mount_invalid');
+  }
+  if (
+    !isObject(storage) ||
+    Object.keys(storage).some((k) => !['size', 'storageClass'].includes(k))
+  ) {
+    throw new ProvisionError(400, 'workspace_field_not_allowed');
+  }
+  // The worker checks these too (spec §6.3).
+  const claim = resolveWorkloadStorage(storage, config.storage);
+  if (typeof claim === 'string') throw new ProvisionError(400, claim);
+  // Several sandboxes on ReadWriteOnce share one node (podTemplate's affinity); nothing more here.
+  return {
+    count: count as number,
+    tier,
+    revision: revision as string,
+    mount: mount as WorkloadMount,
+    storage: claim,
+  };
 }
 
 export function checkRef(name: string, generation: string): void {
@@ -162,6 +229,7 @@ function annotations(ref: WorkloadRef, spec: SandboxSpec): Record<string, string
     [TIER_ANNOTATION]: spec.tier,
     [COUNT_ANNOTATION]: String(spec.count),
     ...(spec.revision ? { [REVISION_ANNOTATION]: spec.revision } : {}),
+    ...(spec.mount ? { [MOUNT_ANNOTATION]: spec.mount } : {}),
   };
 }
 
@@ -261,8 +329,18 @@ const OWN_ENV = new Set(['SANDBOX_ID', 'SANDBOX_TOKEN', 'SANDBOX_TOKEN_FILE', 'S
  * admission policy (workload-sandboxes/admission-policy.yaml) refuses any StatefulSet from this
  * ServiceAccount that references another Secret, a host path or namespace, a privileged container,
  * or a service-account token.
+ *
+ * A mounted workload (spec §5.3) also gets its PVC as a volume, the two seed init containers (the
+ * sandbox image, which is MOCA's), the claim at /workspace/context, and the seed annotation, which
+ * the provisioner removes once pod `<wl>-0` has seeded (settleSeeds).
  */
-export function podTemplate(template: KubeObject, k: Keys, ref: WorkloadRef, spec: SandboxSpec) {
+export function podTemplate(
+  template: KubeObject,
+  k: Keys,
+  ref: WorkloadRef,
+  spec: SandboxSpec,
+  config: ProvisionerConfig,
+) {
   const meta = template.template?.metadata ?? {};
   const pod = template.template?.spec;
   const base = pod?.containers?.find((c: { name: string }) => c.name === SANDBOX_CONTAINER);
@@ -273,6 +351,8 @@ export function podTemplate(template: KubeObject, k: Keys, ref: WorkloadRef, spe
       `PodTemplate ${TEMPLATE} has no '${SANDBOX_CONTAINER}' container`,
     );
   }
+  // A mounted workload's spec always carries its claim and revision (parseSandboxSpec).
+  const seed = spec.mount && spec.storage && spec.revision ? spec : null;
   const container = {
     ...base,
     env: [
@@ -284,17 +364,24 @@ export function podTemplate(template: KubeObject, k: Keys, ref: WorkloadRef, spe
     volumeMounts: [
       ...((base.volumeMounts ?? []) as unknown[]),
       { name: 'attach-token', mountPath: TOKEN_DIR, readOnly: true },
+      ...(seed ? [contextMount(seed)] : []),
     ],
   };
   return {
     metadata: {
       labels: labels(k),
       // The template's own (on kind, setup.sh's moca.dev/image-id), then the binding's.
-      annotations: { ...(meta.annotations ?? {}), ...annotations(ref, spec) },
+      annotations: {
+        ...(meta.annotations ?? {}),
+        ...annotations(ref, spec),
+        ...(seed ? { [SEED_ANNOTATION]: seed.revision } : {}),
+      },
     },
     spec: {
       ...pod,
       automountServiceAccountToken: false,
+      ...(seed ? { initContainers: seedContainers(base, seed, config) } : {}),
+      ...(seed?.storage?.access === 'rwo' ? { affinity: { podAffinity: sameNode(k) } } : {}),
       containers: [
         container,
         ...pod.containers.filter((c: { name: string }) => c.name !== SANDBOX_CONTAINER),
@@ -305,7 +392,105 @@ export function podTemplate(template: KubeObject, k: Keys, ref: WorkloadRef, spe
           name: 'attach-token',
           secret: { secretName: secretName(k.wl), defaultMode: 0o440 },
         },
+        ...(seed ? [{ name: CONTEXT_VOLUME, persistentVolumeClaim: { claimName: k.wl } }] : []),
       ],
+    },
+  };
+}
+
+/** The main container's view of the claim: never the claim root, never `revision/` writable. */
+function contextMount(spec: SandboxSpec) {
+  return spec.mount === 'writable'
+    ? { name: CONTEXT_VOLUME, mountPath: CONTEXT_MOUNT, subPath: 'moca-workspace' }
+    : {
+        name: CONTEXT_VOLUME,
+        mountPath: CONTEXT_MOUNT,
+        subPath: `revision/${spec.revision}`,
+        readOnly: true,
+      };
+}
+
+/**
+ * The seed (spec §5.3), as two init containers so none mounts the claim root: the first fills
+ * `revision/<rev>` from the held bundle, the second (writable mounts only) copies it into
+ * `moca-workspace`. Only pod `<wl>-0` writes; the others wait for it. Both do nothing once the seed
+ * annotation is gone.
+ */
+function seedContainers(base: KubeObject, spec: SandboxSpec, config: ProvisionerConfig) {
+  const seedEnv = [
+    {
+      name: 'SEED_REVISION',
+      valueFrom: { fieldRef: { fieldPath: `metadata.annotations['${SEED_ANNOTATION}']` } },
+    },
+    // Its ordinal: only `<wl>-0` writes.
+    { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
+  ];
+  const common = {
+    image: base.image,
+    ...(base.imagePullPolicy ? { imagePullPolicy: base.imagePullPolicy } : {}),
+    ...(base.securityContext ? { securityContext: base.securityContext } : {}),
+    ...(base.resources ? { resources: base.resources } : {}),
+  };
+  const revision = {
+    name: 'seed-revision',
+    ...common,
+    command: ['bash', '-c', SEED_REVISION_SCRIPT],
+    env: [
+      ...seedEnv,
+      { name: 'SANDBOX_TOKEN_FILE', value: `${TOKEN_DIR}/${TOKEN_KEY}` },
+      { name: 'SEED_URL', value: config.seedUrl },
+      { name: 'MAX_ENTRIES', value: String(config.maxEntries) },
+    ],
+    volumeMounts: [
+      { name: CONTEXT_VOLUME, mountPath: SEED_REVISION_DIR, subPath: 'revision' },
+      { name: 'attach-token', mountPath: TOKEN_DIR, readOnly: true },
+    ],
+  };
+  if (spec.mount !== 'writable') return [revision];
+  const workspace = {
+    name: 'seed-workspace',
+    ...common,
+    command: ['bash', '-c', SEED_WORKSPACE_SCRIPT],
+    env: seedEnv,
+    volumeMounts: [
+      {
+        name: CONTEXT_VOLUME,
+        mountPath: SEED_REVISION_DIR,
+        subPath: `revision/${spec.revision}`,
+        readOnly: true,
+      },
+      { name: CONTEXT_VOLUME, mountPath: SEED_WORKSPACE_DIR, subPath: 'moca-workspace' },
+    ],
+  };
+  return [revision, workspace];
+}
+
+/**
+ * ReadWriteOnce attaches to one node, so every pod of the workload goes where the first went
+ * (spec §5.4). Set whatever the count, so a later scale-up stays on that node too.
+ */
+function sameNode(k: Keys) {
+  return {
+    requiredDuringSchedulingIgnoredDuringExecution: [
+      {
+        labelSelector: { matchLabels: { [WORKLOAD_LABEL]: k.wl } },
+        topologyKey: 'kubernetes.io/hostname',
+      },
+    ],
+  };
+}
+
+/** The workload's own PVC (spec §5.1): a plain claim, not a claim template. */
+function claim(ref: WorkloadRef, k: Keys, spec: SandboxSpec) {
+  const storage = spec.storage!;
+  return {
+    apiVersion: 'v1',
+    kind: 'PersistentVolumeClaim',
+    metadata: { name: k.wl, labels: labels(k), annotations: annotations(ref, spec) },
+    spec: {
+      accessModes: [storage.access === 'rwx' ? 'ReadWriteMany' : 'ReadWriteOnce'],
+      resources: { requests: { storage: storage.size } },
+      ...(storage.storageClass ? { storageClassName: storage.storageClass } : {}),
     },
   };
 }
@@ -316,6 +501,7 @@ function statefulSet(
   k: Keys,
   spec: SandboxSpec,
   minted: Record<string, string>,
+  config: ProvisionerConfig,
 ) {
   return {
     apiVersion: 'apps/v1',
@@ -330,7 +516,9 @@ function statefulSet(
       replicas: spec.count,
       podManagementPolicy: 'Parallel',
       selector: { matchLabels: { app: APP_LABEL, [WORKLOAD_LABEL]: k.wl } },
-      template: podTemplate(template, k, ref, spec),
+      // OnDelete: removing the seed annotation once seeded restarts no pod (spec §5.3).
+      ...(spec.mount ? { updateStrategy: { type: 'OnDelete' } } : {}),
+      template: podTemplate(template, k, ref, spec, config),
     },
   };
 }
@@ -419,8 +607,22 @@ async function converge(
     if (raced && !ours(raced, k)) conflict('Service', k.wl);
   }
 
+  // The claim before the pods that mount it. Its size and class are fixed at create.
+  if (spec.storage) {
+    const pvc = await kube.get('persistentvolumeclaims', k.wl);
+    if (pvc && !ours(pvc, k)) conflict('PersistentVolumeClaim', k.wl);
+    if (!pvc && !(await kube.create('persistentvolumeclaims', claim(ref, k, spec)))) {
+      // Lost a create race: hold whatever is there now to the same ownership as the pre-read.
+      const raced = await kube.get('persistentvolumeclaims', k.wl);
+      if (raced && !ours(raced, k)) conflict('PersistentVolumeClaim', k.wl);
+    }
+  }
+
   if (!sts) {
-    await kube.create('statefulsets', statefulSet(template!, ref, k, spec, minted!.annotations));
+    await kube.create(
+      'statefulsets',
+      statefulSet(template!, ref, k, spec, minted!.annotations, config),
+    );
     sts = await kube.get('statefulsets', k.wl);
     // The re-read is held to the same ownership as the pre-read: never adopt another's object.
     if (sts && !ours(sts, k)) conflict('StatefulSet', k.wl);
@@ -435,6 +637,7 @@ async function converge(
     generation: ref.generation,
     count: spec.count,
     ready: Number(sts?.status?.readyReplicas) || 0,
+    ...seedStatus(deps, k, sts),
   };
 }
 
@@ -447,15 +650,25 @@ export async function getWorkload(deps: ProvisionerDeps, ref: WorkloadRef): Prom
     generation: ref.generation,
     count: Number(sts.spec?.replicas) || 0,
     ready: Number(sts.status?.readyReplicas) || 0,
+    ...seedStatus(deps, k, sts),
   };
 }
 
+function seedStatus(deps: ProvisionerDeps, k: Keys, sts: KubeObject | null) {
+  if (!sts?.metadata.annotations?.[MOUNT_ANNOTATION]) return {};
+  if (!sts.spec?.template?.metadata?.annotations?.[SEED_ANNOTATION])
+    return { seed: 'done' as const };
+  const held = deps.bundles.get(k.wl);
+  return { seed: held ? ('pending' as const) : ('bundle_missing' as const) };
+}
+
 /**
- * Delete a workload's StatefulSet, Service and Secret, each tolerating "already gone", and report
- * the pods still terminating. The caller repeats until none remain, and only then deletes the
- * Context: Context Service refuses to delete a mounted claim (spec §6.1). Queued behind the owner's
- * PUTs and re-mints, so a PUT the worker gave up on (MOCA_PROVISIONER_TIMEOUT_MS) finishes first and
- * its objects are deleted here, instead of being created after `remaining: 0`.
+ * Delete a workload's StatefulSet, Service, Secret and PVC, each tolerating "already gone", and
+ * report the pods still terminating, and the claim until it is gone (its protection finalizer holds
+ * it while a pod mounts it). The caller repeats until nothing remains, and only then deletes the
+ * Context (spec §6.1). Queued behind the owner's PUTs and re-mints, so a PUT the worker gave up on
+ * (MOCA_PROVISIONER_TIMEOUT_MS) finishes first and its objects are deleted here, instead of being
+ * created after `remaining: 0`.
  */
 export function deleteWorkload(
   deps: ProvisionerDeps,
@@ -467,17 +680,132 @@ export function deleteWorkload(
 
 async function removeWorkload(deps: ProvisionerDeps, k: Keys): Promise<{ remaining: number }> {
   const { kube } = deps;
+  // Retired, not only dropped: a late hand-off for it is refused, never held again.
+  deps.bundles.retire(k.wl, nowOf(deps));
+  let claimLeft = 0;
   for (const [kind, name] of [
     ['statefulsets', k.wl],
     ['services', k.wl],
+    ['persistentvolumeclaims', k.wl],
   ] as const) {
     const obj = await kube.get(kind, name);
-    if (obj && ours(obj, k)) await kube.delete(kind, name);
+    if (!obj || !ours(obj, k)) continue;
+    if (kind === 'persistentvolumeclaims') claimLeft = 1;
+    if (!obj.metadata.deletionTimestamp) await kube.delete(kind, name);
   }
   // Unread, as every Secret: its name is derived from the verified owner, so it is this workload's.
   await kube.delete('secrets', secretName(k.wl));
   const pods = await kube.list('pods', `${WORKLOAD_LABEL}=${k.wl},${OWNER_LABEL}=${k.own}`);
-  return { remaining: pods.length };
+  return { remaining: pods.length + claimLeft };
+}
+
+/**
+ * Reserve `bytes` of the seed budget for a bundle hand-off to `ref`'s workload, before its body is
+ * read (spec §5.2): the budget bounds what is in memory, not only what is held. Throws 503
+ * seed_budget_full when it does not fit the budget or the owner's half of it. The caller gives the
+ * reservation back with the returned function once the bundle is held or the hand-off failed.
+ */
+export function reserveBundle(deps: ProvisionerDeps, ref: WorkloadRef, bytes: number): () => void {
+  const k = keysOf(ref);
+  if (!deps.bundles.reserve(k.wl, k.own, bytes)) throw new ProvisionError(503, 'seed_budget_full');
+  let released = false;
+  return () => {
+    if (!released) deps.bundles.release(k.own, bytes);
+    released = true;
+  };
+}
+
+/**
+ * Hold the frozen bundle a mounted workload's init containers seed from (spec §5.2), until
+ * settleSeeds sees the seed done or MOCA_PROVISIONER_SEED_HOLD_S passes. Its bytes were reserved
+ * first (reserveBundle). Not held when the workload's sandboxes have already seeded (a repeat
+ * activate resends it, and it would never be fetched), nor once DELETE has removed the workload: on
+ * the owner's queue, so a hand-off from an activate the worker gave up on, landing after the DELETE,
+ * is refused instead of held for nothing.
+ */
+export function putBundle(
+  deps: ProvisionerDeps,
+  ref: WorkloadRef,
+  bytes: Buffer,
+): Promise<{ held: boolean }> {
+  const k = keysOf(ref);
+  return serialized(k.own, async () => {
+    if (deps.bundles.retired(k.wl)) throw new ProvisionError(404, 'workload_not_found');
+    const sts = await deps.kube.get('statefulsets', k.wl);
+    if (sts && !ours(sts, k)) conflict('StatefulSet', k.wl);
+    if (sts && !sts.spec?.template?.metadata?.annotations?.[SEED_ANNOTATION]) {
+      return { held: false };
+    }
+    deps.bundles.put(k.wl, { gen: ref.generation, own: k.own, bytes, at: nowOf(deps) });
+    return { held: true };
+  });
+}
+
+/**
+ * Finish seeds (spec §5.3): for each workload StatefulSet still carrying the seed annotation, once
+ * pod `<wl>-0` is Initialized (its init containers, the seed's one writer, completed), remove the
+ * annotation and drop the held bundle. OnDelete keeps that patch from restarting any pod; a pod
+ * created later comes up without it, so its init containers do nothing. Then drop every bundle held
+ * past MOCA_PROVISIONER_SEED_HOLD_S, seeded or not. Each StatefulSet is settled on its own: one that
+ * fails is logged and skipped. `pending` counts the StatefulSets still carrying the annotation, which
+ * main.ts keeps checking every few seconds.
+ */
+export async function settleSeeds(
+  deps: ProvisionerDeps,
+): Promise<{ settled: number; pending: number }> {
+  const sets = await deps.kube.list(
+    'statefulsets',
+    `app=${APP_LABEL},${MANAGED_BY_LABEL}=${MANAGED_BY}`,
+  );
+  let settled = 0;
+  let pending = 0;
+  for (const s of sets) {
+    try {
+      const r = await settleOne(deps, s);
+      if (r === 'settled') settled++;
+      if (r === 'pending') pending++;
+    } catch (err) {
+      pending++;
+      const why = err instanceof Error ? err.message : String(err);
+      console.error(`provisioner: seed check of StatefulSet ${s.metadata.name} failed: ${why}`);
+    }
+  }
+  deps.bundles.expire(nowOf(deps));
+  return { settled, pending };
+}
+
+async function settleOne(
+  deps: ProvisionerDeps,
+  s: KubeObject,
+): Promise<'settled' | 'pending' | 'skip'> {
+  const l = s.metadata.labels ?? {};
+  const k = { wl: l[WORKLOAD_LABEL], own: l[OWNER_LABEL] };
+  if (!k.wl || !k.own || s.metadata.name !== k.wl) return 'skip';
+  if (!s.spec?.template?.metadata?.annotations?.[SEED_ANNOTATION]) {
+    deps.bundles.drop(k.wl);
+    return 'skip';
+  }
+  const first = await deps.kube.get('pods', `${k.wl}-0`);
+  const seeded =
+    first !== null &&
+    ours(first, k) &&
+    ((first.status?.conditions ?? []) as { type: string; status: string }[]).some(
+      (c) => c.type === 'Initialized' && c.status === 'True',
+    );
+  if (!seeded) return 'pending';
+  const patched = await serialized(k.own, async () => {
+    // Read again under the owner's queue: a DELETE may have removed it since the list.
+    const cur = await deps.kube.get('statefulsets', k.wl);
+    if (!cur || !ours(cur, k)) return false;
+    if (cur.spec?.template?.metadata?.annotations?.[SEED_ANNOTATION]) {
+      await deps.kube.patch('statefulsets', k.wl, {
+        spec: { template: { metadata: { annotations: { [SEED_ANNOTATION]: null } } } },
+      });
+    }
+    return true;
+  });
+  deps.bundles.drop(k.wl);
+  return patched ? 'settled' : 'skip';
 }
 
 /**

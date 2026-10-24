@@ -359,7 +359,7 @@ export function contextDownloadBytesInFlight(): number {
  * one that inflates to at most `maxExpanded` bytes: the sandbox extracts it onto a disk that several
  * users share, so a small bundle that inflates without bound would fill it for everyone.
  */
-async function assertCompleteGzip(bundle: Buffer, maxExpanded: number): Promise<void> {
+async function assertCompleteGzip(bundle: Buffer, maxExpanded: number): Promise<number> {
   let expanded = 0;
   let tooLarge = false;
   try {
@@ -382,6 +382,19 @@ async function assertCompleteGzip(bundle: Buffer, maxExpanded: number): Promise<
         : 'Context Service returned a truncated or invalid bundle',
     );
   }
+  return expanded;
+}
+
+/**
+ * The bytes a bundle inflates to: its tar stream, headers and padding included, within
+ * MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES. What a mounted workload's PVC must hold for one copy of
+ * its revision (spec §5.1).
+ */
+export function bundleInflatedBytes(bundle: Buffer): Promise<number> {
+  return assertCompleteGzip(
+    bundle,
+    positiveIntEnv('MOCA_CONTEXT_BUNDLE_MAX_EXPANDED_BYTES', 1280 * 1024 * 1024),
+  );
 }
 
 async function fetchBundle(name: string, revision: string, owner: string): Promise<Buffer> {

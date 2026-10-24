@@ -356,6 +356,20 @@ describe('a run on a workload with sandboxes of its own (spec §3.3)', () => {
     expect(env.internalContext).toMatchObject({ workload: contextName, ownerScope: scope(alice) });
   });
 
+  it('names the mount for a mounted workload, so the run uses it and never downloads the bundle', async () => {
+    await seed(alice, 'demo', 'ready', REVISION, {
+      sandboxes: {
+        count: 1,
+        tier: 'container',
+        mount: 'writable',
+        claim: { size: '1Gi', access: 'rwo' },
+      },
+    });
+    expect((await run(alice, prompt('demo'))).status).toBe(200);
+    expect(runLeaf.mock.calls[0]![0].internalContext).toMatchObject({ mount: 'writable' });
+    expect(csCalls).toEqual([]);
+  });
+
   it('leaves both out for a phase 1 workload, which stays on the shared pool', async () => {
     await seed(alice, 'demo', 'ready', REVISION);
     expect((await run(alice, prompt('demo'))).status).toBe(200);

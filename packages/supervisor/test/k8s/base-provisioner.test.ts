@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -61,6 +61,8 @@ function renderGenerated(dir: string, env: Record<string, string>): K8sObject[] 
       GO_SETTINGS_HASH: 'f'.repeat(64),
       GO_WORKLOAD_SANDBOXES: '1',
       GO_KUBE_API_EGRESS: JSON.stringify(KUBE_API_EGRESS),
+      GO_WORKLOAD_CLASSES: 'standard:rwo nfs:rwx',
+      GO_OTHER_CLASSES: 'slow',
       ...env,
     },
     stdio: ['ignore', 'ignore', 'inherit'],
@@ -108,7 +110,11 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
       { apiGroups: [''], resources: ['secrets'], verbs: ['create', 'update', 'delete'] },
       { apiGroups: [''], resources: ['services'], verbs: ['create', 'get', 'delete'] },
       { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list'] },
-      { apiGroups: [''], resources: ['persistentvolumeclaims'], verbs: ['get'] },
+      {
+        apiGroups: [''],
+        resources: ['persistentvolumeclaims'],
+        verbs: ['create', 'get', 'delete'],
+      },
       {
         apiGroups: [''],
         resources: ['podtemplates'],
@@ -159,14 +165,45 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
     });
   });
 
-  it("admits only the supervisor, and reaches only the API server's addresses", () => {
+  it("admits the supervisor to the API and workload pods to the seed port only, and reaches only the API server's addresses", () => {
     const p = find(objs, 'NetworkPolicy', 'moca-provisioner', 'moca');
     expect(p.spec.ingress).toEqual([
       {
         from: [{ podSelector: { matchLabels: { app: 'moca-supervisor' } } }],
         ports: [{ protocol: 'TCP', port: 8080 }],
       },
+      {
+        from: [
+          {
+            namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'moca-sandbox' } },
+            podSelector: { matchLabels: { app: 'moca-workload-sandbox' } },
+          },
+        ],
+        ports: [{ protocol: 'TCP', port: 8081 }],
+      },
     ]);
+    // The other half of the pair: workload pods' egress to the seed port, in its own policy.
+    const seed = find(objs, 'NetworkPolicy', 'allow-seed-workload-sandbox', 'moca-sandbox');
+    expect(seed.spec).toEqual({
+      podSelector: { matchLabels: { app: 'moca-workload-sandbox' } },
+      policyTypes: ['Egress'],
+      egress: [
+        {
+          to: [
+            {
+              namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'moca' } },
+              podSelector: { matchLabels: { app: 'moca-provisioner' } },
+            },
+          ],
+          ports: [{ protocol: 'TCP', port: 8081 }],
+        },
+      ],
+    });
+    const svc = find(objs, 'Service', 'moca-provisioner', 'moca');
+    expect(svc.spec.ports).toContainEqual({ name: 'seed', port: 8081, targetPort: 'seed' });
+    const c = container(find(objs, 'Deployment', 'moca-provisioner', 'moca'), 'provisioner');
+    expect(envVar(c, 'MOCA_PROVISIONER_SEED_PORT')?.value).toBe('8081');
+    expect(envVar(c, 'MOCA_PROVISIONER_SEED_BUDGET_BYTES')?.value).toBe(String(1024 ** 3));
     expect(p.spec.egress).toEqual(KUBE_API_EGRESS);
     expect(JSON.stringify(p)).not.toContain('0.0.0.0/0');
   });
@@ -193,7 +230,13 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
       false,
     );
     const q = find(objs, 'ResourceQuota', 'moca-sandbox', 'moca-sandbox');
-    expect(q.spec.hard).toEqual({ pods: '34' });
+    expect(q.spec.hard).toEqual({
+      pods: '34',
+      persistentvolumeclaims: '32',
+      'requests.storage': '320Gi',
+      // Every class of the cluster outside the allowlist holds no storage.
+      'slow.storageclass.storage.k8s.io/requests.storage': '0',
+    });
   });
 
   it("starts the pod template from the shared pool's container, without its relay token", () => {
@@ -239,6 +282,7 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
       operations: string[];
     }[];
     expect(rules.flatMap((r) => r.resources).sort()).toEqual([
+      'persistentvolumeclaims',
       'secrets',
       'services',
       'statefulsets',
@@ -262,14 +306,56 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
       'externalIPs',
       'loadBalancerIP',
       "?selector['moca.dev/workload'].orValue('') == variables.wl",
-      // Volumes: an allow-list, not a deny-list.
+      // Volumes: an allow-list, not a deny-list; a PVC only as the workload's own, once.
       'has(v.emptyDir) || has(v.configMap) || has(v.downwardAPI)',
+      '(has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == variables.wl)',
+      'size(variables.pod.volumes.filter(v, has(v.persistentVolumeClaim))) <= 1',
+      'object.spec.storageClassName in variables.storageClasses',
+      "m == 'ReadWriteMany' && object.spec.storageClassName in variables.rwxClasses",
+      // A PVC is created empty: never a clone, a restore, a bound PV or a raw device.
+      '!has(object.spec.dataSource) && !has(object.spec.dataSourceRef)',
+      '!has(object.spec.volumeName) && !has(object.spec.selector)',
+      "object.spec.?volumeMode.orValue('Filesystem') == 'Filesystem'",
+      '!has(c.volumeDevices)',
     ]) {
       expect(cel, needle).toContain(needle);
     }
     // No volume source outside the allow-list is ever named as allowed. The CEL itself is
     // evaluated by the API server in deploy/k8s/tests/workload-admission.sh (k8s-e2e).
-    expect(cel).not.toMatch(/has\(v\.(hostPath|persistentVolumeClaim|projected|csi|ephemeral)\)/);
+    expect(cel).not.toMatch(/has\(v\.(hostPath|projected|csi|ephemeral)\)/);
+    // The allowlist, from setup.sh's resolved classes; rendered without it, every PVC is refused.
+    const vars = Object.fromEntries(
+      (vap.spec.variables as { name: string; expression: string }[]).map((v) => [
+        v.name,
+        v.expression,
+      ]),
+    );
+    expect(vars.storageClasses).toBe("['standard','nfs']");
+    // As checked in, before setup.sh fills it in: no class at all, so every PVC is refused.
+    const raw = parseAllDocuments(
+      readFileSync(resolve(K8S_DIR, 'base/workload-sandboxes/admission-policy.yaml'), 'utf8'),
+    )[0]!.toJS() as K8sObject;
+    const rawVars = raw.spec.variables as { name: string; expression: string }[];
+    expect(rawVars.filter((v) => /Classes$/.test(v.name)).map((v) => v.expression)).toEqual([
+      '[]',
+      '[]',
+    ]);
+    expect(vars.rwxClasses).toBe("['nfs']");
+    for (const name of ['moca-provisioner', 'moca-supervisor']) {
+      const dep = find(objs, 'Deployment', name, 'moca');
+      const c = podSpec(dep).containers[0];
+      expect(envVar(c, 'MOCA_WORKLOAD_STORAGE_CLASSES')?.value, name).toBe('standard:rwo,nfs:rwx');
+      expect(envVar(c, 'MOCA_WORKLOAD_MAX_STORAGE')?.value, name).toBe('10Gi');
+      // The bundle ceilings: the workers' and the provisioner's are the same, or a hand-off the
+      // workers accepted is refused (413 bundle_too_large).
+      expect(envVar(c, 'MOCA_CONTEXT_BUNDLE_MAX_BYTES')?.value, name).toBe('268435456');
+      expect(envVar(c, 'MOCA_CONTEXT_BUNDLE_MAX_ENTRIES')?.value, name).toBe('10000');
+    }
+    // One owner holds at most half the seed budget, so it is at least twice the largest bundle.
+    const prov = podSpec(find(objs, 'Deployment', 'moca-provisioner', 'moca')).containers[0];
+    expect(
+      Number(envVar(prov, 'MOCA_PROVISIONER_SEED_BUDGET_BYTES')?.value),
+    ).toBeGreaterThanOrEqual(2 * Number(envVar(prov, 'MOCA_CONTEXT_BUNDLE_MAX_BYTES')?.value));
     const binding = find(objs, 'ValidatingAdmissionPolicyBinding', 'moca-provisioner');
     expect(binding.spec).toEqual({ policyName: 'moca-provisioner', validationActions: ['Deny'] });
   });

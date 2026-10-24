@@ -61,7 +61,13 @@ import type { BundleRedisLike } from '@moca/config-bundle';
 import type { resolvePromotedConfig } from './config-resolver.js';
 import type { overlayConfig } from './config-overlay.js';
 import { attachPromotedConfig, type AttachedPromotedConfig } from './promoted-config.js';
-import { overlayContext, buildContextCleanupScript, contextCacheKey } from './context-overlay.js';
+import {
+  overlayContext,
+  buildContextCleanupScript,
+  buildMountedCleanupScript,
+  contextCacheKey,
+  mountedContext,
+} from './context-overlay.js';
 
 /**
  * Recover a verdict from a persisted `verdict` custom session entry (written by
@@ -139,6 +145,12 @@ export interface LeafEnvelope {
      * sandbox's `moca.dev/owner` label against it. Set by the server alongside `workload`.
      */
     ownerScope?: string;
+    /**
+     * Set with `workload` when the workload's sandboxes have its context mounted (workload
+     * sandboxes spec §5.3): the run starts in that mount and nothing is copied. `writable` then
+     * still gives a `read-only` mount's run its own copy, and is a no-op on a `writable` one.
+     */
+    mount?: 'read-only' | 'writable';
   };
   item: LeafItem; // inputs inline (was inputsRef)
   decision?: Decision; // resume/approve only (was decisionRef)
@@ -556,6 +568,8 @@ async function runPromptLeaf(
   // when the overlay fails partway.
   let contextKey: string | undefined;
   let contextPath: string | undefined;
+  // A run's own copy of a mounted read-only context, removed at the end.
+  let mountedCopy = false;
   try {
     if (selected) {
       const lease = selected;
@@ -566,12 +580,14 @@ async function runPromptLeaf(
       }, promptTimings.heartbeatMs);
     }
     if (env.internalContext) {
-      const { revision, cacheScope, loadBundle, writable } = env.internalContext;
+      const { revision, cacheScope, loadBundle, writable, mount } = env.internalContext;
       if (
         !/^[a-f0-9]{64}$/.test(revision) ||
         !/^[a-f0-9]{32}$/.test(cacheScope) ||
         typeof loadBundle !== 'function' ||
-        (writable !== undefined && typeof writable !== 'boolean')
+        (writable !== undefined && typeof writable !== 'boolean') ||
+        (mount !== undefined &&
+          (workload === undefined || !['read-only', 'writable'].includes(mount)))
       ) {
         return { status: 'failed', reason: 'error', message: 'invalid internal context reference' };
       }
@@ -584,15 +600,21 @@ async function runPromptLeaf(
           message: 'a workload run requires a P6 relay sandbox',
         };
       }
-      contextKey = contextCacheKey(cacheScope, revision);
       try {
-        contextPath = await (deps?.overlayContext ?? overlayContext)(
-          selected.transport,
-          contextKey,
-          sid,
-          loadBundle,
-          { writable: writable === true },
-        );
+        if (mount) {
+          // The workload's sandboxes have the context mounted: no copy crosses the relay.
+          mountedCopy = writable === true && mount === 'read-only';
+          contextPath = await mountedContext(selected.transport, sid, mountedCopy);
+        } else {
+          contextKey = contextCacheKey(cacheScope, revision);
+          contextPath = await (deps?.overlayContext ?? overlayContext)(
+            selected.transport,
+            contextKey,
+            sid,
+            loadBundle,
+            { writable: writable === true },
+          );
+        }
       } catch (err) {
         return {
           status: 'failed',
@@ -634,7 +656,7 @@ async function runPromptLeaf(
     const r: TurnResult = await exec({
       prompt:
         contextPath && selected
-          ? `${env.prompt}\n\n${contextNote(contextPath, env.internalContext?.writable === true, selected.config.podCwd)}`
+          ? `${env.prompt}\n\n${contextNote(contextPath, contextMode(env), selected.config.podCwd)}`
           : env.prompt,
       sessionId: env.sessionId,
       config: leafTurnConfig(config),
@@ -666,6 +688,13 @@ async function runPromptLeaf(
   } finally {
     if (heartbeat) clearInterval(heartbeat);
     await attached?.detach();
+    if (mountedCopy && selected?.transport) {
+      try {
+        await selected.transport.exec(buildMountedCleanupScript(sid), { timeout: 60 });
+      } catch {
+        /* best effort: never mask the run's verdict */
+      }
+    }
     if (contextKey && selected?.transport) {
       try {
         await selected.transport.exec(buildContextCleanupScript(contextKey, sid), {
@@ -680,12 +709,26 @@ async function runPromptLeaf(
   }
 }
 
+/** How a run sees its workload's context: read-only, a per-run copy, or the workload's own tree. */
+export type ContextMode = 'read-only' | 'copy' | 'persistent';
+
+function contextMode(env: LeafEnvelope): ContextMode {
+  if (env.internalContext?.mount === 'writable') return 'persistent';
+  return env.internalContext?.writable === true ? 'copy' : 'read-only';
+}
+
 /**
  * The note appended to a workload run's prompt: the run starts in its context at `path`, and a
  * read-only run writes to `scratch`, the session's own directory.
  */
-export function contextNote(path: string, writable: boolean, scratch: string): string {
-  return writable
+export function contextNote(path: string, mode: ContextMode, scratch: string): string {
+  if (mode === 'persistent') {
+    return (
+      `Your working directory, ${path}, is the workload's own writable tree. Changes there stay ` +
+      "for the workload's later runs, which may run at the same time as this one."
+    );
+  }
+  return mode === 'copy'
     ? `Your working directory, ${path}, is a writable copy of the workload's context. It is ` +
         'discarded when the run ends, so return your changes, such as a diff or test output, in ' +
         'your response.'
@@ -986,6 +1029,19 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
       extensionFactories: [
         ...(allowVerdict ? [submitVerdictExtension(capture, sessionManager)] : []),
         requestApprovalExtension(capture, sessionManager, gateState.nextGateId),
+        // THE BOTH-TIERS SHORTHAND, DELIBERATELY (#245). This is the call site the issue
+        // names, and the one where the fast tier silently did not exist — but splitting the
+        // tiers here would be worse, not better: naming only `streamTransport` would let the
+        // fast tier fall through to its default, `persistentExecInPod`, which spawns a LOCAL
+        // `kubectl exec`. `selected` is a leased pool sandbox reached over the relay (ADR-0024
+        // has it dialling out over one :443 connection, possibly from another cloud), so there
+        // is no kubectl path to it and no pod this process could exec into.
+        //
+        // So the shorthand stays until a transport that can amortize over the relay exists —
+        // which needs a long-lived shell on the wire (`sandbox.proto`'s `rpc Exec` is one
+        // command per RPC), not a flag here. What changed is that the fact is now readable:
+        // `selected.transport.fastTier` says `'per-call-exec'`, and the extension's two knobs
+        // are where that transport goes once there is a better one to put beside it.
         k8sSandboxExtension({
           config: selected?.config ?? null,
           transport: selected?.transport,

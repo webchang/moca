@@ -78,6 +78,7 @@ export function fakeAffinity(
 const fakeTransport = {
   exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
   close: async () => {},
+  fastTier: 'per-call-exec' as const,
 };
 
 export const env = (extra: Record<string, string> = {}) =>

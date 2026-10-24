@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +18,8 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { MAX_EXEC_MESSAGE_BYTES } from '@moca/k8s-sandbox';
 import {
+  buildMountedCleanupScript,
+  buildMountedContextScript,
   buildContextAcquireScript,
   buildContextCleanupScript,
   buildContextPopulateScript,
@@ -476,5 +480,62 @@ describe('P6 context overlay', () => {
     const script = buildContextAcquireScript(revision, 'run-1');
     expect(script).toContain('for STALE in "/workspace/.moca-context"/runs/*');
     expect(script).toContain('[ -d "$STALE" ] && [ ! -L "$STALE" ]');
+  });
+});
+
+describe('a mounted context (workload sandboxes spec §5.3), run for real', () => {
+  const sh = (script: string, mount: string, base: string) =>
+    execFileSync('bash', [
+      '-c',
+      script.replaceAll('/workspace/context', mount).replaceAll('/workspace/.moca-context', base),
+    ]).toString();
+
+  it('roots the view at workspace/ under the copy rule, and a per-run copy is writable and removed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moca-mount-'));
+    const mount = join(dir, 'context');
+    const base = join(dir, 'base');
+    mkdirSync(join(mount, 'workspace'), { recursive: true });
+    writeFileSync(join(mount, 'workspace', 'a.txt'), 'a');
+    expect(sh(buildMountedContextScript('run-1', false), mount, base)).toBe(
+      join(mount, 'workspace'),
+    );
+    const copy = sh(buildMountedContextScript('run-1', true), mount, base);
+    expect(copy).toBe(join(base, 'runs', 'run-1'));
+    writeFileSync(join(copy, 'a.txt'), 'changed');
+    expect(readFileSync(join(mount, 'workspace', 'a.txt'), 'utf8')).toBe('a');
+    sh(buildMountedCleanupScript('run-1'), mount, base);
+    expect(existsSync(copy)).toBe(false);
+    // Another content root besides workspace/: the whole mount is the view.
+    mkdirSync(join(mount, 'memory'));
+    expect(sh(buildMountedContextScript('run-2', false), mount, base)).toBe(mount);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("sweeps per-run copies a killed harness left, a day old, and a fresh copy's age restarts", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'moca-mount-'));
+    const mount = join(dir, 'context');
+    const base = join(dir, 'base');
+    mkdirSync(join(mount, 'workspace'), { recursive: true });
+    const aged = join(mount, 'workspace', 'a.txt');
+    writeFileSync(aged, 'a');
+    const old = new Date(Date.now() - 2 * 86400_000);
+    // The revision itself is old: a copy of it must not look abandoned (`touch "$STAGE"`).
+    utimesSync(join(mount, 'workspace'), old, old);
+    for (const stale of ['dead-run', '.stage.dead-run']) {
+      mkdirSync(join(base, 'runs', stale, 'sub'), { recursive: true });
+      chmodSync(join(base, 'runs', stale, 'sub'), 0o555);
+      utimesSync(join(base, 'runs', stale), old, old);
+    }
+    mkdirSync(join(base, 'runs', 'live-run'));
+    sh(buildMountedContextScript('run-1', false), mount, base);
+    expect(existsSync(join(base, 'runs', 'dead-run'))).toBe(false);
+    expect(existsSync(join(base, 'runs', '.stage.dead-run'))).toBe(false);
+    expect(existsSync(join(base, 'runs', 'live-run'))).toBe(true);
+    const copy = sh(buildMountedContextScript('run-2', true), mount, base);
+    expect(Date.now() - statSync(copy).mtimeMs).toBeLessThan(3600_000);
+    // Another run's sweep leaves that copy alone.
+    sh(buildMountedContextScript('run-3', true), mount, base);
+    expect(existsSync(copy)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

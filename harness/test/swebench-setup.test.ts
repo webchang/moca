@@ -84,6 +84,7 @@ describe('setupSwebenchWorkspace', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await setupSwebenchWorkspace(transport, swebenchArgs)).toBe('/workspace/co-run-1');
   });
@@ -91,6 +92,7 @@ describe('setupSwebenchWorkspace', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 1, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(setupSwebenchWorkspace(transport, swebenchArgs)).rejects.toThrow(
       /swebench setup failed/,
@@ -103,6 +105,7 @@ describe('setupSwebenchWorkspace', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from('partial'), exitCode: null, truncated: true }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(setupSwebenchWorkspace(transport, swebenchArgs)).rejects.toThrow(/output cap/);
   });
@@ -117,6 +120,7 @@ describe('captureSwebenchDiff', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await captureSwebenchDiff(transport, 'run-1')).toBe('diff --git a/x b/x\n');
   });
@@ -124,6 +128,7 @@ describe('captureSwebenchDiff', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 3, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(captureSwebenchDiff(transport, 'run-1')).rejects.toThrow(/exit 3/);
   });
@@ -133,6 +138,7 @@ describe('captureSwebenchDiff', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from('partial'), exitCode: null, truncated: true }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(captureSwebenchDiff(transport, 'run-1')).rejects.toThrow(/output cap/);
   });

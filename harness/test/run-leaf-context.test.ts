@@ -136,7 +136,7 @@ describe('frozen context on a prompt leaf', () => {
     );
     const prompt = executeTurn.mock.calls[0]![0].prompt;
     expect(prompt).toBe(
-      `Inspect.\n\n${contextNote('/workspace/.moca-context/runs/run-1', true, '/workspace/run-1')}`,
+      `Inspect.\n\n${contextNote('/workspace/.moca-context/runs/run-1', 'copy', '/workspace/run-1')}`,
     );
     expect(executeTurn.mock.calls[0]![0].sandbox?.config?.podCwd).toBe(
       '/workspace/.moca-context/runs/run-1',
@@ -271,5 +271,112 @@ describe('a workload on a non-prompt leaf', () => {
     } as LeafEnvelope;
     expect(await runLeaf(e, undefined, { produceSolve })).toMatchObject({ status: 'solved' });
     expect(produceSolve).toHaveBeenCalledOnce();
+  });
+});
+
+describe('a run on a mounted workload (workload sandboxes spec §5.3)', () => {
+  const WL = `w-${'a'.repeat(32)}`;
+  const mountedEnv = (mount: unknown, writable?: boolean) => {
+    const e = env(vi.fn(), writable);
+    Object.assign(e.internalContext!, { workload: WL, ownerScope: 'b'.repeat(32), mount });
+    return e;
+  };
+  const scripts = (transport: ReturnType<typeof relayLease>['transport']) =>
+    transport.exec.mock.calls.map(([script]) => String(script));
+
+  it('starts in the mount, rooted at workspace/, and never copies or downloads the bundle', async () => {
+    const { lease, transport } = relayLease();
+    transport.exec.mockResolvedValueOnce({
+      stdout: Buffer.from('/workspace/context/workspace'),
+      exitCode: 0,
+      truncated: false,
+    });
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const overlayContext = vi.fn();
+    const executeTurn = okTurn();
+    const e = mountedEnv('read-only');
+    const r = await runLeaf(e, undefined, { executeTurn, overlayContext });
+    expect(r.status).toBe('responded');
+    expect(overlayContext).not.toHaveBeenCalled();
+    expect(e.internalContext!.loadBundle).not.toHaveBeenCalled();
+    const [first] = scripts(transport);
+    expect(first).toContain('# CONTEXT_MOUNTED');
+    expect(first).toContain("CACHE='/workspace/context'");
+    // The same root rule as a copied revision.
+    expect(first).toContain('SRC="$CACHE/workspace"');
+    const turn = executeTurn.mock.calls[0]![0];
+    expect(turn.sandbox?.config?.podCwd).toBe('/workspace/context/workspace');
+    expect(turn.prompt).toContain("is the workload's read-only context");
+    // Nothing to clean up: no copy was made, and no cache ref taken.
+    expect(scripts(transport).some((s) => /CONTEXT_(CLEANUP|MOUNTED_CLEANUP)/.test(s))).toBe(false);
+  });
+
+  it("a writable mount is the workload's own tree, and the run-level writable is a no-op on it", async () => {
+    const { lease, transport } = relayLease();
+    transport.exec.mockResolvedValueOnce({
+      stdout: Buffer.from('/workspace/context'),
+      exitCode: 0,
+      truncated: false,
+    });
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const executeTurn = okTurn();
+    await runLeaf(mountedEnv('writable', true), undefined, {
+      executeTurn,
+      overlayContext: vi.fn(),
+    });
+    expect(scripts(transport)[0]).not.toContain('cp -a');
+    const prompt = executeTurn.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("the workload's own writable tree");
+    expect(prompt).not.toContain('discarded');
+  });
+
+  it('the run-level writable on a read-only mount gives the run its own copy, removed at the end', async () => {
+    const { lease, transport } = relayLease();
+    transport.exec.mockResolvedValueOnce({
+      stdout: Buffer.from('/workspace/.moca-context/runs/run-1'),
+      exitCode: 0,
+      truncated: false,
+    });
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const executeTurn = okTurn();
+    await runLeaf(mountedEnv('read-only', true), undefined, {
+      executeTurn,
+      overlayContext: vi.fn(),
+    });
+    expect(scripts(transport)[0]).toContain('cp -a "$SRC" "$STAGE"');
+    expect(executeTurn.mock.calls[0]![0].prompt).toContain('discarded when the run ends');
+    expect(scripts(transport).some((s) => s.includes('# CONTEXT_MOUNTED_CLEANUP'))).toBe(true);
+  });
+
+  it('refuses a mount without a workload, or an unknown mode, before touching the sandbox', async () => {
+    const noWorkload = env(vi.fn());
+    Object.assign(noWorkload.internalContext!, { mount: 'read-only' });
+    for (const e of [noWorkload, mountedEnv('rw')]) {
+      const { lease, transport } = relayLease();
+      selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+      const r = await runLeaf(e, undefined, { executeTurn: okTurn(), overlayContext: vi.fn() });
+      expect(r).toMatchObject({ status: 'failed', message: 'invalid internal context reference' });
+      expect(transport.exec).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a missing mount fails the run as an overlay failure', async () => {
+    const { lease, transport } = relayLease();
+    transport.exec.mockResolvedValueOnce({
+      stdout: Buffer.from(''),
+      exitCode: 1,
+      truncated: false,
+    });
+    selectPoolSandboxMock.mockReset().mockResolvedValue(lease);
+    const executeTurn = okTurn();
+    const r = await runLeaf(mountedEnv('read-only'), undefined, {
+      executeTurn,
+      overlayContext: vi.fn(),
+    });
+    expect(r).toMatchObject({
+      status: 'failed',
+      message: expect.stringContaining('context overlay failed'),
+    });
+    expect(executeTurn).not.toHaveBeenCalled();
   });
 });

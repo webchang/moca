@@ -39,6 +39,11 @@ export function createCapacityLatch(): CapacityLatch {
 
   return {
     watch: (transport) => ({
+      // FORWARDED, never asserted. This is a pass-through wrapper, and `extension.ts`
+      // wraps both tiers in it — so hardcoding either value here would make every
+      // latched transport claim the same tier and silently contradict the thing it
+      // wraps (#245).
+      fastTier: transport.fastTier,
       exec: async (command, opts) => {
         try {
           return await transport.exec(command, opts);

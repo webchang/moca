@@ -1,4 +1,5 @@
-# DNS for workload sandboxes, which resolve the relay's attach Service as the shared pool does.
+# DNS for workload sandboxes, which resolve the relay's attach Service (and the provisioner's seed
+# Service) as the shared pool does.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: { name: allow-dns-workload-sandbox, namespace: moca-sandbox }
@@ -12,3 +13,19 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+---
+# The seed pair's egress half (spec §5.2; the ingress half is on moca-provisioner): a workload
+# sandbox's init containers fetch their bundle from the provisioner's seed port, and nothing else of
+# it. Its own policy, so moca-workload-sandbox's egress stays the shared pool's, rule for rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-seed-workload-sandbox, namespace: moca-sandbox }
+spec:
+  podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: moca } }
+          podSelector: { matchLabels: { app: moca-provisioner } }
+      ports:
+        - { protocol: TCP, port: 8081 }

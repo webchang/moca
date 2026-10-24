@@ -379,6 +379,7 @@ function transportSpy(cacheHit: boolean) {
         };
       },
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     },
   };
 }
@@ -419,6 +420,7 @@ describe('overlayConfig', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 1, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(overlayConfig(transport, DIGEST, 'leaf-1', tarGz)).rejects.toThrow(/overlay/);
   });
@@ -427,6 +429,7 @@ describe('overlayConfig', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: null, truncated: true }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(overlayConfig(transport, DIGEST, 'leaf-1', tarGz)).rejects.toThrow(/output cap/);
   });

@@ -55,4 +55,10 @@ const kubectlFactory: TransportFactory = (b, opts) => {
   };
 };
 
-runConformance('KubectlTransport', kubectlFactory, { producerStop: 'local-kill', streams: true });
+runConformance('KubectlTransport', kubectlFactory, {
+  producerStop: 'local-kill',
+  streams: true,
+  // One `kubectl exec` and one `bash -c` per op (#245). This is the transport
+  // persistentExecInPod puts a reused shell in front of, and falls back to.
+  fastTier: 'per-call-exec',
+});

@@ -77,6 +77,7 @@ describe('convergeWorkspace', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await convergeWorkspace(transport, 'u', 'r', 'leaf-1')).toBe('/workspace/leaves/leaf-1');
   });
@@ -84,6 +85,7 @@ describe('convergeWorkspace', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 1, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(convergeWorkspace(transport, 'u', 'r', 'leaf-1')).rejects.toThrow(
       /converge failed/,
@@ -96,6 +98,7 @@ describe('convergeWorkspace', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from('partial'), exitCode: null, truncated: true }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(convergeWorkspace(transport, 'u', 'r', 'leaf-1')).rejects.toThrow(/output cap/);
   });
@@ -128,6 +131,7 @@ describe('captureWorkspaceDiff', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await captureWorkspaceDiff(transport, 'run-1')).toBe('diff --git a/x b/x\n');
   });
@@ -135,6 +139,7 @@ describe('captureWorkspaceDiff', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 3, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(captureWorkspaceDiff(transport, 'run-1')).rejects.toThrow(/exit 3/);
   });
@@ -142,6 +147,7 @@ describe('captureWorkspaceDiff', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from(''), exitCode: 0, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await captureWorkspaceDiff(transport, 'run-1')).toBe('');
   });
@@ -155,6 +161,7 @@ describe('captureWorkspaceDiff', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     const patch = await captureWorkspaceDiff(transport, 'run-1');
     expect(patch.endsWith('\n')).toBe(true);
@@ -168,6 +175,7 @@ describe('captureWorkspaceDiff', () => {
         truncated: false,
       }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     expect(await captureWorkspaceDiff(transport, 'run-1')).toBe('diff --git a/x b/x\n');
   });
@@ -177,6 +185,7 @@ describe('captureWorkspaceDiff', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.from('partial'), exitCode: null, truncated: true }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     await expect(captureWorkspaceDiff(transport, 'run-1')).rejects.toThrow(/output cap/);
   });

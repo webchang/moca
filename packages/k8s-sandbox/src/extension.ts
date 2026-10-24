@@ -55,7 +55,15 @@ const SANDBOX_TOOLS = new Set(['read', 'write', 'edit', 'ls', 'find', 'bash', 'g
  *
  * @param opts.config    Explicit config; if omitted, resolved from process.env.
  *                       Pass `null` to force-disable.
- * @param opts.transport Override BOTH transports (used by tests / alternate auth).
+ * @param opts.transport Override BOTH tiers. The shorthand, and what every caller used
+ *                       before #245 — which is exactly the problem it now documents: a
+ *                       caller passing a per-call transport here (`run-leaf.ts`, with a
+ *                       leased `GrpcRelayTransport`) silently gives up the fast tier for
+ *                       every file op. Prefer the two below when the tiers differ.
+ * @param opts.fastTransport   Override the FAST tier only (read/write/edit/ls/find).
+ *                             Falls back to `transport`, then to `persistentExecInPod`.
+ * @param opts.streamTransport Override the STREAM tier only (bash, grep, user `!`).
+ *                             Falls back to `transport`, then to `KubectlTransport`.
  * @param opts.capacity  A per-turn CapacityLatch. When given, a host's capacity refusal
  *                       ends the turn instead of being narrated to the model (#452); the
  *                       caller rethrows it after `session.prompt()` returns. Omitted
@@ -65,6 +73,8 @@ const SANDBOX_TOOLS = new Set(['read', 'write', 'edit', 'ls', 'find', 'bash', 'g
 export function k8sSandboxExtension(opts?: {
   config?: K8sSandboxConfig | null;
   transport?: SandboxTransport;
+  fastTransport?: SandboxTransport;
+  streamTransport?: SandboxTransport;
   capacity?: CapacityLatch;
 }): ExtensionFactory {
   return (pi: ExtensionAPI) => {
@@ -72,15 +82,39 @@ export function k8sSandboxExtension(opts?: {
     const config = opts?.config !== undefined ? opts.config : resolveConfig(process.env, localCwd);
     if (!config) return; // off gate — local tools stand
 
+    // THE TWO TIERS ARE RESOLVED SEPARATELY (#245), each falling through the same three
+    // steps: its own override, then the both-tiers shorthand, then this tier's default.
+    //
+    // `transport` used to be the only knob and it meant BOTH, which made the two-tier
+    // design silently conditional on which caller you were: `run-leaf.ts` passes a leased
+    // GrpcRelayTransport for the gRPC path, so on that path `fastTransport` became a
+    // per-call transport and every read/write/edit/ls/find paid a full relay round trip
+    // ending in a fresh `bash -c`, where the kubectl path spent one framed line on an
+    // already-running bash. Keeping the shorthand is deliberate — overriding both is the
+    // right thing for a test, and for a caller whose sandbox genuinely has one channel —
+    // but a caller that can do better now has somewhere to say so.
+    //
+    // ORDER MATTERS: the specific override wins over the shorthand, so passing both
+    // `transport` and `fastTransport` is "both tiers go there, except the fast one".
+    // The reverse precedence would make the specific knob unreachable whenever the
+    // shorthand was also set, which is every existing caller.
+    //
     // WRAPPED HERE, once, around the two transports every tool below draws from — rather
     // than at each of the seven registerTool sites. #452 arrives on bash most often, but
     // read/write/edit/ls/find/grep all cross the same seam and a refusal on any of them
     // is the same host condition.
     const watch = opts?.capacity ? opts.capacity.watch : (t: SandboxTransport) => t;
-    const streamTransport = watch(opts?.transport ?? KubectlTransport(config));
-    const fastTransport = watch(
-      opts?.transport ?? persistentExecInPod(config, { fallback: KubectlTransport(config).exec }),
-    );
+    // Resolved BEFORE wrapping, and kept, because `watch` allocates a fresh wrapper per
+    // call: with a latch supplied, `fastTransport !== streamTransport` even when both
+    // resolve to the one object the `transport` shorthand named. Only these pre-wrap
+    // values can answer "is there really one channel here?", which session_shutdown needs.
+    const streamBase = opts?.streamTransport ?? opts?.transport ?? KubectlTransport(config);
+    const fastBase =
+      opts?.fastTransport ??
+      opts?.transport ??
+      persistentExecInPod(config, { fallback: KubectlTransport(config).exec });
+    const streamTransport = watch(streamBase);
+    const fastTransport = watch(fastBase);
 
     // Fast request/response ops → persistent channel.
     pi.registerTool(
@@ -138,8 +172,20 @@ export function k8sSandboxExtension(opts?: {
     });
 
     // Tear down the persistent kubectl process so it is never leaked.
+    //
+    // BOTH TIERS, and that is new with #245. Closing the fast tier alone was sufficient
+    // while the stream tier was either the SAME OBJECT (the `transport` shorthand) or a
+    // `KubectlTransport`, whose close() is a documented no-op. Now that the two can be
+    // given independently, a caller passing a `streamTransport` that owns something — a
+    // GrpcRelayTransport owns its gRPC channel — would have leaked it once per session.
+    //
+    // Guarded on the PRE-WRAP identity rather than relying on idempotency: close() is
+    // contractually idempotent, so a double close is safe, but the shorthand makes these
+    // one object on every existing caller and closing it twice there is pointless work on
+    // a path that runs for every session.
     pi.on('session_shutdown', async () => {
       await fastTransport.close();
+      if (streamBase !== fastBase) await streamTransport.close();
     });
   };
 }

@@ -157,6 +157,8 @@ Workloads with sandboxes of their own (phase 2, [`docs/context-service.md`](../c
 | `MOCA_PROVISIONER_TIMEOUT_MS`     | `15000`     | Per-request timeout                                                          |
 | `MOCA_PROVISIONER_DELETE_WAIT_MS` | `60000`     | How long `DELETE` waits for the workload's pods to go before answering `202` |
 | `MOCA_WORKLOAD_MAX_SANDBOXES`     | `2`         | Largest `sandboxes.count`; the provisioner checks it again                   |
+| `MOCA_WORKLOAD_MAX_STORAGE`       | `10Gi`      | Largest `workspace.size` with `workspace.mount` (`<n>Mi` or `<n>Gi`)         |
+| `MOCA_WORKLOAD_STORAGE_CLASSES`   | empty       | `<class>:rwo` or `<class>:rwx`, comma-separated; empty: the default class    |
 
 ## moca-provisioner (`packages/provisioner`)
 
@@ -164,17 +166,25 @@ The only MOCA component with Kubernetes permissions in the sandbox namespace
 ([ADR-0043](../adrs/0043-workload-sandboxes-provisioner.md)). Secrets are files under
 `CREDENTIALS_DIRECTORY`, or env vars of the same name.
 
-| Variable                       | Default        | Notes                                                                                                                |
-| ------------------------------ | -------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `MOCA_ATTACH_PRIVATE_KEY`      | none           | **Secret, required.** Ed25519 key that signs attach tokens; its public half is the relay's `MOCA_ATTACH_PUBLIC_KEYS` |
-| `MOCA_PROVISIONER_TOKEN`       | none           | **Secret, required.** The workers' service token                                                                     |
-| `SH_SESSION_TOKEN_PUBLIC_KEYS` | none           | Required. Verifies the API token a worker forwards                                                                   |
-| `MOCA_SANDBOX_NAMESPACE`       | `moca-sandbox` | The one namespace it acts in                                                                                         |
-| `MOCA_PROVISIONER_PORT`        | `8080`         |                                                                                                                      |
-| `MOCA_WORKLOAD_MAX_SANDBOXES`  | `2`            | `count` per workload                                                                                                 |
-| `MOCA_OWNER_MAX_SANDBOXES`     | `4`            | An owner's replicas across all workloads                                                                             |
-| `MOCA_ATTACH_TOKEN_TTL_S`      | `86400`        | Attach-token lifetime; re-minted when less than half remains                                                         |
-| `MOCA_PROVISIONER_RECONCILE_S` | `300`          | How often it checks tokens for re-minting                                                                            |
+| Variable                             | Default                                                | Notes                                                                                                                                                                                    |
+| ------------------------------------ | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MOCA_ATTACH_PRIVATE_KEY`            | none                                                   | **Secret, required.** Ed25519 key that signs attach tokens; its public half is the relay's `MOCA_ATTACH_PUBLIC_KEYS`                                                                     |
+| `MOCA_PROVISIONER_TOKEN`             | none                                                   | **Secret, required.** The workers' service token                                                                                                                                         |
+| `SH_SESSION_TOKEN_PUBLIC_KEYS`       | none                                                   | Required. Verifies the API token a worker forwards                                                                                                                                       |
+| `MOCA_SANDBOX_NAMESPACE`             | `moca-sandbox`                                         | The one namespace it acts in                                                                                                                                                             |
+| `MOCA_PROVISIONER_PORT`              | `8080`                                                 |                                                                                                                                                                                          |
+| `MOCA_WORKLOAD_MAX_SANDBOXES`        | `2`                                                    | `count` per workload                                                                                                                                                                     |
+| `MOCA_OWNER_MAX_SANDBOXES`           | `4`                                                    | An owner's replicas across all workloads                                                                                                                                                 |
+| `MOCA_ATTACH_TOKEN_TTL_S`            | `86400`                                                | Attach-token lifetime; re-minted when less than half remains                                                                                                                             |
+| `MOCA_PROVISIONER_RECONCILE_S`       | `300`                                                  | How often it checks tokens for re-minting                                                                                                                                                |
+| `MOCA_WORKLOAD_MAX_STORAGE`          | `10Gi`                                                 | A mounted workload's largest PVC                                                                                                                                                         |
+| `MOCA_WORKLOAD_STORAGE_CLASSES`      | empty                                                  | `<class>:rwo` or `<class>:rwx`; empty: the default class, `ReadWriteOnce`                                                                                                                |
+| `MOCA_PROVISIONER_SEED_PORT`         | `8081`                                                 | The seed port: `GET /seed/v1/bundle` with an attach token, nothing else                                                                                                                  |
+| `MOCA_PROVISIONER_SEED_URL`          | `http://moca-provisioner.moca.svc:8081/seed/v1/bundle` | What workload pods' init containers fetch their bundle from                                                                                                                              |
+| `MOCA_PROVISIONER_SEED_BUDGET_BYTES` | `1073741824` (1 GiB)                                   | Bundles held for seeding and hand-offs being read, all workloads together, at most half of it per owner; past it, `503 seed_budget_full`. At least twice `MOCA_CONTEXT_BUNDLE_MAX_BYTES` |
+| `MOCA_PROVISIONER_SEED_HOLD_S`       | `600`                                                  | How long a bundle is held, seeded or not; then `GET` reports `seed: bundle_missing` until the next activate resends it                                                                   |
+| `MOCA_CONTEXT_BUNDLE_MAX_BYTES`      | `268435456`                                            | Largest bundle a hand-off may carry. **Must equal the workers'**: the component sets both; patch them together. Over it, activate answers `413 bundle_too_large`                         |
+| `MOCA_CONTEXT_BUNDLE_MAX_ENTRIES`    | `10000`                                                | Most entries the seed extracts. Set to the workers' value, as the component does                                                                                                         |
 
 The pod template is the PodTemplate `moca-workload-sandbox` in the sandbox namespace
 (`deploy/k8s/base/workload-sandboxes/template.yaml`: the shared pool's image, resources, relay address

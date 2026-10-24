@@ -61,8 +61,8 @@ The control plane, the supervisor and the relay stay without Kubernetes permissi
   workers can still write Redis, but not a valid signature.
 - Positive: MI1 §9.1's option A (a launcher that creates a user's container) exists on Kubernetes.
 - Negative / accepted cost: one more Deployment, signing key and internal endpoint to operate.
-- Negative / accepted cost: a compromised provisioner can create pods in `moca-sandbox` and attach
-  any Context there. A ResourceQuota bounds the first; nothing but its small surface bounds the
+- Negative / accepted cost: a compromised provisioner can create pods in `moca-sandbox` and mount
+  any workload's PVC there. A ResourceQuota bounds the first; nothing but its small surface bounds the
   second. It cannot read Secrets (its Role has no get or list on them), and a
   ValidatingAdmissionPolicy holds the pods it creates to their own token Secret, their own
   ServiceAccount and no host access, so it cannot borrow the shared pool's token or another

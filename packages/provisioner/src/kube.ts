@@ -8,10 +8,11 @@ import https from 'node:https';
  * in-memory fake and only this file talks to a cluster.
  *
  * Plain REST over node:https rather than kubectl or a client library: the runtime image's kubectl
- * serves only the deprecated Knative path (Dockerfile), and six verbs on five kinds do not justify
+ * serves only the deprecated Knative path (Dockerfile), and six verbs on six kinds do not justify
  * a dependency.
  */
-export type Kind = 'secrets' | 'services' | 'statefulsets' | 'pods' | 'podtemplates';
+export type Kind =
+  'secrets' | 'services' | 'statefulsets' | 'pods' | 'podtemplates' | 'persistentvolumeclaims';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Kubernetes objects are untyped here
 export type KubeObject = { metadata: { name: string; [k: string]: any }; [k: string]: any };
@@ -51,6 +52,7 @@ const GROUP: Record<Kind, string> = {
   services: '/api/v1',
   pods: '/api/v1',
   podtemplates: '/api/v1',
+  persistentvolumeclaims: '/api/v1',
   statefulsets: '/apis/apps/v1',
 };
 

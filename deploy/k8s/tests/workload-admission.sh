@@ -65,6 +65,16 @@ svc="$(jq -nc --arg wl "$WL" '
   { apiVersion: "v1", kind: "Service", metadata: { name: $wl },
     spec: { clusterIP: "None", selector: { app: "moca-workload-sandbox", "moca.dev/workload": $wl } } }')"
 svc_with() { jq -c "$1" <<<"$svc"; }
+# A mounted workload's own PVC (spec §5.1), as provisioner.ts's claim() writes it. No class: the
+# API server fills in the cluster's default, which setup.sh allowlists when
+# SH_WORKLOAD_STORAGE_CLASSES is unset.
+pvc="$(jq -nc --arg wl "$WL" '
+  { apiVersion: "v1", kind: "PersistentVolumeClaim",
+    metadata: { name: $wl, labels: { app: "moca-workload-sandbox", "moca.dev/workload": $wl } },
+    spec: { accessModes: ["ReadWriteOnce"], resources: { requests: { storage: "1Gi" } } } }')"
+pvc_with() { jq -c "$1" <<<"$pvc"; }
+# The StatefulSet of a mounted workload: its own claim, as one volume.
+own_claim='{name: "context", persistentVolumeClaim: {claimName: "'"$WL"'"}}'
 secret="$(jq -nc --arg wl "$WL" '
   { apiVersion: "v1", kind: "Secret", type: "Opaque", metadata: { name: "\($wl)-attach" },
     data: { token: "eA==" } }')"
@@ -74,11 +84,17 @@ try allow 'StatefulSet from the PodTemplate, with its binding' "$sts"
 try allow 'StatefulSet with emptyDir, configMap and downwardAPI volumes' "$(vol '{name: "e", emptyDir: {}}, {name: "c", configMap: {name: "x"}}, {name: "d", downwardAPI: {items: []}}')"
 try allow 'headless Service selecting its own pods' "$svc"
 try allow 'Opaque <name>-attach Secret' "$secret"
+try allow 'StatefulSet mounting its own <name> PVC' "$(vol "$own_claim")"
+try allow 'a ReadWriteOnce <name> PVC in the default (allowlisted) class' "$pvc"
 
 echo "== refused: StatefulSets"
 try deny 'a hostPath volume' "$(vol '{name: "h", hostPath: {path: "/"}}')"
 try deny 'another Secret as a volume' "$(vol '{name: "s", secret: {secretName: "moca-relay-attach"}}')"
 try deny 'a PVC volume' "$(vol '{name: "p", persistentVolumeClaim: {claimName: "anything"}}')"
+try deny "another workload's PVC" "$(vol '{name: "p", persistentVolumeClaim: {claimName: "w-ffffffffffffffffffffffffffffffff"}}')"
+try deny "Redis's PVC" "$(vol '{name: "p", persistentVolumeClaim: {claimName: "data-redis-0"}}')"
+try deny 'its own PVC through two volumes' "$(vol "$own_claim, {name: \"again\", persistentVolumeClaim: {claimName: \"$WL\"}}")"
+try deny 'an ephemeral volume' "$(vol '{name: "v", ephemeral: {volumeClaimTemplate: {spec: {accessModes: ["ReadWriteOnce"], resources: {requests: {storage: "1Gi"}}}}}}')"
 try deny 'a projected service-account token' "$(vol '{name: "t", projected: {sources: [{serviceAccountToken: {path: "t"}}]}}')"
 try deny 'an inline csi volume' "$(vol '{name: "c", csi: {driver: "x"}}')"
 try deny 'another ServiceAccount' "$(sts_with '.spec.template.spec.serviceAccountName = "default"')"
@@ -87,6 +103,8 @@ try deny 'a privileged container' "$(sts_with '.spec.template.spec.containers[0]
 try deny 'an added capability' "$(sts_with '.spec.template.spec.containers[0].securityContext.capabilities.add = ["NET_ADMIN"]')"
 try deny 'the host network' "$(sts_with '.spec.template.spec.hostNetwork = true')"
 try deny "another Secret in env" "$(sts_with '.spec.template.spec.containers[0].env += [{name: "X", valueFrom: {secretKeyRef: {name: "moca-relay-attach", key: "SH_RELAY_TOKEN"}}}]')"
+try deny 'a raw device (volumeDevices) on a container' "$(vol "$own_claim" | jq -c '.spec.template.spec.containers[0].volumeDevices = [{name: "context", devicePath: "/dev/xvda"}]')"
+try deny 'a raw device (volumeDevices) on an init container' "$(vol "$own_claim" | jq -c '.spec.template.spec.initContainers = [{name: "i", image: .spec.template.spec.containers[0].image, volumeDevices: [{name: "context", devicePath: "/dev/xvda"}]}]')"
 try deny 'a volumeClaimTemplate' "$(sts_with '.spec.volumeClaimTemplates = [{metadata: {name: "v"}, spec: {accessModes: ["ReadWriteOnce"], resources: {requests: {storage: "1Gi"}}}}]')"
 try deny 'a serviceName of another Service' "$(sts_with '.spec.serviceName = "sandbox-relay"')"
 try deny 'a name that is not a workload key (the shared pool)' "$(sts_with '.metadata.name = "moca-sandbox"')"
@@ -102,6 +120,16 @@ try deny "a selector on the shared pool" "$(svc_with '.spec.selector = {app: "mo
 try deny "another workload's pods" "$(svc_with '.spec.selector["moca.dev/workload"] = "w-ffffffffffffffffffffffffffffffff"')"
 try deny 'a selector wider than its own pods' "$(svc_with '.spec.selector = {app: "moca-workload-sandbox"}')"
 try deny 'type ExternalName' "$(svc_with 'del(.spec.clusterIP) | del(.spec.selector) | .spec.type = "ExternalName" | .spec.externalName = "example.com"')"
+
+echo "== refused: PVCs"
+try deny 'a PVC not named w-<32 hex>' "$(pvc_with '.metadata.name = "data-redis-0"')"
+try deny 'a PVC in a class outside the allowlist' "$(pvc_with '.spec.storageClassName = "moca-not-allowlisted"')"
+try deny 'ReadWriteMany on a class not allowlisted as rwx' "$(pvc_with '.spec.accessModes = ["ReadWriteMany"]')"
+try deny "a clone of another workload's PVC (dataSource)" "$(pvc_with '.spec.dataSource = {kind: "PersistentVolumeClaim", name: "w-ffffffffffffffffffffffffffffffff"}')"
+try deny "a clone of another workload's PVC (dataSourceRef)" "$(pvc_with '.spec.dataSourceRef = {kind: "PersistentVolumeClaim", name: "w-ffffffffffffffffffffffffffffffff"}')"
+try deny 'a pre-provisioned PV by volumeName' "$(pvc_with '.spec.volumeName = "pv-someone-else"')"
+try deny 'a pre-provisioned PV by selector' "$(pvc_with '.spec.selector = {matchLabels: {owner: "someone-else"}}')"
+try deny 'a Block volumeMode' "$(pvc_with '.spec.volumeMode = "Block"')"
 
 echo "== refused: Secrets"
 try deny 'a Secret not named <name>-attach' "$(jq -c '.metadata.name = "moca-relay-attach"' <<<"$secret")"

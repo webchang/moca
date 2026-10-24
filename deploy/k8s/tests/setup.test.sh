@@ -139,10 +139,10 @@ case "${1-} ${2-}" in
 "delete pod") : ;;
 # Turning SH_WORKLOAD_SANDBOXES off: the component's objects, and with --delete-workload-sandboxes the
 # workloads' own. Deleting the StatefulSets clears MOCK_WORKLOAD_STS's stand-in.
-"delete statefulsets,services,secrets") rm -f "$MOCK_STATE/workload-sts" ;;
+"delete statefulsets,services,secrets,persistentvolumeclaims") rm -f "$MOCK_STATE/workload-sts" ;;
 "delete deployment/moca-provisioner" | "delete role/moca-provisioner" | "delete validatingadmissionpolicybinding/moca-provisioner") : ;;
-# Workload StatefulSets in moca-sandbox: one name per line in $MOCK_STATE/workload-sts.
-"get statefulsets") [[ ! -f "$MOCK_STATE/workload-sts" ]] || cat "$MOCK_STATE/workload-sts" ;;
+# A workload's StatefulSets, PVCs and Secrets in moca-sandbox: one name per line in $MOCK_STATE/workload-sts.
+"get statefulsets,persistentvolumeclaims,secrets") [[ ! -f "$MOCK_STATE/workload-sts" ]] || cat "$MOCK_STATE/workload-sts" ;;
 # The provisioner, while the last apply listed the component; stopped (and started again) on disable.
 # MOCK_PROVISIONER_STUCK=1: its pod never goes away.
 "get deployment")
@@ -172,6 +172,7 @@ case "${1-} ${2-}" in
 "get storageclass")
   if [[ -n "${MOCK_GET_SC_FAIL-}" ]]; then echo 'Error from server (Forbidden): storageclasses is forbidden' >&2; exit 1; fi
   if [[ -n "${MOCK_NO_DEFAULT_SC-}" ]]; then echo '{"items":[{"metadata":{"name":"slow"}}]}'
+  elif [[ -n "${MOCK_SC_SLOW-}" ]]; then echo '{"items":[{"metadata":{"name":"standard","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}},{"metadata":{"name":"slow"}}]}'
   else echo '{"items":[{"metadata":{"name":"standard","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}]}'; fi ;;
 *) echo "mock kubectl: unhandled: $*" >&2; exit 2 ;;
 esac
@@ -1445,7 +1446,7 @@ expect_out 'labelled app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca
 # The provisioner is stopped BEFORE the check, so no activate can slip between it and the delete,
 # and the check uses the delete's selector; a refusal starts the provisioner again.
 scale0="$(grep -n 'scale deployment/moca-provisioner -n moca --replicas=0' "$MOCK_LOG" | head -1 | cut -d: -f1)"
-check="$(grep -nF 'get statefulsets -n moca-sandbox -l app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner -o name' "$MOCK_LOG" | head -1 | cut -d: -f1)"
+check="$(grep -nF 'get statefulsets,persistentvolumeclaims,secrets -n moca-sandbox -l app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner -o name' "$MOCK_LOG" | head -1 | cut -d: -f1)"
 [[ -n "$scale0" && -n "$check" && "$scale0" -lt "$check" ]] ||
   fail 'the provisioner was not scaled to 0 before the workload sandboxes check, with the delete selector'
 grep -q 'get pods -n moca -l app=moca-provisioner -o name' "$MOCK_LOG" || fail 'the provisioner pod was not waited out'
@@ -1461,12 +1462,57 @@ expect_out "moca-provisioner's pod is still running"
 grep -q '^  - ../../base/workload-sandboxes$' "$MOCK_STATE/applied-kustomization.yaml" || fail 'a refused disable was recorded'
 : >"$MOCK_LOG"
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=; expect_ok --target kind --skip-build --delete-workload-sandboxes)
-grep -qF 'delete statefulsets,services,secrets -n moca-sandbox -l app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner' "$MOCK_LOG" ||
+grep -qF 'delete statefulsets,services,secrets,persistentvolumeclaims -n moca-sandbox -l app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner' "$MOCK_LOG" ||
   fail "--delete-workload-sandboxes did not delete the workloads' objects by label"
 [[ ! -f "$MOCK_STATE/workload-sts" ]] || fail 'the workload StatefulSets are still there'
 ! grep -q 'scale deployment/moca-provisioner -n moca --replicas=1' "$MOCK_LOG" || fail 'a finished disable started the provisioner again'
 ! grep -q 'workload-sandboxes' "$MOCK_STATE/applied-kustomization.yaml" || fail '--delete-workload-sandboxes did not turn it off'
 pass 'turning SH_WORKLOAD_SANDBOXES off is refused while workload sandboxes exist, and stays on; --delete-workload-sandboxes deletes them and turns it off'
+
+reset_state
+# A PVC (user data) left without its StatefulSet still refuses the disable, and the flag deletes by
+# label even when no StatefulSet is left at all.
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1; expect_ok --target kind --skip-build)
+printf 'persistentvolumeclaim/w-%s\n' "$(printf 'b%.0s' {1..32})" >"$MOCK_STATE/workload-sts"
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=; expect_fail --target kind --skip-build)
+expect_out 'workload sandboxes still exist in moca-sandbox (1 StatefulSet(s), PVC(s) or Secret(s)'
+rm -f "$MOCK_STATE/workload-sts"
+: >"$MOCK_LOG"
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=; expect_ok --target kind --skip-build --delete-workload-sandboxes)
+grep -qF 'delete statefulsets,services,secrets,persistentvolumeclaims -n moca-sandbox -l app=moca-workload-sandbox,app.kubernetes.io/managed-by=moca-provisioner' "$MOCK_LOG" ||
+  fail '--delete-workload-sandboxes did not delete by label with no StatefulSet left'
+pass 'a workload PVC or Secret without its StatefulSet refuses the disable; --delete-workload-sandboxes always deletes by label'
+
+reset_state
+# Workload PVC StorageClasses (spec §5.4, §6.3): unset, the cluster's default class as rwo; given,
+# exactly those, sticky; every other class of the cluster is zeroed in the quota.
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1; expect_ok --target kind --skip-build)
+gen="$MOCK_STATE/applied-kustomization.yaml"
+grep -qF "{ op: replace, path: /spec/variables/7/expression, value: \"['standard']\" }" "$gen" ||
+  fail "the admission policy's allowlist is not the default class"
+grep -qF '{ op: replace, path: /spec/variables/8/expression, value: "[]" }' "$gen" || fail 'the default class was allowed rwx'
+grep -qF '{ name: MOCA_WORKLOAD_STORAGE_CLASSES, value: "standard:rwo" }' "$gen" || fail 'the workers and provisioner were not given the default class'
+! grep -q 'storageclass.storage.k8s.io' "$gen" || fail 'a cluster with only the allowed class got a zeroed class'
+(export SH_GITHUB_CLIENT_ID=Iv1.a MOCK_SC_SLOW=1 SH_WORKLOAD_STORAGE_CLASSES=' standard:rwo , slow:rwx'; expect_ok --target kind --skip-build)
+grep -qF "value: \"['standard','slow']\"" "$gen" || fail 'SH_WORKLOAD_STORAGE_CLASSES is not the allowlist'
+grep -qF "{ op: replace, path: /spec/variables/8/expression, value: \"['slow']\" }" "$gen" || fail 'an rwx class is not rwx'
+grep -qF '{ name: MOCA_WORKLOAD_STORAGE_CLASSES, value: "standard:rwo,slow:rwx" }' "$gen" || fail 'the classes did not reach the workers and provisioner'
+(export SH_GITHUB_CLIENT_ID=Iv1.a MOCK_SC_SLOW=1 SH_WORKLOAD_STORAGE_CLASSES=slow:rwo; expect_ok --target kind --skip-build)
+grep -qF 'path: /spec/hard/standard.storageclass.storage.k8s.io~1requests.storage, value: "0"' "$gen" ||
+  fail 'a class outside the allowlist is not zeroed in the quota'
+(export SH_GITHUB_CLIENT_ID=Iv1.a MOCK_SC_SLOW=1; expect_ok --target kind --skip-build)
+grep -qF '{ name: MOCA_WORKLOAD_STORAGE_CLASSES, value: "slow:rwo" }' "$gen" || fail 'SH_WORKLOAD_STORAGE_CLASSES is not sticky'
+: >"$MOCK_LOG"
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_STORAGE_CLASSES='standard:rwo,fsat:rwx'; expect_fail --target kind --skip-build)
+expect_out 'SH_WORKLOAD_STORAGE_CLASSES names StorageClass(es) this cluster does not have: fsat'
+! grep -q '^kubectl .*apply -k' "$MOCK_LOG" || fail 'an unknown workload StorageClass reached kubectl apply -k'
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_STORAGE_CLASSES=fast; expect_fail --target kind --skip-build)
+expect_out "SH_WORKLOAD_STORAGE_CLASSES: 'fast' is not <class>:rwo or <class>:rwx"
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1 MOCK_NO_DEFAULT_SC=1; expect_fail --target kind --skip-build)
+expect_out 'the cluster has no default StorageClass for workload PVCs'
+! grep -q '^kubectl .*apply -k' "$MOCK_LOG" || fail 'a stack with no workload StorageClass reached kubectl apply -k'
+pass 'SH_WORKLOAD_STORAGE_CLASSES: default class when unset, the allowlist when set, sticky; other classes zeroed; malformed, unknown or no default refused'
 
 reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1 MOCK_NO_API_ENDPOINTS=1; expect_fail --target kind --skip-build)

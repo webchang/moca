@@ -110,5 +110,8 @@ export function KubectlTransport(
       if (opts.stdin) child.stdin.end(opts.stdin);
       else child.stdin.end();
     });
-  return { exec, close: async () => {} };
+  // Every exec is its own `kubectl exec` and its own `bash -c`, so N fast ops cost N
+  // apiserver round trips and N processes (#245). `persistentExecInPod` exists to put a
+  // reused shell in front of this one, with THIS transport as its fallback.
+  return { exec, close: async () => {}, fastTier: 'per-call-exec' };
 }

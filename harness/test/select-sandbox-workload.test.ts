@@ -48,6 +48,7 @@ function fakeAffinity(init: Record<string, AffinityEntry> = {}) {
 const fakeTransport = {
   exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
   close: async () => {},
+  fastTier: 'per-call-exec' as const,
 };
 const env = (extra: Record<string, string> = {}) =>
   ({
@@ -163,6 +164,7 @@ describe('selectPoolSandbox: workload filter (spec §3.3)', () => {
     const transport = {
       exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
       close: async () => {},
+      fastTier: 'per-call-exec' as const,
     };
     for (const workload of [WL, undefined]) {
       const { lease } = fakeLease();

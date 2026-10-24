@@ -28,13 +28,18 @@
 # port-forward's local port), SH_WORKLOAD_SANDBOXES=1 (kind, kind-ci and ocp: run moca-provisioner,
 # so a workload created with `sandboxes` gets sandboxes of its own; workload sandboxes spec §4; off
 # when unset or empty. Turning it off is refused while a workload's sandboxes exist -- delete those
-# workloads first, or pass --delete-workload-sandboxes to delete their StatefulSets, Services and
-# Secrets with it), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
+# workloads first, or pass --delete-workload-sandboxes to delete their StatefulSets, Services,
+# Secrets and PVCs with it), SH_WORKLOAD_STORAGE_CLASSES (with SH_WORKLOAD_SANDBOXES=1: the
+# StorageClasses a mounted workload's PVC may use, comma-separated <class>:rwo or <class>:rwx -- rwx
+# only for a class that supports ReadWriteMany; empty, the default, allows the cluster's default
+# class as rwo; workload sandboxes spec §5.4, §6.3), SH_SOURCE_ONLY=1 (define the functions and
+# stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
 # SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT, SH_MODEL_CATALOG_HOSTS,
-# SH_WORKLOAD_SANDBOXES and, on ocp-single, SH_ROUTE_DOMAIN and --tls-secret it is not given; an
+# SH_WORKLOAD_SANDBOXES, SH_WORKLOAD_STORAGE_CLASSES and, on ocp-single, SH_ROUTE_DOMAIN and
+# --tls-secret it is not given; an
 # explicitly empty variable (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
 # a command line -- values travel through pipes and through the environment of the one jq that
 # writes each Secret.
@@ -92,6 +97,13 @@ DELETE_WORKLOAD_SANDBOXES=''
 # The provisioner's egress to the Kubernetes API server (kube_api_egress), as a NetworkPolicy
 # egress list in JSON; set only with SH_WORKLOAD_SANDBOXES=1.
 KUBE_API_EGRESS=''
+# SH_WORKLOAD_STORAGE_CLASSES as given or stored (sticky); WORKLOAD_CLASSES is what the stack gets,
+# that or the cluster's default class as rwo (workload_storage_classes), and OTHER_CLASSES the
+# cluster's other StorageClasses, which the quota holds at zero. Set only with SH_WORKLOAD_SANDBOXES=1.
+WORKLOAD_CLASSES_GIVEN=''
+WORKLOAD_CLASSES_INPUT=''
+WORKLOAD_CLASSES=''
+OTHER_CLASSES=''
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() {
@@ -217,6 +229,8 @@ parse_args() {
   '' | 1) WORKLOAD_SANDBOXES="${SH_WORKLOAD_SANDBOXES-}" ;;
   *) die "SH_WORKLOAD_SANDBOXES='$SH_WORKLOAD_SANDBOXES' must be 1 (on) or empty (off)" ;;
   esac
+  WORKLOAD_CLASSES_GIVEN="${SH_WORKLOAD_STORAGE_CLASSES+x}"
+  WORKLOAD_CLASSES_INPUT="$(normalize_storage_classes "${SH_WORKLOAD_STORAGE_CLASSES-}")"
   # ocp-single puts the sandboxes in the namespace with everything else, so a workload's pods would
   # share it with the supervisor's Secrets: the provisioner's isolation needs the sandbox namespace.
   [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp-single ]] ||
@@ -425,6 +439,27 @@ normalize_egress_except() {
   printf '%s' "$out"
 }
 
+# normalize_storage_classes " fast:rwo, nfs:rwx,," -> "fast:rwo nfs:rwx": SH_WORKLOAD_STORAGE_CLASSES,
+# comma-separated, each entry trimmed, empty entries dropped. Each is a StorageClass name and rwo or
+# rwx, as the provisioner parses MOCA_WORKLOAD_STORAGE_CLASSES (it refuses to boot on anything else).
+normalize_storage_classes() {
+  [[ -n "$1" ]] || return 0
+  [[ "$1" != *$'\n'* ]] || die "SH_WORKLOAD_STORAGE_CLASSES must be one line"
+  local -a parts
+  local c out=''
+  IFS=',' read -ra parts <<<"$1"
+  for c in ${parts[@]+"${parts[@]}"}; do
+    c="${c#"${c%%[![:space:]]*}"}"
+    c="${c%"${c##*[![:space:]]}"}"
+    [[ -n "$c" ]] || continue
+    [[ "$c" =~ ^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?):(rwo|rwx)$ ]] ||
+      die "SH_WORKLOAD_STORAGE_CLASSES: '$c' is not <class>:rwo or <class>:rwx"
+    case " $out " in *" ${c%:*}:"*) die "SH_WORKLOAD_STORAGE_CLASSES lists '${c%:*}' twice" ;; esac
+    out="${out:+$out }$c"
+  done
+  printf '%s' "$out"
+}
+
 # Sandbox tiers (P6.3, docs/specs/2026-10-04-p6-on-kubernetes-slice3-design.md §7): a stack with BOTH
 # container sandboxes and P4 hosts is tiered -- each session stays in the tier it was created in.
 # A single-tier stack stays untiered on purpose: a pre-P6.3 worker advertises no tier and a tiered
@@ -496,8 +531,11 @@ load_setup_inputs() {
   # Before moca-setup records the change, so a refusal leaves the feature on and a re-run checks again.
   [[ "$was_workload_sandboxes" != 1 || "$WORKLOAD_SANDBOXES" == 1 ]] || disable_workload_sandboxes
   [[ "$WORKLOAD_SANDBOXES" != 1 ]] || kube_api_egress
-  data="$(jq -nc --argjson d "$data" --arg w "$WORKLOAD_SANDBOXES" \
-    '($d + {SH_WORKLOAD_SANDBOXES: $w}) | with_entries(select(.value != ""))')"
+  [[ -n "$WORKLOAD_CLASSES_GIVEN" ]] ||
+    WORKLOAD_CLASSES_INPUT="$(normalize_storage_classes "$(cm_value "$json" SH_WORKLOAD_STORAGE_CLASSES)")"
+  [[ "$WORKLOAD_SANDBOXES" != 1 ]] || workload_storage_classes
+  data="$(jq -nc --argjson d "$data" --arg w "$WORKLOAD_SANDBOXES" --arg c "${WORKLOAD_CLASSES_INPUT// /,}" \
+    '($d + {SH_WORKLOAD_SANDBOXES: $w, SH_WORKLOAD_STORAGE_CLASSES: $c}) | with_entries(select(.value != ""))')"
   # The extra sandbox egress exceptions apply on every target, Kind too (#446).
   [[ -n "$EGRESS_EXCEPT_GIVEN" ]] || EGRESS_EXCEPT="$(normalize_egress_except "$(cm_value "$json" SH_SANDBOX_EGRESS_EXCEPT)")"
   data="$(jq -nc --argjson d "$data" --arg e "${EGRESS_EXCEPT// /,}" \
@@ -759,15 +797,18 @@ disable_workload_sandboxes() {
       waited=$((waited + 1))
     done
   fi
-  sets="$(kc get statefulsets -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" -o name)"
-  if [[ -n "$sets" ]]; then
-    if [[ -z "$DELETE_WORKLOAD_SANDBOXES" ]]; then
+  # A PVC (the user's data) or Secret can outlive its StatefulSet -- a DELETE answered 202 while the
+  # claim's finalizer held it and was never repeated -- so those count as a workload's too.
+  if [[ -n "$DELETE_WORKLOAD_SANDBOXES" ]]; then
+    log "--delete-workload-sandboxes: deleting every workload's sandboxes in $SBX_NS"
+    kc delete statefulsets,services,secrets,persistentvolumeclaims -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" --ignore-not-found >/dev/null
+  else
+    sets="$(kc get statefulsets,persistentvolumeclaims,secrets -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" -o name)"
+    if [[ -n "$sets" ]]; then
       kc scale deployment/moca-provisioner -n "$NS" --replicas=1 >/dev/null ||
         log 'WARNING: could not start moca-provisioner again; re-run with SH_WORKLOAD_SANDBOXES=1'
-      die "SH_WORKLOAD_SANDBOXES is being turned off, but workload sandboxes still exist in $SBX_NS ($(grep -c . <<<"$sets") StatefulSet(s) labelled $WORKLOAD_SELECTOR). Delete those workloads first (DELETE /workloads/{id}, or mocactl workloads delete ID), or re-run with --delete-workload-sandboxes to delete their StatefulSets, Services and Secrets"
+      die "SH_WORKLOAD_SANDBOXES is being turned off, but workload sandboxes still exist in $SBX_NS ($(grep -c . <<<"$sets") StatefulSet(s), PVC(s) or Secret(s) labelled $WORKLOAD_SELECTOR). Delete those workloads first (DELETE /workloads/{id}, or mocactl workloads delete ID), or re-run with --delete-workload-sandboxes to delete their StatefulSets, Services, Secrets and PVCs"
     fi
-    log "--delete-workload-sandboxes: deleting every workload's sandboxes in $SBX_NS"
-    kc delete statefulsets,services,secrets -n "$SBX_NS" -l "$WORKLOAD_SELECTOR" --ignore-not-found >/dev/null
   fi
   log 'SH_WORKLOAD_SANDBOXES off: removing moca-provisioner and its policies'
   kc delete -n "$NS" deployment/moca-provisioner service/moca-provisioner \
@@ -776,6 +817,7 @@ disable_workload_sandboxes() {
     serviceaccount/moca-workload-sandbox podtemplate/moca-workload-sandbox \
     networkpolicy/moca-workload-sandbox networkpolicy/allow-dns-workload-sandbox \
     networkpolicy/allow-openshift-dns-workload-sandbox \
+    networkpolicy/allow-seed-workload-sandbox \
     resourcequota/moca-sandbox --ignore-not-found >/dev/null
   kc delete validatingadmissionpolicybinding/moca-provisioner \
     validatingadmissionpolicy/moca-provisioner --ignore-not-found >/dev/null
@@ -808,6 +850,45 @@ kube_api_egress() {
   [[ "$(jq length <<<"$KUBE_API_EGRESS")" == 2 ]] ||
     die 'SH_WORKLOAD_SANDBOXES=1: Service default/kubernetes has no ClusterIP or no endpoint addresses to build the provisioner'"'"'s egress policy from'
   log "provisioner egress: the Kubernetes API at $(jq -r '[.[].to[].ipBlock.cidr] | join(", ")' <<<"$KUBE_API_EGRESS")"
+}
+
+# The StorageClasses a mounted workload's PVC may use (spec §5.4, §6.3): SH_WORKLOAD_STORAGE_CLASSES,
+# or the cluster's default class as rwo. They go to the provisioner and the workers as
+# MOCA_WORKLOAD_STORAGE_CLASSES and to the admission policy as its allowlist, and the namespace quota
+# holds every other class of the cluster at zero storage, a backstop should a request bypass both.
+workload_storage_classes() {
+  local json
+  json="$(kc get storageclass -o json)" || json=''
+  if [[ -n "$WORKLOAD_CLASSES_INPUT" ]]; then
+    WORKLOAD_CLASSES="$WORKLOAD_CLASSES_INPUT"
+    # A typo would install cleanly and leave every mounted activate Pending: refuse a class the
+    # cluster does not have. Unlistable, only warned: the admission policy still holds the allowlist.
+    if [[ -n "$json" ]]; then
+      local c missing=''
+      for c in $WORKLOAD_CLASSES; do
+        jq -e --arg n "${c%:*}" 'any(.items[]; .metadata.name == $n)' <<<"$json" >/dev/null ||
+          missing="${missing:+$missing, }${c%:*}"
+      done
+      [[ -z "$missing" ]] ||
+        die "SH_WORKLOAD_STORAGE_CLASSES names StorageClass(es) this cluster does not have: $missing (kubectl get storageclass)"
+    else
+      log 'WARNING: could not list StorageClasses to check SH_WORKLOAD_STORAGE_CLASSES against them'
+    fi
+  else
+    [[ -n "$json" ]] ||
+      die 'SH_WORKLOAD_SANDBOXES=1: could not list StorageClasses to find the default one: set SH_WORKLOAD_STORAGE_CLASSES (<class>:rwo, comma-separated)'
+    WORKLOAD_CLASSES="$(jq -r '[.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true") | .metadata.name] | first // empty' <<<"$json")"
+    [[ -n "$WORKLOAD_CLASSES" ]] ||
+      die 'SH_WORKLOAD_SANDBOXES=1: the cluster has no default StorageClass for workload PVCs: mark one default, or set SH_WORKLOAD_STORAGE_CLASSES (<class>:rwo, comma-separated)'
+    WORKLOAD_CLASSES="$WORKLOAD_CLASSES:rwo"
+  fi
+  if [[ -n "$json" ]]; then
+    OTHER_CLASSES="$(jq -r --arg allowed " $WORKLOAD_CLASSES " '.items[].metadata.name | select(. as $n | $allowed | contains(" " + $n + ":") | not)' <<<"$json" | tr '\n' ' ')"
+    OTHER_CLASSES="${OTHER_CLASSES% }"
+  else
+    log 'WARNING: could not list StorageClasses: the moca-sandbox quota does not zero the classes outside SH_WORKLOAD_STORAGE_CLASSES (the admission policy still refuses them)'
+  fi
+  log "workload PVCs: StorageClasses $WORKLOAD_CLASSES"
 }
 
 ensure_secrets() {
@@ -1254,8 +1335,28 @@ write_overlay() {
     # shared pool; the provisioner's egress, the API server's addresses (kube_api_egress); and on
     # kind, the same image IDs as the shared pool and relay, so a rebuilt image rolls the
     # provisioner and reaches workload sandboxes created after it.
+    # The workload PVCs' StorageClasses (workload_storage_classes): the provisioner's and workers'
+    # MOCA_WORKLOAD_STORAGE_CLASSES, the admission policy's allowlist as CEL lists, and zero storage
+    # in the quota for every other class of the cluster.
     if [[ "$WORKLOAD_SANDBOXES" == 1 ]]; then
+      local classes_csv="${WORKLOAD_CLASSES// /,}" cel_all cel_rwx c
+      cel_all="$(for c in $WORKLOAD_CLASSES; do printf "'%s'," "${c%:*}"; done)"
+      cel_rwx="$(for c in $WORKLOAD_CLASSES; do [[ "$c" != *:rwx ]] || printf "'%s'," "${c%:*}"; done)"
       printf '  - target: { kind: ResourceQuota, name: moca-sandbox }\n    patch: |-\n      - { op: replace, path: /spec/hard/pods, value: "%s" }\n' "$((SH_SANDBOX_COUNT + 32))"
+      for c in $OTHER_CLASSES; do
+        printf '      - { op: add, path: /spec/hard/%s.storageclass.storage.k8s.io~1requests.storage, value: "0" }\n' "$c"
+      done
+      printf '  - target: { kind: ValidatingAdmissionPolicy, name: moca-provisioner }\n    patch: |-\n'
+      printf '      - { op: test, path: /spec/variables/7/name, value: storageClasses }\n'
+      printf '      - { op: replace, path: /spec/variables/7/expression, value: "[%s]" }\n' "${cel_all%,}"
+      printf '      - { op: test, path: /spec/variables/8/name, value: rwxClasses }\n'
+      printf '      - { op: replace, path: /spec/variables/8/expression, value: "[%s]" }\n' "${cel_rwx%,}"
+      for c in moca-provisioner:provisioner moca-supervisor:supervisor; do
+        printf '  - target: { kind: Deployment, name: %s }\n    patch: |-\n' "${c%:*}"
+        printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: %s }\n' "${c%:*}"
+        printf '      spec:\n        template:\n          spec:\n            containers:\n              - name: %s\n                env:\n' "${c#*:}"
+        printf '                  - { name: MOCA_WORKLOAD_STORAGE_CLASSES, value: "%s" }\n' "$classes_csv"
+      done
       printf '  - target: { kind: NetworkPolicy, name: moca-provisioner }\n    patch: |-\n      - { op: replace, path: /spec/egress, value: %s }\n' "$KUBE_API_EGRESS"
       if is_kind; then
         printf '  - target: { kind: Deployment, name: moca-provisioner }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/image-id: "%s" } }\n' "$HARNESS_IMAGE_ID"

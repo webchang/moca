@@ -4,9 +4,12 @@
 # refuses, for requests from its ServiceAccount only: an object name that is not a workload's; a
 # Secret other than an Opaque `<wl>-attach`; a Service other than a port-less headless ClusterIP one
 # that selects exactly its own workload's pods (no externalIPs, NodePort or LoadBalancer); and a pod
-# template with a volume other than emptyDir, configMap, downwardAPI or its own `<wl>-attach` Secret,
-# an env or envFrom read of any other Secret, a host namespace, a privileged container or added
-# capability, a claim template, another ServiceAccount, or a mounted service-account token.
+# template with a volume other than emptyDir, configMap, downwardAPI, its own `<wl>-attach` Secret or
+# one claim on its own `<wl>` PVC, an env or envFrom read of any other Secret, a host namespace, a
+# privileged container or added capability, a claim template, another ServiceAccount, or a mounted
+# service-account token, or a raw device (volumeDevices). PVCs (spec §5.1): it may write only one
+# named `<wl>`, created empty (no dataSource, dataSourceRef, volumeName or selector) as a Filesystem
+# claim in an allowlisted StorageClass with an access mode that class allows.
 # Deletes are held to the same names, so it cannot delete the shared pool or another Secret either.
 #
 # admissionregistration.k8s.io/v1: Kubernetes 1.30 or newer (OpenShift 4.17 or newer).
@@ -24,7 +27,7 @@ spec:
         operations: [CREATE, UPDATE, DELETE]
       - apiGroups: ['']
         apiVersions: [v1]
-        resources: [secrets, services]
+        resources: [secrets, services, persistentvolumeclaims]
         operations: [CREATE, UPDATE, DELETE]
   matchConditions:
     - name: from-the-provisioner
@@ -45,6 +48,13 @@ spec:
       expression: "variables.kind == 'services' && request.operation != 'DELETE' ? object.spec : null"
     - name: pod
       expression: "variables.kind == 'statefulsets' ? variables.obj.spec.template.spec : null"
+    # The StorageClasses a workload PVC may use, and those of them that allow ReadWriteMany: CEL
+    # lists, MOCA_WORKLOAD_STORAGE_CLASSES's entries. setup.sh's generated overlay fills both in;
+    # rendered without it, every PVC is refused, as the provisioner's egress fails closed.
+    - name: storageClasses
+      expression: '[]'
+    - name: rwxClasses
+      expression: '[]'
     - name: containers
       expression: >-
         variables.kind == 'statefulsets'
@@ -56,7 +66,7 @@ spec:
     - expression: "variables.kind != 'secrets' || request.operation == 'DELETE' || variables.secretType == 'Opaque'"
       message: the provisioner may write only Opaque Secrets
     - expression: "variables.kind == 'secrets' || variables.obj.metadata.name.matches('^w-[0-9a-f]{32}$')"
-      message: the provisioner may write only Services and StatefulSets named w-<32 hex>
+      message: the provisioner may write only Services, StatefulSets and PVCs named w-<32 hex>
     # A Service is only ever the workload's governing one: headless, no ports, and selecting exactly
     # its own pods. externalIPs would let it intercept cluster traffic (CVE-2020-8554), and a
     # NodePort, a LoadBalancer or a wider selector would expose or reach other pods.
@@ -76,6 +86,27 @@ spec:
       message: >-
         the provisioner may write only headless ClusterIP Services with no ports or external
         addresses, selecting exactly app=moca-workload-sandbox and moca.dev/workload=<name>
+    # Checked at create only: a class later dropped from the allowlist must not block a delete. The
+    # class is the one the claim ends up with, after the default class is filled in.
+    - expression: >-
+        variables.kind != 'persistentvolumeclaims' || request.operation != 'CREATE' ||
+        (has(object.spec.storageClassName) && object.spec.storageClassName in variables.storageClasses &&
+         has(object.spec.accessModes) && object.spec.accessModes.all(m, m == 'ReadWriteOnce' ||
+           (m == 'ReadWriteMany' && object.spec.storageClassName in variables.rwxClasses)))
+      message: >-
+        a workload PVC must use an allowlisted StorageClass (MOCA_WORKLOAD_STORAGE_CLASSES), and
+        ReadWriteOnce, or ReadWriteMany only on a class allowlisted as rwx
+    # A fresh, empty Filesystem claim only: a dataSource or dataSourceRef would clone another
+    # workload's PVC or restore a snapshot or populator, and volumeName or selector would bind a
+    # pre-provisioned PV. Block mode is a raw device, never a tree.
+    - expression: >-
+        variables.kind != 'persistentvolumeclaims' || request.operation != 'CREATE' ||
+        (!has(object.spec.dataSource) && !has(object.spec.dataSourceRef) &&
+         !has(object.spec.volumeName) && !has(object.spec.selector) &&
+         object.spec.?volumeMode.orValue('Filesystem') == 'Filesystem')
+      message: >-
+        a workload PVC must be a new, empty Filesystem claim: no dataSource, dataSourceRef,
+        volumeName or selector, and no Block volumeMode
     - expression: >-
         variables.kind != 'statefulsets' ||
         (has(variables.obj.metadata.labels) && 'app' in variables.obj.metadata.labels &&
@@ -101,13 +132,23 @@ spec:
     - expression: "variables.kind != 'statefulsets' || request.operation == 'DELETE' || variables.obj.spec.serviceName == variables.obj.metadata.name"
       message: a workload StatefulSet's serviceName must be its own name
     # An allow-list: the API server already holds each volume to exactly one source, so a volume
-    # passes only as one of these. No hostPath, PVC, ephemeral, csi or projected volume, and no
-    # Secret but the workload's own.
+    # passes only as one of these. No hostPath, ephemeral, csi or projected volume, no Secret but the
+    # workload's own, and at most one PVC volume, on the workload's own `<wl>` claim (spec §5.1).
     - expression: >-
         variables.kind != 'statefulsets' || !has(variables.pod.volumes) ||
         variables.pod.volumes.all(v, has(v.emptyDir) || has(v.configMap) || has(v.downwardAPI) ||
-          (has(v.secret) && has(v.secret.secretName) && v.secret.secretName == variables.attach))
-      message: workload pods may mount only emptyDir, configMap, downwardAPI and their own <name>-attach Secret
+          (has(v.secret) && has(v.secret.secretName) && v.secret.secretName == variables.attach) ||
+          (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == variables.wl))
+      message: >-
+        workload pods may mount only emptyDir, configMap, downwardAPI, their own <name>-attach Secret
+        and their own <name> PVC
+    - expression: >-
+        variables.kind != 'statefulsets' || !has(variables.pod.volumes) ||
+        size(variables.pod.volumes.filter(v, has(v.persistentVolumeClaim))) <= 1
+      message: workload pods may mount their own <name> PVC through one volume only
+    # A claim's raw device, which the Filesystem rule above already keeps from existing.
+    - expression: 'variables.containers.all(c, !has(c.volumeDevices))'
+      message: workload containers may not attach a volume as a raw device (volumeDevices)
     - expression: >-
         variables.containers.all(c,
           (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) ||

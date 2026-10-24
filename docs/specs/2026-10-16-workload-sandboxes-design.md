@@ -226,7 +226,7 @@ grants (MI1 §4.2 I2). Until then the worker remains the trust root for routing,
 | `secrets`                | create, update, delete           | the workload's attach token, re-minted       |
 | `services`               | create, get, delete              | the StatefulSet's headless governing Service |
 | `pods`                   | get, list                        | readiness, and the reconciler's view         |
-| `persistentvolumeclaims` | get                              | until PR 3; see §5.1 for its additions       |
+| `persistentvolumeclaims` | create, get, delete              | the mounted workload's own PVC (§5)          |
 | `podtemplates`           | get, on `moca-workload-sandbox`  | the operator's pod template (§4.2)           |
 
 No create on bare pods, and no read on Secrets: the provisioner writes its workloads' tokens blind
@@ -256,9 +256,15 @@ concurrent PUTs could both pass it. The provisioner serializes PUTs per owner in
 as exactly one replica with the `Recreate` strategy; scaling it out needs a lock in the API.
 
 The governing Service is headless with no ports, as the shared pool's is: a workload sandbox
-accepts no connections. The provisioner has no rights outside `moca-sandbox`, and in PR 2 none on
-PVCs beyond `get`. PR 3 adds create and delete, since the provisioner owns the workload's PVC (§5.1,
-2026-10-22). The control plane, supervisor and relay stay without a Kubernetes token.
+accepts no connections. The provisioner has no rights outside `moca-sandbox`. PR 3 added create,
+get and delete on PVCs there, since the provisioner owns the workload's PVC (§5.1, 2026-10-22).
+That is not limited to the workload's own claim: the Role has no `resourceNames`, so `get` reaches
+any PVC in `moca-sandbox` (admission never sees a GET), and the admission policy holds create and
+delete to `w-<32 hex>` names, which is any workload's PVC. A created PVC must be a new, empty
+Filesystem claim (no `dataSource`, `dataSourceRef`, `volumeName` or `selector`), so it cannot clone
+another workload's claim or bind its volume. That the provisioner touches only the workload's own
+PVC rests on its code deriving the name from the verified owner. The control plane, supervisor and
+relay stay without a Kubernetes token.
 
 Its internal API is reached only by the supervisor's workers (NetworkPolicy):
 
@@ -340,14 +346,17 @@ Context Service's side does not move: the Context, the managed PVC `createContex
 helper pods and `CONTEXT_SERVICE_NAMESPACE` stay as they are, and no pod mounts that PVC. A phase 2
 workload therefore holds its revision twice, once in each PVC, and a `writable` one three times:
 Context Service's PVC, `revision/<revision>` and `moca-workspace`. `workspace.size` must cover the
-bundle's inflated size once for `read-only`, and twice plus the run's own writes for `writable`; the
-worker refuses a size below that with `400 workspace_size_too_small`, before any seed can hit
-`ENOSPC`.
+compressed bundle, which the seed downloads onto the claim before extracting it, plus its inflated
+size once for `read-only`, and twice plus the run's own writes for `writable`, and a margin for the
+filesystem (10% and 16 MiB); the worker refuses a size below that with
+`400 workspace_size_too_small`, before any seed can hit `ENOSPC`.
 
 **What PR 3 adds to the provisioner's permissions.** The Role gains create, get and delete on
 `persistentvolumeclaims` in `moca-sandbox`. The admission policy (§4.1) gains PVCs: the
 provisioner may create or delete only a PVC named `^w-[0-9a-f]{32}$` whose StorageClass is on the
-allowlist, and a workload pod may mount no PVC but its own `<wl>`.
+allowlist, created empty as a Filesystem claim (no `dataSource`, `dataSourceRef`, `volumeName`,
+`selector` or Block mode), and a workload pod may mount no PVC but its own `<wl>`, and attach no
+volume as a raw device (`volumeDevices`).
 
 ### 5.2 Seeding
 
@@ -358,9 +367,14 @@ inflate and entry ceilings) and hands it to the provisioner with
 `PUT /internal/v1/workloads/{name}/{generation}/bundle` before the `PUT` that creates the
 StatefulSet. The provisioner holds it in memory until the seed has run, within
 `MOCA_PROVISIONER_SEED_BUDGET_BYTES` (default 1 GiB, about four bundles at phase 1's 256 MiB
-ceiling) across all workloads waiting to seed. A `PUT …/bundle` that would exceed it answers
-`503 seed_budget_full` with `Retry-After`, and the worker's activate answers the same, so a burst of
-activations queues on the client instead of growing the provisioner's memory. The init container
+ceiling) across all workloads waiting to seed, and at most half of it per owner. A `PUT …/bundle`
+reserves its `Content-Length` (required) before its body is read, so held bundles and hand-offs in
+flight together stay within the budget; one that would exceed it answers `503 seed_budget_full`
+with `Retry-After`, and the worker's activate answers the same, so a burst of activations queues on
+the client instead of growing the provisioner's memory. A bundle is held for
+`MOCA_PROVISIONER_SEED_HOLD_S` (default 600 s) at most, seeded or not, so a workload whose pod 0
+never initializes (a Pending claim, a crash-looping seed) does not keep its share; each activate
+resends it and restarts the hold. The init container
 fetches it from the provisioner's seed port (`GET /seed/v1/bundle`) with the workload's attach token
 (`SANDBOX_TOKEN_FILE`) as its bearer, and the token's `wl` and `gen` pick the bundle. So the
 provisioner needs no Context Service credential, and the bytes come from the same trusted export as
@@ -374,7 +388,8 @@ seed port accepts it as its bearer, checking `typ`, `iss`, `aud: moca-relay-atta
 own key, and only there; no other provisioner route accepts it. That widens the token's use, which
 is acceptable: its only extra power is reading its own workload's bundle. Model code shares the
 pod's network and holds the token, so it can fetch that bundle, which it can read anyway once
-seeded. A provisioner restart before the seed loses the bundle. The seed port then answers
+seeded. A provisioner restart before the seed loses the bundle, as does the hold running out. The
+seed port then answers
 `404 seed_bundle_missing`, the init container keeps failing, and the provisioner's `GET` reports
 `seed: bundle_missing`, which the worker surfaces on `GET /workloads/{id}` as `provisioning` with
 `error: seed_bundle_missing`. The retry is client-driven: the next `POST /workloads/{id}/activate`
