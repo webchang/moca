@@ -1862,7 +1862,7 @@ for mode in with without; do
   : >"$mw/stage/kernel"; : >"$mw/stage/rootfs"; : >"$mw/stage/agent"
   {
     echo 'log() { :; }'
-    echo "STAGE='$mw/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; MANIFEST_CAPABILITIES=''"
+    echo "STAGE='$mw/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; VCPUS=1; MANIFEST_CAPABILITIES=''"
     if [ "$mode" = with ]; then
       echo "EGRESS_CA='$EGT/ca.crt'"
       fn_body validate_egress_ca
