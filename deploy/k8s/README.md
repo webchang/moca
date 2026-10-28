@@ -162,7 +162,13 @@ re-running with just that one:
   (`docs/reference/configuration.md`; without it, listing and choosing models per session
   degrades to `model_catalog_unavailable`). Empty, the default, allows only those two. A scheme,
   port or path in an entry is refused here, matching the control plane's own boot check. A change
-  rolls the control plane.
+  rolls the control plane. A pre-0.8 stack may carry the allow-list as a hand-patched
+  `SH_MODEL_CATALOG_HOSTS` env on the control plane Deployment (the manifests did not wire it
+  then); setup.sh carries that value into `moca-settings` — a value given for the run or one
+  already stored wins over it — and strips the env before its own apply, without which
+  server-side apply would merge the literal with the ConfigMap ref above and the API server
+  would reject the Deployment. The strip rolls the control plane once on its own, just before
+  the apply rolls it again: a one-time cost of the upgrade.
 - `SH_PUBLIC_HARNESS_URL` (kind and `--target ocp-single` without Routes) overrides the default
   `http://127.0.0.1:8080` the control plane advertises via `GET /v1/discovery`; set it when 8080
   conflicts with another local service. The port in the URL also becomes the printed `kubectl
@@ -262,13 +268,14 @@ existing value, and fills in only a key that is missing. It reads each Secret wi
 Secret and replacing it. No value is ever put on a command line. Values travel through pipes and
 through the environment of the one `jq` that writes each Secret, and are applied on stdin.
 
-| Secret                | Namespace      | Keys                                                                                                     | Consumed by                                                                                                                    |
-| --------------------- | -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `moca-relay`          | `moca`         | `SH_RELAY_TOKEN`, `MOCA_RELAY_EXEC_TOKEN`                                                                | relay (both, env); supervisor (`MOCA_RELAY_EXEC_TOKEN` only, env)                                                              |
-| `moca-redis`          | `moca`         | `REDIS_PASSWORD`, `REDIS_URL`, `redis.conf`                                                              | Redis (`redis.conf` as a file; `REDIS_PASSWORD` as `REDISCLI_AUTH` for probes); supervisor, relay, control plane (`REDIS_URL`) |
-| `moca-mu1`            | `moca`         | `SH_SESSION_TOKEN_PRIVATE_KEY`, `SH_SESSION_TOKEN_PUBLIC_KEYS`, `SH_CREDENTIAL_KEK`, `SH_EXCHANGE_TOKEN` | control plane (private key, KEK, exchange token as files); supervisor (exchange token as a file, public keyset as env)         |
-| `moca-relay-attach`   | `moca-sandbox` | `SH_RELAY_TOKEN` (copied from `moca-relay`)                                                              | sandboxes                                                                                                                      |
-| `moca-supervisor-tls` | `moca` (OCP)   | `tls.crt`, `tls.key`                                                                                     | ghostunnel sidecar                                                                                                             |
+| Secret                | Namespace      | Keys                                                                                                     | Consumed by                                                                                                                                 |
+| --------------------- | -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `moca-relay`          | `moca`         | `SH_RELAY_TOKEN`, `MOCA_RELAY_EXEC_TOKEN`                                                                | relay (both, env); supervisor (`MOCA_RELAY_EXEC_TOKEN` only, env)                                                                           |
+| `moca-redis`          | `moca`         | `REDIS_PASSWORD`, `REDIS_URL`, `redis.conf`                                                              | Redis (`redis.conf` as a file; `REDIS_PASSWORD` as `REDISCLI_AUTH` for probes); supervisor, relay, control plane, provisioner (`REDIS_URL`) |
+| `moca-mu1`            | `moca`         | `SH_SESSION_TOKEN_PRIVATE_KEY`, `SH_SESSION_TOKEN_PUBLIC_KEYS`, `SH_CREDENTIAL_KEK`, `SH_EXCHANGE_TOKEN` | control plane (private key, KEK, exchange token as files); supervisor (exchange token as a file, public keyset as env)                      |
+| `moca-test-users`     | `moca`         | `SH_TEST_USER_SECRET` (only while `SH_TEST_USERS` > 0; deleted when off)                                 | control plane (as a file, from an `optional` projected source; ADR-0045, §13)                                                               |
+| `moca-relay-attach`   | `moca-sandbox` | `SH_RELAY_TOKEN` (copied from `moca-relay`)                                                              | sandboxes                                                                                                                                   |
+| `moca-supervisor-tls` | `moca` (OCP)   | `tls.crt`, `tls.key`                                                                                     | ghostunnel sidecar                                                                                                                          |
 
 - The tokens and the Redis password are `openssl rand -hex 32`.
 - `REDIS_URL` and `redis.conf` are re-derived from `REDIS_PASSWORD` on every run, so the three never
@@ -290,8 +297,9 @@ kubectl --context kind-moca -n moca rollout restart deployment/sandbox-relay dep
 kubectl --context kind-moca -n moca-sandbox rollout restart statefulset/moca-sandbox
 ```
 
-The consumers are in the table. For `moca-redis`, restart `redis` as well. For `moca-mu1`, restart
-the control plane and the supervisor.
+The consumers are in the table. For `moca-redis`, restart `redis` as well, and, when workload
+sandboxes are on, `deployment/moca-provisioner` (it reads `REDIS_URL` at start). For `moca-mu1`,
+restart the control plane and the supervisor.
 
 > **Rotating `moca-mu1` logs everyone out**: a new signing key invalidates every API and session
 > token. If the KEK changes, **every stored credential becomes unreadable**: the per-user
@@ -1109,3 +1117,106 @@ The §12.3 tenant verified all of it: the operator's Let's Encrypt wildcard for
 `*.moca-ns.vpc-int.res.ibm.com` (served by `--tls-secret`, and also covering the edge Route as the
 controller's default certificate), a namespace-scoped ingress controller admitted by the
 `policy-group.network.openshift.io/ingress` selector, and mocactl logins and turns over the Routes.
+
+## 13. Test users, for unattended multi-user testing (`SH_TEST_USERS`)
+
+> **Preview.** Test-user logins are implemented but not yet declared Stable; interfaces and limits
+> may change. Known limits: dev and test only, container tier only, and not available on the
+> sandbox profile (see below and [ADR-0045](../../docs/adrs/0045-test-user-logins.md)).
+
+Every login is GitHub's device flow, which needs a person and a browser. `SH_TEST_USERS=N` adds N
+synthetic subjects `test:1` … `test:N` that log in with a shared secret instead, so a script can
+exercise the multi-user claims — each subject spending only its own credential, and one user being
+refused another's session. A test user is configured exactly like a GitHub user: the control plane
+issues the same refresh family and the same token lifetimes, so rotation, roles
+(`SH_ADMIN_SUBJECTS`), the ownership index and the audit trail behave identically.
+
+**It is off unless asked for,** and gated by a secret, because the endpoint issues a real login for
+an arbitrary subject: without one, anyone who can reach the control plane is every test user.
+`POST /v1/auth/test-token` answers 404 while `SH_TEST_USERS` is unset, the route is not mounted on
+the sandbox profile, and the control plane refuses to boot if the two are combined.
+
+### 13.1 Bring it up
+
+`SH_TEST_USERS` is sticky like every other setting (section 2); `SH_TEST_USERS=` turns it off and
+deletes the secret with it. On `--target ocp` -- the shared-cluster target -- it additionally needs
+`SH_TEST_USERS_ACK=i-know-this-is-not-for-production`, so a stale export cannot quietly leave a
+password-gated login path on a cluster other people use.
+
+```bash
+export LOG_DIR=/tmp/kagenti/tdd/moca; mkdir -p "$LOG_DIR"
+SH_TEST_USERS=10 SH_GITHUB_CLIENT_ID=<client id> SH_SINGLE_NAMESPACE=<ns> \
+  deploy/k8s/setup.sh --target ocp-single --skip-build \
+  --image <registry>/moca:<tag> --sandbox-image <registry>/moca-remote-worker:<tag> \
+  >"$LOG_DIR/t-users-setup.log" 2>&1; echo "EXIT:$?"
+```
+
+**Look for:** `WARNING: SH_TEST_USERS=10: test:1..test:10 can log in with the shared secret`, and
+either `generated SH_TEST_USER_SECRET` or nothing (a re-run keeps the stored one and never rotates
+it). The secret lives in a Secret of its own, `moca-test-users`, and reaches the control plane as a
+credential **file** under `CREDENTIALS_DIRECTORY`, never an environment line. Its own Secret
+because the credential loader treats an empty file as an error and only an _absent_ one as "unset":
+`setup.sh` therefore writes it only while test users are on and **deletes** it when they go off, and
+`control-plane.yaml` projects it from an `optional` source so a stack without it still boots. Give your own instead of a generated one
+with `SH_TEST_USER_SECRET=<at least 16 characters>`.
+
+```bash
+kubectl -n <ns> get secret moca-test-users -o jsonpath='{.data.SH_TEST_USER_SECRET}' | base64 -d
+```
+
+### 13.2 Check the gate first
+
+Before trusting the feature, prove it is invisible without it. On a stack where `SH_TEST_USERS` is
+unset this must answer `404`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+  -d '{"index":1}' http://127.0.0.1:8090/v1/auth/test-token
+```
+
+### 13.3 One user, by hand
+
+The secret travels in `MOCA_TEST_USER_SECRET`, never a flag — a flag would land in the shell history
+and in every `ps` listing on the machine.
+
+```bash
+export MOCA_TEST_USER_SECRET=<the secret>
+mocactl --control-plane-url http://127.0.0.1:8090 login --test-user 3
+# logged in as Test User 3 (test:3)
+```
+
+### 13.4 N users, and the cross-user case
+
+`deploy/k8s/test-users.py` drives N users (default 10, `--users N`) through real `mocactl`
+commands, then asserts the cross-user claims. `--api` runs the same claims straight against the
+HTTP API, which separates a client bug from a server one.
+
+```bash
+export MOCA_TEST_USER_SECRET=<the secret>
+./deploy/k8s/test-users.py --users 10 --control-plane-url http://127.0.0.1:8090
+./deploy/k8s/test-users.py --users 10 --api --json
+```
+
+**Look for:** `users 10/10 fully ok; cross-user 4/4` and `RESULT: PASS`.
+
+Each user gets its own `XDG_CONFIG_HOME`, because `mocactl` keeps one login in one `auth.json`
+(`packages/mocactl/src/config.ts`): a second `login` in the same directory overwrites the first, so
+one process in one directory cannot hold ten logins. That is also what makes `--jobs` safe.
+
+The operator's check, that each turn spent its own user's credential — the audit records credential
+**names**, never values:
+
+```bash
+kubectl -n <ns> exec redis-0 -- sh -c \
+  'redis-cli --no-auth-warning -a "$REDISCLI_AUTH" XREVRANGE sh:cp:audit + - COUNT 300' |
+  grep -A1 '^subject$' | grep '^test:' | sort -u    # ten distinct subjects
+```
+
+**Stop any `port-forward` on the harness port (`8080`) and on `18090` before running `smoke.sh`**:
+it binds `18090` itself and reaches the harness at the URL the control plane advertises, so a
+leftover forward makes every `/turn` answer 404. Section 9.3 gives the same warning for its
+connection count.
+
+Tested on OpenShift 4.x (IBM Cloud ROKS, `--target ocp-single`, edit-only namespace rights),
+2026-10-26: N=10 passed in both CLI and `--api` modes, with ten distinct `test:N` subjects and ten
+credential names in the audit stream.

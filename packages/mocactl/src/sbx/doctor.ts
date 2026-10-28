@@ -5,7 +5,15 @@ import { ApiError } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
 import { ensureRuntimeAuth } from '../runtime.js';
-import { CLAUDE_MIN_VERSION, checkAgentConfig, claudeTooOld } from './agent-config.js';
+import { CLAUDE_MIN_VERSION, checkAgentConfig, claudeTooOld, cortexMode } from './agent-config.js';
+import {
+  agentopProblem,
+  CORTEX_INSTALL,
+  MOCA_SANDBOX,
+  mocaSandboxStatus,
+  runAgentop,
+  type AgentopExec,
+} from './agentop.js';
 import { notEnrolledMessage, SBX_EXIT, type SbxCtx } from './commands.js';
 import { openExec, sandboxFailureText, type ExecFactory, type OpenedExec } from './exec.js';
 import { PushError, sandboxState } from './push.js';
@@ -174,6 +182,49 @@ function claudeVersionCheck(version: string | undefined): DoctorCheck | undefine
   };
 }
 
+/**
+ * In Cortex mode, the check that something keeps the agent off local tools: Cortex's moca-sandbox
+ * script, installed and loaded (sbx-up-cortex spec §4). Whether Claude Code reaches the model
+ * through Cortex is not checked: agentop has no machine-readable answer to that.
+ */
+export async function cortexCheck(agentop: AgentopExec = runAgentop): Promise<DoctorCheck> {
+  const name = 'cortex';
+  const bad = await agentopProblem(agentop);
+  if (bad) return { name, ok: false, detail: bad, fix: CORTEX_INSTALL };
+  const { status: st, problem } = await mocaSandboxStatus(agentop);
+  if (!st)
+    return { name, ok: false, detail: problem!, fix: `agentop script install ${MOCA_SANDBOX}` };
+  if (st.state !== 'installed') {
+    return {
+      name,
+      ok: false,
+      detail: `${MOCA_SANDBOX} is ${st.state}`,
+      fix: `agentop script install ${MOCA_SANDBOX}`,
+    };
+  }
+  if (st.loaded === undefined) {
+    return {
+      name,
+      ok: false,
+      detail: `Cortex is not running, so nothing keeps the agent off this machine's tools`,
+      fix: 'agentop service start',
+    };
+  }
+  if (st.loaded < st.scripts || (st.notStarted ?? 0) > 0) {
+    return {
+      name,
+      ok: false,
+      detail: `${MOCA_SANDBOX} did not start (${st.loaded} of ${st.scripts} scripts loaded)`,
+      fix: "see Cortex's log; a Python script needs python3",
+    };
+  }
+  return {
+    name,
+    ok: true,
+    detail: `${MOCA_SANDBOX} is installed and loaded; Claude Code must reach the model through Cortex`,
+  };
+}
+
 function configCheck(root: string): DoctorCheck {
   const problems = checkAgentConfig(root);
   return problems.length
@@ -188,9 +239,11 @@ function configCheck(root: string): DoctorCheck {
     : {
         name: 'agent config',
         ok: true,
-        detail:
-          'Claude Code and OpenCode use the sandbox MCP server, with every local tool denied ' +
-          "in this repository's project config; user-level and managed settings are not checked",
+        detail: cortexMode(root)
+          ? "Claude Code and OpenCode use the sandbox MCP server; Claude Code's local tools left " +
+            "to Cortex, OpenCode's disabled in this repository's project config"
+          : 'Claude Code and OpenCode use the sandbox MCP server, with every local tool denied ' +
+            "in this repository's project config; user-level and managed settings are not checked",
       };
 }
 
@@ -311,6 +364,7 @@ export async function runDoctor(
   factory?: ExecFactory,
   /** `claude --version`'s output (default: asked of the `claude` on PATH); tests pass their own. */
   claudeVersion: () => Promise<string | undefined> | string | undefined = installedClaudeVersion,
+  agentop: AgentopExec = runAgentop,
 ): Promise<DoctorCheck[]> {
   const out: DoctorCheck[] = [];
   const login = await loginCheck(c);
@@ -330,6 +384,7 @@ export async function runDoctor(
   }
   if (root !== undefined) {
     out.push(configCheck(root));
+    if (cortexMode(root)) out.push(await cortexCheck(agentop));
     const old = claudeVersionCheck(await claudeVersion());
     if (old) out.push(old);
   }
@@ -345,8 +400,9 @@ export async function cmdDoctor(
   id: string | undefined,
   factory?: ExecFactory,
   claudeVersion?: () => Promise<string | undefined> | string | undefined,
+  agentop?: AgentopExec,
 ): Promise<number> {
-  const checks = await runDoctor(c, root, id, factory, claudeVersion);
+  const checks = await runDoctor(c, root, id, factory, claudeVersion, agentop);
   const ok = checks.every((k) => k.ok);
   const clean = (k: DoctorCheck): DoctorCheck => ({
     ...k,

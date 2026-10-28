@@ -22,6 +22,7 @@ export const CP_ERROR_CODES = [
   'subject_conflict',
   'unauthorized',
   'forbidden',
+  'not_found',
   'session_not_found',
   'session_mismatch',
   'not_enrolled',
@@ -38,6 +39,10 @@ export const CP_ERROR_CODES = [
   'credential_ambiguous',
   'credential_not_found',
   'credential_unavailable',
+  'credential_unsafe',
+  'destination_conflict',
+  'destination_ambiguous',
+  'no_credential',
   'endpoint_unresolved',
   'model_unavailable',
   'model_catalog_unavailable',
@@ -66,6 +71,7 @@ const STATUS: Record<CpErrorCode, number> = {
   forbidden: 403,
   // 404, never 403, for another user's session: 403 is an existence oracle (spec §8.1). 403 is
   // reserved for "authenticated but insufficiently privileged on a resource you may know exists".
+  not_found: 404,
   session_not_found: 404,
   session_mismatch: 400,
   not_enrolled: 403,
@@ -86,6 +92,14 @@ const STATUS: Record<CpErrorCode, number> = {
   credential_ambiguous: 400,
   credential_not_found: 404,
   credential_unavailable: 503,
+  // 500: a stored egress secret renders to a header value with CR/LF/NUL; never forwarded.
+  credential_unsafe: 500,
+  // 409: another credential of the owner already holds the identical normalized destination.
+  destination_conflict: 409,
+  // 500: two of an owner's egress destinations are identical; stored state from a write race.
+  destination_ambiguous: 500,
+  // 404: egress lookup for a live sandbox whose owner holds no credential for the host.
+  no_credential: 404,
   endpoint_unresolved: 400,
   // 400: the credential's endpoint does not offer that model id (per-session model spec §4.2).
   model_unavailable: 400,

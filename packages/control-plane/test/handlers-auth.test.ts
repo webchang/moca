@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { HANDLERS } from '../src/handlers.js';
 import { verifyToken } from '../src/token.js';
+import { TestUserProvider } from '../src/identity.js';
 import { StubIdentity } from './helpers/stub-identity.js';
 import { NOW_MS, alice, codeOf, ctx, makeDeps } from './helpers/deps.js';
 
@@ -152,5 +153,107 @@ describe('POST /v1/auth/revoke and /v1/auth/revoke-all', () => {
   it('revoke-all requires an API token', async () => {
     const { d } = clocked();
     expect(await codeOf(() => HANDLERS.revokeAllAuth!(ctx(), d))).toBe('token_required');
+  });
+});
+
+// ---------------------------------------------------------------- test users (ADR-0045, #616)
+
+const SECRET = 'test-user-secret-0123456789'; // notsecret
+const testProvider = (count = 10, adminSubjects: string[] = []) =>
+  new TestUserProvider({ count, secret: SECRET, adminSubjects });
+
+const testLogin = (d: ReturnType<typeof makeDeps>, body: Record<string, unknown>) =>
+  HANDLERS.testUserToken!(ctx({ body }), d);
+
+describe('POST /v1/auth/test-token is invisible unless SH_TEST_USERS is set', () => {
+  // The gate that matters most: a production control plane must not advertise a test-login path.
+  it('404s with no testUsers provider, whatever the body', async () => {
+    const d = makeDeps(); // no testUsers
+    for (const body of [
+      {},
+      { index: 1 },
+      { index: 1, secret: SECRET },
+      { index: 999, secret: 'wrong' },
+    ]) {
+      expect(await codeOf(() => testLogin(d, body)), JSON.stringify(body)).toBe('not_found');
+    }
+  });
+});
+
+describe('POST /v1/auth/test-token requires the shared secret', () => {
+  it('refuses a missing, wrong, empty or non-string secret as `unauthorized`', async () => {
+    const d = makeDeps({ testUsers: testProvider() });
+    for (const secret of [undefined, '', 'wrong', SECRET + 'x', SECRET.slice(0, -1), 42, null]) {
+      expect(await codeOf(() => testLogin(d, { index: 1, secret })), String(secret)).toBe(
+        'unauthorized',
+      );
+    }
+  });
+
+  // The secret is checked BEFORE the index, so an unauthenticated prober cannot learn how many
+  // test users exist by watching which indexes answer differently.
+  it('answers the same for a bad index as for a good one when the secret is wrong', async () => {
+    const d = makeDeps({ testUsers: testProvider(10) });
+    expect(await codeOf(() => testLogin(d, { index: 1, secret: 'wrong' }))).toBe('unauthorized');
+    expect(await codeOf(() => testLogin(d, { index: 9999, secret: 'wrong' }))).toBe('unauthorized');
+  });
+});
+
+describe('POST /v1/auth/test-token bounds the index', () => {
+  it('refuses 0, N+1, a fraction, a string and a missing index', async () => {
+    const d = makeDeps({ testUsers: testProvider(10) });
+    for (const index of [0, -1, 11, 1.5, '1', undefined, null]) {
+      expect(await codeOf(() => testLogin(d, { index, secret: SECRET })), String(index)).toBe(
+        'invalid_request',
+      );
+    }
+  });
+});
+
+describe('a test-user login is configured exactly like a GitHub one', () => {
+  it('returns the same body shape, with a refresh token and an api-scoped token', async () => {
+    const d = makeDeps({ testUsers: testProvider(10) });
+    const body = (await testLogin(d, { index: 3, secret: SECRET, label: 'driver' })).body as {
+      token: string;
+      subject: string;
+      displayName: string;
+      roles: string[];
+      refreshToken: string;
+      expiresAt: number;
+    };
+    expect(body.subject).toBe('test:3');
+    expect(body.displayName).toBe('Test User 3');
+    expect(body.refreshToken).toBeTruthy();
+    const claims = verifyToken(body.token, d.verifyKeys, { now: Math.floor(NOW_MS / 1000) });
+    expect(claims.sub).toBe('test:3');
+    // One subject is one tenant in MU1, as for a GitHub subject.
+    expect(claims.tenant).toBe('test:3');
+    expect(claims.scope).toContain('api');
+  });
+
+  it('issues a refresh token that actually rotates, so renewal works as it does for a user', async () => {
+    const d = makeDeps({ testUsers: testProvider(10) });
+    const first = (await testLogin(d, { index: 1, secret: SECRET })).body as {
+      refreshToken: string;
+    };
+    const rotated = (await refresh(d, first.refreshToken)).body as {
+      token: string;
+      refreshToken: string;
+    };
+    expect(rotated.token).toBeTruthy();
+    expect(rotated.refreshToken).not.toBe(first.refreshToken);
+  });
+
+  it('gives different indexes different subjects', async () => {
+    const d = makeDeps({ testUsers: testProvider(10) });
+    const a = (await testLogin(d, { index: 1, secret: SECRET })).body as { subject: string };
+    const b = (await testLogin(d, { index: 2, secret: SECRET })).body as { subject: string };
+    expect(a.subject).not.toBe(b.subject);
+  });
+
+  it('honours SH_ADMIN_SUBJECTS for a test subject', async () => {
+    const d = makeDeps({ testUsers: testProvider(10, ['test:4']) });
+    const body = (await testLogin(d, { index: 4, secret: SECRET })).body as { roles: string[] };
+    expect(body.roles).toEqual(['admin']);
   });
 });

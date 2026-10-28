@@ -39,10 +39,13 @@ export function createCapacityLatch(): CapacityLatch {
 
   return {
     watch: (transport) => ({
-      // FORWARDED, never asserted. This is a pass-through wrapper, and `extension.ts`
-      // wraps both tiers in it — so hardcoding either value here would make every
-      // latched transport claim the same tier and silently contradict the thing it
-      // wraps (#245).
+      // FORWARDED. This is a pass-through wrapper, and `extension.ts` wraps both tiers in
+      // it — so hardcoding either value here would make every latched transport claim the
+      // same tier and silently contradict the thing it wraps (#245). On a harness turn
+      // this wrapper IS the object a caller reads the tier off, so the forwarding is
+      // asserted for every transport by test/conformance.ts, not taken on trust: the
+      // per-transport assertion beside it reads the UNWRAPPED object and cannot see a
+      // wrapper that answers for what it wraps.
       fastTier: transport.fastTier,
       exec: async (command, opts) => {
         try {

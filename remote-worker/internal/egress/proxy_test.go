@@ -181,9 +181,23 @@ func (u *httpUpstream) last(t *testing.T) *http.Request {
 	return u.reqs[len(u.reqs)-1]
 }
 
-type stubCreds map[string]bool
+type fakePolicy struct {
+	res   []Credential
+	err   error
+	calls atomic.Int32
+}
 
-func (s stubCreds) Intercept(_ Caller, host string) bool { return s[host] }
+func (f *fakePolicy) Lookup(context.Context, Caller, string) ([]Credential, error) {
+	f.calls.Add(1)
+	return f.res, f.err
+}
+
+type fakeInterceptor struct{ calls atomic.Int32 }
+
+func (f *fakeInterceptor) serve(pc *proxyConn, _ target, _ []netip.Addr, _ *bufio.Reader, _ Event) {
+	f.calls.Add(1)
+	pc.c.Close()
+}
 
 type harness struct {
 	t    *testing.T
@@ -422,6 +436,262 @@ func TestPerVMConnCap(t *testing.T) {
 	h.sink.waitEvent(t, DecisionConnCap)
 }
 
+// fakeClock is a clock the test advances by hand. It is read from the proxy's
+// accept goroutine and written from the test, so both go through the mutex.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock { return &fakeClock{t: time.Now()} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// capRefusalsInFlight reads vm's in-flight refusal count under the proxy lock.
+func (h *harness) capRefusalsInFlight(vmID string) int {
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	b := h.p.vms[vmID]
+	if b == nil {
+		return 0
+	}
+	return b.capRefusals
+}
+
+// capCharged counts refusals charged to vm so far: every charge either becomes
+// an event, or is suppressed and reported on a later event's Coalesced, or is
+// still pending in the binding.
+func (h *harness) capCharged(vmID string) int {
+	n := 0
+	for _, e := range capEvents(h.sink.events()) {
+		if e.VMID == vmID {
+			n += 1 + int(e.Coalesced)
+		}
+	}
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	if b := h.p.vms[vmID]; b != nil {
+		n += int(b.capSuppressed)
+	}
+	return n
+}
+
+// waitCapCharged waits until want refusals have been charged to vm. The accept
+// loop charges asynchronously, so totals are only stable once it has caught up.
+func (h *harness) waitCapCharged(t *testing.T, vmID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.capCharged(vmID) >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("%d of %d refusals charged to %s", h.capCharged(vmID), want, vmID)
+}
+
+// TestCapRefusalsAreBoundedPerVM is #586's first defect: every refusal used to
+// spawn a goroutine holding a socket for ~2s, so a guest in a tight loop could
+// multiply fds in a process shared by every VM. Refusals in flight must stay
+// under the bound no matter how many are offered.
+func TestCapRefusalsAreBoundedPerVM(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	h := newHarness(t, fmt.Sprintf("up.test:%d", up.port), func(c *Config) { c.MaxConnsPerVM = 1 })
+	h.res.set("up.test", "127.0.0.1")
+	path := h.register("vm-1", "run-a")
+	connect(t, dial(t, path), fmt.Sprintf("up.test:%d", up.port)) // fills the cap
+
+	// Each of these is refused. None reads its 429, so a draining refusal stays
+	// in flight for drainTimeout -- which is what makes the bound observable.
+	const offered = maxCapRefusalsPerVM * 6
+	peak := 0
+	for i := 0; i < offered; i++ {
+		c := dial(t, path)
+		fmt.Fprintf(c, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
+		if n := h.capRefusalsInFlight("vm-1"); n > peak {
+			peak = n
+		}
+		if n := h.capRefusalsInFlight("vm-1"); n > maxCapRefusalsPerVM {
+			t.Fatalf("refusal %d: %d in flight, over the bound of %d: a guest can grow host fds without limit",
+				i, n, maxCapRefusalsPerVM)
+		}
+	}
+	if peak == 0 {
+		t.Fatal("no refusal was ever in flight: the test did not exercise the refusal path")
+	}
+	t.Logf("offered %d refusals, peak in flight %d, bound %d", offered, peak, maxCapRefusalsPerVM)
+}
+
+// TestCapRefusalPastTheBoundClosesWithoutDraining pins the trade: below the
+// bound a guest reads its 429 (TestPerVMConnCap), past it the fd is shed.
+func TestCapRefusalPastTheBoundClosesWithoutDraining(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	h := newHarness(t, fmt.Sprintf("up.test:%d", up.port), func(c *Config) { c.MaxConnsPerVM = 1 })
+	h.res.set("up.test", "127.0.0.1")
+	path := h.register("vm-1", "run-a")
+	connect(t, dial(t, path), fmt.Sprintf("up.test:%d", up.port))
+
+	// Hold the bound full with refusals that never read their response.
+	held := make([]net.Conn, 0, maxCapRefusalsPerVM)
+	for i := 0; i < maxCapRefusalsPerVM; i++ {
+		c := dial(t, path)
+		fmt.Fprintf(c, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
+		held = append(held, c)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h.capRefusalsInFlight("vm-1") < maxCapRefusalsPerVM && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := h.capRefusalsInFlight("vm-1"); n != maxCapRefusalsPerVM {
+		t.Fatalf("%d refusals in flight, want the bound %d held", n, maxCapRefusalsPerVM)
+	}
+
+	// One more: it is closed at once, so the read ends rather than returning a
+	// 429 or hanging for drainTimeout. How it ends is the kernel's choice, not
+	// this code's: the request sits unread in the receive buffer, so Linux
+	// answers the close with an RST (ECONNRESET) where macOS gives EOF. Either
+	// is a shed fd; what must hold is that no refusal was written and the read
+	// did not block for drainTimeout.
+	over := dial(t, path)
+	fmt.Fprintf(over, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
+	over.SetReadDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	b, err := io.ReadAll(over)
+	if err != nil && isTimeout(err) {
+		t.Fatalf("past the bound the read blocked for %v: the conn was drained, not shed", time.Since(start))
+	}
+	if len(b) != 0 {
+		t.Fatalf("past the bound the guest got %q, want nothing written: the fd should be shed, not drained", b)
+	}
+	for _, c := range held {
+		c.Close()
+	}
+}
+
+// TestCapEventsAreCoalescedPerVM is the other half of defect 1: one conn_cap
+// line per refusal floods journald, whose rate limit then drops other VMs'
+// events. Repeats inside an interval must be counted onto one event.
+func TestCapEventsAreCoalescedPerVM(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	h := newHarness(t, fmt.Sprintf("up.test:%d", up.port), func(c *Config) { c.MaxConnsPerVM = 1 })
+	h.res.set("up.test", "127.0.0.1")
+
+	// A clock the test owns, so coalescing is driven without sleeping. It is
+	// read from the accept goroutine, hence the lock inside fakeClock.
+	clk := newFakeClock()
+	h.p.now = clk.now
+
+	path := h.register("vm-1", "run-a")
+	connect(t, dial(t, path), fmt.Sprintf("up.test:%d", up.port))
+
+	refuse := func(n int) {
+		for i := 0; i < n; i++ {
+			c := dial(t, path)
+			fmt.Fprintf(c, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
+			c.Close()
+		}
+	}
+	const burst = 12
+	refuse(burst)
+	h.waitCapCharged(t, "vm-1", burst)
+	if n := countDecision(h.sink.events(), DecisionConnCap); n != 1 {
+		t.Fatalf("%d conn_cap events for %d refusals in one interval, want 1: a tight loop still floods the audit stream", n, burst)
+	}
+
+	// A new interval reports again, and carries what the first interval
+	// suppressed, so the count is not lost.
+	clk.advance(capEventEvery + time.Millisecond)
+	refuse(1)
+	deadline := time.Now().Add(3 * time.Second)
+	for countDecision(h.sink.events(), DecisionConnCap) < 2 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	evs := capEvents(h.sink.events())
+	if len(evs) != 2 {
+		t.Fatalf("%d conn_cap events after a new interval, want 2", len(evs))
+	}
+	if evs[1].Coalesced == 0 {
+		t.Fatal("the second event reports no suppressed refusals: the burst vanished from the audit trail")
+	}
+	// Every refusal is accounted for: two events plus what they coalesced.
+	if total := 2 + int(evs[0].Coalesced) + int(evs[1].Coalesced); total != burst+1 {
+		t.Fatalf("events account for %d refusals, want %d", total, burst+1)
+	}
+}
+
+// TestOneVMsRefusalFloodDoesNotSuppressAnotherVMsEvents is the cross-tenant
+// property that motivates #586: coalescing is per VM, so a noisy guest cannot
+// silence a quiet one.
+func TestOneVMsRefusalFloodDoesNotSuppressAnotherVMsEvents(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	h := newHarness(t, fmt.Sprintf("up.test:%d", up.port), func(c *Config) { c.MaxConnsPerVM = 1 })
+	h.res.set("up.test", "127.0.0.1")
+	clk := newFakeClock()
+	h.p.now = clk.now
+
+	noisy := h.register("vm-noisy", "run-a")
+	quiet := h.register("vm-quiet", "run-b")
+	hp := fmt.Sprintf("up.test:%d", up.port)
+	connect(t, dial(t, noisy), hp)
+	connect(t, dial(t, quiet), hp)
+
+	for i := 0; i < 20; i++ {
+		c := dial(t, noisy)
+		fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: up.test\r\n\r\n", hp)
+		c.Close()
+	}
+	// The quiet VM's single refusal, in the same interval, must still be
+	// recorded: its first refusal is its own interval's first.
+	c := dial(t, quiet)
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: up.test\r\n\r\n", hp)
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var quietSeen bool
+		for _, e := range capEvents(h.sink.events()) {
+			if e.VMID == "vm-quiet" {
+				quietSeen = true
+			}
+		}
+		if quietSeen {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("vm-quiet's refusal was never recorded while vm-noisy flooded; events: %+v", capEvents(h.sink.events()))
+}
+
+func countDecision(evs []Event, decision string) int {
+	var n int
+	for _, e := range evs {
+		if e.Decision == decision {
+			n++
+		}
+	}
+	return n
+}
+
+func capEvents(evs []Event) []Event {
+	var out []Event
+	for _, e := range evs {
+		if e.Decision == DecisionConnCap {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func TestPerSessionRequestCap(t *testing.T) {
 	up := newHTTPUpstream(t)
 	h := newHarness(t, fmt.Sprintf("up.test:%d", up.port), func(c *Config) { c.MaxRequestsPerSession = 3 })
@@ -510,20 +780,140 @@ func TestPlainHTTPForwardsWithoutCredentialsAndRedactsQuery(t *testing.T) {
 	}
 }
 
-func TestHostThatNeedsACredentialFailsClosed(t *testing.T) {
-	up := newHTTPUpstream(t)
-	tcp := newTCPUpstream(t, echo)
-	h := newHarness(t, fmt.Sprintf("up.test:%d,up.test:%d", up.port, tcp.port), func(c *Config) {
-		c.Credentials = stubCreds{"up.test": true}
+func credHarness(t *testing.T, allowList string, fp *fakePolicy, fi *fakeInterceptor) *harness {
+	t.Helper()
+	h := newHarness(t, allowList, func(c *Config) {
+		c.Credentials = fp
+		c.interceptor = fi
 	})
 	h.res.set("up.test", "127.0.0.1")
-	path := h.register("vm-1", "run-a")
-	resp, body := roundTrip(t, dial(t, path), fmt.Sprintf("CONNECT up.test:%d HTTP/1.1\r\n\r\n", tcp.port))
+	return h
+}
+
+func TestLookupErrorRefuses503NoDial(t *testing.T) {
+	tcp := newTCPUpstream(t, echo)
+	fp := &fakePolicy{err: errors.New("unknown")}
+	h := credHarness(t, fmt.Sprintf("up.test:%d", tcp.port), fp, &fakeInterceptor{})
+	resp, body := roundTrip(t, dial(t, h.register("vm-1", "run-a")), fmt.Sprintf("CONNECT up.test:%d HTTP/1.1\r\n\r\n", tcp.port))
 	assertRefusal(t, resp, body, 503, DecisionCredentialUnavailable, "up.test")
-	resp, body = roundTrip(t, dial(t, path), fmt.Sprintf("GET http://up.test:%d/ HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port))
-	assertRefusal(t, resp, body, 503, DecisionCredentialUnavailable, "up.test")
-	if up.accepts.Load() != 0 || tcp.accepts.Load() != 0 {
-		t.Fatal("a credentialed host was dialed")
+	h.sink.waitEvent(t, DecisionCredentialUnavailable)
+	if tcp.accepts.Load() != 0 {
+		t.Fatal("dialed after a lookup error")
+	}
+}
+
+func TestLookupNoneTunnelsAsBefore(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	fi := &fakeInterceptor{}
+	h := credHarness(t, fmt.Sprintf("up.test:%d", up.port), &fakePolicy{}, fi)
+	c := dial(t, h.register("vm-1", "run-a"))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+	c.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("echo %q, %v", buf, err)
+	}
+	c.Close()
+	h.sink.waitEvent(t, DecisionTunnel)
+	if fi.calls.Load() != 0 {
+		t.Fatal("interceptor called")
+	}
+}
+
+func TestLookupOtherPortTunnels(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	fi := &fakeInterceptor{}
+	fp := &fakePolicy{res: []Credential{{Name: "x", PathPrefix: "/", Port: up.port + 1}}}
+	h := credHarness(t, fmt.Sprintf("up.test:%d", up.port), fp, fi)
+	c := dial(t, h.register("vm-1", "run-a"))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+	c.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("echo %q, %v", buf, err)
+	}
+	c.Close()
+	h.sink.waitEvent(t, DecisionTunnel)
+	if fi.calls.Load() != 0 {
+		t.Fatal("interceptor called for another port")
+	}
+}
+
+func TestLookupFoundPlainHTTP403(t *testing.T) {
+	up := newHTTPUpstream(t)
+	fi := &fakeInterceptor{}
+	fp := &fakePolicy{res: []Credential{{Name: "x", PathPrefix: "/", Port: up.port}}}
+	h := credHarness(t, fmt.Sprintf("up.test:%d", up.port), fp, fi)
+	resp, body := roundTrip(t, dial(t, h.register("vm-1", "run-a")), fmt.Sprintf("GET http://up.test:%d/ HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port))
+	assertRefusal(t, resp, body, 403, DecisionPlaintextCredential, "up.test")
+	h.sink.waitEvent(t, DecisionPlaintextCredential)
+	if up.accepts.Load() != 0 || fi.calls.Load() != 0 {
+		t.Fatal("plain HTTP with a credential reached upstream or the interceptor")
+	}
+}
+
+func TestLookupFoundHandsToInterceptor(t *testing.T) {
+	tcp := newTCPUpstream(t, echo)
+	fi := &fakeInterceptor{}
+	fp := &fakePolicy{res: []Credential{{Name: "x", PathPrefix: "/", Port: tcp.port}}}
+	h := credHarness(t, fmt.Sprintf("up.test:%d", tcp.port), fp, fi)
+	c := dial(t, h.register("vm-1", "run-a"))
+	io.WriteString(c, fmt.Sprintf("CONNECT up.test:%d HTTP/1.1\r\n\r\n", tcp.port))
+	io.Copy(io.Discard, c) // the fake closes the conn
+	if n := fi.calls.Load(); n != 1 {
+		t.Fatalf("interceptor called %d times", n)
+	}
+	if tcp.accepts.Load() != 0 {
+		t.Fatal("dialed before the interceptor")
+	}
+}
+
+func TestSelectFor(t *testing.T) {
+	mk := func(ps ...string) []Credential {
+		var s []Credential
+		for _, p := range ps {
+			s = append(s, Credential{Name: p, PathPrefix: p})
+		}
+		return s
+	}
+	all := mk("/", "/a", "/a/b")
+	for path, want := range map[string]string{"/a/b/c": "/a/b", "/a/bc": "/a", "/x": "/", "/a": "/a"} {
+		if c, ok := selectFor(all, path); !ok || c.PathPrefix != want {
+			t.Errorf("%s -> %q, %v; want %q", path, c.PathPrefix, ok, want)
+		}
+	}
+	only := mk("/a")
+	if _, ok := selectFor(only, "/b"); ok {
+		t.Error("/b matched /a")
+	}
+	if c, ok := selectFor(only, "/a"); !ok || c.PathPrefix != "/a" {
+		t.Error("/a did not match /a")
+	}
+	if pathScoped(mk("/")) || !pathScoped(all) {
+		t.Error("pathScoped wrong")
+	}
+	if got := forPort([]Credential{{Port: 1}, {Port: 2}}, 2); len(got) != 1 || got[0].Port != 2 {
+		t.Errorf("forPort %+v", got)
+	}
+}
+
+func TestLookupAfterAllowlist(t *testing.T) {
+	fp := &fakePolicy{}
+	h := credHarness(t, "other.test", fp, &fakeInterceptor{})
+	resp, body := roundTrip(t, dial(t, h.register("vm-1", "run-a")), "CONNECT up.test:443 HTTP/1.1\r\n\r\n")
+	assertRefusal(t, resp, body, 403, DecisionDestinationDenied, "up.test")
+	if fp.calls.Load() != 0 {
+		t.Fatal("Lookup called for an off-allowlist host")
+	}
+}
+
+func TestNewProxyRefusesPolicyWithoutInterceptor(t *testing.T) {
+	_, err := NewProxy(Config{
+		Allow: allow(t, "up.test"), MaxConnsPerVM: 1, MaxRequestsPerSession: 1,
+		Resolver: newResolver(), Credentials: &fakePolicy{}, Audit: &recSink{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "needs an interceptor") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -549,6 +939,369 @@ func TestTunnelPropagatesHalfClose(t *testing.T) {
 	if e := h.sink.waitEvent(t, DecisionTunnel); e.BytesUp != 3 || e.BytesDown != 4 {
 		t.Fatalf("event %+v", e)
 	}
+}
+
+// #585: an established connection used to have no time bound at all. The read
+// deadline guarding the request headers is cleared once they are read
+// (handler.go), and before this change nothing replaced it on either path, so
+// a guest could pin every one of its connection slots -- and an upstream
+// socket each, in a process shared by every VM -- for the VM's lifetime.
+//
+// idleHarness is a harness whose bounds are short enough to wait on. Both
+// knobs are set: a test that bounds one must not pass because the other fired.
+//
+// Callers use 400ms rather than the tightest bound that works. These tests run
+// under -race on shared CI runners, where a scheduling hiccup between a write
+// and the deadline it was meant to refresh is the difference between pass and
+// fail; the tests that *survive* a bound write at half the interval, so the
+// margin is what absorbs that. The cost is a few seconds of wall clock, which
+// is cheaper than a flake.
+func idleHarness(t *testing.T, allowList string, idle, respHeader time.Duration) *harness {
+	t.Helper()
+	return newHarness(t, allowList, func(c *Config) {
+		c.IdleTimeout = idle
+		c.ResponseHeaderTimeout = respHeader
+	})
+}
+
+// connsInFlight counts vm's live connection slots under the proxy lock. The
+// cap is applied to this map, so it is what "the slot came back" means.
+func (h *harness) connsInFlight(vmID string) int {
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	b := h.p.vms[vmID]
+	if b == nil {
+		return 0
+	}
+	return len(b.conns)
+}
+
+func (h *harness) waitConnsInFlight(t *testing.T, vmID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.connsInFlight(vmID) == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("%s has %d conns in flight, want %d", vmID, h.connsInFlight(vmID), want)
+}
+
+// TestIdleTunnelIsClosedAndItsSlotFreed is the defect itself: a tunnel where
+// neither side says anything must not be held forever, and the slot it held
+// must return to the per-VM cap.
+func TestIdleTunnelIsClosedAndItsSlotFreed(t *testing.T) {
+	// The upstream accepts and then says nothing, which is the whole point:
+	// without a deadline both copy goroutines block in Read indefinitely.
+	up := newTCPUpstream(t, func(c net.Conn) { defer c.Close(); io.ReadAll(c) })
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), 400*time.Millisecond, 2*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+
+	// The tunnel event is emitted when the splice returns, so its arrival is
+	// the proof the copy loops unblocked rather than the guest giving up.
+	h.sink.waitEvent(t, DecisionTunnel)
+	h.waitConnsInFlight(t, "vm-1", 0)
+	if n, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("guest conn still readable after the idle bound: %d bytes", n)
+	}
+}
+
+// TestActiveTunnelSurvivesManyIdlePeriods is the regression the per-read reset
+// exists to prevent. An absolute deadline, or one armed once before the copy
+// loop, would kill a slow but healthy transfer -- a large repo being cloned.
+// Only a deadline refreshed on every read lets this pass.
+func TestActiveTunnelSurvivesManyIdlePeriods(t *testing.T) {
+	up := newTCPUpstream(t, echo)
+	const idle = 400 * time.Millisecond
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), idle, 2*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+
+	// Six exchanges at half the bound: over 3x the idle timeout in total, with
+	// no gap long enough to expire it.
+	buf := make([]byte, 4)
+	for i := 0; i < 6; i++ {
+		time.Sleep(idle / 2)
+		if _, err := c.Write([]byte("ping")); err != nil {
+			t.Fatalf("write %d after %v: %v", i, time.Duration(i)*idle/2, err)
+		}
+		if _, err := io.ReadFull(c, buf); err != nil {
+			t.Fatalf("read %d after %v: %v", i, time.Duration(i)*idle/2, err)
+		}
+	}
+	if h.connsInFlight("vm-1") != 1 {
+		t.Fatalf("active tunnel lost its slot: %d conns in flight", h.connsInFlight("vm-1"))
+	}
+}
+
+// TestOneWayTunnelDownloadSurvivesASilentGuest is the case a per-leg bound got
+// wrong. TestActiveTunnelSurvivesManyIdlePeriods echoes, so every read on both
+// legs is refreshed by the guest's own pings and it passes either way. Here the
+// traffic is one-way, which is what a `git clone` actually looks like: the
+// guest says nothing at all for as long as the pack takes to stream down, so
+// the guest→up leg's read has to be kept alive by the *other* leg's bytes or it
+// expires on a perfectly healthy transfer and closeBoth tears it down.
+func TestOneWayTunnelDownloadSurvivesASilentGuest(t *testing.T) {
+	const idle = 400 * time.Millisecond
+	const chunks = 8
+	// A byte every half-interval, 4x the bound in total, and never a word from
+	// the guest.
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		for i := 0; i < chunks; i++ {
+			time.Sleep(idle / 2)
+			if _, err := io.WriteString(c, "x"); err != nil {
+				return
+			}
+		}
+	})
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), idle, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+
+	if _, err := io.ReadFull(c, make([]byte, chunks)); err != nil {
+		t.Fatalf("one-way download of %d bytes over %v failed: %v", chunks, chunks*idle/2, err)
+	}
+	if n := h.connsInFlight("vm-1"); n != 1 {
+		t.Fatalf("streaming tunnel lost its slot: %d conns in flight, want 1", n)
+	}
+}
+
+// TestOneWayTunnelUploadSurvivesASilentUpstream is the mirror -- a `git push`,
+// where the upstream says nothing until the whole pack is in. The up→client
+// leg's read is the one that would expire.
+func TestOneWayTunnelUploadSurvivesASilentUpstream(t *testing.T) {
+	const idle = 400 * time.Millisecond
+	const chunks = 8
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		if _, err := io.ReadFull(c, make([]byte, chunks)); err != nil {
+			return
+		}
+		io.WriteString(c, "ok") // only now, once the upload is complete
+	})
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), idle, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+
+	for i := 0; i < chunks; i++ {
+		time.Sleep(idle / 2)
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatalf("upload chunk %d after %v: %v", i, time.Duration(i)*idle/2, err)
+		}
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ok" {
+		t.Fatalf("one-way upload over %v got %q, %v; want the upstream's reply", chunks*idle/2, buf, err)
+	}
+}
+
+// TestForwardSlowUploadSurvivesASilentUpstream is the forward path's version: a
+// POST whose body trickles in over several times the bound, with an upstream
+// that says nothing until the body is complete. End to end, the only activity
+// anywhere is on the guest side.
+//
+// Honest note on its strength: this passes even with the upstream conn dropped
+// from the request-body clock, because net/http swallows the readLoop's Peek
+// error while a request is in flight, so the expiry it would cause never
+// reaches the caller. The test pins the behaviour a guest sees; the reason the
+// upstream deadline is in that clock anyway is in forward.go's comment, and it
+// rests on the IdleTimeout invariant rather than on this assertion.
+func TestForwardSlowUploadSurvivesASilentUpstream(t *testing.T) {
+	const idle = 400 * time.Millisecond
+	const chunks = 8
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		r, err := http.ReadRequest(bufio.NewReader(c))
+		if err != nil {
+			return
+		}
+		n, _ := io.Copy(io.Discard, r.Body) // says nothing until the body is in
+		fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", n, strings.Repeat("y", int(n)))
+	})
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), idle, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(c, "POST http://up.test:%d/x HTTP/1.1\r\nHost: up.test\r\nContent-Length: %d\r\n\r\n", up.port, chunks); err != nil {
+		t.Fatal(err)
+	}
+	// A byte every half-interval, 4x the bound in total.
+	for i := 0; i < chunks; i++ {
+		time.Sleep(idle / 2)
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatalf("upload chunk %d after %v: %v", i, time.Duration(i)*idle/2, err)
+		}
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("slow upload over %v got no response: %v", chunks*idle/2, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("slow upload got %d, want 200: the bound fired while bytes were moving", resp.StatusCode)
+	}
+	if e := h.sink.waitEvent(t, DecisionForward); e.BytesUp != chunks {
+		t.Fatalf("event %+v, want all %d uploaded bytes", e, chunks)
+	}
+}
+
+// TestHalfClosedIdleTunnelExpires covers the case the issue calls out: after a
+// half-close exactly one leg is still running, so bounding only the guest's
+// reads would leave a client that sent CloseWrite and then waits on a silent
+// upstream holding its slot indefinitely.
+func TestHalfClosedIdleTunnelExpires(t *testing.T) {
+	// Reads to EOF, then holds the conn open saying nothing.
+	done := make(chan struct{})
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		io.ReadAll(c)
+		<-done
+	})
+	t.Cleanup(func() { close(done) })
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), 400*time.Millisecond, 2*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	connect(t, c, fmt.Sprintf("up.test:%d", up.port))
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	h.sink.waitEvent(t, DecisionTunnel)
+	h.waitConnsInFlight(t, "vm-1", 0)
+}
+
+// TestForwardResponseHeaderTimeout: an upstream that accepts the connection
+// and never answers used to hang RoundTrip forever. It must become the 502 the
+// unreachable-upstream arm already emits.
+func TestForwardResponseHeaderTimeout(t *testing.T) {
+	hold := make(chan struct{})
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		http.ReadRequest(bufio.NewReader(c))
+		<-hold // read the request, answer nothing
+	})
+	t.Cleanup(func() { close(hold) })
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), 5*time.Second, 400*time.Millisecond)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	resp, body := roundTrip(t, c, fmt.Sprintf("GET http://up.test:%d/x HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port))
+	assertRefusal(t, resp, body, 502, DecisionUpstreamUnreachable, "up.test")
+	h.waitConnsInFlight(t, "vm-1", 0)
+}
+
+// TestForwardStalledResponseBodyExpires is the gap ResponseHeaderTimeout does
+// not cover: headers arrive promptly and then the body stops. The bound has to
+// be on the upstream conn itself, which is why the Transport is handed a
+// wrapped conn rather than the raw one.
+func TestForwardStalledResponseBodyExpires(t *testing.T) {
+	hold := make(chan struct{})
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		http.ReadRequest(bufio.NewReader(c))
+		// Promises 64 bytes, sends 4, then stalls.
+		io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nabcd")
+		<-hold
+	})
+	t.Cleanup(func() { close(hold) })
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), 400*time.Millisecond, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	if _, err := fmt.Fprintf(c, "GET http://up.test:%d/x HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port); err != nil {
+		t.Fatal(err)
+	}
+	// The forward event is emitted once resp.Write returns, which only happens
+	// when the stalled body read fails. Without the bound it never returns.
+	if e := h.sink.waitEvent(t, DecisionForward); e.BytesDown != 4 {
+		t.Fatalf("event %+v, want the 4 bytes that did arrive", e)
+	}
+	h.waitConnsInFlight(t, "vm-1", 0)
+}
+
+// TestForwardSlowGuestReaderExpires bounds the other half of a stall: a guest
+// that asks for a large response and then stops reading holds its slot just as
+// effectively as one that stops sending, so the response write is bounded too.
+func TestForwardSlowGuestReaderExpires(t *testing.T) {
+	// Big enough that the write cannot complete into socket buffers alone.
+	const size = 8 << 20
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		http.ReadRequest(bufio.NewReader(c))
+		fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", size)
+		io.Copy(c, io.LimitReader(zeros{}, size))
+	})
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), 400*time.Millisecond, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(c, "GET http://up.test:%d/big HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port); err != nil {
+		t.Fatal(err)
+	}
+	// Never read the body: the response write stalls once the buffers fill.
+	h.sink.waitEvent(t, DecisionForward)
+	h.waitConnsInFlight(t, "vm-1", 0)
+}
+
+// TestForwardStalledGuestBodyExpiresWhileUpstreamTalks is why the guest conn's
+// bound lives on keptBody and not on the countingBody it embeds: that struct is
+// shared with the response body, whose reads come off the *upstream* conn. Put
+// the deadline there and an upstream that keeps talking would refresh the
+// deadline guarding the guest's conn, so a guest that promised a body and never
+// sent it would hold its slot for as long as the upstream cared to trickle.
+//
+// A serialized request/response cannot see this -- the two bodies never
+// overlap. A duplex exchange can, so this is the only test that pins the
+// placement.
+func TestForwardStalledGuestBodyExpiresWhileUpstreamTalks(t *testing.T) {
+	const idle = 400 * time.Millisecond
+	const chunks = 8
+	up := newTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		http.ReadRequest(bufio.NewReader(c))
+		fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", chunks)
+		// A byte every half-interval: never idle from the upstream's side, and
+		// 4x the bound in total, so a deadline wrongly refreshed by these reads
+		// would carry the whole exchange through.
+		for i := 0; i < chunks; i++ {
+			time.Sleep(idle / 2)
+			if _, err := io.WriteString(c, "x"); err != nil {
+				return
+			}
+		}
+	})
+	h := idleHarness(t, fmt.Sprintf("up.test:%d", up.port), idle, 5*time.Second)
+	h.res.set("up.test", "127.0.0.1")
+	c := dial(t, h.register("vm-1", "run-a"))
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	// Promises a body and sends none. The Transport reads it through keptBody,
+	// which is the read that has to expire.
+	if _, err := fmt.Fprintf(c, "POST http://up.test:%d/x HTTP/1.1\r\nHost: up.test\r\nContent-Length: 1000\r\n\r\n", up.port); err != nil {
+		t.Fatal(err)
+	}
+	// The exchange is torn down mid-response rather than running to completion,
+	// so fewer bytes come down than the upstream meant to send.
+	if e := h.sink.waitEvent(t, DecisionForward); e.BytesDown >= chunks {
+		t.Fatalf("event %+v: whole response relayed, so the stalled guest body never expired", e)
+	}
+	h.waitConnsInFlight(t, "vm-1", 0)
+}
+
+// zeros is an endless source of zero bytes.
+type zeros struct{}
+
+func (zeros) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = 0
+	}
+	return len(b), nil
 }
 
 func TestRegisterRefusesAGrant(t *testing.T) {
@@ -591,6 +1344,8 @@ func TestNewProxyValidatesConfig(t *testing.T) {
 		"allow": func(c *Config) { c.Allow = nil }, "resolver": func(c *Config) { c.Resolver = nil },
 		"audit": func(c *Config) { c.Audit = nil }, "creds": func(c *Config) { c.Credentials = nil },
 		"conns": func(c *Config) { c.MaxConnsPerVM = 0 }, "reqs": func(c *Config) { c.MaxRequestsPerSession = -1 },
+		"idle": func(c *Config) { c.IdleTimeout = -1 },
+		"resp": func(c *Config) { c.ResponseHeaderTimeout = -time.Second },
 	} {
 		c := good
 		mod(&c)
@@ -601,6 +1356,11 @@ func TestNewProxyValidatesConfig(t *testing.T) {
 	p, err := NewProxy(good)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Zero means the default, never "no bound": a caller who left the field
+	// alone must still get a connection bounded in time (#585).
+	if p.cfg.IdleTimeout != defaultIdleTimeout || p.cfg.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
+		t.Fatalf("defaults = %v, %v", p.cfg.IdleTimeout, p.cfg.ResponseHeaderTimeout)
 	}
 	p.Close()
 }

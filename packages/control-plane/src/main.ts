@@ -13,7 +13,13 @@ import {
 } from './credential-store.js';
 import { directModeMismatch } from './exchange.js';
 import { FileCredentialStore } from './file-store.js';
-import { adminSubjectsFromEnv, GithubOAuthProvider } from './identity.js';
+import {
+  adminSubjectsFromEnv,
+  GithubOAuthProvider,
+  TestUserProvider,
+  testUsersFromEnv,
+  testUserSecretFromEnv,
+} from './identity.js';
 import { K8sSecretStore } from './k8s-secret-store.js';
 import { defaultRunKubectl } from './kubectl.js';
 import { OwnershipIndex, type CpRedisLike } from './ownership.js';
@@ -111,7 +117,7 @@ export function hostFromEnv(env: NodeJS.ProcessEnv): string | undefined {
  * (`LoadCredential=`, MI1 §6.7) rather than an env line; everywhere else, as today, from the env.
  */
 // prettier-ignore
-export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN'] as const;
+export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN', 'SH_TEST_USER_SECRET'] as const;
 
 /** The API, session and refresh token lifetimes, shared by both route profiles. */
 function tokenTtlsFromEnv(
@@ -159,10 +165,36 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     bundleSubjectBytes: byteBudgetEnv(env, 'SH_BUNDLE_SUBJECT_BYTES', 16 * 1024 * 1024),
     bundleTotalBytes: byteBudgetEnv(env, 'SH_BUNDLE_TOTAL_BYTES', 64 * 1024 * 1024),
     version: resolveVersion(env),
+    testUsers: testUsersFromEnv(env.SH_TEST_USERS),
   };
+  // Validated at startup even though only the provider uses it: a deployment with
+  // SH_TEST_USERS set and no secret must fail to boot, not serve an unguarded login path.
+  testUserSecretFromEnv(env.SH_TEST_USER_SECRET, config.testUsers);
   checkInferenceConfig(config);
   checkRefreshConfig(config);
   return config;
+}
+
+/**
+ * ADR-0045: the test-user provider, as a spreadable fragment so `testUsers` is ABSENT (not
+ * undefined) on a deployment that did not ask for it. Logs one line when enabled: an operator must
+ * never have to wonder whether a cluster has password-gated test logins on.
+ */
+function testUserProvider(
+  env: NodeJS.ProcessEnv,
+  config: CpConfig,
+): { testUsers?: TestUserProvider } {
+  if (config.testUsers <= 0) return {};
+  const provider = new TestUserProvider({
+    count: config.testUsers,
+    secret: testUserSecretFromEnv(env.SH_TEST_USER_SECRET, config.testUsers),
+    adminSubjects: adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS),
+  });
+  console.warn(
+    `[control-plane] SH_TEST_USERS=${config.testUsers}: test:1..test:${config.testUsers} ` +
+      'can log in with SH_TEST_USER_SECRET (dev/test only, ADR-0045)',
+  );
+  return { testUsers: provider };
 }
 
 /**
@@ -170,6 +202,16 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
  * settings, so none is required; the harness-only fields take inert values that no mounted route reads.
  */
 function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
+  // ADR-0045: the sandbox profile admits only ENROLLED GitHub subjects (SBX0 §4.2,
+  // SH_ALLOWED_SUBJECTS, which every entry must match GITHUB_SUBJECT_RE). A synthetic `test:N`
+  // subject can never be enrolled there, so rather than serve a route that always refuses, refuse
+  // to boot and say which two settings conflict.
+  if (testUsersFromEnv(env.SH_TEST_USERS) > 0) {
+    throw new Error(
+      'SH_TEST_USERS cannot be used on the sandbox profile: it admits only enrolled ' +
+        'github: subjects (SH_ALLOWED_SUBJECTS)',
+    );
+  }
   const config: CpConfig = {
     routeProfile: 'sandbox',
     sandbox: sandboxConfigFromEnv(env),
@@ -181,6 +223,7 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
     bundleSubjectBytes: 0,
     bundleTotalBytes: 0,
     version: resolveVersion(env),
+    testUsers: 0,
   };
   checkRefreshConfig(config);
   return config;
@@ -349,6 +392,15 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
   const signer = makeSigner(env.SH_SESSION_TOKEN_PRIVATE_KEY!);
   const client = createClient(redisClientOptions(env.REDIS_URL ?? 'redis://127.0.0.1:6379'));
   const sandboxProfile = config.routeProfile === 'sandbox';
+  if (
+    sandboxProfile &&
+    config.sandbox?.egress &&
+    (!env.SH_CREDENTIAL_STORE || env.SH_CREDENTIAL_STORE === 'kubernetes')
+  ) {
+    throw new Error(
+      'SH_CREDENTIAL_STORE must be file or vault on the sandbox profile with egress credentials (it has no Kubernetes API access)',
+    );
+  }
   // Without a listener an 'error' event is an uncaught exception and the process exits. The message
   // only: node-redis socket errors name host:port, never userinfo, and the error object itself is not
   // logged in case some future one carries the URL (the test checks the password never appears).
@@ -383,7 +435,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
       undefined,
       defaultAuditLog,
     ),
-    credentials: sandboxProfile ? new UnavailableCredentialStore() : credentialStoreFromEnv(env),
+    // The sandbox profile stores credentials only when egress is configured (SBX0.2b).
+    credentials:
+      sandboxProfile && !config.sandbox?.egress
+        ? new UnavailableCredentialStore()
+        : credentialStoreFromEnv(env),
     ...(sandboxProfile
       ? { sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike) }
       : {}),
@@ -391,6 +447,9 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
       clientId: env.SH_GITHUB_CLIENT_ID!,
       adminSubjects: adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS),
     }),
+    // ADR-0045: constructed ONLY when SH_TEST_USERS > 0. Its absence is what makes the
+    // test-login route 404, so an ordinary deployment gains no new code path at all.
+    ...testUserProvider(env, config),
     signer,
     verifyKeys: verifyKeysFromEnv(env, signer.publicKeyBase64),
     config,

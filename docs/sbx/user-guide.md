@@ -1,7 +1,7 @@
 # Using the sandbox service (SBX0): a user guide
 
 > **Preview.** The SBX0 sandbox service is implemented for an internal cohort, but not yet
-> declared Stable; interfaces and limits may change. Known limits: [Limits](#6-limits).
+> declared Stable; interfaces and limits may change. Known limits: [Limits](#7-limits).
 
 This guide takes you from nothing installed to an agent's work applied in your own repository. You
 need no MOCA background. The design is
@@ -10,10 +10,11 @@ need no MOCA background. The design is
 
 ## 1. What you get
 
-Your coding agent (Claude Code or OpenCode) still runs on your laptop, but **every command it runs
-runs in the sandbox service**, each one in a fresh virtual machine (VM). It reads, edits and tests
-your code there, in a copy of your repository at `/workspace`. **Your laptop's tree is untouched**
-until you take the agent's work back as a patch and apply it (`mocactl sbx pull --apply`).
+Your coding agent (Claude Code, OpenCode or Codex) still runs on your laptop, but **every command
+it runs runs in the sandbox service**, each one in a fresh virtual machine (VM). It reads, edits
+and tests your code there, in a copy of your repository at `/workspace`. **Your laptop's tree is
+untouched** until you take the agent's work back as a patch and apply it
+(`mocactl sbx pull --apply`).
 
 Why this is safer than letting the agent run on your laptop:
 
@@ -87,7 +88,7 @@ repository's sandbox while it is live.
 **Each worktree gets its own sandbox.** A sandbox belongs to one working tree: another clone, or
 another `git worktree` of the same repository, gets a sandbox of its own at its first `up`, so
 two agents in two worktrees never share, or overwrite, one tree. Each counts toward your quota
-of sandboxes ([Limits](#6-limits)): `mocactl sbx rm` the ones you are done with.
+of sandboxes ([Limits](#7-limits)): `mocactl sbx rm` the ones you are done with.
 
 **Run your agent** in the repository, as you normally do:
 
@@ -115,6 +116,102 @@ Headless use (scripts, CI) works the same way, without the prompts:
 claude -p "Fix the failing test and run the suite" --mcp-config .mcp.json --strict-mcp-config
 opencode run "Fix the failing test and run the suite"
 ```
+
+### Codex CLI
+
+**Install it** (Node.js 22 or later, the same floor as `mocactl`):
+
+```bash
+npm install -g @openai/codex
+codex --version
+```
+
+`mocactl sbx codex` needs a Codex that takes `-c` and `--disable`, which 0.163.0 and 0.164.0 do
+(those are the versions it was tested against). To check your own, pass both and see the server
+listed:
+
+```bash
+codex -c 'mcp_servers.sandbox={command="mocactl",args=["sbx","mcp"]}' --disable shell_tool mcp list
+```
+
+```
+Name     Command  Args     Env  Cwd  Status   Auth
+sandbox  mocactl  sbx mcp  -    -    enabled  Unsupported
+```
+
+If it errors on the flags, upgrade. (`Auth Unsupported` is expected: the sandbox server does not
+use MCP's own authentication.)
+
+**Give it credentials.** This is Codex's own account, nothing to do with your sandbox-service
+login — `mocactl sbx login` does not authenticate Codex, and Codex never sees your sandbox token.
+Either:
+
+```bash
+codex login                                   # a ChatGPT plan, in a browser
+codex login --device-auth                     # ... on a machine with no browser
+printenv OPENAI_API_KEY | codex login --with-api-key   # an API key, stored once
+```
+
+or set `OPENAI_API_KEY` (or `CODEX_API_KEY`) in your environment and skip `login` altogether.
+Check which it found:
+
+```bash
+codex doctor | grep -A3 "auth "
+```
+
+```
+  ✓ auth         auth is provided by environment
+      auth storage mode        File
+      auth.json path (file backend/fallback) ~/.codex/auth.json
+      auth env vars present    OPENAI_API_KEY
+```
+
+`✗ auth no Codex credentials were found` means neither is in place. Credentials live in
+`~/.codex/auth.json` (or `$CODEX_HOME`), outside your repository, so they are never pushed to a
+sandbox — `up` skips `.env*`, `*.pem`, `*.key` and `id_*` as well.
+
+**Point it at the sandbox.** `up` cannot configure Codex as it does the other two: Codex reads no
+project-local configuration, so there is no file in your repository to put the server in. Start it
+through `mocactl` instead, which passes the server for that one run and writes nothing:
+
+```bash
+mocactl sbx codex                                               # the TUI
+mocactl sbx codex -- "Fix the failing test and run the suite"    # one-shot
+```
+
+Anything after `--` goes to Codex, so its own flags still work
+(`mocactl sbx codex -- -c sandbox_mode="read-only"`, or `--sandbox ID` before the `--` to name a
+sandbox other than the bound one). Inside the TUI, `/mcp` lists the server's tools: `bash`, `read`,
+`write`, `edit`, `grep`, `find`, `ls` and `sandbox_info`, each as `sandbox.<tool>`. To run it
+yourself, that is:
+
+```bash
+codex -c 'mcp_servers.sandbox={command="mocactl",args=["sbx","mcp"]}' --disable shell_tool
+```
+
+Codex does not give a stdio MCP server its own environment — the server sees only Codex's
+allowlist (`HOME`, `PATH`, `SHELL`, `LANG`, `TMPDIR`, the `NODE_EXTRA_CA_CERTS` family, …) and
+whatever the server asks for. `mocactl sbx codex` therefore asks for `MOCACTL_SBX_URL`,
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME`, so the server reads the same login and talks to the same
+control plane as you do, and forwards `--control-plane-url` when you pass one. Anything else you
+set in your shell does not reach it; Claude Code and OpenCode pass everything, so this is specific
+to Codex.
+
+A session looks like this — every call through the sandbox, your tree untouched until you pull:
+
+```
+• Called sandbox.bash   └ Ran 1 test in 0.000s / FAILED (failures=1)
+• Called sandbox.edit
+• Called sandbox.bash   └ OK
+```
+
+**Codex's local tools are restricted, not denied.** `--disable shell_tool` (which
+`mocactl sbx codex` passes) turns off its shell tool, but `unified_exec` also runs local commands
+and cannot be disabled: both `--disable unified_exec` and `-c features.unified_exec=false` are
+ignored. In practice a session with `shell_tool` off uses the sandbox's tools, but that is the
+model's choice rather than a guarantee, so unlike Claude Code and OpenCode there is no deny list
+behind it. Codex's own sandbox is the protection that remains: add `-c sandbox_mode="read-only"`
+if you want its filesystem confinement as well.
 
 **Take the work back** when the agent is done:
 
@@ -156,9 +253,30 @@ file and key.
 | `CLAUDE.md`, `AGENTS.md` | A block between `<!-- sbx:begin -->` and `<!-- sbx:end -->` telling the agent how the sandbox works (below)                                                                                                                              |
 | `.sbx/`                  | `sandbox.json`, the binding (your sandbox's id and the service URL), and `agent-config.json`, the record of what `up` added. `.sbx/` is listed in `.git/info/exclude`, never in your `.gitignore`                                        |
 
+An older mocactl also denied `MultiEdit`, `LS` and `NotebookRead`, which current Claude Code does
+not know: it warns about each one at every start. Re-running `mocactl sbx up` takes those three
+back out — the ones its own record says it added. One you wrote yourself is not in that record, so
+it stays.
+
 They are ordinary files in your working tree, so `git status` shows them. Leave them uncommitted:
 committed, they would point every teammate's agents at a sandbox and deny their local tools.
 `mocactl sbx up --no-agent-config` creates and pushes without touching them.
+
+### Loading your project's `CLAUDE.md`: `sbx up --cortex`
+
+The `Read` deny in `.claude/settings.json` also stops Claude Code loading your project's own
+`CLAUDE.md`. With [Cortex](https://github.com/rossoctl/cortex) v0.9.3 or later installed,
+`mocactl sbx up --cortex` leaves the deny list out and has Cortex keep the agent off local tools
+instead:
+
+- `up` runs `agentop script install moca-sandbox` before it creates anything, and stops if that
+  fails.
+- `.claude/settings.json` gets the allow rule and `enabledMcpjsonServers`, but no
+  `permissions.deny`.
+- Later `up` runs keep the mode. `mocactl sbx doctor` checks the script is installed and loaded.
+
+Claude Code must reach the model through Cortex (`agentop configure claude-code`). Without it,
+nothing blocks the local tools.
 
 ### The first `claude` asks about the sandbox server
 
@@ -254,7 +372,9 @@ that is not bound here.
 
   `push` replaces the sandbox's tree with yours. It refuses while the sandbox has changes you have
   not pulled; pull them first, or `mocactl sbx push --force` to discard them. `up` on a sandbox with
-  changes not yet pulled leaves it unpushed, with a warning, and still succeeds.
+  changes not yet pulled leaves it unpushed, with a warning, and still succeeds. What is sent is
+  always the **whole work tree**, whatever directory you run `up` or `push` from; run from a
+  subdirectory, both say so before pushing.
 
 - **Run a command yourself:**
 
@@ -277,7 +397,73 @@ that is not bound here.
 
   `put` writes only under `/workspace` (a relative path is taken from there).
 
-## 6. Limits
+## 6. Credentials
+
+The sandbox has no network of its own, but your operator may allow it to reach a few services
+(GitHub, say) through a proxy on the host. **Credential injection** lets those calls carry _your_
+token without the token ever entering the sandbox. You store the token once with `mocactl sbx
+credentials`; the host's proxy adds it to requests for the services you stored it for, and only
+for your sandboxes. A second user's sandbox gets none of it.
+
+Inside the sandbox, tools see only the placeholder `moca-placeholder` (in `GH_TOKEN`, for
+example). It is not a secret and is useless anywhere else: sent straight to GitHub, it gets a
+`401`. The real token is not in the sandbox's environment, its files or its memory.
+
+### GitHub
+
+Create a **fine-grained personal access token** limited to the repositories your sandboxes need,
+with only the permissions you want the agent to have. MOCA does not narrow it further: the token's
+scope is your limit. Then store it, reading it from stdin so it stays out of your shell history:
+
+```bash
+mocactl sbx credentials presets          # the available presets
+mocactl sbx credentials add github --preset github < token.txt
+```
+
+The `github` preset covers `github.com` (git over HTTPS) and `api.github.com` (`gh`). In the
+sandbox, `git clone`, `git push` and `gh pr create` then work against those repositories. The
+`github-mcp` preset does the same for GitHub's remote MCP server (`api.githubcopilot.com`); the
+same PAT works, and `.mcp.json` needs no token. `api.githubcopilot.com` is not on the default
+egress allowlist: the operator must add it, or the preset gets `403 destination_denied`.
+
+### List and delete
+
+```bash
+mocactl sbx credentials            # names and destinations, never the secret (--json for scripts)
+mocactl sbx credentials delete github
+```
+
+Injection stops **within about a minute** of a delete (the proxy caches a credential for up to
+60 s by default; ask your operator for the exact value). A request already open finishes with the
+token it started with; no new request carries it. Also revoke the token on GitHub if you think it
+leaked.
+
+### Internal services and MCP servers
+
+Any other service works the same way, if your operator has allowlisted it and made it reachable
+from the host (`MOCA_EGRESS_PERMIT_CIDRS` for its address range, `MOCA_EGRESS_UPSTREAM_CA` for a
+private CA). Ask them first. Then:
+
+```bash
+mocactl sbx credentials add jira --host jira.corp.example:8443/api < token.txt
+mocactl sbx credentials add docs-mcp --host mcp.corp.example/docs --kind bearer < token.txt
+```
+
+A destination is `host[:port][/prefix]`: the port defaults to 443, and a prefix limits the token
+to that path (several MCP servers behind one gateway each get their own). Wildcard hosts are not
+supported. Two of your credentials cannot hold the identical destination (`409 destination_conflict`); nested prefixes such as `mcp.corp.example` and `mcp.corp.example/jira` are fine, and the longest matching prefix wins.
+
+### Things to know
+
+- **`this sandbox service does not offer egress credentials`** means your operator has not enabled
+  the feature. Nothing is wrong with your setup.
+- A service the proxy has no credential of yours for is passed through untouched, so a `curl`
+  there sends only what you give it.
+- An upstream can send back a cookie it minted from your token, or echo the request's headers in
+  a response; either would reach the sandbox. Use narrowly scoped, short-lived tokens, and store
+  only services your operator trusts.
+
+## 7. Limits
 
 - **Sandboxes expire after 7 days** by default (your operator may set another lifetime). Then the
   sandbox and its files are gone: pull before. `mocactl sbx ls` shows each sandbox's expiry, and
@@ -314,7 +500,7 @@ that is not bound here.
   business hours. If it is lost, every sandbox on it ends and its files are gone. Your laptop
   keeps the original tree, so pull often.
 
-## 7. Using the API directly
+## 8. Using the API directly
 
 The sandbox is also reachable from your own code over gRPC (`sandbox/v1`):
 
@@ -327,7 +513,7 @@ prints, for the bound sandbox, `export` lines for a client: `SBX_ADDR`, `SBX_TLS
 self-issued, `SBX_CA_FILE`. `mocactl sbx token` prints a fresh token. See
 [the direct-client guide](../api/sandbox-v1-direct-client.md) for what a client sends.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 Start with `mocactl sbx doctor` in the repository:
 
@@ -379,12 +565,22 @@ Other messages:
   too, which `doctor` does not read.
 - **TLS errors at login**: the service's certificate is not publicly trusted. Ask your operator for
   its CA and set `NODE_EXTRA_CA_CERTS=<ca.pem>` in your environment.
+- **"sbx: codex is not on PATH"**: install it (`npm install -g @openai/codex`). The message also
+  prints the `codex -c …` line to run by hand, if you have it somewhere else.
+- **Codex says it has no credentials** (`✗ auth no Codex credentials were found`): that is Codex's
+  own account, not your sandbox login — `codex login`, or set `OPENAI_API_KEY`.
+  `codex doctor | grep -A3 "auth "` names which one it found.
+- **Codex edits files on your laptop instead of in the sandbox**: check you started it with
+  `mocactl sbx codex` (or the `-c mcp_servers.sandbox=…` line), and that `/mcp` in the TUI lists
+  the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code and
+  OpenCode only: Codex has nothing in your repository for it to check, and its `unified_exec` tool
+  cannot be disabled, so add `-c sandbox_mode="read-only"` if you want its own confinement too.
 
 **Logging out.** `mocactl sbx logout` ends this login and deletes `sbx-auth.json` (in
 `~/.config/mocactl/`). It is kept apart from `mocactl login`'s MOCA login: you can have both, and
 logging out of one leaves the other.
 
-## 9. Data handling
+## 10. Data handling
 
 Your code sits on one shared KVM host that other users' sandboxes also run on. **Push internal
 code only, and no secrets.** `sbx up` and `push` leave out common secret files by default (`.env*`,

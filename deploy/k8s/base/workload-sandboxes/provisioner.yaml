@@ -6,7 +6,8 @@ apiVersion: v1
 kind: ServiceAccount
 metadata: { name: moca-provisioner, namespace: moca }
 ---
-# Spec §4.1's table, verb for verb, with §5.1's PVC verbs: it owns each mounted workload's PVC.
+# Spec §4.1's table, verb for verb, with §5.1's PVC verbs: it owns each mounted workload's PVC, and
+# §6.2's list on Services and PVCs: the orphan sweep lists them by label, as it does StatefulSets.
 # No create on bare pods, no rights outside moca-sandbox. No get or list on Secrets: it writes its workloads' attach tokens blind
 # (create, or an unconditional update) and can never read one, so not moca-relay-attach either.
 # What its object names and pod specs may be is admission-policy.yaml's, whatever this Role allows.
@@ -22,13 +23,13 @@ rules:
     verbs: [create, update, delete]
   - apiGroups: ['']
     resources: [services]
-    verbs: [create, get, delete]
+    verbs: [create, get, list, delete]
   - apiGroups: ['']
     resources: [pods]
     verbs: [get, list]
   - apiGroups: ['']
     resources: [persistentvolumeclaims]
-    verbs: [create, get, delete]
+    verbs: [create, get, list, delete]
   # The operator's workload sandbox pod template (template.yaml), and nothing else of its kind.
   - apiGroups: ['']
     resources: [podtemplates]
@@ -83,6 +84,14 @@ spec:
             - { name: MOCA_OWNER_MAX_SANDBOXES, value: '4' }
             - { name: MOCA_ATTACH_TOKEN_TTL_S, value: '86400' }
             - { name: MOCA_PROVISIONER_RECONCILE_S, value: '300' }
+            # The orphan sweep (spec §6.2), on the same loop: a workload's objects whose Redis record
+            # is missing, deleted, deleting or of another generation are deleted once all of them are
+            # older than this grace; a missing record never deletes the PVC. It reads Redis with the
+            # deployment's one read-write credential (no ACL users exist, spec §3.1, §9); its code only
+            # GETs, each bounded by MOCA_PROVISIONER_REDIS_TIMEOUT_MS (default 2000).
+            - { name: MOCA_PROVISIONER_ORPHAN_GRACE_S, value: '600' }
+            - name: REDIS_URL
+              valueFrom: { secretKeyRef: { name: moca-redis, key: REDIS_URL } }
             # A mounted workload's PVC (spec §5.1, §6.3): its largest size, and the StorageClasses it
             # may use as <class>:rwo|rwx (unset: the cluster's default class, ReadWriteOnce). The
             # admission policy holds the provisioner to the same allowlist.
@@ -172,6 +181,26 @@ spec:
   # (setup.sh kube_api_egress), and refuses to install if it cannot read them. Rendered without
   # setup.sh, the provisioner reaches nothing: it fails closed, never open to 0.0.0.0/0.
   egress: []
+---
+# The orphan sweep's reach (spec §6.2): Redis, to read workload records, and DNS, to resolve
+# redis.moca.svc. Its own policy, because setup.sh replaces moca-provisioner's egress wholesale with
+# the API server's addresses; NetworkPolicies add up. Redis's ingress admits the provisioner through
+# the component's patch (kustomization.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: moca-provisioner-redis, namespace: moca }
+spec:
+  podSelector: { matchLabels: { app: moca-provisioner } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: redis } } }]
+      ports: [{ protocol: TCP, port: 6379 }]
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
 ---
 # The workload sandboxes' own ServiceAccount (spec §4.2): no token, no binding. The admission policy
 # holds every workload pod to it.

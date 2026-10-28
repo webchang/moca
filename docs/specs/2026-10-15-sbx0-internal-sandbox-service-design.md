@@ -5,6 +5,15 @@ Status: Accepted (2026-10-20; live acceptance recorded in [docs/sbx/security-rev
 Milestone: **SBX0**, registered in [the milestone registry](README.md) (new `SBX` track).
 Decision record: [ADR-0042](../adrs/0042-sbx0-sandbox-service-on-sandbox-v1.md).
 
+> **Amendment, 2026-10-26 — increment 2b, user-scoped egress credentials.** The
+> [SBX0.2b spec](2026-10-26-sbx-egress-credentials-design.md) ([ADR-0046](../adrs/0046-sbx-egress-credentials-owner-lookup.md))
+> refines two statements here, and only when a deployment enables it (`SH_CREDENTIAL_KEK` and
+> `SH_EGRESS_HOSTS` set). Without those settings, nothing below changes. (1) §4.1: the `sandbox`
+> profile then mounts `/v1/credentials` for the `sandbox-egress` consumer only, needs a credential
+> store (the file store on a PVC) and a KEK, and mounts a new `POST /v1/egress/credential` for
+> KVM-host bearers. It still has no Kubernetes API access. (2) §11: a row 2b follows row 2. The
+> guest egress of row 2 ships in v0.8.0. Its wiring in `deploy/sbx/install-host.sh` is #623.
+
 Builds on these; it reuses them and redesigns nothing:
 
 - [P4](2026-09-09-p4-microvm-sandbox-design.md) and ADR-0035: `microvm-worker`, golden snapshots, a
@@ -427,23 +436,23 @@ persistence follows the existing `base/redis.yaml`.
 
 ### 6.1 Commands
 
-| Command                                                                    | Does                                                                                                                                                                                                                                                                         |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbx login`                                                                | Device flow against the sbx control plane (config key `sbxControlPlaneUrl`, or `--control-plane-url`). Auth is cached per URL, so it coexists with a MOCA login                                                                                                              |
-| `sbx logout`                                                               | Revoke and delete the sbx login                                                                                                                                                                                                                                              |
-| `sbx templates`                                                            | Lists templates                                                                                                                                                                                                                                                              |
-| `sbx create [--template T] [--name N] [--label K=V]…`                      | Creates a sandbox and prints its id and expiry, with no push and no agent configuration. This is the HTTP-only form of `up` (1b)                                                                                                                                             |
-| `sbx up [--template T] [--name N] [--no-agent-config] [--include-secrets]` | Inside a git repository: reuse the user's live sandbox labelled `project=<repo id>`, or create one. Push the working tree (§6.2). Write `.sbx/sandbox.json` and the agent configuration (§6.3). Print id, template and expiry                                                |
-| `sbx push [--force]`                                                       | Push again. Refuses if the sandbox holds changes not yet pulled, unless `--force`                                                                                                                                                                                            |
-| `sbx pull [--apply] [-o FILE]`                                             | Capture the patch (§6.2). `--apply` applies it locally (plain, else a checked 3-way merge; refused for agent-config files), then advances the sandbox's baseline                                                                                                             |
-| `sbx run [--timeout S] [-- CMD…]`                                          | Runs `CMD`, or the script on stdin, in `/workspace`. CMD's words are quoted (shell syntax via stdin or `-- sh -c`). Exits with the command's code. 124 means the command timed out or was killed (`ExecError{"timeout:<n>"}`, or a signal), and 125 means the sandbox failed |
-| `sbx put PATH`                                                             | Writes stdin to `PATH` under `/workspace`, creating parent directories                                                                                                                                                                                                       |
-| `sbx ls`                                                                   | The user's sandboxes, with state, reason, template and expiry                                                                                                                                                                                                                |
-| `sbx rm [ID] [--keep-config] [--force]`                                    | Delete a sandbox; for the bound one, also take back the agent configuration `up` added, and `.sbx/` (unless `--keep-config`). Refuses while the sandbox has changes not yet pulled (or when that cannot be checked), unless `--force`                                        |
-| `sbx token [ID]`                                                           | Prints a fresh sandbox token                                                                                                                                                                                                                                                 |
-| `sbx env [ID]`                                                             | Prints `export` lines: `SBX_ADDR`, `SBX_SANDBOX_ID` (`wrk`), `SBX_WORKSPACE_KEY` (`wsk`), `SBX_TOKEN_CMD="mocactl sbx token ID"`, and `SBX_CA_FILE` if the endpoint's certificate is self-issued                                                                             |
-| `sbx mcp [--sandbox ID]`                                                   | A stdio MCP server bound to one sandbox (§6.4)                                                                                                                                                                                                                               |
-| `sbx doctor`                                                               | Checks login; that the sandbox is live and its expiry; that the agent config denies every local tool; one `true` Exec and its latency; work not yet pulled                                                                                                                   |
+| Command                                                                               | Does                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbx login`                                                                           | Device flow against the sbx control plane (config key `sbxControlPlaneUrl`, or `--control-plane-url`). Auth is cached per URL, so it coexists with a MOCA login                                                                                                              |
+| `sbx logout`                                                                          | Revoke and delete the sbx login                                                                                                                                                                                                                                              |
+| `sbx templates`                                                                       | Lists templates                                                                                                                                                                                                                                                              |
+| `sbx create [--template T] [--name N] [--label K=V]…`                                 | Creates a sandbox and prints its id and expiry, with no push and no agent configuration. This is the HTTP-only form of `up` (1b)                                                                                                                                             |
+| `sbx up [--template T] [--name N] [--no-agent-config] [--cortex] [--include-secrets]` | Inside a git repository: reuse the user's live sandbox labelled `project=<repo id>`, or create one. Push the working tree (§6.2). Write `.sbx/sandbox.json` and the agent configuration (§6.3). Print id, template and expiry                                                |
+| `sbx push [--force]`                                                                  | Push again. Refuses if the sandbox holds changes not yet pulled, unless `--force`                                                                                                                                                                                            |
+| `sbx pull [--apply] [-o FILE]`                                                        | Capture the patch (§6.2). `--apply` applies it locally (plain, else a checked 3-way merge; refused for agent-config files), then advances the sandbox's baseline                                                                                                             |
+| `sbx run [--timeout S] [-- CMD…]`                                                     | Runs `CMD`, or the script on stdin, in `/workspace`. CMD's words are quoted (shell syntax via stdin or `-- sh -c`). Exits with the command's code. 124 means the command timed out or was killed (`ExecError{"timeout:<n>"}`, or a signal), and 125 means the sandbox failed |
+| `sbx put PATH`                                                                        | Writes stdin to `PATH` under `/workspace`, creating parent directories                                                                                                                                                                                                       |
+| `sbx ls`                                                                              | The user's sandboxes, with state, reason, template and expiry                                                                                                                                                                                                                |
+| `sbx rm [ID] [--keep-config] [--force]`                                               | Delete a sandbox; for the bound one, also take back the agent configuration `up` added, and `.sbx/` (unless `--keep-config`). Refuses while the sandbox has changes not yet pulled (or when that cannot be checked), unless `--force`                                        |
+| `sbx token [ID]`                                                                      | Prints a fresh sandbox token                                                                                                                                                                                                                                                 |
+| `sbx env [ID]`                                                                        | Prints `export` lines: `SBX_ADDR`, `SBX_SANDBOX_ID` (`wrk`), `SBX_WORKSPACE_KEY` (`wsk`), `SBX_TOKEN_CMD="mocactl sbx token ID"`, and `SBX_CA_FILE` if the endpoint's certificate is self-issued                                                                             |
+| `sbx mcp [--sandbox ID]`                                                              | A stdio MCP server bound to one sandbox (§6.4)                                                                                                                                                                                                                               |
+| `sbx doctor`                                                                          | Checks login; that the sandbox is live and its expiry; that the agent config denies every local tool; one `true` Exec and its latency; work not yet pulled                                                                                                                   |
 
 `ID` defaults to the sandbox in `./.sbx/sandbox.json`, searched upward to the repository root.
 `.sbx/` is added to `.git/info/exclude`, never to `.gitignore`. The control plane is taken from
@@ -495,7 +504,9 @@ Every curated template ships `tar` and `git` (§8.2).
     `enabledMcpjsonServers` gets `sandbox`. The list names only tools current Claude Code knows,
     since it warns at every start about a deny rule naming an unknown tool (#568). The pre-2.0
     tools (`MultiEdit`, `LS`, `NotebookRead`) are therefore not denied. `sbx doctor` fails when
-    the Claude Code on `PATH` is older than 2.0.0.
+    the Claude Code on `PATH` is older than 2.0.0. A repository configured before those three were
+    dropped still lists them, so `sbx up` takes back the ones its own record says it added, and
+    leaves one the developer wrote (#574).
 - **OpenCode:** `opencode.json` gets `mcp.sandbox = { "type": "local", "command": ["mocactl", "sbx", "mcp"], "enabled": true }`,
   and `tools` set to `false` for `bash`, `read`, `edit`, `write`, `patch`, `apply_patch`
   (`patch`'s newer name), `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`, and
@@ -511,7 +522,8 @@ Every curated template ships `tar` and `git` (§8.2).
   Claude Code never loads this `CLAUDE.md`: the `Read` deny covers it, and an allow rule cannot
   carve an exception out of a deny (#568). The server's instructions are what steers every agent.
   Each MCP client receives them on connecting, whatever its permission rules. The block is the
-  same text, for people reading the repository.
+  same text, for people reading the repository. `sbx up --cortex` (below) is the way to have the
+  project's own `CLAUDE.md` load.
 
 Merging rules:
 
@@ -524,6 +536,13 @@ Merging rules:
 
 The tool names are a list in one module, updated as the agents add tools. That keeps the denied
 state checkable (`doctor`) instead of assumed.
+
+**Cortex mode** (`sbx up --cortex`; design: [`2026-10-27-sbx-up-cortex-design.md`](2026-10-27-sbx-up-cortex-design.md)):
+with Cortex v0.9.3 or later installed, `up` installs Cortex's `moca-sandbox` script plugin, which
+keeps the model off local tools in the proxy, and writes Claude Code's configuration without the
+`permissions.deny` list. Claude Code then loads the project's `CLAUDE.md`. The record keeps the
+mode, so a later `up` keeps it; `doctor` checks the script instead of the denies. Without the flag,
+nothing here changes, and moca does not need Cortex.
 
 ### 6.4 The MCP server
 

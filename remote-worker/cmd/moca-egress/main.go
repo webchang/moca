@@ -53,15 +53,30 @@ func main() {
 		proxy.Close()
 		log.Fatalf("moca-egress: control socket %s: %v", cc.Socket, err)
 	}
+	// Flushes the audit queue. Called after proxy.Close() in every arm below, never before:
+	// Unregister emits one aborted event per live connection as it tears down, and those are
+	// only written if the sink outlives it.
+	closeAudit := func() {
+		if err := egress.CloseAudit(cfg.Audit); err != nil {
+			log.Printf("moca-egress: audit sink: %v", err)
+		}
+	}
+
 	if ctx.Err() != nil {
 		// Stopped before we began serving: nothing is registered yet, so close and exit 0.
 		srv.Close()
 		proxy.Close()
+		closeAudit()
 		return
 	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
+	if cp, ok := cfg.Credentials.(*egress.CPCredentials); ok {
+		log.Printf("moca-egress: credentials: on (control plane %s)", cp.Host())
+	} else {
+		log.Printf("moca-egress: credentials: off")
+	}
 	log.Printf("moca-egress: serving %d allowlist entries, control socket %s", len(cfg.Allow), cc.Socket)
 	// The control socket is bound (NewServer listened on it above), so a worker ordered After=
 	// this Type=notify unit can connect from here on. A failed notify is logged, not fatal:
@@ -75,12 +90,15 @@ func main() {
 		srv.Close()
 		<-serveErr
 		proxy.Close()
+		closeAudit()
 	case err := <-serveErr:
 		if err != nil {
 			log.Printf("moca-egress: control server: %v", err)
 			proxy.Close()
+			closeAudit()
 			os.Exit(1)
 		}
 		proxy.Close()
+		closeAudit()
 	}
 }

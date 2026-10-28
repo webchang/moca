@@ -22,6 +22,7 @@ import {
 } from '../src/main.js';
 import { keyIdFor, makeSigner, parseKeyset, publicKeyToBase64, verifyToken } from '../src/token.js';
 import { VaultCredentialStore } from '../src/vault-store.js';
+import { testUserSecretFromEnv, testUsersFromEnv } from '../src/identity.js';
 import { withCredentials } from '../src/systemd-credentials.js';
 import { codeOf, ctx } from './helpers/deps.js';
 
@@ -356,6 +357,9 @@ describe('the control plane`s secrets as systemd credentials (deploy/vm)', () =>
       'SH_JANITOR_TOKEN',
       'SH_OPERATOR_INFERENCE_TOKEN',
       'SH_SESSION_TOKEN_PRIVATE_KEY',
+      // ADR-0045: a password on a login path, so it travels as a credential FILE like the rest --
+      // never an env line a kubectl child could inherit.
+      'SH_TEST_USER_SECRET',
     ]);
   });
 
@@ -461,5 +465,90 @@ describe('redisReconnectStrategy (#434)', () => {
     const opts = redisClientOptions('redis://127.0.0.1:6379');
     expect(opts.url).toBe('redis://127.0.0.1:6379');
     expect(opts.socket.reconnectStrategy).toBe(redisReconnectStrategy);
+  });
+});
+
+describe('SH_TEST_USERS (ADR-0045)', () => {
+  const SECRET = 'test-user-secret-0123456789'; // notsecret
+
+  it('is 0 by default, so the test-login path is off', () => {
+    expect(configFromEnv(baseEnv).testUsers).toBe(0);
+  });
+
+  it('is read with its secret', () => {
+    const c = configFromEnv({ ...baseEnv, SH_TEST_USERS: '10', SH_TEST_USER_SECRET: SECRET });
+    expect(c.testUsers).toBe(10);
+  });
+
+  // The whole feature is a login path for an arbitrary subject: without a secret it must not boot.
+  it('refuses to boot with test users and no secret', () => {
+    expect(() => configFromEnv({ ...baseEnv, SH_TEST_USERS: '10' })).toThrow(
+      /SH_TEST_USER_SECRET is required/,
+    );
+  });
+
+  it('refuses a short secret, and a secret with no test users', () => {
+    expect(() =>
+      configFromEnv({ ...baseEnv, SH_TEST_USERS: '2', SH_TEST_USER_SECRET: 'short' }),
+    ).toThrow(/at least/);
+    expect(() => configFromEnv({ ...baseEnv, SH_TEST_USER_SECRET: SECRET })).toThrow(
+      /SH_TEST_USERS is not/,
+    );
+  });
+
+  // SBX0 §4.2 admits only enrolled github: subjects, which a test:N subject can never be. Refuse at
+  // boot rather than serve a route that would always 403.
+  it('cannot be combined with the sandbox profile', () => {
+    expect(() =>
+      configFromEnv({
+        ...baseEnv,
+        SH_ROUTE_PROFILE: 'sandbox',
+        SH_ALLOWED_SUBJECTS: 'github:1',
+        SH_TEST_USERS: '10',
+        SH_TEST_USER_SECRET: SECRET,
+      }),
+    ).toThrow(/cannot be used on the sandbox profile/);
+  });
+});
+
+describe('the k8s credentials volume as the control plane sees it (ADR-0045)', () => {
+  // The k8s-kind-e2e failure on #620: the test-user secret was projected from moca-mu1 as a
+  // required item, so with test users OFF the key was written EMPTY -- and credentialValue returns
+  // "unset" only for ENOENT, throwing on an empty file. The control plane crash-looped before
+  // identity.ts ran. A setup.sh test cannot catch it (the mock starts no pod), so assert the
+  // boundary here: a directory shaped like the mounted volume.
+  const volume = (files: Record<string, string>): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'sh-cp-vol-'));
+    for (const [name, value] of Object.entries(files)) writeFileSync(join(dir, name), value);
+    return dir;
+  };
+  const base = {
+    SH_SESSION_TOKEN_PRIVATE_KEY: 'priv\n',
+    SH_CREDENTIAL_KEK: 'kek\n',
+    SH_EXCHANGE_TOKEN: 'xchg\n',
+  };
+
+  it('boots with test users OFF, when the secret is simply ABSENT', () => {
+    const dir = volume(base);
+    const env = withCredentials({ CREDENTIALS_DIRECTORY: dir }, CONTROL_PLANE_SECRETS);
+    expect(env.SH_TEST_USER_SECRET).toBeUndefined();
+    // ...and that absence is what configFromEnv reads as "no test users".
+    expect(testUsersFromEnv(env.SH_TEST_USERS)).toBe(0);
+  });
+
+  // The regression itself: this is what the previous head mounted.
+  it('refuses to boot when the secret is present but EMPTY', () => {
+    const dir = volume({ ...base, SH_TEST_USER_SECRET: '' });
+    expect(() => withCredentials({ CREDENTIALS_DIRECTORY: dir }, CONTROL_PLANE_SECRETS)).toThrow(
+      /SH_TEST_USER_SECRET.*is empty/,
+    );
+  });
+
+  it('reads the secret when test users are on', () => {
+    const secret = 'a'.repeat(32); // notsecret
+    const dir = volume({ ...base, SH_TEST_USER_SECRET: `${secret}\n` });
+    const env = withCredentials({ CREDENTIALS_DIRECTORY: dir }, CONTROL_PLANE_SECRETS);
+    expect(env.SH_TEST_USER_SECRET).toBe(secret);
+    expect(testUserSecretFromEnv(env.SH_TEST_USER_SECRET, 10)).toBe(secret);
   });
 });

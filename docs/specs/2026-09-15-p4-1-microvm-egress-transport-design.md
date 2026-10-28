@@ -6,7 +6,7 @@
 **Extends:** [P4 — MicroVM sandbox tier](2026-09-09-p4-microvm-sandbox-design.md)
 **Touches:** Z1 (identity spine) — partially, and behind an interface · MU2 (`sandbox-egress` credential delivery)
 
-> **Amendment, 2026-10-21 — the transport-first slice.** Eight decisions, none replacing a Z5 decision.
+> **Amendment, 2026-10-21 — the transport-first slice.** Nine decisions, none replacing a Z5 decision.
 >
 > 1. §12.2 is decided: the proxy is `moca-egress` ([MI1](2026-09-28-moca-multi-user-isolation-design.md)
 >    D4, §2.4, §14). rossoctl/moca#277 is implemented as MI1 S4's transport and core, without S2.
@@ -34,6 +34,60 @@
 >    (upstream to guest), and adds `dial_addr`, the address actually dialled, which is the evidence for
 >    resolve-once. The conformance suite (`remote-worker/egress/conformance`) pins both, so MI1 §8.5 owes
 >    a matching amendment.
+> 9. _Added 2026-10-26 (#585, the second #583 review follow-up)._ An established connection is bounded
+>    in time: `MOCA_EGRESS_IDLE_TIMEOUT_S` (default `300`) closes a connection on which no byte has
+>    moved, on the tunnel and the forward path alike and in either direction, and
+>    `MOCA_EGRESS_RESPONSE_HEADER_TIMEOUT_S` (which defaults to the idle bound) bounds the wait for a
+>    forwarded request's response headers. The idle bound is refreshed per byte, not armed once, so a
+>    transfer of any duration survives — a `git clone` of a large repo must not die because it was slow.
+>    The default matches squid's `request_timeout` and is a judgement about real upstreams, not a
+>    measured result; the knob exists so an operator who disagrees can move it. Zero is rejected rather
+>    than read as "no bound".
+>
+>    **The bound is on the connection, not on one socket's one direction.** A socket deadline is per
+>    direction of one socket, so a byte arriving on one leg has to push out the deadlines on both: real
+>    traffic is frequently one-way for long stretches — during a `git clone` the guest sends nothing for
+>    as long as the pack takes to stream down — and a per-leg bound would expire mid-transfer on exactly
+>    the healthy transfer the refresh exists to protect.
+>
+>    Which deadlines one byte vouches for is **per path**, because only the forward path can tell the
+>    directions apart. A tunnel is opaque, so any byte either way keeps the whole thing alive. On the
+>    forward path, relaying a response to a guest proves the guest is _reading_ and must not excuse a
+>    request body the guest promised and never sent, so a response write refreshes the guest's write
+>    deadline only. Request-body reads, by contrast, do carry the upstream conn: `http.Transport` has
+>    its read loop blocked on that conn from the dial, so during a slow upload the guest side is the
+>    only place anything is happening.
+>
+>    No watchdog goroutine enforces this. A socket deadline applies to calls already blocked in
+>    `Read`/`Write`, so writing the clock through to the sockets _is_ the enforcement — which also keeps
+>    every expiry an ordinary timeout error rather than the `ErrClosed` a `Close` would produce, and
+>    adds no per-connection goroutine to a process every VM on the host shares.
+>
+>    `MOCA_EGRESS_RESPONSE_HEADER_TIMEOUT_S` defaults to the idle bound rather than to something
+>    tighter. The slot is already bounded without it — the idle clock covers the upstream conn from the
+>    dial — so a tighter default would buy no safety while turning legitimate slow thinking into a
+>    `502`: a plain-HTTP inference endpoint, or a forge packing a large repo, can take minutes before
+>    its first header byte. An operator who would rather fail fast sets it below the idle bound, and
+>    raising only the idle bound carries this one with it, so no tighter bound is left hiding behind it.
+>
+>    **This is a transport-layer time bound, not a Z5 policy change,** which §3 reserves "budget and
+>    cap" to. It adds no quota, meters nothing and denies nothing a policy would have allowed: a
+>    connection that keeps moving bytes is never affected, and the per-VM and per-session caps keep the
+>    values Z5 gave them. It closes a hole in those caps rather than changing them — a count-only cap is
+>    unbounded in time, so one guest could hold all 32 of its slots, plus an upstream socket each in a
+>    host process every VM shares, for the VM's lifetime. An expiry ends a connection exactly as any
+>    other copy error does, so there is **no new audit decision value and no new `Event` field**, and
+>    MI1 §8.5's audit shape is untouched — unlike item 8, this amendment owes no audit-shape change.
+>    MI1 §8.5 item 2 and its config table record the two knobs. Two conformance cases
+>    (`connect_tunnel_idle_deadline`, `forward_response_header_timeout`) pin the behaviour.
+
+> **Amendment, 2026-10-26 — the interception slice, on the SBX path.**
+> [SBX0.2b](2026-10-26-sbx-egress-credentials-design.md) ([ADR-0046](../adrs/0046-sbx-egress-credentials-owner-lookup.md))
+> is the interception slice item 2 above defers: TLS interception, a per-host CA baked into the
+> snapshot (T6), and the placeholder swap (T5). It covers `mocactl sbx` microVMs, with credentials
+> resolved by sandbox owner (phase 1) and then by the user's sandbox token (phase 2). #277's CA and
+> swap acceptance items are discharged there for that path. For the harness's own microVM sessions
+> they remain with MI1 S2/S4.
 
 ## 1. What this is, and what it is not
 

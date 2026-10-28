@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { Exec, ExecConnOptions } from '@moca/sandbox-client';
 import { resolvePaths, saveAuth } from '../../src/config.js';
 import { sbxMain, sbxPaths } from '../../src/sbx/cli.js';
+import type { AgentopExec } from '../../src/sbx/agentop.js';
 
 /** The fakes `mocactl sbx`'s tests share: a scripted control plane, a login, a sandbox, a token. */
 
@@ -320,12 +321,19 @@ export function workspaces(o: Parameters<typeof localWorkspace>[0] = {}) {
 }
 
 export function harness(
-  o: { boxes?: ReturnType<typeof sandbox>[]; ws?: Parameters<typeof localWorkspace>[0] } = {},
+  o: {
+    boxes?: ReturnType<typeof sandbox>[];
+    ws?: Parameters<typeof localWorkspace>[0];
+    /** Cortex's agentop, for `up --cortex` and doctor in Cortex mode (default: none on PATH). */
+    agentop?: AgentopExec;
+  } = {},
 ) {
   const s = setup();
   const cp = controlPlane(o.boxes);
   const ws = workspaces(o.ws);
   const r = repo();
+  const agentop: AgentopExec =
+    o.agentop ?? (async () => ({ code: null, stdout: '', stderr: 'agentop is not on PATH' }));
   const run = (argv: string[], over: { cwd?: string; env?: Record<string, string> } = {}) => {
     s.io.outs.length = 0;
     s.io.errs.length = 0;
@@ -335,6 +343,7 @@ export function harness(
       fetchImpl: cp.fetchImpl,
       cwd: over.cwd ?? r,
       execFactory: ws.factory,
+      agentop,
     });
   };
   const err = () => s.io.errs.join('\n');

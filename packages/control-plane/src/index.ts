@@ -110,6 +110,14 @@ export {
 } from './ownership.js';
 export {
   GithubOAuthProvider,
+  TestUserProvider,
+  testSubject,
+  testUsersFromEnv,
+  testUserSecretFromEnv,
+  secretMatches,
+  TEST_SUBJECT_RE,
+  TEST_USERS_MAX,
+  TEST_USER_SECRET_MIN_CHARS,
   adminSubjectsFromEnv,
   rolesFor,
   type DeviceStart,
@@ -174,6 +182,7 @@ export {
   credentialStoreFromEnv,
   depsFromEnv,
   portFromEnv,
+  redisClientOptions,
   verifyKeysFromEnv,
   type CredentialStoreKind,
 } from './main.js';

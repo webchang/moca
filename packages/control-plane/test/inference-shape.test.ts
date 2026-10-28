@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CpError } from '../src/errors.js';
-import { inferenceAuthHeader, parseCredentialBody } from '../src/credential-store.js';
+import { firstBinding, inferenceAuthHeader, parseCredentialBody } from '../src/credential-store.js';
 
 /**
  * #368 scope 1 (#362 item 3): an inference credential goes upstream in exactly one of two headers,
@@ -60,7 +60,7 @@ describe('parseCredentialBody: inference shapes', () => {
         secret: { key: RAW_KEY },
       }),
     );
-    expect(inferenceAuthHeader(c.descriptor.binding, 'key')).toBe('x-api-key');
+    expect(inferenceAuthHeader(firstBinding(c.descriptor), 'key')).toBe('x-api-key');
   });
 
   it('refuses a binding the inference path cannot send', () => {

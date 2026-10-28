@@ -2,8 +2,9 @@
 
 Your local agent follows the `moca-delegate-task` skill and runs two CLIs: `contextctl` packs a
 folder into a `.context` file, and `mocactl` sends it to MOCA and runs tasks on it. MOCA runs each
-task on one of the operator's shared sandboxes. Context Service stores the context; it never
-creates sandboxes.
+task on one of the operator's shared sandboxes, or, for a workload created with `--sandboxes`, on
+sandboxes of its own ([#476](https://github.com/rossoctl/moca/issues/476), per-workload sandboxes
+and storage). Context Service stores the context; it never creates sandboxes.
 
 ![Context delegation flow](internal-flow.svg)
 

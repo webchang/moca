@@ -27,6 +27,9 @@ export function openableUrl(url: string): string | undefined {
 
 // The URL comes from the server (the device flow's verificationUri): anything but http(s) — a
 // file: path, a custom scheme handler, a bare word `open` would treat as a file — is not opened.
+// On Windows it must not reach cmd.exe either: `cmd /c start "" <url>` lets cmd parse the URL, and
+// `new URL()` leaves `&`, `|` and `%` alone, so `https://x/?a&calc.exe` would run calc.exe.
+// rundll32's FileProtocolHandler takes the URL as a plain argument, with no shell in between.
 export function openCommand(
   platform: NodeJS.Platform,
   raw: string,
@@ -34,7 +37,7 @@ export function openCommand(
   const url = openableUrl(raw);
   if (!url) return undefined;
   if (platform === 'darwin') return { cmd: 'open', args: [url] };
-  if (platform === 'win32') return { cmd: 'cmd', args: ['/c', 'start', '', url] };
+  if (platform === 'win32') return { cmd: 'rundll32', args: ['url.dll,FileProtocolHandler', url] };
   return { cmd: 'xdg-open', args: [url] };
 }
 
@@ -138,6 +141,54 @@ export function realOs(
     openInEditor(file) {
       runEditor(env, file);
     },
+  };
+}
+
+/**
+ * The clipboard and browser for a device login, or undefined when nobody is likely at this
+ * machine's own screen:
+ *  - stdin or stderr is not a terminal (a script, CI);
+ *  - the shell came in over SSH, where `open` would start a browser on the far machine and the
+ *    clipboard is not the user's;
+ *  - it runs under sudo, which strips SSH_* and would start the browser as root;
+ *  - off macOS and Windows, there is no DISPLAY or WAYLAND_DISPLAY: a headless box, a container
+ *    (`docker exec -it`), a virtual console, or mosh/sudo sessions that lost the SSH_* variables.
+ *    Then xdg-open would fail or fall back to a text browser in this terminal.
+ * Not detected: a tmux or screen server started locally and reattached over SSH (its environment
+ * is the local one); `--no-browser` covers that.
+ */
+export interface LoginHelpersWithState extends Pick<OsDeps, 'copy' | 'openUrl'> {
+  /**
+   * True while a copy has not settled. clipboardy takes no signal or timeout, so a helper that
+   * hangs (an X server that does not answer, a stuck wl-copy) cannot be killed from here, and its
+   * pipes keep the event loop alive: main.ts then exits explicitly rather than wait on it.
+   */
+  busy(): boolean;
+}
+
+export function loginHelpers(
+  env: NodeJS.ProcessEnv,
+  tty: { stdin: boolean; stderr: boolean },
+  os: Pick<OsDeps, 'copy' | 'openUrl'> = realOs(env),
+  platform: NodeJS.Platform = process.platform,
+): LoginHelpersWithState | undefined {
+  if (!tty.stdin || !tty.stderr) return undefined;
+  if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT) return undefined;
+  if (env.SUDO_USER) return undefined;
+  const graphical = platform === 'darwin' || platform === 'win32';
+  if (!graphical && !env.DISPLAY && !env.WAYLAND_DISPLAY) return undefined;
+  let pending = 0;
+  return {
+    async copy(text) {
+      pending++;
+      try {
+        await os.copy(text);
+      } finally {
+        pending--;
+      }
+    },
+    openUrl: os.openUrl,
+    busy: () => pending > 0,
   };
 }
 

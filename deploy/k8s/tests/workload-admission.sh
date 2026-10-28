@@ -4,7 +4,8 @@
 # ServiceAccount, so RBAC and the ValidatingAdmissionPolicy both run and nothing is persisted.
 # Well-formed objects -- the StatefulSet built from the cluster's own PodTemplate the way
 # packages/provisioner/src/provisioner.ts builds it -- must be admitted; each unsafe one refused by
-# the policy (not by RBAC).
+# the policy (not by RBAC). Then RBAC alone (kubectl auth can-i): the lists the orphan sweep makes are
+# granted, and Secrets stay unreadable.
 #
 #   deploy/k8s/tests/workload-admission.sh [--context CTX]
 #
@@ -134,6 +135,23 @@ try deny 'a Block volumeMode' "$(pvc_with '.spec.volumeMode = "Block"')"
 echo "== refused: Secrets"
 try deny 'a Secret not named <name>-attach' "$(jq -c '.metadata.name = "moca-relay-attach"' <<<"$secret")"
 try deny 'a Secret that is not Opaque' "$(jq -c '.type = "moca.dev/other"' <<<"$secret")"
+
+# can VERB RESOURCE WANT: RBAC alone, as the provisioner's ServiceAccount (yes or no).
+can() {
+  local got
+  got="$(kc auth can-i "$1" "$2" --as="$AS" -n "$NS" 2>/dev/null || true)"
+  if [[ "$got" == "$3" ]]; then echo "ok - can-i $1 $2: $3"; return; fi
+  echo "FAIL - can-i $1 $2: $got, expected $3"
+  FAILED=1
+}
+
+echo "== RBAC: what the orphan sweep lists (spec §6.2), and still no read on Secrets"
+can list statefulsets yes
+can list services yes
+can list persistentvolumeclaims yes
+can list secrets no
+can get secrets no
+can create pods no
 
 if [[ "$FAILED" != 0 ]]; then
   echo "workload-admission.sh: FAILED" >&2

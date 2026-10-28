@@ -3,8 +3,9 @@
 # feature is here, so a stack without it renders exactly as before -- byte for byte.
 #
 #   provisioner.yaml       moca-provisioner: ServiceAccount, Role, Deployment, Service and its
-#                          NetworkPolicy; the workload sandboxes' ServiceAccount, NetworkPolicy and
-#                          the namespace's pod and PVC quota
+#                          NetworkPolicies (the API server; Redis and DNS for the orphan sweep); the
+#                          workload sandboxes' ServiceAccount, NetworkPolicy and the namespace's pod
+#                          and PVC quota
 #   template.yaml          the PodTemplate every workload sandbox starts from (operators patch it)
 #   admission-policy.yaml  what the provisioner may write, enforced by the API server
 #   network-policy.yaml    DNS for workload sandboxes, and their egress to the provisioner's seed port
@@ -46,6 +47,17 @@ patches:
         value:
           namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: moca-sandbox } }
           podSelector: { matchLabels: { app: moca-workload-sandbox } }
+  # The provisioner's orphan sweep reads workload records (spec §6.2; its egress half is
+  # moca-provisioner-redis).
+  - target: { kind: NetworkPolicy, name: redis, namespace: moca }
+    patch: |-
+      - op: test
+        path: /spec/ingress/0/ports/0/port
+        value: 6379
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          podSelector: { matchLabels: { app: moca-provisioner } }
   # The supervisor's workers call the provisioner.
   - target: { kind: NetworkPolicy, name: moca-supervisor, namespace: moca }
     patch: |-

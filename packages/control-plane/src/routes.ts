@@ -22,10 +22,17 @@ export interface RouteSpec {
    * `api`      -- Ed25519 token with scope `api` (plan gap #7).
    * `exchange` -- the shared SH_EXCHANGE_TOKEN bearer (spec §5.3.1).
    * `janitor`  -- the sandbox host janitor's SH_JANITOR_TOKEN bearer (SBX0 §8.3).
+   * `egress`   -- one configured KVM host's egress token (SBX0.2b §4.2); names the host.
    */
-  auth: 'none' | 'api' | 'exchange' | 'janitor';
+  auth: 'none' | 'api' | 'exchange' | 'janitor' | 'egress';
   /** The profiles that mount this route (see RouteProfile). */
   profiles: readonly RouteProfile[];
+  /**
+   * On the `sandbox` profile the route is mounted only when egress is configured
+   * (`config.sandbox.egress` defined); otherwise it is unmounted like any unlisted route. Ignored on
+   * the `harness` profile, which mounts the route as it always did.
+   */
+  requiresEgress?: boolean;
   /** A `/v1/sandboxes/{id}` route: its handler goes through assertSandboxOwner (SBX0 §5.1). */
   sandboxScoped?: boolean;
   /** Goes through assertOwner(params.id, principal) before the handler body runs. */
@@ -43,6 +50,11 @@ export interface RouteSpec {
   maxBodyBytes?: number;
   /** Stable key the router and the OpenAPI drift test both use to name the operation. */
   operationId: string;
+  /**
+   * Mounted only when this feature is on (see RouteFeatures). Absent means always mounted.
+   * `requiresEgress` above is the same idea, kept separate because it applies per profile.
+   */
+  feature?: 'testUsers';
 }
 
 const BOTH: readonly RouteProfile[] = ['harness', 'sandbox'];
@@ -91,6 +103,23 @@ export const ROUTES: readonly RouteSpec[] = [
     sessionScoped: false,
     profiles: BOTH,
     operationId: 'completeDeviceAuth',
+  },
+  // ADR-0045: a test-user login. `auth: 'none'` because the caller has no API token yet -- exactly
+  // like the device-flow routes above. It is NOT unauthenticated: the handler requires the
+  // SH_TEST_USER_SECRET, and 404s when SH_TEST_USERS is unset so the path is invisible by default.
+  {
+    method: 'POST',
+    path: '/v1/auth/test-token',
+    auth: 'none',
+    sessionScoped: false,
+    // Unmounted unless SH_TEST_USERS > 0, so the path is genuinely unrouted when the feature is
+    // off -- not merely 404'd by the handler after the body has already been validated.
+    feature: 'testUsers',
+    // HARNESS, not BOTH: main.ts refuses to boot test users on the sandbox profile (it admits only
+    // enrolled github: subjects, SBX0 §4.2), so the route is not mounted there at all. One fewer
+    // place for the invariant to be broken later.
+    profiles: HARNESS,
+    operationId: 'testUserToken',
   },
   // B14: the refresh token is the credential on the first two, so they take no API token.
   {
@@ -205,7 +234,8 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/credentials',
     auth: 'api',
     sessionScoped: false,
-    profiles: HARNESS,
+    profiles: BOTH,
+    requiresEgress: true,
     operationId: 'listCredentials',
   },
   {
@@ -213,7 +243,8 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/credentials/{name}',
     auth: 'api',
     sessionScoped: false,
-    profiles: HARNESS,
+    profiles: BOTH,
+    requiresEgress: true,
     operationId: 'putCredential',
   },
   {
@@ -221,8 +252,18 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/credentials/{name}',
     auth: 'api',
     sessionScoped: false,
-    profiles: HARNESS,
+    profiles: BOTH,
+    requiresEgress: true,
     operationId: 'deleteCredential',
+  },
+  {
+    method: 'POST',
+    path: '/v1/egress/credential',
+    auth: 'egress',
+    sessionScoped: false,
+    profiles: SANDBOX,
+    requiresEgress: true,
+    operationId: 'lookupEgressCredential',
   },
   {
     method: 'POST',
@@ -343,14 +384,30 @@ function compile(path: string): { re: RegExp; names: string[] } {
 
 const COMPILED = ROUTES.map((route) => ({ route, ...compile(route.path) }));
 
+/**
+ * ADR-0045: routes that exist only when a feature is switched on. Unmounting here -- rather than
+ * 404ing inside the handler -- is what makes the path truly indistinguishable from an unrouted one:
+ * server.ts parses and validates the body BEFORE calling the handler, so a mounted route answers
+ * `400 invalid_json` to an empty or malformed body and thereby reveals that it exists.
+ */
+export interface RouteFeatures {
+  /** `config.sandbox.egress` is configured: mounts the credential routes on the sandbox profile. */
+  egress?: boolean;
+  /** SH_TEST_USERS > 0: mounts POST /v1/auth/test-token. */
+  testUsers?: boolean;
+}
+
 export function matchRoute(
   method: string,
   url: string,
   profile: RouteProfile = 'harness',
+  opts: RouteFeatures = {},
 ): { route: RouteSpec; params: Record<string, string> } | null {
   const pathname = url.split('?')[0] ?? '';
   for (const { route, re, names } of COMPILED) {
     if (route.method !== method || !route.profiles.includes(profile)) continue;
+    if (profile === 'sandbox' && route.requiresEgress && !opts.egress) continue;
+    if (route.feature && !opts[route.feature]) continue;
     const m = re.exec(pathname);
     if (!m) continue;
     const params: Record<string, string> = {};

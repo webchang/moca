@@ -1,7 +1,7 @@
 # OpenShift's half of workload sandboxes (workload sandboxes spec §4): DNS on openshift-dns:5353 for
-# their pods, as network-policy-ocp.yaml gives the shared pool. A Component: setup.sh's generated
-# overlay lists it after base/workload-sandboxes only on --target ocp with SH_WORKLOAD_SANDBOXES=1,
-# so every default render is unchanged.
+# their pods and the provisioner, as network-policy-ocp.yaml gives the shared pool. A Component:
+# setup.sh's generated overlay lists it after base/workload-sandboxes only on --target ocp with
+# SH_WORKLOAD_SANDBOXES=1, so every default render is unchanged.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:

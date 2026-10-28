@@ -33,6 +33,12 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
   },
   {
     method: 'post',
+    path: '/v1/auth/test-token',
+    reads: ['token', 'subject', 'expiresAt', 'refreshToken', 'refreshExpiresAt'],
+    sends: ['index', 'secret', 'label'],
+  },
+  {
+    method: 'post',
     path: '/v1/auth/token',
     reads: ['token', 'subject', 'expiresAt', 'refreshToken', 'refreshExpiresAt'],
     sends: ['grant_type', 'refresh_token'],
@@ -183,6 +189,7 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
     await cProxy.discovery();
     await cProxy.startDeviceAuth();
     await cProxy.pollDeviceAuth('d');
+    await cProxy.testUserToken(1, 'secret'); // notsecret
     await cProxy.refreshAuth('mrt_x');
     await cProxy.revokeAuth('mrt_x');
     await cProxy.revokeAllAuth();

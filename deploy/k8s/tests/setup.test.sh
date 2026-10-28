@@ -137,6 +137,9 @@ case "${1-} ${2-}" in
   printf 'SH_CREDENTIAL_KEK=%s=\n' "$(hex 22 | cut -c1-43)"
   printf 'SH_EXCHANGE_TOKEN=%s\n' "$(hex 32)" ;;
 "delete pod") : ;;
+# ADR-0045: turning test users off deletes their Secret, so the mock must actually remove the file
+# the assertions look at -- otherwise the on->off case would pass without the delete happening.
+"delete secret") rm -f "$(store "$ns" Secret "$3")" ;;
 # Turning SH_WORKLOAD_SANDBOXES off: the component's objects, and with --delete-workload-sandboxes the
 # workloads' own. Deleting the StatefulSets clears MOCK_WORKLOAD_STS's stand-in.
 "delete statefulsets,services,secrets,persistentvolumeclaims") rm -f "$MOCK_STATE/workload-sts" ;;
@@ -146,7 +149,28 @@ case "${1-} ${2-}" in
 # The provisioner, while the last apply listed the component; stopped (and started again) on disable.
 # MOCK_PROVISIONER_STUCK=1: its pod never goes away.
 "get deployment")
-  ! grep -q workload-sandboxes "$MOCK_STATE/applied-kustomization.yaml" 2>/dev/null || echo deployment.apps/moca-provisioner ;;
+  if [[ "$3" == moca-control-plane ]]; then
+    # The upgrade migration reads the control plane Deployment from the store, like a Secret or
+    # ConfigMap; --ignore-not-found on a missing one prints nothing and exits 0.
+    f="$(store "$ns" Deployment moca-control-plane)"
+    if [[ ! -f "$f" ]]; then
+      [[ " $* " != *" --ignore-not-found "* ]] || exit 0
+      echo "Error from server (NotFound): deployments \"moca-control-plane\" not found" >&2
+      exit 1
+    fi
+    cat "$f"
+  else
+    ! grep -q workload-sandboxes "$MOCK_STATE/applied-kustomization.yaml" 2>/dev/null || echo deployment.apps/moca-provisioner
+  fi ;;
+# The 0.8 upgrade migration: a trailing dash removes the env entry from the stored Deployment.
+"set env")
+  [[ "$3" == deployment/moca-control-plane && "$4" == -c && "$5" == control-plane && "$6" == SH_MODEL_CATALOG_HOSTS- ]] ||
+    { echo "mock kubectl: unhandled: $*" >&2; exit 2; }
+  f="$(store "$ns" Deployment moca-control-plane)"
+  [[ -f "$f" ]] || { echo "Error from server (NotFound): deployments \"moca-control-plane\" not found" >&2; exit 1; }
+  jq '(.spec.template.spec.containers[] | select(.name == "control-plane") | .env) |=
+      map(select(.name != "SH_MODEL_CATALOG_HOSTS"))' "$f" >"$f.new"
+  mv "$f.new" "$f" ;;
 "scale deployment/moca-provisioner") : ;;
 "get pods") [[ -z "${MOCK_PROVISIONER_STUCK-}" ]] || echo pod/moca-provisioner-0 ;;
 # kube_api_egress's reads. MOCK_NO_VAP=1: a cluster older than 1.30; MOCK_NO_API_ENDPOINTS=1: no
@@ -414,13 +438,99 @@ grep -q '^  - ../../overlays/kind$' "$MOCK_STATE/applied-kustomization.yaml" || 
 [[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:8080 ]] || fail 'kind advertises the wrong harness URL'
 # The control plane's configMapKeyRefs are not optional, bar the two tier keys and the catalog
 # allow-list: a missing key stops the pod opaquely. Those and the token lifetimes are written on
-# every run too ('' when untiered, defaulted or empty, as here), so the hash input is the same nine
-# keys on every stack.
-[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_GITHUB_CLIENT_ID","SH_MODEL_CATALOG_HOSTS","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS"]' ]] ||
-  fail 'moca-settings must hold exactly the nine keys the control plane and the supervisor reference'
+# every run too ('' when untiered, defaulted or empty, as here), so the hash input is the same ten
+# keys on every stack (SH_TEST_USERS is '0' unless an operator asked for test users, ADR-0045).
+[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_GITHUB_CLIENT_ID","SH_MODEL_CATALOG_HOSTS","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS","SH_TEST_USERS"]' ]] ||
+  fail 'moca-settings must hold exactly the ten keys the control plane and the supervisor reference'
 [[ -z "$(setting SH_SANDBOX_TIERS)" && -z "$(setting SH_SANDBOX_DEFAULT_TIER)" ]] || fail 'kind is never tiered'
 expect_out 'port-forward svc/moca-supervisor 8080:8080'
 pass 'kind: generated overlay applied; control plane held at 0 without a client id; access printed'
+
+# ADR-0045: test users. The COUNT is a sticky setting; the SECRET is generated into moca-mu1 and
+# never rotated, like every other value there.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.test; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 0 ]] || fail 'SH_TEST_USERS defaults to 0'
+[[ -z "$(sv moca moca-test-users SH_TEST_USER_SECRET)" ]] || fail 'no test users must mean no generated secret'
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=10; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 10 ]] || fail 'SH_TEST_USERS was not stored'
+tsec="$(sv moca moca-test-users SH_TEST_USER_SECRET)"
+[[ "$tsec" =~ ^[0-9a-f]{64}$ ]] || fail "switching test users on did not generate a secret (got '$tsec')"
+# Its own value, not a copy of the exchange token: generated_value reads the generator's output by
+# key name, so asking it for SH_EXCHANGE_TOKEN twice would have produced the same string twice.
+[[ "$tsec" != "$(sv moca moca-mu1 SH_EXCHANGE_TOKEN)" ]] || fail 'the test-user secret equals the exchange token'
+expect_out 'SH_TEST_USERS=10'
+assert_no_secret_in_argv
+# Sticky, and not rotated by a re-run that does not mention it.
+(export SH_GITHUB_CLIENT_ID=Iv1.test; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 10 ]] || fail 'a plain re-run dropped SH_TEST_USERS'
+[[ "$(sv moca moca-test-users SH_TEST_USER_SECRET)" == "$tsec" ]] || fail 'a re-run rotated the test-user secret'
+# An operator-supplied secret is used as given, so CI can know it before the stack exists.
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=3 SH_TEST_USER_SECRET=given-secret-0123456789; expect_ok --target kind --skip-build)
+[[ "$(sv moca moca-test-users SH_TEST_USER_SECRET)" == given-secret-0123456789 ]] || fail 'a given SH_TEST_USER_SECRET was not used'
+# Explicitly off again, and refusals.
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 0 ]] || fail 'SH_TEST_USERS= did not turn test users off'
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=ten; expect_fail --target kind --skip-build)
+expect_out 'whole number'
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=1001; expect_fail --target kind --skip-build)
+expect_out 'at most 1000'
+pass 'SH_TEST_USERS: sticky count, a generated non-rotating secret, and refusals'
+
+# The k8s-kind-e2e failure (#620, review): the secret lives in a Secret OF ITS OWN, written only
+# while test users are on and DELETED when they go off. credentialValue treats an empty file as an
+# error and only ENOENT as "unset", so an empty value anywhere on this path crash-loops the control
+# plane before identity.ts runs -- and a leftover secret with test users off makes
+# testUserSecretFromEnv refuse to boot ("set but SH_TEST_USERS is not").
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.test; expect_ok --target kind --skip-build)
+[[ ! -f "$MOCK_STATE/moca__Secret__moca-test-users.json" ]] ||
+  fail 'test users off must leave no moca-test-users Secret at all'
+# On: the Secret appears, with a real value (never empty).
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=4; expect_ok --target kind --skip-build)
+tsec="$(sv moca moca-test-users SH_TEST_USER_SECRET)"
+[[ "$tsec" =~ ^[0-9a-f]{64}$ ]] || fail "switching test users on did not generate a secret (got '$tsec')"
+[[ "$tsec" != "$(sv moca moca-mu1 SH_EXCHANGE_TOKEN)" ]] || fail 'the test-user secret equals the exchange token'
+# moca-mu1 must NOT carry it: that is what projected an empty required item and broke the pod.
+! jq -e '.data | has("SH_TEST_USER_SECRET")' "$MOCK_STATE/moca__Secret__moca-mu1.json" >/dev/null ||
+  fail 'the test-user secret must not live in moca-mu1 (an empty required item crash-loops the pod)'
+assert_no_secret_in_argv
+# Sticky, and not rotated by a plain re-run.
+(export SH_GITHUB_CLIENT_ID=Iv1.test; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 4 ]] || fail 'a plain re-run dropped SH_TEST_USERS'
+[[ "$(sv moca moca-test-users SH_TEST_USER_SECRET)" == "$tsec" ]] || fail 'a re-run rotated the test-user secret'
+# OFF again: the Secret must be DELETED, not emptied -- else the next boot refuses with
+# "SH_TEST_USER_SECRET is set but SH_TEST_USERS is not".
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=; expect_ok --target kind --skip-build)
+[[ "$(setting SH_TEST_USERS)" == 0 ]] || fail 'SH_TEST_USERS= did not turn test users off'
+[[ ! -f "$MOCK_STATE/moca__Secret__moca-test-users.json" ]] ||
+  fail 'turning test users off left the secret behind (the control plane would refuse to boot)'
+pass 'the test-user secret is its own Secret: written when on, deleted when off, never in moca-mu1'
+
+# --target ocp is the shared-cluster target, so test users there need an explicit acknowledgement.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=2; expect_fail --target ocp)
+expect_out 'dev/test feature and this is the shared-cluster target'
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=2 SH_TEST_USERS_ACK=i-know-this-is-not-for-production; expect_ok --target ocp)
+[[ "$(setting SH_TEST_USERS)" == 2 ]] || fail 'the acknowledged ocp run did not store SH_TEST_USERS'
+pass 'test users on --target ocp need SH_TEST_USERS_ACK'
+
+# The settings-hash must cover the test-user SECRET, not just the count: otherwise changing the
+# secret rewrites the Secret while the running control plane keeps the old value, and --test-user
+# logins fail against a secret the operator just set.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=2 SH_TEST_USER_SECRET=first-secret-0123456789; expect_ok --target kind --skip-build)
+h1="$(grep -o 'settings-hash: "[0-9a-f]*"' "$MOCK_STATE/applied-kustomization.yaml" | head -1)"
+[[ -n "$h1" ]] || fail 'could not read the settings-hash from the generated overlay'
+(export SH_GITHUB_CLIENT_ID=Iv1.test SH_TEST_USERS=2 SH_TEST_USER_SECRET=second-secret-0123456789; expect_ok --target kind --skip-build)
+h2="$(grep -o 'settings-hash: "[0-9a-f]*"' "$MOCK_STATE/applied-kustomization.yaml" | head -1)"
+[[ "$h1" != "$h2" ]] || fail 'changing SH_TEST_USER_SECRET with the same count did not change the settings-hash (the pod would keep the old value)'
+# ...and the digest is a digest: the secret itself must never reach the overlay or the ConfigMap.
+! grep -q 'second-secret-0123456789' "$MOCK_STATE/applied-kustomization.yaml" || fail 'the test-user secret leaked into the generated overlay'
+! grep -q 'second-secret-0123456789' "$MOCK_STATE/moca__ConfigMap__moca-settings.json" || fail 'the test-user secret leaked into moca-settings'
+pass 'the settings-hash covers the test-user secret, by digest, without leaking it'
+
 
 reset_state
 (export SH_PUBLIC_HARNESS_URL=http://127.0.0.1:18080; expect_ok --target kind --skip-build)
@@ -1169,8 +1279,8 @@ jq -nc '{apiVersion: "v1", kind: "Secret", metadata: {name: "op-cert", namespace
 for k in SH_SINGLE_NAMESPACE SH_ROUTE_DOMAIN SH_TLS_SECRET SH_SANDBOX_DEFAULT_TIER SH_SANDBOX_COUNT; do
   setup_cm moca-single | jq -e --arg k "$k" '.data | has($k)' >/dev/null || fail "ocp-single with Routes: moca-setup lacks $k"
 done
-[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 9 ]] ||
-  fail 'ocp-single with Routes: moca-settings does not hold exactly nine keys'
+[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 10 ]] ||
+  fail 'ocp-single with Routes: moca-settings does not hold exactly ten keys'
 [[ "$(jq -r '.data.SH_PUBLIC_HARNESS_URL' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == https://moca.example.test ]] ||
   fail 'ocp-single with Routes: SH_PUBLIC_HARNESS_URL is not the supervisor Route'
 [[ "$(annotation_adds moca-control-plane)" == 1 && "$(annotation_adds moca-supervisor)" == 1 ]] ||
@@ -1395,6 +1505,74 @@ jq '.data.SH_MODEL_CATALOG_HOSTS = "gw.example.com:4000"' "$MOCK_STATE/moca__Con
 (export SH_GITHUB_CLIENT_ID=Iv1.a; expect_fail --target kind --skip-build)
 expect_out "moca-settings holds SH_MODEL_CATALOG_HOSTS='gw.example.com:4000'"
 pass 'a malformed catalog allow-list is refused, given (before any apply) or stored'
+
+# The 0.8 upgrade of a hand-patched allow-list: before the manifests wired it into moca-settings
+# (5615ffd6), the only way to set it on k8s was a hand patch of the control plane Deployment -- a
+# literal env value owned by another field manager. The manifests now apply that env entry as a
+# configMapKeyRef, and server-side apply never declares `value`, so the literal survives the merge
+# and the API server rejects the Deployment ("may not be specified when `value` is not empty").
+# setup.sh must carry the hand-patched value into moca-settings (a pre-0.8 ConfigMap has no catalog
+# key, so the strip would otherwise delete the only copy) and strip the env before the apply.
+seed_control_plane_env() { # $1: the SH_MODEL_CATALOG_HOSTS env entry, as strict JSON (--argjson)
+  jq -n --argjson entry "$1" '{apiVersion: "apps/v1", kind: "Deployment",
+    metadata: {name: "moca-control-plane", namespace: "moca"},
+    spec: {template: {spec: {containers: [{name: "control-plane",
+      env: [{name: "HOME", value: "/tmp"}, $entry]}]}}}}' \
+    >"$MOCK_STATE/moca__Deployment__moca-control-plane.json"
+}
+reset_state
+seed_control_plane_env '{"name": "SH_MODEL_CATALOG_HOSTS", "value": "litellm.cb.example.com"}'
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+grep -q ' set env deployment/moca-control-plane .*SH_MODEL_CATALOG_HOSTS-$' "$MOCK_LOG" ||
+  fail 'a hand-patched SH_MODEL_CATALOG_HOSTS env value was not stripped'
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == litellm.cb.example.com ]] ||
+  fail 'the hand-patched allow-list was dropped instead of carried into moca-settings'
+strip_line="$(grep -n ' set env deployment/moca-control-plane ' "$MOCK_LOG" | head -1 | cut -d: -f1)"
+apply_line="$(grep -n 'apply -k' "$MOCK_LOG" | head -1 | cut -d: -f1)"
+[[ -n "$strip_line" && -n "$apply_line" && "$strip_line" -lt "$apply_line" ]] ||
+  fail 'the hand patch was not stripped before the apply (the API server would see value and valueFrom together)'
+jq -e '(.spec.template.spec.containers[0].env // []) | map(select(.name == "SH_MODEL_CATALOG_HOSTS")) | length == 0' \
+  "$MOCK_STATE/moca__Deployment__moca-control-plane.json" >/dev/null ||
+  fail 'the strip left the SH_MODEL_CATALOG_HOSTS entry on the live Deployment'
+# The hand patch is the last resort: a value given for this run, and one an earlier run stored,
+# both win over it -- an operator who replaced or cleared the allow-list is never dragged back.
+reset_state
+seed_control_plane_env '{"name": "SH_MODEL_CATALOG_HOSTS", "value": "litellm.cb.example.com"}'
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS=gw.override.example.com; expect_ok --target kind --skip-build)
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == gw.override.example.com ]] ||
+  fail 'a SH_MODEL_CATALOG_HOSTS given for the run did not win over the hand patch'
+grep -q ' set env deployment/moca-control-plane ' "$MOCK_LOG" ||
+  fail 'the hand patch outlived a run that replaced its value'
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a SH_MODEL_CATALOG_HOSTS=gw.stored.example.com; expect_ok --target kind --skip-build)
+seed_control_plane_env '{"name": "SH_MODEL_CATALOG_HOSTS", "value": "litellm.cb.example.com"}'
+: >"$MOCK_LOG" # only this run's calls: the stored value must win with the hand patch present
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+[[ "$(setting SH_MODEL_CATALOG_HOSTS)" == gw.stored.example.com ]] ||
+  fail 'a stored SH_MODEL_CATALOG_HOSTS did not win over the hand patch'
+grep -q ' set env deployment/moca-control-plane ' "$MOCK_LOG" ||
+  fail 'the hand patch outlived the run that ignored its value'
+# A malformed hand-patched value is refused like a malformed given or stored one, naming where it
+# lives, and never reaches the stack apply (the Secret applies before write_settings are fine:
+# the stored-value refusal behaves the same way).
+reset_state
+seed_control_plane_env '{"name": "SH_MODEL_CATALOG_HOSTS", "value": "gw.example.com:4000"}'
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_fail --target kind --skip-build)
+expect_out "deployment/moca-control-plane holds SH_MODEL_CATALOG_HOSTS='gw.example.com:4000'"
+! grep -q 'apply -k' "$MOCK_LOG" || fail 'a malformed hand-patched allow-list reached the stack apply'
+# Without a hand patch there is nothing to strip: an absent entry (a stack that never set the
+# allow-list) and a valueFrom one (a stack this setup.sh already applied) must not be touched,
+# or every re-run would roll the control plane for nothing.
+reset_state
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+! grep -q ' set env deployment/moca-control-plane' "$MOCK_LOG" ||
+  fail 'a Deployment without the hand patch was patched anyway'
+reset_state
+seed_control_plane_env '{"name": "SH_MODEL_CATALOG_HOSTS", "valueFrom": {"configMapKeyRef": {"name": "moca-settings", "key": "SH_MODEL_CATALOG_HOSTS"}}}'
+(export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
+! grep -q ' set env deployment/moca-control-plane' "$MOCK_LOG" ||
+  fail 'a valueFrom SH_MODEL_CATALOG_HOSTS (a stack this setup.sh applied) was stripped, rolling the control plane for nothing'
+pass 'the 0.8 upgrade carries a hand-patched SH_MODEL_CATALOG_HOSTS into moca-settings and strips the env before the apply, and strips nothing without one'
 echo "== workload sandboxes (SH_WORKLOAD_SANDBOXES, workload sandboxes spec §4)"
 reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
@@ -1430,6 +1608,8 @@ grep -q '^    newName: dev.local/moca-remote-worker$' "$MOCK_STATE/applied-kusto
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=; expect_ok --target kind --skip-build)
 ! grep -q 'workload-sandboxes' "$MOCK_STATE/applied-kustomization.yaml" || fail 'SH_WORKLOAD_SANDBOXES= did not turn it off'
 grep -q 'delete -n moca deployment/moca-provisioner' "$MOCK_LOG" || fail 'turning it off left the provisioner running'
+grep -q 'networkpolicy/moca-provisioner-redis networkpolicy/allow-openshift-dns-provisioner' "$MOCK_LOG" ||
+  fail "turning it off left the provisioner's Redis and DNS policies"
 grep -q 'delete validatingadmissionpolicybinding/moca-provisioner' "$MOCK_LOG" || fail 'turning it off left the admission policy'
 ! grep -q 'images:' "$MOCK_STATE/applied-kustomization.yaml" || fail 'the off render on kind is not the pre-feature one'
 pass 'SH_WORKLOAD_SANDBOXES=1 adds the component and makes the provisioner Secret once; sticky; empty turns it off and removes the provisioner'

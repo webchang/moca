@@ -1,5 +1,7 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { CpError, writeError } from './errors.js';
+import type { EgressHost } from './egress-config.js';
 import { checkExchangeAuth, checkStaticBearer } from './exchange.js';
 import { HANDLERS, apiIssuer, type CpDeps, type RequestCtx } from './handlers.js';
 import { matchRoute, type RouteSpec, bodyLimitFor } from './routes.js';
@@ -67,6 +69,20 @@ function authorize(route: RouteSpec, req: IncomingMessage, deps: CpDeps, ctx: Re
     ctx.janitorAuthorized = true;
     return;
   }
+  if (route.auth === 'egress') {
+    // Compare against EVERY configured host and never return early, so timing shows nothing about
+    // which host matched. Digests keep the comparison fixed-length (as checkStaticBearer does).
+    // With no hosts, no bearer or no match: 401, naming neither the host list nor the value.
+    const want = presented ? createHash('sha256').update(presented).digest() : undefined;
+    let found: EgressHost | undefined;
+    for (const h of deps.config.sandbox?.egress?.hosts ?? []) {
+      const have = createHash('sha256').update(h.token).digest();
+      if (want && timingSafeEqual(want, have) && found === undefined) found = h;
+    }
+    if (!found) throw new CpError('unauthorized', 'egress authentication failed');
+    ctx.egressHost = found;
+    return;
+  }
   if (!presented) throw new CpError('token_required', 'this route requires a token');
   // requiredScope 'api' is what stops a session token rewriting credentials or creating a second
   // session, and stops the shared exchange bearer standing in for a user identity (plan gap #7).
@@ -84,6 +100,13 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
         req.method ?? '',
         req.url ?? '',
         deps.config.routeProfile ?? 'harness',
+        // Both gates, in one object. ADR-0045: a feature-gated route is unmounted when its
+        // feature is off, so it 404s before the body below is read -- otherwise an empty body
+        // would answer 400 invalid_json and thereby reveal that the route exists.
+        {
+          egress: deps.config.sandbox?.egress !== undefined,
+          testUsers: !!deps.testUsers,
+        },
       );
       if (!matched) {
         res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: 'not_found' }));

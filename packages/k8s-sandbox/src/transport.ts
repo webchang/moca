@@ -83,6 +83,13 @@ export interface SandboxTransport {
  *
  * Pinned PER TRANSPORT by test/conformance.ts, in the same discipline `producerStop`
  * uses: every implementation makes a positive claim, so a fourth cannot ship without one.
+ * That takes TWO tests, because the required field and the battery each cover only half.
+ * The field makes OMITTING the claim a compile error; the battery asserts the claim a
+ * caller reads matches the one the transport makes, both raw and through the capacity
+ * latch that wraps it on a harness turn. Neither can see a fourth transport that declares
+ * a tier and simply never enrols in the battery — type-correct, unasserted, which is the
+ * state this whole divergence was already in. test/fast-tier-coverage.test.ts closes it by
+ * pinning the declaration sites against the enrolments.
  */
 export type FastTier = 'persistent-channel' | 'per-call-exec';
 

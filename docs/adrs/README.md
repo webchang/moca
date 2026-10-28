@@ -55,6 +55,8 @@ spec). Chronological by the spec's date; numbers are permanent.
 | [0042](0042-sbx0-sandbox-service-on-sandbox-v1.md)        | Offer the P4 tier to an internal cohort on `sandbox/v1` as it is, behind per-sandbox tokens     | Accepted                                                        |
 | [0043](0043-workload-sandboxes-provisioner.md)            | A separate `moca-provisioner` is the only MOCA component that creates workload sandboxes        | Proposed                                                        |
 | [0044](0044-audit-log-mirror-stdout.md)                   | Mirror audit decisions to component stdout as structured JSON, carrying subject and sessionId   | Proposed                                                        |
+| [0045](0045-test-user-logins.md)                          | Test-user logins (`SH_TEST_USERS`) behind a shared secret, so automation can log in unattended  | Proposed                                                        |
+| [0046](0046-sbx-egress-credentials-owner-lookup.md)       | Inject SBX egress credentials at `moca-egress`: owner lookup (phase 1), sandbox token (phase 2) | Proposed                                                        |
 
 ## What an ADR is (and isn't)
 

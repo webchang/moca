@@ -24,6 +24,7 @@ const EXPECTED: Record<CpErrorCode, number> = {
   unauthorized: 401,
   forbidden: 403,
   // 404, not 403, for another user's session: a 403 is an existence oracle (spec §8.1).
+  not_found: 404,
   session_not_found: 404,
   session_mismatch: 400,
   not_enrolled: 403,
@@ -40,6 +41,10 @@ const EXPECTED: Record<CpErrorCode, number> = {
   credential_ambiguous: 400,
   credential_not_found: 404,
   credential_unavailable: 503,
+  credential_unsafe: 500,
+  destination_conflict: 409,
+  destination_ambiguous: 500,
+  no_credential: 404,
   endpoint_unresolved: 400,
   // 400: the credential's endpoint does not offer that model id (per-session model spec §4.2).
   model_unavailable: 400,

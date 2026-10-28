@@ -44,6 +44,13 @@ components:
         The sandbox host janitor's `SH_JANITOR_TOKEN` (SBX0 §8.3); admits GET /v1/janitor/sandboxes
         only. No user or admin API token is accepted there, and with none configured every call is
         refused.
+    egress:
+      type: http
+      scheme: bearer
+      description: |
+        One KVM host's egress token (`SH_EGRESS_TOKEN_<ID>`, SBX0.2b §4.2); admits
+        POST /v1/egress/credential only. Compared against every configured host; no user,
+        admin or janitor token is accepted there.
   parameters:
     sessionId:
       name: id
@@ -84,12 +91,17 @@ components:
             - subject_conflict
             - unauthorized
             - forbidden
+            - not_found
             - session_not_found
             - session_mismatch
             - not_enrolled
             - sandbox_not_found
             - sandbox_terminated
             - name_conflict
+            - credential_unsafe
+            - destination_conflict
+            - destination_ambiguous
+            - no_credential
             - quota_exceeded
             - unknown_template
             - digest_mismatch
@@ -165,11 +177,21 @@ components:
               items: { type: string }
               description: host allow-list, not a base URL
         binding:
-          type: object
-          required: [header, format]
-          properties:
-            header: { type: string }
-            format: { type: string }
+          oneOf:
+            - type: object
+              required: [header, format]
+              properties:
+                header: { type: string }
+                format: { type: string }
+            - type: array
+              minItems: 1
+              maxItems: 4
+              items:
+                type: object
+                required: [header, format]
+                properties:
+                  header: { type: string }
+                  format: { type: string }
         endpoint:
           type: [string, 'null']
           maxLength: 2048
@@ -424,6 +446,81 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '410':
           description: device_code_expired — the code expired before it was approved; start a new one
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/auth/test-token:
+    post:
+      operationId: testUserToken
+      summary: Log in as a configured test user, without the GitHub device flow (dev/test only)
+      description: |
+        Present only when the control plane was started with `SH_TEST_USERS=N` (ADR-0045); without
+        it every request answers 404, so the path is invisible in an ordinary deployment. Requires
+        the shared secret `SH_TEST_USER_SECRET`, because the endpoint issues a real login for an
+        arbitrary `test:<index>` subject.
+
+        The reply is the SAME body as `/v1/auth/device/token`: a test user gets a refresh family,
+        the configured token TTLs and its roles from `SH_ADMIN_SUBJECTS`, so it is configured
+        exactly like a GitHub user everywhere downstream. Refused on the sandbox profile, which
+        the control plane will not even boot with test users enabled.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [index, secret]
+              properties:
+                index:
+                  type: integer
+                  minimum: 1
+                  description: 1-based; must be <= SH_TEST_USERS. The subject is `test:<index>`.
+                secret:
+                  type: string
+                  description: must equal SH_TEST_USER_SECRET; compared in constant time
+                label:
+                  type: string
+                  maxLength: 64
+                  description: a client hint such as the hostname; shown back, never trusted
+      responses:
+        '200':
+          description: an api-scoped token, the same shape /v1/auth/device/token returns
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, subject, expiresAt, refreshToken, refreshExpiresAt]
+                properties:
+                  token: { type: string }
+                  subject: { type: string, pattern: '^test:[0-9]+$' }
+                  displayName: { type: string }
+                  roles: { type: array, items: { type: string } }
+                  expiresAt: { type: integer, description: epoch seconds }
+                  refreshToken:
+                    type: string
+                    pattern: '^mrt_[A-Za-z0-9_-]{43}$'
+                    description: opaque, single-use; exchange at /v1/auth/token for the next pair
+                  refreshExpiresAt:
+                    { type: integer, description: epoch seconds; the login's absolute limit }
+        '400':
+          description: |
+            invalid_request -- `index` is missing, not an integer, or outside 1..SH_TEST_USERS.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            unauthorized -- the shared credential in the request was missing or did not match. One
+            code for both, and checked before `index`, so a prober learns neither which half is
+            wrong nor how many test users exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            not_found -- this control plane has no test users configured (`SH_TEST_USERS` unset).
+            Deliberately indistinguishable from an unrouted path.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1228,6 +1325,76 @@ paths:
                         wrk: { type: string }
                         terminatedAt: { type: integer, description: epoch seconds }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: redis_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/egress/credential:
+    post:
+      operationId: lookupEgressCredential
+      summary: moca-egress's owner lookup -- ready header values for a sandbox's outbound host
+      description: |
+        Sandbox service control planes with egress credentials configured only. Authenticated by
+        a KVM host's egress token. Returns the sandbox OWNER's `sandbox-egress` credentials whose
+        destination matches `host`, rendered to header values, sorted by port, then path prefix
+        length descending, then name. Header values are never logged or audited (SBX0.2b §4.2).
+      security: [{ egress: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sandbox, host]
+              properties:
+                sandbox: { type: string, pattern: '^sbx-[0-9a-f]{26}$' }
+                host: { type: string, pattern: '^[A-Za-z0-9.-]{1,253}$' }
+      responses:
+        '200':
+          description: the credentials for the host
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subject, ttlSeconds, credentials]
+                properties:
+                  subject: { type: string }
+                  ttlSeconds: { type: integer, minimum: 5 }
+                  credentials:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, port, pathPrefix, headers, expiresAt]
+                      properties:
+                        name: { type: string }
+                        port: { type: integer }
+                        pathPrefix: { type: string }
+                        headers:
+                          type: array
+                          items:
+                            type: object
+                            required: [name, value]
+                            properties:
+                              name: { type: string }
+                              value: { type: string }
+                        expiresAt: { type: [string, 'null'], format: date-time }
+        '400':
+          description: invalid_request (bad sandbox id or host)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`sandbox_not_found` (unknown, terminated or another host's) or `no_credential`"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`destination_ambiguous` or `credential_unsafe`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: redis_unavailable
           content:

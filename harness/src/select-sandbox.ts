@@ -637,6 +637,13 @@ export async function selectPoolSandbox(
      * `moca.dev/owner=<ownerScope>`, a second check on the same signed binding (spec §3.3).
      */
     ownerScope?: string;
+    /**
+     * True when the leaf's only writable directory is the workload context view (a copy overlay
+     * or a writable mount), so a per-session `<WorkspaceRoot>/<sessionId>` dir on the worker is
+     * unused and need not be created. Honoured only for records that advertise
+     * `WORKSPACE_SUBDIR_CAPABILITY` (the container worker): other records keep the session key.
+     */
+    agentWritesInContext?: boolean;
   },
   deps: SelectDeps = {},
 ): Promise<SelectedSandbox | null> {
@@ -662,6 +669,7 @@ async function select(
   const selector = env.KAGENTI_SANDBOX_POOL_SELECTOR;
   const workload = opts.workload || undefined;
   const ownerScope = opts.ownerScope || undefined;
+  const agentWritesInContext = opts.agentWritesInContext === true;
   // Without the owner a workload run could not apply the owner half of the filter; refuse rather
   // than fall back to matching on the workload alone.
   if (workload && !ownerScope) {
@@ -767,7 +775,17 @@ async function select(
             // an unseen key and lives until an idle Reclaim (§4.4), so keying it per turn would
             // open turn 2 of a session in an empty workspace and give it its own standby VM pool
             // (§4.3) -- continuity lost and standbys multiplied per turn rather than per session.
-            { workspaceKey: sessionId, ...(workload ? { workload } : {}) },
+            // The key is dropped only when the agent's only writable dir is the context view AND
+            // the record advertises WORKSPACE_SUBDIR_CAPABILITY. The microVM worker does not
+            // advertise it and refuses an empty key; today's workload deployments default to the
+            // container tier, but the capability gate protects correctness regardless of default.
+            {
+              workspaceKey:
+                agentWritesInContext && rec.capabilities.includes(WORKSPACE_SUBDIR_CAPABILITY)
+                  ? ''
+                  : sessionId,
+              ...(workload ? { workload } : {}),
+            },
           )
         : undefined;
       return {

@@ -1,3 +1,4 @@
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { parseOptionFlags } from './core/session-options.js';
 import type { CredentialConsumer } from './api/types.js';
@@ -9,16 +10,18 @@ import {
   cmdCredentials,
   cmdDoctor,
   cmdLogin,
+  cmdLoginTestUser,
   cmdLogout,
   cmdPromote,
   cmdRun,
   cmdSessionDelete,
   cmdSessions,
   type Io,
+  type LoginHelpers,
 } from './headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
 import { sbxMain } from './sbx/cli.js';
-import { cmdGet, cmdSpawn, cmdSubagents, runSpawnWorker } from './subagent.js';
+import { cmdGet, cmdSpawn, cmdSubagents, MAX_PROMPT_BYTES, runSpawnWorker } from './subagent.js';
 import { WORKLOAD_MOUNTS, type WorkloadMount } from './api/workloads.js';
 import { cmdWorkloadCreate, cmdWorkloadDelete, cmdWorkloadGet } from './workloads.js';
 import { VERSION } from './version.js';
@@ -26,7 +29,10 @@ import { VERSION } from './version.js';
 export const USAGE = `usage:
   mocactl [--setup] [--no-animation]             interactive terminal UI
   mocactl --version                              print this build's version (a release tag, edge-<sha> or dev)
-  mocactl login                                  log in with the GitHub device flow
+  mocactl login [--no-browser]                   log in with the GitHub device flow (in a local
+                                                 terminal: copies the code, opens the browser)
+  mocactl login --test-user N                    log in as test user N (needs the control plane's
+                                                 SH_TEST_USERS; secret in MOCA_TEST_USER_SECRET)
   mocactl logout [--all]                         end this login (--all: every login of yours)
   mocactl auth token [--json]                    print a valid API token, refreshing if needed
                                                  (exit 3: log in first; 4: control plane unreachable)
@@ -48,6 +54,8 @@ export const USAGE = `usage:
                                                  fork a detached subagent (solve needs --repo/--ref;
                                                  --label names one dispatch within a --tag group,
                                                  surfaced on 'mocactl subagents --json' as label)
+  mocactl spawn --prompt-file FILE [...]         read the prompt from FILE (UTF-8, trimmed); use when
+                                                 the prompt would otherwise be awkward on argv
   mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]
                                                  run the subagent on a workload's context
                                                  (--writable: its own copy, discarded after)
@@ -100,6 +108,8 @@ export async function main(
     readStdin?: () => Promise<string>;
     /** All of stdin, byte for byte (at least `limit` bytes when given): `sbx put`'s content. */
     readStdinBytes?: (limit?: number) => Promise<Buffer>;
+    /** `login`'s clipboard and browser; absent when nobody is at this machine's screen. */
+    loginHelpers?: LoginHelpers;
   } = {},
 ): Promise<number> {
   // `mocactl sbx` (SBX0) is its own command group with its own flags and its own control plane, so
@@ -110,6 +120,7 @@ export async function main(
       stdinIsTTY: deps.stdinIsTTY,
       readStdin: deps.readStdin,
       readStdinBytes: deps.readStdinBytes,
+      loginHelpers: deps.loginHelpers,
     });
   }
   let parsed;
@@ -122,6 +133,7 @@ export async function main(
         'control-plane-url': { type: 'string' },
         'harness-url': { type: 'string' },
         session: { type: 'string' },
+        'test-user': { type: 'string' },
         new: { type: 'boolean' },
         option: { type: 'string', multiple: true },
         json: { type: 'boolean' },
@@ -131,6 +143,7 @@ export async function main(
         endpoint: { type: 'string' },
         config: { type: 'string' },
         all: { type: 'boolean' },
+        'no-browser': { type: 'boolean' },
         setup: { type: 'boolean' },
         'no-animation': { type: 'boolean' },
         'dry-run': { type: 'boolean' },
@@ -145,6 +158,7 @@ export async function main(
         name: { type: 'string' },
         sandboxes: { type: 'string' },
         mount: { type: 'string' },
+        'prompt-file': { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'V' },
       },
@@ -190,6 +204,14 @@ export async function main(
     io.err(`--all only applies to \`mocactl logout\`\n${USAGE}`);
     return 2;
   }
+  if (values['no-browser'] !== undefined && command !== 'login') {
+    io.err(`--no-browser only applies to \`mocactl login\`\n${USAGE}`);
+    return 2;
+  }
+  if (values['test-user'] !== undefined && command !== 'login') {
+    io.err(`--test-user only applies to \`mocactl login\`\n${USAGE}`);
+    return 2;
+  }
   if ((values.repo !== undefined || values.ref !== undefined) && command !== 'spawn') {
     io.err(`--repo and --ref only apply to \`mocactl spawn\`\n${USAGE}`);
     return 2;
@@ -212,6 +234,10 @@ export async function main(
   }
   if (values.writable !== undefined && command !== 'spawn') {
     io.err(`--writable only applies to \`mocactl spawn\`\n${USAGE}`);
+    return 2;
+  }
+  if (values['prompt-file'] !== undefined && command !== 'spawn') {
+    io.err(`--prompt-file only applies to \`mocactl spawn\`\n${USAGE}`);
     return 2;
   }
   if (values.writable && values.workload === undefined) {
@@ -238,8 +264,19 @@ export async function main(
     await ensureRuntimeAuth(rt);
   }
   switch (command) {
-    case 'login':
-      return cmdLogin(rt, io, deps.signal);
+    case 'login': {
+      const raw = values['test-user'];
+      // A test-user login prints no device code, so it needs neither the clipboard nor the browser.
+      if (raw === undefined) {
+        return cmdLogin(rt, io, deps.signal, values['no-browser'] ? undefined : deps.loginHelpers);
+      }
+      // Validated before any network call, so a typo costs nothing and reports as usage.
+      if (!/^[0-9]+$/.test(raw) || Number(raw) < 1) {
+        io.err(`--test-user needs a whole number from 1 (got ${JSON.stringify(raw)})\n${USAGE}`);
+        return 2;
+      }
+      return cmdLoginTestUser(rt, io, Number(raw), process.env);
+    }
     case 'logout':
       if (rest.length > 0) return usage(io);
       return cmdLogout(rt, io, { all: values.all === true });
@@ -332,10 +369,55 @@ export async function main(
       });
     }
     case 'spawn': {
-      const prompt = rest.join(' ').trim();
-      if (!prompt) {
-        io.err(`spawn needs a prompt\n${USAGE}`);
-        return 2;
+      const promptFile = values['prompt-file'];
+      let prompt: string;
+      if (promptFile !== undefined) {
+        if (rest.length > 0) {
+          io.err(`--prompt-file and an inline prompt cannot be used together\n${USAGE}`);
+          return 2;
+        }
+        // Open once, stat and read the same fd. O_NOFOLLOW refuses symlinks so a swapped
+        // path cannot redirect the read elsewhere between stat and read (CodeQL CWE-367).
+        // O_NONBLOCK keeps open() from parking on a FIFO with no writer; the isFile() check
+        // then refuses it like any other non-regular file.
+        let fd: number | undefined;
+        try {
+          fd = openSync(
+            promptFile,
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+          );
+          const st = fstatSync(fd);
+          if (!st.isFile()) {
+            io.err(`--prompt-file: ${promptFile} is not a regular file`);
+            return 2;
+          }
+          if (st.size > MAX_PROMPT_BYTES) {
+            io.err(`--prompt-file: ${promptFile} is ${st.size} bytes; max is ${MAX_PROMPT_BYTES}`);
+            return 2;
+          }
+          prompt = readFileSync(fd, 'utf8').trim();
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'ELOOP') {
+            io.err(`--prompt-file: ${promptFile} is a symlink; pass the target path`);
+          } else {
+            io.err(`--prompt-file: cannot read ${promptFile}: ${(err as Error).message}`);
+          }
+          return 2;
+        } finally {
+          // readFileSync(fd) leaves the fd open; close it on every exit path.
+          if (fd !== undefined) closeSync(fd);
+        }
+        if (!prompt) {
+          io.err(`--prompt-file: ${promptFile} has no prompt content (empty or whitespace-only)`);
+          return 2;
+        }
+      } else {
+        prompt = rest.join(' ').trim();
+        if (!prompt) {
+          io.err(`spawn needs a prompt\n${USAGE}`);
+          return 2;
+        }
       }
       const kind = values.kind;
       if (kind !== 'prompt' && kind !== 'solve') {

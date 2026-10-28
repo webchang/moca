@@ -40,8 +40,24 @@ const SANDBOX_ONLY = [
   'janitorSandboxes',
   'listSandboxes',
   'listTemplates',
+  'lookupEgressCredential',
   'mintSandboxToken',
 ];
+
+// SBX0.2b: mounted on `sandbox` only when egress is configured (RouteSpec.requiresEgress).
+const EGRESS = [
+  'GET /v1/credentials',
+  'PUT /v1/credentials/{name}',
+  'DELETE /v1/credentials/{name}',
+  'POST /v1/egress/credential',
+];
+// Egress-gated AND sandbox-only: the one route harness never mounts.
+const EGRESS_SANDBOX_ONLY = 'POST /v1/egress/credential';
+const EGRESS_CONFIG = {
+  hosts: [{ id: 'kvm', workers: ['sbx_default'], token: 'a'.repeat(64) }], // notsecret
+  ttlSeconds: 60,
+};
+const key = (r: RouteSpec) => `${r.method} ${r.path}`;
 
 const JANITOR_TOKEN = 'j'.repeat(40); // notsecret
 
@@ -84,11 +100,13 @@ describe('route profiles (SBX0 §4.1)', () => {
     );
   });
 
-  it('shares exactly the probe, discovery and login routes between the two profiles', () => {
+  it('shares exactly the probe, discovery, login and egress-gated credential routes between the two profiles', () => {
     const both = ROUTES.filter(
       (r) => r.profiles.includes('harness') && r.profiles.includes('sandbox'),
     );
-    expect(both.map((r) => `${r.method} ${r.path}`).sort()).toEqual([...SHARED].sort());
+    expect(both.map((r) => `${r.method} ${r.path}`).sort()).toEqual(
+      [...SHARED, ...EGRESS.filter((k) => k !== EGRESS_SANDBOX_ONLY)].sort(),
+    );
   });
 
   it('matches a route only under a profile that lists it', () => {
@@ -117,6 +135,35 @@ describe('route profiles (SBX0 §4.1)', () => {
     const sandboxOnly = ROUTES.filter((r) => !r.profiles.includes('harness'));
     expect(sandboxOnly.map((r) => r.operationId).sort()).toEqual(SANDBOX_ONLY);
     await expectUnknownPath(base, sandboxOnly);
+  });
+
+  it('mounts the egress routes on sandbox only when egress is configured', async () => {
+    const off = ROUTES.filter((r) => EGRESS.includes(key(r)));
+    expect(off.map(key).sort()).toEqual([...EGRESS].sort());
+    expect(
+      ROUTES.filter((r) => r.requiresEgress)
+        .map(key)
+        .sort(),
+    ).toEqual([...EGRESS].sort());
+    await expectUnknownPath(await serveWith(sandboxDeps()), off);
+    for (const r of off) {
+      expect(matchRoute(r.method, concrete(r.path), 'sandbox')).toBeNull();
+      expect(matchRoute(r.method, concrete(r.path), 'sandbox', { egress: true })?.route).toBe(r);
+      if (key(r) === EGRESS_SANDBOX_ONLY) {
+        expect(matchRoute(r.method, concrete(r.path), 'harness')).toBeNull();
+      } else {
+        expect(matchRoute(r.method, concrete(r.path), 'harness')?.route).toBe(r);
+      }
+    }
+    // with egress: reachable (matched, then refused for want of a token)
+    const base = await serveWith(sandboxDeps({ egress: EGRESS_CONFIG }));
+    for (const r of off) {
+      const res = await fetch(base + concrete(r.path), {
+        method: r.method,
+        body: r.method === 'PUT' ? '{}' : undefined,
+      });
+      expect(res.status, key(r)).toBe(401);
+    }
   });
 
   it('serves the janitor read only with the janitor bearer (SBX0 §8.3)', async () => {

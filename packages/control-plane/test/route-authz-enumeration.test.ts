@@ -133,6 +133,30 @@ describe('sandbox-scoped routes (SBX0 §5.1)', () => {
     expect(scoped.every((r) => r.path.startsWith('/v1/sandboxes/{id}'))).toBe(true);
   });
 
+  it('sets requiresEgress only on the egress routes', () => {
+    expect(
+      ROUTES.filter((r) => r.requiresEgress)
+        .map((r) => `${r.method} ${r.path}`)
+        .sort(),
+    ).toEqual([
+      'DELETE /v1/credentials/{name}',
+      'GET /v1/credentials',
+      'POST /v1/egress/credential',
+      'PUT /v1/credentials/{name}',
+    ]);
+  });
+
+  it('refuses an egress route without a resolved egress host, whoever the principal is', async () => {
+    const egress = ROUTES.filter((r) => r.auth === 'egress');
+    expect(egress.length).toBe(1);
+    for (const route of egress) {
+      const janitorCtx = ctx({ janitorAuthorized: true, body: {} });
+      for (const c of [ctx({ body: {} }), ctx({ principal: admin, body: {} }), janitorCtx]) {
+        expect(await codeOf(() => HANDLERS[route.operationId]!(c, sbx()))).toBe('unauthorized');
+      }
+    }
+  });
+
   it('refuses the janitor route without the janitor bearer', async () => {
     const janitor = ROUTES.filter((r) => r.auth === 'janitor');
     expect(janitor.length).toBe(1);

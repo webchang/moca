@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import { buildHandler, startControlPlane } from '../src/server.js';
+import { TestUserProvider } from '../src/identity.js';
 import { makeDeps, seedCredential, type TestDeps } from './helpers/deps.js';
 
 let server: ReturnType<typeof startControlPlane>;
@@ -380,5 +381,52 @@ describe('startControlPlane host', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('a feature-gated route is UNROUTED when its feature is off (ADR-0045)', () => {
+  // The claim in README/ADR/openapi is that the test-login path is indistinguishable from an
+  // unrouted one. A route that is merely mounted-and-404ing is not: server.ts validates the body
+  // BEFORE the handler, so an empty body would answer `400 invalid_json` and reveal the route.
+  // These go through a real server, because the ordering is the server's, not the handler's.
+  const paths = ['/v1/auth/test-token', '/v1/no/such/path'];
+
+  it('answers 404 not_found for an empty body, malformed JSON and a valid body alike', async () => {
+    for (const path of paths) {
+      const empty = await request('POST', path);
+      expect([path, empty.status, empty.json()]).toEqual([path, 404, { error: 'not_found' }]);
+
+      const malformed = await request('POST', path, { rawBody: '{ not json' });
+      expect([path, malformed.status, malformed.json()]).toEqual([
+        path,
+        404,
+        { error: 'not_found' },
+      ]);
+
+      const valid = await request('POST', path, { body: { index: 1, secret: 'x' } }); // notsecret
+      expect([path, valid.status, valid.json()]).toEqual([path, 404, { error: 'not_found' }]);
+    }
+  });
+
+  it('mounts the route once test users are configured', async () => {
+    const secret = 'server-test-secret-0123456789'; // notsecret
+    server.close();
+    d = makeDeps({
+      config: { exchangeToken: 'shared-abc', testUsers: 2 }, // notsecret
+      testUsers: new TestUserProvider({ count: 2, secret }),
+    });
+    await seedCredential(d);
+    server = startControlPlane(d, 0);
+    await new Promise<void>((r) => server.once('listening', () => r()));
+    base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    // Now mounted, so the body IS validated -- an empty one is a 400, not a 404.
+    const empty = await request('POST', '/v1/auth/test-token');
+    expect(empty.status).toBe(400);
+    // ...and a real login works.
+    const ok = await request('POST', '/v1/auth/test-token', { body: { index: 2, secret } });
+    expect([ok.status, (ok.json() as { subject: string }).subject]).toEqual([200, 'test:2']);
+    // An unrouted path is still 404, so the two cases stay distinguishable in the right direction.
+    expect((await request('POST', '/v1/no/such/path')).status).toBe(404);
   });
 });

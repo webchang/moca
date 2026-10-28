@@ -18,6 +18,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { randomFillSync } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -97,6 +98,19 @@ const pushed = async (r: string, o: Parameters<typeof localWorkspace>[0] = {}) =
   await pushTree(w.exec, await planPush(r));
   return w;
 };
+
+/**
+ * Random bytes, which gzip cannot shrink -- the point being that a chunk stays at its uncompressed
+ * size, so the splitter has to split.
+ *
+ * `randomFillSync` into a pre-allocated Buffer, NOT
+ * `Buffer.from(Array.from({ length: n }, () => Math.floor(Math.random() * 256)))`: the array form
+ * builds an n-element JS array before the Buffer, which for the ~27 MiB this file generates costs
+ * about a second of CPU and a 27-million-element allocation, against ~3 ms here. A secondary
+ * saving -- the bulk of this test's time was a `toEqual` on two 12 MiB buffers, see below -- but
+ * worth having on the one test in this package carrying a 120 s timeout.
+ */
+const incompressible = (n: number): Buffer => randomFillSync(Buffer.allocUnsafe(n));
 
 describe('the push list (SBX0 §6.2)', () => {
   it('lists tracked files (even under an ignored dir) and untracked ones, never ignored ones or secrets', async () => {
@@ -226,16 +240,10 @@ describe('the push list (SBX0 §6.2)', () => {
   it('splits a large tree into several Execs, each under the stdin ceiling', async () => {
     const r = repo();
     for (let i = 0; i < 3; i++) {
-      writeFileSync(
-        join(r, `blob${i}.bin`),
-        Buffer.from(Array.from({ length: 5 << 20 }, () => Math.floor(Math.random() * 256))),
-      );
+      writeFileSync(join(r, `blob${i}.bin`), incompressible(5 << 20));
     }
     // One file just under the per-file limit, incompressible: its chunk is the largest possible.
-    writeFileSync(
-      join(r, 'big.bin'),
-      Buffer.from(Array.from({ length: MAX_FILE - 4096 }, () => Math.floor(Math.random() * 256))),
-    );
+    writeFileSync(join(r, 'big.bin'), incompressible(MAX_FILE - 4096));
     const plan = await planPush(r);
     expect(plan.chunks.length).toBeGreaterThan(2);
     for (const c of plan.chunks) expect(c.length).toBeLessThanOrEqual(MAX_STDIN);
@@ -246,7 +254,14 @@ describe('the push list (SBX0 §6.2)', () => {
     );
     for (const s of sent) expect(s.stdin?.length ?? 0).toBeLessThanOrEqual(MAX_STDIN_BYTES);
     expect(statSync(join(ws, 'blob2.bin')).size).toBe(5 << 20);
-    expect(readFileSync(join(ws, 'big.bin'))).toEqual(readFileSync(join(r, 'big.bin')));
+    // `Buffer.equals`, not `toEqual`: both assert byte-for-byte identity, but toEqual walks the
+    // two ~12 MiB buffers as structures, element by element, which measured 18.7 s against 0 ms
+    // here -- on its own more than enough to blow a CI budget. The `.length` check first so a
+    // failure still says something useful, since `equals` collapses to a bare true/false.
+    const pushed = readFileSync(join(ws, 'big.bin'));
+    const original = readFileSync(join(r, 'big.bin'));
+    expect(pushed.length).toBe(original.length);
+    expect(pushed.equals(original)).toBe(true);
     expect(await hasUnpulled(exec)).toBe(false);
   }, 120_000);
 });

@@ -104,3 +104,9 @@ git commit -s -m "feat: description"
 Use `Assisted-By` (not `Co-Authored-By`) for AI attribution:
 
     Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>
+
+Never add `Co-authored-by`, `Made-with`, or similar trailers that GitHub parses as
+co-authorship. A `commit-msg` hook in `scripts/hooks/commit-msg` enforces this
+automatically (it rewrites AI co-author trailers to `Assisted-By`); the standard
+`pre-commit install` sets it up via `default_install_hook_types` in
+`.pre-commit-config.yaml`.

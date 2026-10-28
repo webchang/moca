@@ -284,6 +284,9 @@ export class OwnershipIndex {
     /** The sandbox a decision is about (SBX0 §5). */
     sandboxId?: string;
     credential?: string;
+    /** The host an egress lookup asked for (SBX0.2b), and the egress host that asked. */
+    destination?: string;
+    egressHost?: string;
     configRef?: string;
     bytes?: number;
     decision: string;
@@ -304,6 +307,8 @@ export class OwnershipIndex {
           ...(entry.sandboxId ? { sandboxId: entry.sandboxId } : {}),
           // The credential NAME, never its value (spec §7.2).
           ...(entry.credential ? { credential: entry.credential } : {}),
+          ...(entry.destination ? { destination: entry.destination } : {}),
+          ...(entry.egressHost ? { egressHost: entry.egressHost } : {}),
           ...(entry.configRef ? { configRef: entry.configRef } : {}),
           ...(entry.bytes !== undefined ? { bytes: String(entry.bytes) } : {}),
           ...(entry.reason ? { reason: entry.reason } : {}),

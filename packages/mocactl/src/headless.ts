@@ -25,6 +25,7 @@ import {
   resolveSessionOptions,
 } from './core/session-options.js';
 import { workspaceResetText } from './render/blocks.js';
+import { openableUrl, type OsDeps } from './os.js';
 import { ensureRuntimeAuth, sessionManager, setAuth, type Runtime } from './runtime.js';
 
 export interface Io {
@@ -53,16 +54,66 @@ function missing(rt: Runtime, io: Io, need: Array<keyof typeof MISSING>): boolea
   return absent.length > 0;
 }
 
+/** What a device login at this machine's own screen uses: the clipboard and the browser. */
+export type LoginHelpers = Pick<OsDeps, 'copy' | 'openUrl'>;
+
+/** How long the clipboard may take before the browser opens anyway (a helper can hang, not fail). */
+export const COPY_TIMEOUT_MS = 1000;
+
+/**
+ * The shape of a device user code (GitHub's is `WDJB-MJHT`). The code comes from the server, and
+ * anything else is not put on the clipboard: a hostile control plane could otherwise plant text
+ * with newlines there for the user to paste into a shell.
+ */
+const USER_CODE = /^[A-Z0-9-]{4,16}$/;
+
 /**
  * The device flow's prompt, on stderr: where to go and the code to enter, sanitized (both come from
  * the server). Shared by `mocactl login` and `mocactl sbx login`.
+ *
+ * With `helpers` (a terminal on this machine, no --no-browser) the code is also copied to the
+ * clipboard and then the page is opened, so the user only pastes and approves. GitHub's device
+ * flow has no verification_uri_complete, so the code cannot ride in the URL. A clipboard that
+ * fails, hangs past COPY_TIMEOUT_MS, or is handed an odd-shaped code is not an error: the
+ * browser still opens and the printed code still works.
  */
-export function devicePrompt(io: Io): (s: DeviceStart, attempt: number) => void {
-  return (s, attempt) =>
+export function devicePrompt(
+  io: Io,
+  helpers?: LoginHelpers,
+): (s: DeviceStart, attempt: number) => void {
+  return (s, attempt) => {
     io.err(
       `${attempt > 1 ? 'That code expired. ' : ''}Open ${sanitizeRemote(s.verificationUri)} ` +
         `and enter the code ${sanitizeRemote(s.userCode)} (valid for ${codeValidity(s.expiresIn)})`,
     );
+    if (!helpers) return;
+    let timer: NodeJS.Timeout | undefined;
+    const copied = USER_CODE.test(s.userCode)
+      ? Promise.race([
+          helpers.copy(s.userCode).then(() => true),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), COPY_TIMEOUT_MS);
+            timer.unref();
+          }),
+        ])
+      : Promise.resolve(false);
+    void copied
+      .catch(() => false)
+      .then((ok) => {
+        clearTimeout(timer);
+        // openUrl opens only http(s) and is silent otherwise: say nothing about a browser then.
+        const opens = openableUrl(s.verificationUri) !== undefined;
+        const copiedLine = ok ? 'The code is copied to the clipboard' : undefined;
+        if (!opens) {
+          if (copiedLine) io.err(`${copiedLine}.`);
+          return;
+        }
+        io.err(copiedLine ? `${copiedLine}; opening the browser…` : 'Opening the browser…');
+        // openUrl restricts to http/https, so it gets the raw value; the sanitized form is for display.
+        helpers.openUrl(s.verificationUri);
+      })
+      .catch(() => undefined);
+  };
 }
 
 /**
@@ -83,12 +134,65 @@ export function deviceLoginEnd(
   return undefined;
 }
 
-export async function cmdLogin(rt: Runtime, io: Io, signal?: AbortSignal): Promise<number> {
+/**
+ * `mocactl login --test-user N` (ADR-0045). The secret comes from MOCA_TEST_USER_SECRET in the
+ * environment, never a flag: a flag would put it in the shell history and in every `ps` listing of
+ * the machine running the test.
+ */
+export async function cmdLoginTestUser(
+  rt: Runtime,
+  io: Io,
+  index: number,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp) return 2;
+  const secret = env.MOCA_TEST_USER_SECRET ?? '';
+  if (secret === '') {
+    io.err(
+      'login failed: --test-user needs the shared secret in MOCA_TEST_USER_SECRET ' +
+        "(the control plane's SH_TEST_USER_SECRET)",
+    );
+    return 2;
+  }
+  try {
+    const login = await rt.cp.testUserToken(index, secret);
+    // The SAME store a device login writes, so renewal and every later command behave identically.
+    setAuth(rt, toCachedAuth(login, rt.endpoints.controlPlaneUrl!));
+    io.err(`logged in as ${login.displayName ?? login.subject} (${login.subject})`);
+    return 0;
+  } catch (err) {
+    // The two misconfigurations worth naming, in the style identity.ts uses for the device flow:
+    // say the fix, and name only settings.
+    if (err instanceof ApiError && err.status === 404) {
+      io.err(
+        'login failed: this control plane has no test users ' +
+          '(set SH_TEST_USERS on the control plane to enable them)',
+      );
+      return 1;
+    }
+    if (err instanceof ApiError && err.code === 'unauthorized') {
+      io.err(
+        'login failed: the test-user secret was refused ' +
+          "(MOCA_TEST_USER_SECRET must match the control plane's SH_TEST_USER_SECRET)",
+      );
+      return 1;
+    }
+    io.err(`login failed: ${describeError(err)}`);
+    return 1;
+  }
+}
+
+export async function cmdLogin(
+  rt: Runtime,
+  io: Io,
+  signal?: AbortSignal,
+  helpers?: LoginHelpers,
+): Promise<number> {
   if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp) return 2;
   try {
     const login = await deviceLogin(
       { cp: rt.cp, sleep: rt.sleep, now: rt.now },
-      devicePrompt(io),
+      devicePrompt(io, helpers),
       signal,
     );
     setAuth(rt, toCachedAuth(login, rt.endpoints.controlPlaneUrl!));
@@ -185,12 +289,12 @@ export interface RunOptions {
   configRef?: string;
 }
 
-/** False (with the reason on stderr) unless there is a control plane and a valid login for it. */
-export function ready(
-  rt: Runtime,
-  io: Io,
-): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
-  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp || !rt.harness) return false;
+/**
+ * False (with the reason on stderr) unless there is a control plane and a valid login for it. The
+ * harness is not asked about: `mocactl sbx` has a control plane of its own and no harness.
+ */
+export function readyCp(rt: Runtime, io: Io): rt is Runtime & Required<Pick<Runtime, 'cp'>> {
+  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp) return false;
   if (!apiTokenValid(rt.auth, rt.now())) {
     io.err(
       rt.auth?.refreshToken
@@ -200,6 +304,15 @@ export function ready(
     return false;
   }
   return true;
+}
+
+/** `readyCp`, and a harness too. */
+export function ready(
+  rt: Runtime,
+  io: Io,
+): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
+  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp || !rt.harness) return false;
+  return readyCp(rt, io);
 }
 
 export async function cmdPromote(
@@ -438,6 +551,20 @@ export interface ManageOptions {
   signal?: AbortSignal;
 }
 
+/** What the credential commands need ready: `mocactl sbx` has a control plane and no harness. */
+export interface CredentialReadiness {
+  readiness?: 'cp' | 'harness';
+  /** The exit code for a failed request, when the caller words failures itself (default: `failed`). */
+  onError?: (err: unknown) => number;
+}
+
+const credentialsReady = (
+  rt: Runtime,
+  io: Io,
+  o: CredentialReadiness,
+): rt is Runtime & Required<Pick<Runtime, 'cp'>> =>
+  o.readiness === 'cp' ? readyCp(rt, io) : ready(rt, io);
+
 export async function cmdSessions(rt: Runtime, io: Io, opts: ManageOptions): Promise<number> {
   if (!ready(rt, io)) return 2;
   let sessions: SessionSummary[];
@@ -500,8 +627,12 @@ export async function cmdSessionDelete(
   return 0;
 }
 
-export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): Promise<number> {
-  if (!ready(rt, io)) return 2;
+export async function cmdCredentials(
+  rt: Runtime,
+  io: Io,
+  opts: ManageOptions & CredentialReadiness,
+): Promise<number> {
+  if (!credentialsReady(rt, io, opts)) return 2;
   let rows;
   try {
     rows = (await cancellable(rt.cp.listCredentials(), opts.signal)).map((c) => ({
@@ -512,7 +643,7 @@ export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): 
       endpoint: c.endpoint ?? null,
     }));
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   if (opts.json) {
     io.out(JSON.stringify({ credentials: rows }) + '\n');
@@ -530,7 +661,7 @@ export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): 
   return 0;
 }
 
-export interface CredentialAddOptions extends ManageOptions {
+export interface CredentialAddOptions extends ManageOptions, CredentialReadiness {
   name: string;
   kind: string;
   consumer: CredentialConsumer;
@@ -546,7 +677,7 @@ export async function cmdCredentialAdd(
   io: Io,
   opts: CredentialAddOptions,
 ): Promise<number> {
-  if (!ready(rt, io)) return 2;
+  if (!credentialsReady(rt, io, opts)) return 2;
   const values = {
     name: opts.name,
     kind: opts.kind,
@@ -576,7 +707,7 @@ export async function cmdCredentialAdd(
   try {
     text = await cancellable(opts.readStdin(), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   const read = secretFromStdin(opts.kind, text);
   if ('problem' in read) {
@@ -592,7 +723,7 @@ export async function cmdCredentialAdd(
   try {
     await cancellable(rt.cp.putCredential(name, req), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   io.err(`stored credential ${sanitizeRemote(name)}`);
   if (opts.json) io.out(JSON.stringify({ name, status: 'stored' }) + '\n');
@@ -602,9 +733,9 @@ export async function cmdCredentialAdd(
 export async function cmdCredentialDelete(
   rt: Runtime,
   io: Io,
-  opts: ManageOptions & { name: string },
+  opts: ManageOptions & CredentialReadiness & { name: string },
 ): Promise<number> {
-  if (!ready(rt, io)) return 2;
+  if (!credentialsReady(rt, io, opts)) return 2;
   const name = sanitizeRemote(opts.name);
   try {
     // The server answers 204 for a name that never existed (no existence oracle), but the owner
@@ -616,7 +747,7 @@ export async function cmdCredentialDelete(
     }
     await cancellable(rt.cp.deleteCredential(opts.name), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   io.err(`deleted credential ${name}`);
   if (opts.json) io.out(JSON.stringify({ name: opts.name, status: 'deleted' }) + '\n');

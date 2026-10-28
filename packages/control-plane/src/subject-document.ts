@@ -79,7 +79,7 @@ function parseEntry(name: string, entry: unknown): Entry | null {
     typeof d.consumer !== 'string' ||
     !isRecord(d.destination) ||
     !Array.isArray(d.destination.hosts) ||
-    !isRecord(d.binding)
+    !(isRecord(d.binding) || Array.isArray(d.binding))
   ) {
     return null;
   }

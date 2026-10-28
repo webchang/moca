@@ -40,6 +40,11 @@ export function fakeControlPlane(
       expiresIn: 900,
     }),
     pollDeviceAuth: async () => 'pending',
+    // Default: a control plane with no test users configured, which is the 404 the real one
+    // returns. A test that wants a success overrides it.
+    testUserToken: async () => {
+      throw new ApiError('control-plane', 404, 'not_found');
+    },
     refreshAuth: async () => {
       throw new ApiError('control-plane', 400, 'invalid_grant');
     },

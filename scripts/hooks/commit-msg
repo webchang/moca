@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+TEMP_FILE=$(mktemp)
+
+# One pattern for both the detection and the strip, so they cannot drift apart.
+AI_TRAILER_PATTERN='^Co-authored-by:.*(Claude|Cursor|anthropic)'
+
+# Check if any AI co-author trailers exist before stripping
+HAS_AI_TRAILER=false
+if grep -qi -E "$AI_TRAILER_PATTERN" "$COMMIT_MSG_FILE"; then
+  HAS_AI_TRAILER=true
+fi
+
+# Strip Co-authored-by lines for Claude/Cursor and Made-with lines
+grep -vi -E "$AI_TRAILER_PATTERN" "$COMMIT_MSG_FILE" \
+  | grep -vi '^Made-with:' \
+  > "$TEMP_FILE" || true
+
+# If AI trailers were present, add Assisted-By instead. interpret-trailers
+# inserts into the trailer block -- above the scissors line of a `commit -v`
+# message, deduped against an existing Assisted-By via --if-exists doNothing,
+# as a single trailer block. No manual blank-line handling needed.
+if [ "$HAS_AI_TRAILER" = true ]; then
+  git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>" \
+    "$TEMP_FILE"
+fi
+
+cat "$TEMP_FILE" > "$COMMIT_MSG_FILE"
+rm -f "$TEMP_FILE"

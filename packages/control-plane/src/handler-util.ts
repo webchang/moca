@@ -1,6 +1,9 @@
 import type { AuditLog } from './audit-log.js';
 import { defaultAuditLog } from './audit-log.js';
 import type { OwnershipIndex } from './ownership.js';
+import { CpError } from './errors.js';
+import { isEnrolled, notEnrolled } from './sandbox-config.js';
+import type { CpConfig } from './handlers.js';
 import type { TokenClaims } from './token.js';
 
 /**
@@ -58,4 +61,15 @@ export async function auditBestEffort(
         `${(err as Error).message} -- the write itself SUCCEEDED`,
     );
   }
+}
+
+/** Spec §4.2: the allow list (plus admins) gates the sandbox profile's routes; returns the principal. */
+export function requireEnrolledPrincipal(
+  ctx: { principal?: TokenClaims },
+  config: CpConfig,
+): TokenClaims {
+  const p = ctx.principal;
+  if (!p) throw new CpError('token_required', 'this route requires a token');
+  if (!isEnrolled(p.sub, p.roles ?? [], config)) throw notEnrolled(p.sub);
+  return p;
 }

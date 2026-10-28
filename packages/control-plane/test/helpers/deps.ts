@@ -50,6 +50,7 @@ export function makeDeps(
     refreshReuseGraceSeconds: 30,
     allowOperatorFallback: false,
     injectorConfigured: false,
+    testUsers: 0,
     sandboxNamespace: 'default',
     sandboxTiers: null,
     bundleSubjectBytes: 16 * 1024 * 1024,

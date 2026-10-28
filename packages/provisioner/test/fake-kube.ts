@@ -3,7 +3,8 @@ import type { Kind, KubeApi, KubeObject } from '../src/kube.js';
 /**
  * An in-memory namespace with the API's observable rules: create of an existing name is a
  * conflict, delete of a missing one is "already gone", a JSON merge patch merges, and a selector is
- * `k=v[,k=v]`. Deleting a StatefulSet leaves its pods until `reapPods()`, as the garbage
+ * `k=v[,k=v]`. A created object is stamped with `creationTimestamp` from `clock`, and a replace
+ * keeps it. Deleting a StatefulSet leaves its pods until `reapPods()`, as the garbage
  * collector does. Reading a Secret is forbidden, as the provisioner's Role makes it. Every call
  * yields first, so concurrent callers interleave as they would against a real API server.
  */
@@ -17,6 +18,8 @@ export class FakeKube implements KubeApi {
     persistentvolumeclaims: new Map(),
   };
   calls: string[] = [];
+  /** The API server's clock, in ms: what a created object's creationTimestamp is stamped from. */
+  clock: () => number = () => Date.now();
   private rv = 1;
 
   private clone<T>(o: T): T {
@@ -48,6 +51,7 @@ export class FakeKube implements KubeApi {
     if (this.objects[kind].has(obj.metadata.name)) return false;
     const stored = this.clone(obj);
     stored.metadata.resourceVersion = String(this.rv++);
+    stored.metadata.creationTimestamp = new Date(this.clock()).toISOString();
     this.objects[kind].set(obj.metadata.name, stored);
     return true;
   }
@@ -58,6 +62,7 @@ export class FakeKube implements KubeApi {
     if (!cur) throw new Error(`replace of missing ${kind} ${obj.metadata.name}`);
     const stored = this.clone(obj);
     stored.metadata.resourceVersion = String(this.rv++);
+    stored.metadata.creationTimestamp = cur.metadata.creationTimestamp;
     this.objects[kind].set(obj.metadata.name, stored);
   }
 

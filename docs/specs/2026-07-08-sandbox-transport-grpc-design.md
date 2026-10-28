@@ -408,6 +408,44 @@ The frame _semantics_ are carried from the superseded design verbatim — only t
   seam a second truncation concept for bytes it does not return would buy nothing, and the Go
   worker logs the event instead.
 
+- **Fast-tier availability, declared per transport (#245).** `extension.ts` runs **two**
+  tiers — a fast one for the small request/response file ops (`read`/`write`/`edit`/`ls`/
+  `find`) and a stream one for `bash`/`grep` — because file ops are the highest-frequency
+  tool calls. Whether a burst of N of them costs **one reused shell or N round trips** was
+  for a while a property of the seam that the seam did not state, and the cost of that
+  silence was concrete: `opts.transport` overrode **both** tiers, and `run-leaf.ts` passes
+  exactly that for a leased relay sandbox, so on the gRPC path the fast tier did not exist
+  and every file op became a full `Exec` ending in a fresh `bash -c`. No caller above the
+  seam could see that, let alone choose it.
+
+  So `SandboxTransport.fastTier` is a required field, in the same discipline as
+  `producerStop` above: every implementation makes a **positive claim**, and a `FastTier` is
+  a claim about **cost**, not correctness.
+
+  | Transport             | Fast tier            | Why                                               |
+  | --------------------- | -------------------- | ------------------------------------------------- |
+  | `persistentExecInPod` | `persistent-channel` | one long-lived nonce-framed `bash` serves the ops |
+  | `KubectlTransport`    | `per-call-exec`      | one `kubectl exec` and one `bash -c` per op       |
+  | `GrpcRelayTransport`  | `per-call-exec`      | `rpc Exec` is one command per RPC                 |
+
+  The battery cannot **measure** this from one exec — it is a claim about the cost of N ops,
+  and a scripted fake's process count is the factory's fiction — so the cost itself is proved
+  per implementation (`persistent-exec.test.ts` counts spawns) and the battery pins that the
+  value a **caller reads** is the value the transport **claims**. It asserts that twice: on
+  the raw transport, and through the `CapacityLatch` wrapper, which is the object a harness
+  turn actually reads the tier off and which therefore must forward rather than answer for
+  what it wraps. Enrolment itself is pinned too (`fast-tier-coverage.test.ts`): a required
+  field stops a fourth transport **omitting** the claim, but not from declaring one and never
+  being held to the battery — type-correct and unasserted, which is the state this divergence
+  was already in.
+
+  The relay path keeps the both-tiers shorthand deliberately. Splitting the tiers at
+  `run-leaf.ts` would let the fast tier fall through to its default, `persistentExecInPod`,
+  which spawns a **local** `kubectl exec` — and a leased pool sandbox is reached over the
+  relay (ADR-0024), so there is no kubectl path to it and no pod to exec into. Closing the
+  gap needs a long-lived shell **on the wire**, not a flag at the call site; what changed is
+  that the fact is now readable rather than implicit.
+
 - **Message-size ceiling, and why it is derived rather than chosen.** gRPC defaults every
   receive limit to 4 MiB on both implementations (grpc-js
   `DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH`, grpc-go `defaultClient/ServerMaxReceiveMessageSize`);
@@ -497,7 +535,7 @@ shared-pool model.
 | ----------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | Pure unit   | Frame reassembly, dedup cache, output-cap counter, timeout math, transport selection               | Plain vitest / Go test, no I/O.                                                                                                         |
 | Contract    | `GrpcRelayTransport` + Go worker against a real relay, worker pointed at a local bash              | Round-trip every op (read/write/bash/grep), abort mid-stream, timeout, reconnect→dedup, output-cap. Core suite.                         |
-| Conformance | The _same_ battery run against **both** `KubectlTransport` and `GrpcRelayTransport`                | One shared spec proving identical `SandboxTransport` contract — this is what makes them safely swappable (driver #2).                   |
+| Conformance | The _same_ battery run against **all three** transports, plus a test pinning that enrolment        | One shared spec proving identical `SandboxTransport` contract — this is what makes them safely swappable (driver #2).                   |
 | Live gate   | Real Go worker pod dialing the in-cluster relay over `:443`; one leaf end-to-end on Kind, then OCP | Follows the existing leaf-smoke pattern; manifest-shape vitest parses the relay + worker Deployment YAML directly (no kustomize in CI). |
 
 ## 12. Why this supersedes the Redis-Streams design

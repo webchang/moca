@@ -70,6 +70,13 @@ export const CLAUDE_DENY: readonly string[] = Object.freeze([
   // here; `sbx doctor` fails a Claude Code older than CLAUDE_MIN_VERSION instead.
 ]);
 /**
+ * The names `CLAUDE_DENY` held until #572: the pre-2.0 tools. A repository configured before they
+ * were dropped still lists all three, and each one costs a warning at every Claude Code start, so
+ * `sbx up` takes back the ones it added itself (#574). They are not denies to add, only denies to
+ * recognise, which is why they are a list of their own rather than a comment.
+ */
+export const CLAUDE_RETIRED: readonly string[] = Object.freeze(['MultiEdit', 'LS', 'NotebookRead']);
+/**
  * The oldest Claude Code CLAUDE_DENY covers: older ones also have `MultiEdit`, `LS` and
  * `NotebookRead`. The unknown-name warning came in 2.1.166, and every name in the list is a
  * known tool there and since (2.1.304 checked: no warning, `PowerShell` included on macOS).
@@ -109,7 +116,15 @@ export const MARK_END = '<!-- sbx:end -->';
  * heading. Claude Code does not load this CLAUDE.md (the `Read` deny covers it), so what steers it
  * is the server's instructions; the block is the same text, for people and for OpenCode (#568).
  */
-export const RULES = ['## Working in the MOCA sandbox', '', MCP_INSTRUCTIONS].join('\n');
+export const GH_TOKEN_STEERING =
+  "GH_TOKEN in the sandbox is a placeholder that the host replaces with the user's token; never set, print or ask for a token.";
+export const RULES = [
+  '## Working in the MOCA sandbox',
+  '',
+  MCP_INSTRUCTIONS,
+  '',
+  GH_TOKEN_STEERING,
+].join('\n');
 
 /** The server name in every file: Claude Code's tools are then `mcp__sandbox__*`. */
 export const SERVER = 'sandbox';
@@ -169,6 +184,12 @@ type MdRec =
   | { file: string; mode: 'replaced'; previous: string };
 interface Manifest {
   version: 1;
+  /**
+   * The repository is in Cortex mode (`sbx up --cortex`): Cortex's moca-sandbox script keeps the
+   * agent off local tools, so Claude Code's local tools are not denied and its CLAUDE.md loads.
+   * Absent in a record written before the mode existed, which is not in Cortex mode.
+   */
+  cortex?: true;
   /** Files `sbx up` created: deleted when nothing but its own content is left. */
   files: string[];
   /** Directories it created (`.claude`): removed when empty. */
@@ -585,6 +606,47 @@ function addItems(doc: Doc, path: JsonPath, values: unknown[], recs: JsonRec[]):
   for (const v of values) recs.push({ file: doc.rel, op: 'item', path, value: v });
 }
 
+/**
+ * Takes back the `permissions.deny` items an earlier `up` recorded whose value `wanted` picks, and
+ * returns their records so the merged record drops them. One the developer wrote is not recorded,
+ * so it is never touched; one already gone by hand loses its record and nothing else.
+ *
+ * `soft` keeps a refused removal from failing the run: a `dropAt` guard refuses when taking the
+ * member out would change text around it, and for a take-back that is a tidy-up rather than a
+ * correctness fix (#574) the entry and its record are better left alone than the whole `up` failed.
+ */
+function dropDenies(
+  doc: Doc,
+  prev: Manifest | undefined,
+  wanted: (value: unknown) => boolean,
+  soft = false,
+): JsonRec[] {
+  const dropped = (prev?.json ?? []).filter(
+    (r) =>
+      r.op === 'item' &&
+      r.file === doc.rel &&
+      same(r.path, ['permissions', 'deny']) &&
+      wanted(r.value),
+  );
+  for (const r of [...dropped]) {
+    const arr = at(doc.data, r.path);
+    if (!Array.isArray(arr)) continue;
+    let i = arr.length - 1;
+    while (i >= 0 && !same(arr[i], (r as { value: unknown }).value)) i--;
+    if (i < 0) continue; // gone by hand: only its record is left to drop
+    const was = { text: doc.text, data: doc.data };
+    try {
+      dropAt(doc, [...r.path, i], prev!.json);
+    } catch (err) {
+      if (!soft || !(err instanceof ConfigConflict)) throw err;
+      doc.text = was.text;
+      doc.data = was.data;
+      dropped.splice(dropped.indexOf(r), 1);
+    }
+  }
+  return dropped;
+}
+
 /** The doc's new text: a file created here ends with a newline. */
 function finalText(doc: Doc): string {
   if (!doc.exists && !doc.text.endsWith(doc.style.eol)) return doc.text + doc.style.eol;
@@ -855,6 +917,7 @@ function manifestProblem(m: Json, ok: { json: string[]; md: string[] }): string 
   };
   const mi = (m.markdown as unknown[]).findIndex((r) => !mdOk(r));
   if (mi >= 0) return at('markdown', mi);
+  if (m.cortex !== undefined && m.cortex !== true) return 'has a malformed cortex entry';
   return undefined;
 }
 
@@ -880,7 +943,10 @@ const uniq = <T>(xs: T[]): T[] => {
  * nothing anywhere. `dryRun` checks and reports what would change, writing nothing: `sbx up` runs
  * it before it creates or pushes anything.
  */
-export function writeAgentConfig(root: string, o: { dryRun?: boolean } = {}): AgentConfigResult {
+export function writeAgentConfig(
+  root: string,
+  o: { dryRun?: boolean; cortex?: boolean } = {},
+): AgentConfigResult {
   const sbxBad = sbxDirProblem(root);
   if (sbxBad) throw new ConfigConflict('.sbx', '.sbx', sbxBad, SBX_DIR_HINT);
   const recs: JsonRec[] = [];
@@ -891,6 +957,8 @@ export function writeAgentConfig(root: string, o: { dryRun?: boolean } = {}): Ag
   // written over, or what it lists could no longer be taken back.
   const { m: prev, bad } = loadManifest(root);
   if (bad) throw new ConfigConflict(MANIFEST, MANIFEST, bad, BAD_RECORD_HINT);
+  // Cortex mode sticks: once a repository is in it, a plain `up` keeps it (spec §3 step 4).
+  const cortex = o.cortex === true || prev?.cortex === true;
   const mcp = loadDoc(root, MCP_JSON, false);
   const settings = loadDoc(root, SETTINGS, false);
   const oc = loadDoc(root, opencodeFile(root), true);
@@ -973,12 +1041,35 @@ export function writeAgentConfig(root: string, o: { dryRun?: boolean } = {}): Ag
     allow.includes(CLAUDE_ALLOW) ? [] : [CLAUDE_ALLOW],
     recs,
   );
-  addItems(
-    settings,
-    ['permissions', 'deny'],
-    CLAUDE_DENY.filter((t) => !deny.includes(t)),
-    recs,
-  );
+  // In Cortex mode the local tools are not denied: Cortex blocks them, and a Read deny would stop
+  // Claude Code loading CLAUDE.md (#568). Deny items an earlier `up` added are taken back; one
+  // the developer wrote is not in the record, so it stays.
+  let dropped: JsonRec[] = [];
+  if (cortex) {
+    dropped = dropDenies(settings, prev, () => true);
+    // The list itself, when an earlier `up` created it and nothing is left in it.
+    const made = (prev?.json ?? []).find(
+      (r) =>
+        r.op === 'container' && r.file === settings.rel && same(r.path, ['permissions', 'deny']),
+    );
+    const left = at(settings.data, ['permissions', 'deny']);
+    if (made && Array.isArray(left) && left.length === 0) {
+      dropAt(settings, ['permissions', 'deny'], prev!.json);
+      dropped.push(made);
+    }
+  } else {
+    addItems(
+      settings,
+      ['permissions', 'deny'],
+      CLAUDE_DENY.filter((t) => !deny.includes(t)),
+      recs,
+    );
+    // A repository configured before #572 still lists the pre-2.0 tools, and each one costs a
+    // warning at every Claude Code start. The ones an earlier `up` added are taken back, after the
+    // additions above so the list is never emptied here; one the developer wrote is not in the
+    // record, so it stays (#574).
+    dropped = dropDenies(settings, prev, (v) => CLAUDE_RETIRED.includes(ruleTool(v)), true);
+  }
   addItems(settings, ['enabledMcpjsonServers'], enabled.includes(SERVER) ? [] : [SERVER], recs);
   if (ocHave === undefined) setKey(oc, ['mcp', SERVER], { ...OPENCODE_SERVER }, recs);
   for (const t of OPENCODE_OFF) {
@@ -1003,15 +1094,17 @@ export function writeAgentConfig(root: string, o: { dryRun?: boolean } = {}): Ag
     if (!existsSync(join(root, dir))) dirs.push(dir);
   }
   const changed = writes.map((w) => w.t.rel);
-  if (o.dryRun || !writes.length) return { changed };
+  const enteringCortex = cortex && prev?.cortex !== true;
+  if (o.dryRun || (!writes.length && !enteringCortex)) return { changed };
 
   // The record first: if a write below fails, removal still knows what may have been added.
   const mdRecs = md.flatMap((p) => (p.rec ? [p.rec] : []));
   const merged: Manifest = {
     version: 1,
+    ...(cortex ? { cortex: true as const } : {}),
     files: uniq([...(prev?.files ?? []), ...created]),
     dirs: uniq([...(prev?.dirs ?? []), ...dirs]),
-    json: uniq([...(prev?.json ?? []), ...recs]),
+    json: uniq([...(prev?.json ?? []).filter((r) => !dropped.includes(r)), ...recs]),
     // An earlier run's record of a file wins: it knows what was there before sbx touched it.
     markdown: [
       ...(prev?.markdown ?? []),
@@ -1175,6 +1268,14 @@ export function takeBackAgentConfig(root: string): TakeBack {
   return { removed: touched, warnings, recordKept: false };
 }
 
+/**
+ * Whether the repository at `root` is in Cortex mode: its record says `sbx up --cortex` set it up.
+ * A record that cannot be read is not, so its checks stay the strict ones.
+ */
+export function cortexMode(root: string): boolean {
+  return loadManifest(root).m?.cortex === true;
+}
+
 /** `takeBackAgentConfig`'s files: what was changed back. */
 export function removeAgentConfig(root: string): string[] {
   return takeBackAgentConfig(root).removed;
@@ -1189,6 +1290,7 @@ export function removeAgentConfig(root: string): string[] {
  */
 export function checkAgentConfig(root: string): string[] {
   const problems: string[] = [];
+  const cortex = cortexMode(root);
   const load = (rel: string, jsonc: boolean): Json | undefined => {
     try {
       const d = loadDoc(root, rel, jsonc, 'mocactl sbx up re-merges it once fixed');
@@ -1214,7 +1316,7 @@ export function checkAgentConfig(root: string): string[] {
   }
   const deny = at(settings, ['permissions', 'deny']);
   const denied = Array.isArray(deny) ? deny : [];
-  const missing = CLAUDE_DENY.filter((t) => !denied.includes(t));
+  const missing = cortex ? [] : CLAUDE_DENY.filter((t) => !denied.includes(t));
   if (missing.length) {
     problems.push(
       `Claude Code: local built-in tools not denied in ${SETTINGS}: ${missing.join(', ')}`,

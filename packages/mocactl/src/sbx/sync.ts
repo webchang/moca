@@ -6,9 +6,18 @@ import { sanitizeRemote } from '../core/sanitize.js';
 import {
   CLAUDE_PROMPT_PICK,
   ConfigConflict,
+  cortexMode,
   takeBackAgentConfig,
   writeAgentConfig,
 } from './agent-config.js';
+import {
+  agentopProblem,
+  CORTEX_INSTALL,
+  installMocaSandbox,
+  MOCA_SANDBOX,
+  runAgentop,
+  type AgentopExec,
+} from './agentop.js';
 import type { SbxSandbox } from './api.js';
 import { failed, SBX_EXIT, type SbxCtx } from './commands.js';
 import {
@@ -44,6 +53,11 @@ export const DEFAULT_TEMPLATE = 'default';
 
 export const UNPULLED_TEXT = 'the sandbox has changes not yet pulled';
 
+/** What `up` says in Cortex mode, every time: the blocking needs Claude Code to go through Cortex. */
+export const CORTEX_NOTE =
+  "Cortex blocks local tools in this repo's Claude Code sessions; Claude Code must reach the " +
+  'model through Cortex (agentop configure claude-code).';
+
 const mib = (n: number) => `${(n / 2 ** 20).toFixed(1)} MiB`;
 const when = (epochS: number) => new Date(epochS * 1000).toISOString();
 const say = (c: SbxCtx, s: string) => c.io.err(`sbx: ${sanitizeRemote(s)}`);
@@ -78,7 +92,7 @@ async function withExec(
 async function plan(
   c: SbxCtx,
   root: string,
-  o: { includeSecrets?: boolean; maxPush?: number },
+  o: { includeSecrets?: boolean; maxPush?: number; cwd?: string },
 ): Promise<PushPlan | number> {
   let p: PushPlan;
   try {
@@ -87,6 +101,15 @@ async function plan(
     if (!(err instanceof PushError)) throw err;
     say(c, err.message);
     return SBX_EXIT.failed;
+  }
+  // Said before anything is sent: run from a subdirectory, `up` and `push` still send the whole
+  // work tree (the sandbox belongs to the working tree, not the directory), and the file count
+  // alone does not make that obvious (#611).
+  if (o.cwd !== undefined && resolve(o.cwd) !== resolve(root)) {
+    say(
+      c,
+      `the whole work tree at ${root} (${p.files} files) is what gets pushed, not just the current directory`,
+    );
   }
   if (p.excludedSecrets.length) {
     say(
@@ -119,6 +142,13 @@ export interface PushFlags {
   force: boolean;
   includeSecrets: boolean;
   maxPush?: number;
+  /**
+   * The directory `up`/`push` was run from, when known: not a CLI flag, but the plan says when it
+   * differs from the work-tree root (#611). Both sides are `resolve`d before the comparison:
+   * `repoRoot` returns git's `--show-toplevel` verbatim, which on Windows is forward-slashed where
+   * `resolve` yields backslashes.
+   */
+  cwd?: string;
 }
 
 /** `mocactl sbx push`: refused while the sandbox holds changes not yet pulled, unless `--force`. */
@@ -203,6 +233,8 @@ export interface UpFlags extends PushFlags {
   template?: string;
   name?: string;
   noAgentConfig: boolean;
+  /** `--cortex`: Cortex's moca-sandbox script blocks local tools, so none are denied. */
+  cortex?: boolean;
   /** The id in `.sbx/sandbox.json`, if valid. */
   boundId?: string;
 }
@@ -277,6 +309,7 @@ export async function cmdUp(
   root: string,
   f: UpFlags,
   factory?: ExecFactory,
+  agentop: AgentopExec = runAgentop,
 ): Promise<number> {
   const p = await plan(c, root, f);
   if (typeof p === 'number') return p;
@@ -287,16 +320,34 @@ export async function cmdUp(
     say(c, err.message);
     return SBX_EXIT.failed;
   }
+  // Cortex mode is a choice made once (the flag) and kept (the record): a later plain `up` keeps it.
+  const cortex = !f.noAgentConfig && (f.cortex === true || cortexMode(root));
   // The agent configuration is checked now, so a conflict stops `up` with nothing created,
   // bound or pushed; it is written after the push, so the push carries the developer's tree.
   if (!f.noAgentConfig) {
     try {
-      writeAgentConfig(root, { dryRun: true });
+      writeAgentConfig(root, { dryRun: true, cortex });
     } catch (err) {
       if (!(err instanceof ConfigConflict)) throw err;
       say(c, err.message);
       return SBX_EXIT.failed;
     }
+  }
+  // Then Cortex is checked and its script installed, still with nothing created, bound or pushed: a
+  // repository in Cortex mode without the script would have nothing keeping the agent off local tools.
+  // After the dry run, because the install changes the shared Cortex (~/.cortex): a conflict must not.
+  if (cortex) {
+    const bad = await agentopProblem(agentop);
+    if (bad) {
+      say(c, `sbx up --cortex: ${bad}; install it with: ${CORTEX_INSTALL}`);
+      return SBX_EXIT.failed;
+    }
+    const got = await installMocaSandbox(agentop);
+    if (!got.ok) {
+      say(c, `Cortex could not install ${MOCA_SANDBOX}: ${got.message}`);
+      return SBX_EXIT.failed;
+    }
+    if (got.message) c.io.err(got.message);
   }
   const rid = await repoId(root);
   const found = await findOrCreate(c, rid, f);
@@ -326,7 +377,8 @@ export async function cmdUp(
   if (code !== SBX_EXIT.ok) return code;
   if (!f.noAgentConfig) {
     try {
-      const { changed } = writeAgentConfig(root);
+      const { changed } = writeAgentConfig(root, { cortex });
+      if (cortex) c.io.err(CORTEX_NOTE);
       if (changed.length) {
         c.io.err(`configured Claude Code and OpenCode: ${changed.join(', ')}`);
         // enabledMcpjsonServers does not suppress the prompt on a first session (#577), and its

@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { CpError } from './errors.js';
 
 /**
@@ -49,6 +50,148 @@ export type FetchLike = (
 
 /** The subject form the control plane mints (`github:<numeric id>`, see completeDeviceAuth). */
 export const GITHUB_SUBJECT_RE = /^github:[0-9]+$/;
+
+/** The synthetic subject form `SH_TEST_USERS` mints (`test:<1-based index>`). */
+export const TEST_SUBJECT_RE = /^test:[0-9]+$/;
+
+/**
+ * The most test users one deployment may mint. A mistyped `SH_TEST_USERS=100000` would otherwise
+ * create a six-digit subject space, each able to store credentials and own sessions.
+ */
+export const TEST_USERS_MAX = 1000;
+
+/** The shortest `SH_TEST_USER_SECRET` accepted: it is a password on a login path, not a label. */
+export const TEST_USER_SECRET_MIN_CHARS = 16;
+
+export const testSubject = (index: number): string => `test:${index}`;
+
+/**
+ * `SH_TEST_USERS`: how many synthetic logins this deployment serves; 0 (the default) disables the
+ * path entirely. Refused rather than coerced -- a silent 0 from a typo would look like "the feature
+ * is off" to an operator who had just switched it on, and a silent huge value is worse.
+ */
+export function testUsersFromEnv(raw: string | undefined): number {
+  const s = (raw ?? '').trim();
+  if (s === '') return 0;
+  if (!/^[0-9]+$/.test(s)) {
+    throw new Error(`SH_TEST_USERS must be a whole number of users (got ${JSON.stringify(s)})`);
+  }
+  const n = Number(s);
+  if (n > TEST_USERS_MAX) {
+    throw new Error(`SH_TEST_USERS must be at most ${TEST_USERS_MAX} (got ${n})`);
+  }
+  return n;
+}
+
+/**
+ * `SH_TEST_USER_SECRET`: the shared secret a client must present to get a test-user login. Required
+ * whenever test users are on, because the endpoint hands out a real login for an arbitrary subject:
+ * without it, anyone who can reach the control plane is every test user. A minimum length is
+ * enforced here -- the variable is set by the same hand that sets SH_TEST_USERS, and a two-character
+ * value would be brute-forceable long before an operator noticed.
+ */
+export function testUserSecretFromEnv(raw: string | undefined, testUsers: number): string {
+  const s = raw ?? '';
+  if (testUsers === 0) {
+    // Set-without-SH_TEST_USERS is a misconfiguration worth naming: the operator believes they
+    // enabled something they have not.
+    if (s !== '') {
+      throw new Error('SH_TEST_USER_SECRET is set but SH_TEST_USERS is not: no test users exist');
+    }
+    return '';
+  }
+  if (s === '') {
+    throw new Error(
+      'SH_TEST_USER_SECRET is required when SH_TEST_USERS is set: the test-login endpoint ' +
+        'issues a real login for any test subject, so it must be gated by a secret',
+    );
+  }
+  if (s.length < TEST_USER_SECRET_MIN_CHARS) {
+    throw new Error(
+      `SH_TEST_USER_SECRET must be at least ${TEST_USER_SECRET_MIN_CHARS} characters ` +
+        `(got ${s.length})`,
+    );
+  }
+  return s;
+}
+
+/**
+ * Constant time, so the reply's latency cannot be used to recover the secret one character at a
+ * time. `timingSafeEqual` throws on a length mismatch, which would itself be a length oracle, so
+ * both sides are hashed to a fixed width first -- the comparison is then always over 32 bytes.
+ *
+ * Hashing with SHA-256 (not HMAC) is enough here: this compares a secret against itself, so there
+ * is no message to authenticate and no key to separate.
+ */
+export function secretMatches(presented: string, expected: string): boolean {
+  if (expected === '') return false;
+  const a = createHash('sha256').update(presented, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Identity for `SH_TEST_USERS` (ADR-0045): N synthetic subjects that log in with a shared secret
+ * instead of a browser, so automation can exercise the multi-user claims.
+ *
+ * It implements the same seam as GithubOAuthProvider but refuses the device flow: a test user has
+ * no browser to approve anything. Everything AFTER identity is deliberately unchanged -- the
+ * handler issues the same refresh family and returns the same login body as a device login, so a
+ * test user is configured exactly like a GitHub user.
+ */
+export class TestUserProvider implements IdentityProvider {
+  readonly count: number;
+  private readonly secret: string;
+  private readonly adminSubjects: string[];
+
+  constructor(opts: { count: number; secret: string; adminSubjects?: string[] }) {
+    if (!Number.isInteger(opts.count) || opts.count <= 0) {
+      throw new Error('TestUserProvider needs a positive whole user count');
+    }
+    if (opts.secret.length < TEST_USER_SECRET_MIN_CHARS) {
+      throw new Error(
+        `TestUserProvider needs a secret of at least ${TEST_USER_SECRET_MIN_CHARS} characters`,
+      );
+    }
+    this.count = opts.count;
+    this.secret = opts.secret;
+    this.adminSubjects = opts.adminSubjects ?? [];
+  }
+
+  /** True when the client presented the configured secret. Constant time (see secretMatches). */
+  authenticates(presentedSecret: string): boolean {
+    return secretMatches(presentedSecret, this.secret);
+  }
+
+  /** 1-based, matching the subject form a user reads in `test:3`. */
+  has(index: number): boolean {
+    return Number.isInteger(index) && index >= 1 && index <= this.count;
+  }
+
+  principalFor(index: number): Principal {
+    if (!this.has(index)) {
+      throw new CpError('invalid_request', `index must be a whole number in 1..${this.count}`);
+    }
+    const subject = testSubject(index);
+    return {
+      subject,
+      displayName: `Test User ${index}`,
+      roles: rolesFor(subject, this.adminSubjects),
+    };
+  }
+
+  async startDeviceAuth(): Promise<DeviceStart> {
+    throw new CpError('unauthorized', 'a test user does not use the device flow');
+  }
+
+  async completeDeviceAuth(): Promise<Principal> {
+    throw new CpError('unauthorized', 'a test user does not use the device flow');
+  }
+
+  rolesFor(subject: string): string[] {
+    return rolesFor(subject, this.adminSubjects);
+  }
+}
 
 export function adminSubjectsFromEnv(raw: string | undefined): string[] {
   return (raw ?? '')

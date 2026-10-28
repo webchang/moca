@@ -21,7 +21,13 @@ import {
 } from './bundle-budget.js';
 import { type AuditLog, defaultAuditLog } from './audit-log.js';
 import { CpError } from './errors.js';
-import { asRecord, auditBestEffort, isAdmin, seconds } from './handler-util.js';
+import {
+  asRecord,
+  auditBestEffort,
+  isAdmin,
+  requireEnrolledPrincipal,
+  seconds,
+} from './handler-util.js';
 import { subjectHash } from './subject-document.js';
 import {
   resolveInferenceName,
@@ -48,7 +54,7 @@ import {
 } from './model-catalog.js';
 import type { RunKubectl } from './kubectl.js';
 import { DEFAULT_PAGE_SIZE, type OwnershipIndex, type SessionRecord } from './ownership.js';
-import type { IdentityProvider } from './identity.js';
+import type { IdentityProvider, TestUserProvider } from './identity.js';
 import type { KeyObject } from 'node:crypto';
 import { DEFAULT_ISSUER, SANDBOX_API_ISSUER, type MintInput, type TokenClaims } from './token.js';
 import { isRefreshTokenShape, type RefreshStore } from './refresh-store.js';
@@ -58,6 +64,18 @@ import type { RouteProfile } from './routes.js';
 import { isEnrolled, notEnrolled, type SandboxConfig } from './sandbox-config.js';
 import type { SandboxStore } from './sandbox-store.js';
 import { SANDBOX_HANDLERS } from './sandbox-handlers.js';
+import { EGRESS_HANDLERS } from './egress-handlers.js';
+import type { EgressHost } from './egress-config.js';
+import { formatDestination, parseDestination } from './egress-destination.js';
+
+/** A stored destination in normalized form; a legacy or corrupt entry compares as written. */
+function normalizeStored(h: string): string {
+  try {
+    return formatDestination(parseDestination(h));
+  } catch {
+    return h;
+  }
+}
 
 /** The `iss` this control plane mints API tokens under and accepts on API routes. */
 export function apiIssuer(config: Pick<CpConfig, 'routeProfile'>): string {
@@ -111,6 +129,8 @@ export interface CpConfig {
   bundleTotalBytes: number;
   /** Advertised alongside harnessUrl; null when the deployment reports none (predates MOCA_VERSION). */
   version?: string;
+  /** ADR-0045: how many `test:N` logins `SH_TEST_USERS` enabled; 0 means the path is off. */
+  testUsers: number;
   /** The sandbox profile's settings (SBX0 §4, §5); configFromEnv sets it on that profile only. */
   sandbox?: SandboxConfig;
 }
@@ -121,6 +141,8 @@ export interface CpDeps {
   /** Content-addressed config bundles (ADR-0038); the same Redis the ownership index uses. */
   bundles: BundleRedisLike & BundleBudgetRedisLike;
   identity: IdentityProvider;
+  /** ADR-0045: present only when SH_TEST_USERS > 0; its absence is what 404s the test-login route. */
+  testUsers?: TestUserProvider;
   signer: {
     kid: string;
     mint(input: MintInput): string;
@@ -175,6 +197,8 @@ export interface RequestCtx {
   exchangeAuthorized?: boolean;
   /** Set by the router for `auth: 'janitor'` routes. */
   janitorAuthorized?: boolean;
+  /** Set by the router for `auth: 'egress'` routes: the host whose token was presented. */
+  egressHost?: EgressHost;
 }
 
 export type Handler = (ctx: RequestCtx, deps: CpDeps) => Promise<{ status: number; body: unknown }>;
@@ -468,6 +492,59 @@ export const HANDLERS: Record<string, Handler> = {
       throw notEnrolled(principal.subject);
     }
     const label = asRecord(ctx.body).label;
+    const issued = await deps.refresh.issue({
+      subject: principal.subject,
+      displayName: principal.displayName,
+      label: typeof label === 'string' ? label : '',
+      nowMs: deps.now(),
+    });
+    return { status: 200, body: loginBody(deps, principal, issued) };
+  },
+
+  /**
+   * A test-user login (ADR-0045). Deliberately the same two calls as completeDeviceAuth -- issue a
+   * refresh family, return loginBody -- so a test user is indistinguishable from a GitHub user
+   * everywhere downstream: token TTLs, rotation, roles, ownership, audit, credentials.
+   *
+   * Order matters. The 404 comes first, so a deployment without test users reveals nothing; the
+   * secret check comes before the index is even looked at, so an unauthenticated caller cannot
+   * learn how many test users exist by probing indexes.
+   */
+  testUserToken: async (ctx, deps) => {
+    const provider = deps.testUsers;
+    // Belt and braces: routes.ts leaves this route UNMOUNTED when test users are off, so what a
+    // caller actually sees is an unrouted 404 -- before server.ts reads the body, which would
+    // otherwise answer 400 to an empty one and reveal that the route exists. This guard only
+    // matters if a future wiring mistake mounts the route without a provider.
+    if (!provider) throw new CpError('not_found', 'not_found');
+    const body = asRecord(ctx.body);
+    const secret = body.secret;
+    if (typeof secret !== 'string' || !provider.authenticates(secret)) {
+      // Audited, because this endpoint mints a real login -- an admin one, if SH_ADMIN_SUBJECTS
+      // names the subject -- so a brute-force attempt must leave a trace an operator can find.
+      // The presented value is NEVER recorded; the subject is '-' because the caller proved nothing.
+      resolveAuditLog(deps)({
+        event: 'audit',
+        ts: String(deps.now()),
+        subject: '-',
+        decision: 'test_user_login_refused',
+        reason: typeof secret === 'string' ? 'wrong_secret' : 'no_secret',
+      });
+      // One code for a missing and a wrong secret alike: distinguishing them tells a prober which
+      // half of the problem to work on.
+      throw new CpError('unauthorized', 'test-user login refused: wrong or missing secret');
+    }
+    const index = body.index;
+    if (typeof index !== 'number' || !provider.has(index)) {
+      throw new CpError('invalid_request', `index must be a whole number in 1..${provider.count}`);
+    }
+    const principal = provider.principalFor(index);
+    // SBX0 §4.2's enrolment gate still applies: main.ts refuses to boot test users on the sandbox
+    // profile, and this keeps the invariant even if that guard were ever relaxed.
+    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+      throw notEnrolled(principal.subject);
+    }
+    const label = body.label;
     const issued = await deps.refresh.issue({
       subject: principal.subject,
       displayName: principal.displayName,
@@ -794,7 +871,8 @@ export const HANDLERS: Record<string, Handler> = {
    * fact.
    */
   putCredential: async (ctx, deps) => {
-    const p = requirePrincipal(ctx);
+    const sandbox = deps.config.routeProfile === 'sandbox';
+    const p = sandbox ? requireEnrolledPrincipal(ctx, deps.config) : requirePrincipal(ctx);
     const name = validateCredentialName(ctx.params.name ?? '');
     if (name === OPERATOR_FALLBACK_NAME) {
       // The audit names the operator's key this way (exchange.ts, createSession): a subject's own
@@ -802,6 +880,25 @@ export const HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', `credential name '${name}' is reserved`);
     }
     const cred = parseCredentialBody(name, ctx.body);
+    if (sandbox && cred.descriptor.consumer !== 'sandbox-egress') {
+      throw new CpError(
+        'invalid_request',
+        'the sandbox service stores only consumer: sandbox-egress credentials',
+      );
+    }
+    if (sandbox) {
+      const mine = new Set(cred.descriptor.destination.hosts);
+      for (const other of await deps.credentials.list(p.sub)) {
+        if (other.consumer !== 'sandbox-egress' || other.name === name) continue;
+        const hit = other.destination.hosts.find((h) => mine.has(normalizeStored(h)));
+        if (hit !== undefined) {
+          throw new CpError(
+            'destination_conflict',
+            `destination '${hit}' is already held by credential '${other.name}'`,
+          );
+        }
+      }
+    }
     await deps.credentials.put(p.sub, cred);
     await auditBestEffort(deps, 'putCredential', `credential=${name}`, {
       subject: p.sub,
@@ -813,10 +910,12 @@ export const HANDLERS: Record<string, Handler> = {
 
   /** Metadata only, and it decrypts nothing: the descriptor lives in annotations (spec §6.2). */
   listCredentials: async (ctx, deps) => {
-    const p = requirePrincipal(ctx);
+    const sandbox = deps.config.routeProfile === 'sandbox';
+    const p = sandbox ? requireEnrolledPrincipal(ctx, deps.config) : requirePrincipal(ctx);
     // No ?owner= is read here. Listing another user's credential NAMES is not a privilege MU1
     // grants, and not reading the parameter is what stops it becoming one by accident.
-    const descriptors = await deps.credentials.list(p.sub);
+    const all = await deps.credentials.list(p.sub);
+    const descriptors = sandbox ? all.filter((d) => d.consumer === 'sandbox-egress') : all;
     return {
       status: 200,
       body: {
@@ -833,7 +932,10 @@ export const HANDLERS: Record<string, Handler> = {
   },
 
   deleteCredential: async (ctx, deps) => {
-    const p = requirePrincipal(ctx);
+    const p =
+      deps.config.routeProfile === 'sandbox'
+        ? requireEnrolledPrincipal(ctx, deps.config)
+        : requirePrincipal(ctx);
     const name = validateCredentialName(ctx.params.name ?? '');
     await deps.credentials.delete(p.sub, name);
     await auditBestEffort(deps, 'deleteCredential', `credential=${name}`, {
@@ -971,4 +1073,5 @@ export const HANDLERS: Record<string, Handler> = {
 
   // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
   ...SANDBOX_HANDLERS,
+  ...EGRESS_HANDLERS,
 };

@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@moca/control-plane": "workspace:*"
+    "@moca/control-plane": "workspace:*",
+    "redis": "^6.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

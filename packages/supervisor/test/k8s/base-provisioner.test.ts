@@ -108,12 +108,13 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
         verbs: ['create', 'get', 'list', 'patch', 'delete'],
       },
       { apiGroups: [''], resources: ['secrets'], verbs: ['create', 'update', 'delete'] },
-      { apiGroups: [''], resources: ['services'], verbs: ['create', 'get', 'delete'] },
+      // list on Services and PVCs: the orphan sweep lists them by label (spec §6.2).
+      { apiGroups: [''], resources: ['services'], verbs: ['create', 'get', 'list', 'delete'] },
       { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list'] },
       {
         apiGroups: [''],
         resources: ['persistentvolumeclaims'],
-        verbs: ['create', 'get', 'delete'],
+        verbs: ['create', 'get', 'list', 'delete'],
       },
       {
         apiGroups: [''],
@@ -390,6 +391,57 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s workload-sandboxes component (setup.sh o
       to: [{ podSelector: { matchLabels: { app: 'moca-provisioner' } } }],
       ports: [{ protocol: 'TCP', port: 8080 }],
     });
+  });
+
+  it('reaches Redis for the orphan sweep (spec §6.2), with the one credential, and DNS', () => {
+    const c = container(find(objs, 'Deployment', 'moca-provisioner', 'moca'), 'provisioner');
+    expect(envVar(c, 'REDIS_URL')?.valueFrom).toEqual({
+      secretKeyRef: { name: 'moca-redis', key: 'REDIS_URL' },
+    });
+    expect(envVar(c, 'MOCA_PROVISIONER_ORPHAN_GRACE_S')?.value).toBe('600');
+    expect(envVar(c, 'MOCA_PROVISIONER_RECONCILE_S')?.value).toBe('300');
+    // Its own policy: setup.sh replaces moca-provisioner's egress with the API server's addresses.
+    const p = find(objs, 'NetworkPolicy', 'moca-provisioner-redis', 'moca');
+    expect(p.spec).toEqual({
+      podSelector: { matchLabels: { app: 'moca-provisioner' } },
+      policyTypes: ['Egress'],
+      egress: [
+        {
+          to: [{ podSelector: { matchLabels: { app: 'redis' } } }],
+          ports: [{ protocol: 'TCP', port: 6379 }],
+        },
+        {
+          to: [
+            {
+              namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } },
+              podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } },
+            },
+          ],
+          ports: [
+            { protocol: 'UDP', port: 53 },
+            { protocol: 'TCP', port: 53 },
+          ],
+        },
+      ],
+    });
+    expect(find(objs, 'NetworkPolicy', 'moca-provisioner', 'moca').spec.egress).toEqual(
+      KUBE_API_EGRESS,
+    );
+    // Redis admits it, on its one port, beside the base's three.
+    const redis = find(objs, 'NetworkPolicy', 'redis', 'moca');
+    expect(
+      redis.spec.ingress[0].from.map(
+        (f: { podSelector: { matchLabels: { app: string } } }) => f.podSelector.matchLabels.app,
+      ),
+    ).toEqual(['moca-supervisor', 'sandbox-relay', 'moca-control-plane', 'moca-provisioner']);
+    expect(redis.spec.ingress[0].ports).toEqual([{ protocol: 'TCP', port: 6379 }]);
+    // OpenShift DNS answers on 5353: on ocp only, the provisioner gets that rule too.
+    const ocpDns = find(ocp, 'NetworkPolicy', 'allow-openshift-dns-provisioner', 'moca');
+    expect(ocpDns.spec.podSelector).toEqual({ matchLabels: { app: 'moca-provisioner' } });
+    expect(ocpDns.spec.egress).toEqual(
+      find(ocp, 'NetworkPolicy', 'allow-openshift-dns', 'moca').spec.egress,
+    );
+    expect(objs.some((o) => o.metadata.name === 'allow-openshift-dns-provisioner')).toBe(false);
   });
 
   it('leaves every image the base and target set unchanged', () => {

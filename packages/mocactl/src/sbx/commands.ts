@@ -7,7 +7,7 @@ import { deviceLogin, toCachedAuth } from '../core/auth.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
 import { saveConfig } from '../config.js';
-import { deviceLoginEnd, devicePrompt, type Io } from '../headless.js';
+import { deviceLoginEnd, devicePrompt, type Io, type LoginHelpers } from '../headless.js';
 import { setAuth, type RefreshFailure, type Runtime } from '../runtime.js';
 import type { SandboxApiClient, SbxDiscovery, SbxSandbox } from './api.js';
 
@@ -89,7 +89,11 @@ export function fail(io: Io, err: unknown, refreshFailure?: RefreshFailure): num
  */
 export const failed = (c: SbxCtx, err: unknown): number => fail(c.io, err, c.rt.lastRefreshFailure);
 
-export async function cmdLogin(c: SbxCtx, remember: boolean): Promise<number> {
+export async function cmdLogin(
+  c: SbxCtx,
+  remember: boolean,
+  helpers?: LoginHelpers,
+): Promise<number> {
   if (!c.rt.cp) return SBX_EXIT.usage;
   try {
     // Refuse a MOCA control plane before a device code is shown: its login would be useless here.
@@ -105,7 +109,7 @@ export async function cmdLogin(c: SbxCtx, remember: boolean): Promise<number> {
     }
     const login = await deviceLogin(
       { cp: c.rt.cp, sleep: c.rt.sleep, now: c.rt.now },
-      devicePrompt(c.io),
+      devicePrompt(c.io, helpers),
       c.signal,
     );
     setAuth(c.rt, toCachedAuth(login, c.url));

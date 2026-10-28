@@ -1,3 +1,6 @@
+# Plain `pre-commit install` sets up both hook types, including the commit-msg
+# rewriter below -- no extra --hook-type flags needed.
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -53,6 +56,15 @@ repos:
     hooks:
       - id: hadolint-docker
         entry: ghcr.io/hadolint/hadolint:v2.12.0 hadolint
+
+  # Rewrite AI co-author trailers to Assisted-By (see CLAUDE.md, Commit Attribution).
+  - repo: local
+    hooks:
+      - id: ai-assisted-by-trailer
+        name: Replace Co-Authored-By with Assisted-By
+        entry: scripts/hooks/commit-msg
+        language: script
+        stages: [commit-msg]
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2

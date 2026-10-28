@@ -3,6 +3,7 @@ import type { CpConfig } from './handlers.js';
 import type { RouteProfile } from './routes.js';
 import { GITHUB_SUBJECT_RE } from './identity.js';
 import { DEFAULT_SANDBOX_ISSUER } from './sandbox-token.js';
+import { egressConfigFromEnv, type EgressConfig } from './egress-config.js';
 
 /**
  * The sandbox profile's settings (SBX0 spec §4, §5). Every refusal happens at BOOT and names the
@@ -40,6 +41,8 @@ export interface SandboxConfig {
   execCa?: string;
   /** `SH_JANITOR_TOKEN` (a credential), at least 32 characters; absent refuses the janitor's route. */
   janitorToken?: string;
+  /** `SH_EGRESS_HOSTS` + `SH_CREDENTIAL_KEK`: user-scoped egress credentials (SBX0.2b); absent = off. */
+  egress?: EgressConfig;
 }
 
 const TEMPLATE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -147,8 +150,10 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
       `SH_SANDBOX_TOKEN_TTL_SECONDS must be at most ${MAX_SANDBOX_TOKEN_TTL_S}: a delete takes effect only within one token lifetime`,
     );
   }
+  const templates = parseTemplates(env.SH_SANDBOX_TEMPLATES);
+  const egress = egressConfigFromEnv(env, templates);
   return {
-    templates: parseTemplates(env.SH_SANDBOX_TEMPLATES),
+    templates,
     allowedSubjects,
     lifetimeS: positive(env, 'SH_SANDBOX_LIFETIME_SECONDS', 7 * 86_400),
     retentionS: positive(env, 'SH_SANDBOX_RETENTION_SECONDS', 14 * 86_400),
@@ -159,6 +164,7 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
     execEndpoint,
     ...(execCa ? { execCa } : {}),
     ...(janitorToken ? { janitorToken } : {}),
+    ...(egress ? { egress } : {}),
   };
 }
 

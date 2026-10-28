@@ -96,6 +96,41 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(loadConfig(paths).config.sbxControlPlaneUrl).toBe(URL_);
   });
 
+  it.each([
+    [[], ['copy ABCD-EFGH', 'open https://github.com/login/device']],
+    [['--no-browser'], []],
+  ])('sbx login %j: copies and opens unless --no-browser', async (flags, expected) => {
+    const { home, io } = setup({ loggedIn: false });
+    const cp = fakeCp({
+      'GET /v1/discovery': () => ({ status: 200, body: SBX_DISCOVERY }),
+      'POST /v1/auth/device': () => ({ status: 200, body: DEVICE }),
+      'POST /v1/auth/device/token': () => ({
+        status: 200,
+        body: loginBody('api-new', 'github:7'),
+      }),
+    });
+    const steps: string[] = [];
+    const loginHelpers = {
+      copy: async (t: string) => void steps.push(`copy ${t}`),
+      openUrl: (u: string) => void steps.push(`open ${u}`),
+    };
+    expect(
+      await sbxMain(['login', '--control-plane-url', URL_, ...flags], { HOME: home }, io, {
+        home,
+        fetchImpl: cp.fetchImpl,
+        loginHelpers,
+      }),
+    ).toBe(0);
+    await new Promise((r) => setImmediate(r));
+    expect(steps).toEqual(expected);
+  });
+
+  it('refuses --no-browser on a command other than login', async () => {
+    const { env, io } = setup();
+    expect(await sbxMain(['templates', '--no-browser'], env, io)).toBe(2);
+    expect(io.errs.join('\n')).toContain('--no-browser');
+  });
+
   it('keeps a MOCA login and an sbx login side by side, neither overwriting the other', async () => {
     const { home, paths, io } = setup({ loggedIn: false });
     const env = { HOME: home };

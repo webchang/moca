@@ -73,7 +73,7 @@ keys in `config.json` under `keybinds`, e.g. `{ "session.new": "ctrl+x s" }`.
 ## Headless
 
 ```bash
-mocactl login                               # device-flow login, prints the code
+mocactl login                               # device-flow login: prints the code; in a local terminal also copies it and opens the browser (--no-browser: don't)
 mocactl logout [--all]                      # end this login on the server (--all: all of yours)
 mocactl auth token [--json]                 # a valid API token for scripts and the Claude Code hook
 mocactl doctor [--json]                     # seven checks, one fix per failure; exit 1 on failure
@@ -100,6 +100,7 @@ mocactl credentials delete NAME [--json]    # exit 1 if you own no credential of
 ```bash
 mocactl spawn "prompt" [--config sha256:…] --kind prompt|solve \
   [--repo URL --ref REF] [--tag T] [--label L] [--json]  # fork a detached subagent; prints its sessionId
+mocactl spawn --prompt-file FILE [--kind prompt|solve] [...]  # read the prompt from FILE instead of argv
 mocactl subagents [--tag T] [--json]        # list spawned subagents + current honest state
 mocactl get SESSIONID [--out DIR] [--json]  # write result files + bounded summary
 mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]  # run it on a workload's context
@@ -123,6 +124,12 @@ can list them in isolation. The optional `--label L` names one dispatch within a
 column (`-` on unlabeled rows) and on `--json` as `label` on rows that have one. Alphabet
 is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (stricter than `--tag` so `jq`-side filtering doesn't
 need quoting).
+
+`mocactl spawn --prompt-file FILE` reads the prompt from FILE (UTF-8, trimmed; must be a regular
+file, no symlinks) instead of positional argv. Mutually exclusive with an inline prompt. Use it
+when the prompt would carry characters a parent shell or coding agent refuses on argv
+(multi-line, `#`, `$(...)`, heredocs) — typically when chaining subagents. Same 64 KiB cap as
+inline prompts.
 
 `mocactl subagents` reads the ledger and joins it with `/runs/status`, resolving the server's
 `queued` ambiguity with child-pid liveness and a 60-second grace: a `queued` row with a live

@@ -8,6 +8,7 @@ describe('the route table', () => {
       [
         'POST /v1/auth/device',
         'POST /v1/auth/device/token',
+        'POST /v1/auth/test-token',
         'POST /v1/auth/token',
         'POST /v1/auth/revoke',
         'POST /v1/auth/revoke-all',
@@ -30,6 +31,7 @@ describe('the route table', () => {
         'GET /healthz',
         'GET /readyz',
         'GET /v1/discovery',
+        'POST /v1/egress/credential',
         // SBX0 §5.1: the sandbox profile's own.
         'GET /v1/templates',
         'POST /v1/sandboxes',
@@ -74,10 +76,12 @@ describe('the route table', () => {
     // A session token must not be able to rewrite credentials or create a second session, so
     // nothing under /v1 accepts scope `turn:write` (plan gap #7).
     // The named exceptions: discovery (public config, read before login, GET-only), and the host
-    // janitor's read, which takes the janitor's bearer instead (SBX0 §8.3).
+    // janitor's read, which takes the janitor's bearer instead (SBX0 §8.3), and moca-egress's lookup,
+    // which takes its host's egress token (SBX0.2b §4.2).
     const EXEMPT = new Map([
       ['GET /v1/discovery', 'none'],
       ['GET /v1/janitor/sandboxes', 'janitor'],
+      ['POST /v1/egress/credential', 'egress'],
     ]);
     const wrong = ROUTES.filter(
       (r) =>

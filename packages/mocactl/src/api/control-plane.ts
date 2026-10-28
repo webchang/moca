@@ -135,6 +135,17 @@ export class ControlPlaneClient implements ControlPlaneApi {
     }
   }
 
+  /**
+   * A test-user login (ADR-0045): one request, no polling, no browser. The reply is an ordinary
+   * login body, so the caller stores it exactly as it stores a device login's.
+   */
+  testUserToken(index: number, secret: string): Promise<ApiLogin> {
+    return this.json('POST', '/v1/auth/test-token', {
+      auth: false,
+      body: { index, secret, ...(this.opts.label ? { label: this.opts.label } : {}) },
+    });
+  }
+
   refreshAuth(refreshToken: string): Promise<ApiLogin> {
     return this.json('POST', '/v1/auth/token', {
       auth: false,

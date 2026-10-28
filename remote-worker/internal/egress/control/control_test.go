@@ -421,12 +421,118 @@ func TestAlreadyCancelledCallNeverTouchesTheConnection(t *testing.T) {
 	acceptOne(t, ln)
 }
 
-// A call whose ctx expires with the reply still pending loses the connection (the stream is
-// out of step), and the client heals on its own: the server ends up holding vm-1 again.
-func TestCallTimingOutMidFlightHealsTheConnection(t *testing.T) {
+// A call whose ctx expires with the reply still pending keeps the connection: the reply is
+// owed, the reader discards it, and the stream comes back into step. The point is what does
+// NOT happen -- vm-1 is never unbound, so in the real proxy its in-flight tunnels keep
+// flowing. (Dropping the connection instead would unbind every VM it owned, which is #587.)
+func TestCallTimingOutMidFlightKeepsTheConnection(t *testing.T) {
 	dir := shortDir(t)
 	ctlPath := filepath.Join(dir, "c.sock")
-	h := &slowRecorder{recorder: newRecorder(), slow: map[string]time.Duration{"vm-2": 500 * time.Millisecond}}
+	h := newGatedRecorder(t)
+	h.closeOnUnregister = true // so an unbind of vm-1 would also kill its listener
+	h.gateReg("vm-2")
+	startServer(t, ctlPath, []int{os.Getuid()}, h)
+	c := NewClient(ctlPath)
+	defer c.Close()
+
+	vm1Path, _, f1 := vmListener(t, dir, "vm1.sock")
+	if err := c.Register(ctx(t), "vm-1", "s", nil, f1); err != nil {
+		t.Fatal(err)
+	}
+	reg1 := recv(t, h.regs)
+
+	c.mu.Lock()
+	before := c.conn
+	c.mu.Unlock()
+
+	_, _, f2 := vmListener(t, dir, "vm2.sock")
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	wantAbandoned(t, c.Register(short, "vm-2", "s", nil, f2))
+
+	// vm-1 is not collateral damage. This is the whole issue: the drop this replaces unbound
+	// it, and an unbind is what aborts a VM's live connections in the real proxy.
+	select {
+	case vm := <-h.unregs:
+		t.Fatalf("an abandoned call unbound %q", vm)
+	case <-time.After(500 * time.Millisecond):
+	}
+	c.mu.Lock()
+	same, healing := c.conn == before, c.healing
+	c.mu.Unlock()
+	if !same {
+		t.Fatal("the connection was replaced: an abandoned call dropped it")
+	}
+	if healing {
+		t.Fatal("the heal loop started: an abandoned call dropped the connection")
+	}
+
+	// Release the handler and let the reader discard the owed reply. Nothing else moves owed
+	// back to 0, so reaching 0 IS the discard.
+	h.release()
+	recv(t, h.regs) // the server finished vm-2 even though nobody was waiting
+	waitOwedDrained(t, before)
+
+	// The stream is in step again: a follow-up call gets its own reply, on the same connection.
+	if err := c.Unregister(ctx(t), "vm-other"); err != nil {
+		t.Fatalf("follow-up call on the kept connection: %v", err)
+	}
+	c.mu.Lock()
+	same = c.conn == before
+	c.mu.Unlock()
+	if !same {
+		t.Fatal("the follow-up call redialled")
+	}
+	// vm-1's listener still serves, so it was never closed -- and with closeOnUnregister set,
+	// closing it is exactly what an unbind would have done.
+	vmConn, err := net.Dial("unix", vm1Path)
+	if err != nil {
+		t.Fatalf("dial vm-1's socket: %v", err)
+	}
+	defer vmConn.Close()
+	acceptOne(t, reg1.ln)
+}
+
+// An owed reply must be discarded, not left in the channel for the next caller to read as its
+// own. A refusal makes that unmistakable: if the owed one leaks through, the Register below
+// returns a verdict passed on another VM.
+func TestAnOwedReplyIsNotDeliveredToTheNextCall(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h := newGatedRecorder(t)
+	h.refuse = map[string]bool{"vm-doomed": true}
+	h.gateReg("vm-doomed")
+	startServer(t, ctlPath, []int{os.Getuid()}, h)
+	c := NewClient(ctlPath)
+	defer c.Close()
+
+	_, _, f1 := vmListener(t, dir, "vm-doomed.sock")
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	wantAbandoned(t, c.Register(short, "vm-doomed", "s", nil, f1))
+	c.mu.Lock()
+	cc := c.conn
+	c.mu.Unlock()
+	if cc == nil {
+		t.Fatal("the connection was dropped")
+	}
+	h.release()
+	waitOwedDrained(t, cc)
+
+	_, _, f2 := vmListener(t, dir, "vm-ok.sock")
+	if err := c.Register(ctx(t), "vm-ok", "s", nil, f2); err != nil {
+		t.Fatalf("Register of vm-ok = %v, want nil: it was handed the owed refusal", err)
+	}
+}
+
+// The cleanup the kept connection no longer gets for free: the server binds a VM before it
+// calls the handler, so an abandoned Register can complete server-side although the client
+// never recorded it. The reaper Unregisters it, with no further call from vmpool.
+func TestAnAbandonedRegisterIsReapedFromTheServer(t *testing.T) {
+	dir := shortDir(t)
+	ctlPath := filepath.Join(dir, "c.sock")
+	h := newGatedRecorder(t)
+	h.gateReg("vm-2")
 	startServer(t, ctlPath, []int{os.Getuid()}, h)
 	c := NewClient(ctlPath)
 	defer c.Close()
@@ -440,31 +546,13 @@ func TestCallTimingOutMidFlightHealsTheConnection(t *testing.T) {
 	_, _, f2 := vmListener(t, dir, "vm2.sock")
 	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := c.Register(short, "vm-2", "s", nil, f2); err == nil {
-		t.Fatal("Register outlived its ctx")
-	}
-	// The server finishes vm-2 (the handler was already running), sees the connection gone,
-	// and unbinds both; then the heal loop re-registers vm-1 and only vm-1.
-	//
-	// Wait for that unbind first: until it lands the handler still holds the ORIGINAL vm-1,
-	// and a check made then would pass even with no heal at all. Then judge by the handler's
-	// own binding table rather than by replaying its regs/unregs channels -- those are two
-	// channels, so a select can take "reg vm-1" before the "unreg vm-1" that preceded it.
-	waitUnreg := func(want string) {
-		t.Helper()
-		deadline := time.After(3 * time.Second)
-		for {
-			select {
-			case vm := <-h.unregs:
-				if vm == want {
-					return
-				}
-			case <-deadline:
-				t.Fatalf("the dropped connection never unbound %s", want)
-			}
-		}
-	}
-	waitUnreg("vm-1")
+	wantAbandoned(t, c.Register(short, "vm-2", "s", nil, f2))
+	h.release()
+	// vm-2 really is bound server-side first -- without that there would be nothing to reap.
+	recv(t, h.regs)
+
+	// Judge by the handler's binding table, not by replaying regs/unregs: those are two
+	// channels, so a select can take them out of order (see recorder.held).
 	deadline := time.Now().Add(3 * time.Second)
 	var held []string
 	for {
@@ -473,15 +561,172 @@ func TestCallTimingOutMidFlightHealsTheConnection(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after the drop the server holds %v, want exactly [vm-1] (re-registered by the heal loop)", held)
+			t.Fatalf("the server holds %v, want exactly [vm-1]: vm-2 was never reaped", held)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// And it stays that way: no late Unregister undoes the heal.
+	// And the reaper stops there rather than going on to unbind vm-1 as well.
 	time.Sleep(300 * time.Millisecond)
 	if held = h.held(); len(held) != 1 || held[0] != "vm-1" {
 		t.Fatalf("after settling the server holds %v, want exactly [vm-1]", held)
 	}
+}
+
+// A reply that lands in the window between call's select giving up and abandon taking the
+// lock is not owed: abandon drains it. Left owed, it would be counted twice -- the stale reply
+// sits in the channel AND the reader discards the next call's own reply, so that call reads
+// someone else's verdict.
+//
+// This drives clientConn directly, with no server. The window is a few instructions wide and a
+// gated handler cannot be steered into it, so -count=20 against a real server does not reach
+// this case (it survives that run); the invariant it protects is deterministic, and this is
+// where it gets pinned.
+func TestAReplyThatLandsAsTheCallGivesUpIsNotOwed(t *testing.T) {
+	cc := &clientConn{replies: make(chan []byte, 1), dead: make(chan struct{})}
+
+	if !cc.take([]byte("first")) { // it landed while the call was still selecting
+		t.Fatal("take of a reply nobody has given up on yet was refused")
+	}
+	cc.abandon() // and only then did the call give up
+
+	cc.mu.Lock()
+	owed := cc.owed
+	cc.mu.Unlock()
+	if owed != 0 {
+		t.Fatalf("owed = %d after abandoning a call whose reply had already landed, want 0", owed)
+	}
+	select {
+	case body := <-cc.replies:
+		t.Fatalf("replies still holds %q: the abandoned call's reply was not drained", body)
+	default:
+	}
+
+	// So the next call gets its own reply, not the abandoned one's.
+	if !cc.take([]byte("second")) {
+		t.Fatal("take of the next call's reply was refused")
+	}
+	select {
+	case body := <-cc.replies:
+		if string(body) != "second" {
+			t.Fatalf("the next call read %q, want %q", body, "second")
+		}
+	default:
+		t.Fatal("the next call's reply was discarded as owed")
+	}
+}
+
+// The ordinary abandonment: the reply has not landed, so exactly one is owed and the reader
+// discards exactly that one, leaving the call after it to read its own.
+func TestAnOwedReplyIsDiscardedExactlyOnce(t *testing.T) {
+	cc := &clientConn{replies: make(chan []byte, 1), dead: make(chan struct{})}
+
+	cc.abandon()
+	cc.mu.Lock()
+	owed := cc.owed
+	cc.mu.Unlock()
+	if owed != 1 {
+		t.Fatalf("owed = %d after abandoning a call with its reply pending, want 1", owed)
+	}
+
+	if !cc.take([]byte("owed")) {
+		t.Fatal("the owed reply was treated as unsolicited")
+	}
+	select {
+	case body := <-cc.replies:
+		t.Fatalf("replies holds %q: the owed reply was delivered instead of discarded", body)
+	default:
+	}
+
+	if !cc.take([]byte("next")) {
+		t.Fatal("take of the following call's reply was refused")
+	}
+	select {
+	case body := <-cc.replies:
+		if string(body) != "next" {
+			t.Fatalf("the following call read %q, want %q", body, "next")
+		}
+	default:
+		t.Fatal("the following call's reply was discarded: more than one was owed")
+	}
+}
+
+// wantAbandoned asserts that a call gave up with its reply pending. Which deadline fires
+// first is a race the test must not depend on: call selects on ctx.Done() and on a timer
+// built from the same deadline, so the error wraps either context.DeadlineExceeded or
+// os.ErrDeadlineExceeded. Both are abandonments, and that is what matters here.
+func wantAbandoned(t *testing.T, err error) {
+	t.Helper()
+	var ae *abandonedError
+	if !errors.As(err, &ae) {
+		t.Fatalf("call = %v, want an abandonedError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("call = %v, want it to wrap a deadline error for callers that test for one", err)
+	}
+}
+
+// waitOwedDrained waits until the reader has discarded every owed reply.
+func waitOwedDrained(t *testing.T, cc *clientConn) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		cc.mu.Lock()
+		owed := cc.owed
+		cc.mu.Unlock()
+		if owed == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owed is still %d: the reader never discarded the abandoned call's reply", owed)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// gatedRecorder parks Register for the named VMs until the test releases it, which holds a
+// call mid-flight deterministically rather than racing a sleep against a timeout. refuse
+// names VMs whose Register fails once the gate opens.
+type gatedRecorder struct {
+	*recorder
+	refuse map[string]bool
+
+	gmu   sync.Mutex
+	gated map[string]bool
+	gate  chan struct{}
+	once  sync.Once
+}
+
+// newGatedRecorder releases the gate on cleanup whether or not the test got that far: a
+// parked handler holds Server.wg, so a test that fails before releasing would otherwise
+// wedge the server's Close until the package timeout.
+func newGatedRecorder(t *testing.T) *gatedRecorder {
+	t.Helper()
+	g := &gatedRecorder{
+		recorder: newRecorder(), gated: map[string]bool{}, gate: make(chan struct{}),
+	}
+	t.Cleanup(g.release)
+	return g
+}
+
+func (g *gatedRecorder) gateReg(vmID string) {
+	g.gmu.Lock()
+	defer g.gmu.Unlock()
+	g.gated[vmID] = true
+}
+
+func (g *gatedRecorder) release() { g.once.Do(func() { close(g.gate) }) }
+
+func (g *gatedRecorder) Register(vmID, sid string, grant []byte, ln net.Listener) error {
+	g.gmu.Lock()
+	gated := g.gated[vmID]
+	g.gmu.Unlock()
+	if gated {
+		<-g.gate
+	}
+	if g.refuse[vmID] {
+		return errors.New("no")
+	}
+	return g.recorder.Register(vmID, sid, grant, ln)
 }
 
 // held is the set of VMs the handler currently has bound, sorted.

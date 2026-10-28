@@ -774,12 +774,81 @@ describe("a mounted workload's PVC and seed (spec §5)", () => {
     expect(await putBundle(deps, ref('github:bob', 'one'), Buffer.alloc(50))).toEqual({
       held: true,
     });
-    // A resend for a workload replaces its own bundle: it is not counted twice.
-    const one = ref('github:carol', 'one');
+  });
+
+  it("a resend counts against the owner's share with the bundle it replaces, until that one is replaced", async () => {
     deps = { ...deps, bundles: new BundleStore(100) };
-    await putBundle(deps, one, Buffer.alloc(50));
-    expect(await putBundle(deps, one, Buffer.alloc(50))).toEqual({ held: true });
-    expect(deps.bundles.heldBytes).toBe(50);
+    const one = ref('github:carol', 'one');
+    await putBundle(deps, one, Buffer.alloc(30));
+    // 30 held and 30 more read would pass Carol's half (50): the held one stays as it was.
+    await expect(putBundle(deps, one, Buffer.alloc(30))).rejects.toMatchObject({
+      status: 503,
+      code: 'seed_budget_full',
+    });
+    expect(deps.bundles.get(keysFor(one))!.bytes.length).toBe(30);
+    expect(await putBundle(deps, one, Buffer.alloc(20))).toEqual({ held: true });
+    expect(deps.bundles.get(keysFor(one))!.bytes.length).toBe(20);
+    expect(deps.bundles.inMemory).toBe(20);
+  });
+
+  it('keeps the held bundle when a resend is refused or fails to be held', async () => {
+    const r = ref('github:alice');
+    const wl = keysFor(r);
+    const old = Buffer.from('old bundle');
+    await putBundle(deps, r, old);
+    // The StatefulSet lookup fails: the resend is not held, the old one still is.
+    const get = kube.get.bind(kube);
+    kube.get = async () => {
+      throw new Error('apiserver down');
+    };
+    await expect(putBundle(deps, r, Buffer.from('new bundle'))).rejects.toThrow('apiserver down');
+    kube.get = get;
+    expect(deps.bundles.get(wl)!.bytes).toBe(old);
+    // Already seeded (no seed annotation): not held, and the old one is left to settleSeeds.
+    await putWorkload(deps, r, mounted('read-only'));
+    delete stsOf(wl).spec.template.metadata.annotations['moca.dev/seed-revision'];
+    expect(await putBundle(deps, r, Buffer.from('new bundle'))).toEqual({ held: false });
+    expect(deps.bundles.get(wl)!.bytes).toBe(old);
+    expect(deps.bundles.inMemory).toBe(old.length);
+  });
+
+  it('swaps a resend in once held: the old one is released, or counted while a seed GET still sends it', async () => {
+    deps = { ...deps, bundles: new BundleStore(100) };
+    const r = ref('github:alice');
+    const wl = keysFor(r);
+    await putBundle(deps, r, Buffer.alloc(10));
+    await putBundle(deps, r, Buffer.alloc(20));
+    expect(deps.bundles.inMemory).toBe(20);
+    const done = deps.bundles.serve(deps.bundles.get(wl)!.bytes);
+    await putBundle(deps, r, Buffer.alloc(15));
+    expect(deps.bundles.get(wl)!.bytes.length).toBe(15);
+    expect(deps.bundles.heldBytes).toBe(15);
+    expect(deps.bundles.inMemory).toBe(35);
+    done();
+    expect(deps.bundles.inMemory).toBe(15);
+  });
+
+  it('counts a held bundle a seed GET is sending: a resend past the budget is refused, never over it in memory', async () => {
+    deps = { ...deps, bundles: new BundleStore(100) };
+    await putBundle(deps, ref('github:bob'), Buffer.alloc(40));
+    const r = ref('github:alice');
+    await putBundle(deps, r, Buffer.alloc(25));
+    const done = deps.bundles.serve(deps.bundles.get(keysFor(r))!.bytes);
+    // Bob's 40, Alice's 25 being sent, and 50 more read would be 115 bytes in memory.
+    await expect(putBundle(deps, r, Buffer.alloc(50))).rejects.toMatchObject({
+      status: 503,
+      code: 'seed_budget_full',
+    });
+    expect(deps.bundles.inMemory).toBe(65);
+    expect(deps.bundles.get(keysFor(r))!.bytes.length).toBe(25);
+    // Once replaced, the 25 still being sent counts against Alice's share: 20 + 25 + 10 > 50.
+    await putBundle(deps, r, Buffer.alloc(20));
+    expect(deps.bundles.inMemory).toBe(85);
+    await expect(
+      putBundle(deps, ref('github:alice', 'two'), Buffer.alloc(10)),
+    ).rejects.toMatchObject({ status: 503, code: 'seed_budget_full' });
+    done();
+    expect(deps.bundles.inMemory).toBe(60);
   });
 
   it('drops a held bundle after MOCA_PROVISIONER_SEED_HOLD_S whether or not its StatefulSet exists, and GET then reports bundle_missing', async () => {

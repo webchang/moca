@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { CpError } from '../src/errors.js';
 import { HANDLERS, type CpDeps, type RequestCtx } from '../src/handlers.js';
+import { InMemoryCredentialStore } from '../src/credential-store.js';
 import { makeDeps, ctx, alice, bob, codeOf } from './helpers/deps.js';
 
 const body = (over: Record<string, unknown> = {}) => ({
@@ -221,5 +222,128 @@ describe('DELETE /v1/credentials/{name}', () => {
         ),
       ),
     ).toBe('invalid_request');
+  });
+});
+
+describe('sandbox profile', () => {
+  const egressDeps = (): CpDeps => {
+    const base = makeDeps().config.sandbox!;
+    return makeDeps({
+      credentials: new InMemoryCredentialStore(),
+      config: {
+        routeProfile: 'sandbox',
+        sandbox: {
+          ...base,
+          egress: {
+            hosts: [{ id: 'kvm', workers: ['sbx_default'], token: 'a'.repeat(64) }], // notsecret
+            ttlSeconds: 60,
+          },
+        },
+      },
+    });
+  };
+  const outsider = {
+    sub: 'github:5555',
+    tenant: 'github:5555',
+    roles: [],
+    scope: ['api'],
+  } as unknown as typeof alice;
+
+  it('refuses a non-sandbox-egress consumer', async () =>
+    expect(
+      await codeOf(() =>
+        HANDLERS.putCredential!(
+          ctx({ principal: alice, params: { name: 'gh' }, body: body({ consumer: 'inference' }) }),
+          egressDeps(),
+        ),
+      ),
+    ).toBe('invalid_request'));
+
+  it('refuses an unenrolled subject on all three routes', async () => {
+    for (const op of ['putCredential', 'listCredentials', 'deleteCredential'])
+      expect(
+        await codeOf(() =>
+          HANDLERS[op]!(
+            ctx({ principal: outsider, params: { name: 'gh' }, body: body() }),
+            egressDeps(),
+          ),
+        ),
+      ).toBe('not_enrolled');
+  });
+
+  it('stores and lists only sandbox-egress credentials', async () => {
+    const d = egressDeps();
+    await HANDLERS.putCredential!(
+      ctx({ principal: alice, params: { name: 'gh' }, body: body() }),
+      d,
+    );
+    const stored = (await d.credentials.get('github:1234', 'gh'))!;
+    await d.credentials.put('github:1234', {
+      ...stored,
+      descriptor: { ...stored.descriptor, name: 'inf', consumer: 'inference' },
+    });
+    const r = await HANDLERS.listCredentials!(ctx({ principal: alice }), d);
+    expect((r.body as { credentials: { name: string }[] }).credentials.map((c) => c.name)).toEqual([
+      'gh',
+    ]);
+  });
+
+  describe('destination conflicts', () => {
+    const put = (d: CpDeps, name: string, hosts: string[]) =>
+      HANDLERS.putCredential!(
+        ctx({ principal: alice, params: { name }, body: body({ destination: { hosts } }) }),
+        d,
+      );
+
+    it('refuses an identical normalized destination under another name, naming the holder', async () => {
+      const d = egressDeps();
+      await put(d, 'gh', ['github.com']);
+      let err: CpError | undefined;
+      try {
+        await put(d, 'gh2', ['GitHub.com']);
+      } catch (e) {
+        err = e as CpError;
+      }
+      expect(err?.code).toBe('destination_conflict');
+      expect(err?.message).toContain('gh');
+      expect(await d.credentials.get('github:1234', 'gh2')).toBeNull();
+    });
+
+    it('allows sibling and nested prefixes', async () => {
+      const d = egressDeps();
+      await put(d, 'mcp-a', ['mcp.corp/github']);
+      await put(d, 'mcp-b', ['mcp.corp/jira']);
+      await put(d, 'mcp-root', ['mcp.corp']);
+      expect((await d.credentials.list('github:1234')).length).toBe(3);
+    });
+
+    it('allows re-PUT of the same name', async () => {
+      const d = egressDeps();
+      await put(d, 'gh', ['github.com']);
+      const res = await put(d, 'gh', ['github.com']);
+      expect(res.status).toBe(204);
+    });
+
+    it('stores a multi-header binding and lists it as an array', async () => {
+      const d = egressDeps();
+      await HANDLERS.putCredential!(
+        ctx({
+          principal: alice,
+          params: { name: 'multi' },
+          body: body({
+            kind: 'api-key',
+            secret: { key: 'k' }, // notsecret
+            binding: [
+              { header: 'X-API-Key', format: '{key}' },
+              { header: 'X-Org', format: 'acme-{key}' },
+            ],
+          }),
+        }),
+        d,
+      );
+      const r = await HANDLERS.listCredentials!(ctx({ principal: alice }), d);
+      const list = (r.body as { credentials: { binding: unknown }[] }).credentials;
+      expect(Array.isArray(list[0]!.binding)).toBe(true);
+    });
   });
 });

@@ -232,6 +232,9 @@ describe('selectPoolSandbox remote dispatch', () => {
     // per-turn holder while all of them must share the session's workspace. Keying the workspace by
     // the holder instead gave turn 2 an empty `WorkspaceRoot/<key>` and its own standby VM pool
     // (spec §3.4, §4.3, §4.4) — cross-turn continuity lost, standbys multiplied per turn.
+    //
+    // The record advertises WORKSPACE_SUBDIR_CAPABILITY so the key-drop gate's record half is
+    // satisfied; the key must still stay set because this is a non-workload-context session.
     const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
     let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
     const fakeTransport = {
@@ -248,7 +251,7 @@ describe('selectPoolSandbox remote dispatch', () => {
         listPods: async () => [],
         lease,
         affinity: noAffinity,
-        records: fakeRecords([grpcRec]),
+        records: fakeRecords([{ ...grpcRec, capabilities: [WORKSPACE_SUBDIR_CAPABILITY] }]),
         makeExecClient: () => fakeExecClient,
         makeTransport: (id, _client, transportOpts) => {
           seen = { id, opts: transportOpts };
@@ -262,6 +265,69 @@ describe('selectPoolSandbox remote dispatch', () => {
     // ...and the lease itself is taken under the holder, not the session id.
     expect(lease.acquired).toEqual(['sbx-remote-1']);
     expect(lease.acquiredHolders).toEqual(['sess-1:11111111-2222-3333-4444-555555555555']);
+  });
+
+  // When the agent's only writable dir is the context view, selection suppresses the per-session
+  // workspace_key so the worker does not create an unused <WorkspaceRoot>/<sessionId> dir that
+  // lives until the idle sweep -- but only for records that advertise WORKSPACE_SUBDIR_CAPABILITY.
+  it('drops the workspace key when agentWritesInContext is set on a container-capability record', async () => {
+    const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
+    let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
+    const fakeTransport = {
+      exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
+      close: async () => {},
+      fastTier: 'per-call-exec' as const,
+    };
+    const sel = await selectPoolSandbox(
+      env(),
+      '/head',
+      'sess-wl-1',
+      { ...opts, agentWritesInContext: true },
+      {
+        listPods: async () => [],
+        lease,
+        affinity: noAffinity,
+        records: fakeRecords([{ ...grpcRec, capabilities: [WORKSPACE_SUBDIR_CAPABILITY] }]),
+        makeExecClient: () => fakeExecClient,
+        makeTransport: (id, _client, transportOpts) => {
+          seen = { id, opts: transportOpts };
+          return fakeTransport;
+        },
+      },
+    );
+    expect(sel?.transport).toBeDefined();
+    expect(seen?.opts?.workspaceKey).toBe('');
+  });
+
+  // A record without WORKSPACE_SUBDIR_CAPABILITY (the microVM worker is one such; its launcher
+  // refuses an empty workspace_key) keeps the session key even when agentWritesInContext is set.
+  it('keeps the session key on a record without the workspace-subdir capability', async () => {
+    const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
+    let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
+    const fakeTransport = {
+      exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
+      close: async () => {},
+      fastTier: 'per-call-exec' as const,
+    };
+    const sel = await selectPoolSandbox(
+      env(),
+      '/head',
+      'sess-wl-2',
+      { ...opts, agentWritesInContext: true },
+      {
+        listPods: async () => [],
+        lease,
+        affinity: noAffinity,
+        records: fakeRecords([{ ...grpcRec, capabilities: [] }]),
+        makeExecClient: () => fakeExecClient,
+        makeTransport: (id, _client, transportOpts) => {
+          seen = { id, opts: transportOpts };
+          return fakeTransport;
+        },
+      },
+    );
+    expect(sel?.transport).toBeDefined();
+    expect(seen?.opts?.workspaceKey).toBe('sess-wl-2');
   });
 
   // #408: a container worker that honours workspace_key runs each session in <root>/<session id>.

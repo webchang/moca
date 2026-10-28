@@ -2,6 +2,7 @@ package egress
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -31,13 +32,52 @@ type Config struct {
 	LocalAddrs func() ([]netip.Addr, error)
 
 	Credentials CredentialPolicy
+	// InterceptCACertPEM and InterceptCAKeyPEM are the loaded interception CA
+	// (set by ConfigFromEnv when credentials are configured; Task 9 builds the
+	// interceptor from them). UpstreamRoots verifies upstream servers; nil
+	// means the system roots.
+	InterceptCACertPEM, InterceptCAKeyPEM []byte
+	UpstreamRoots                         *x509.CertPool
+	// interceptor serves hosts that have credentials. nil is allowed only
+	// while Credentials is NoCredentials.
+	interceptor interceptor
 	Audit       AuditSink
 
 	DialTimeout time.Duration // default 10s
+	// IdleTimeout bounds how long an established connection may go with no
+	// bytes moving, in either direction and on either path. It is refreshed on
+	// every read and every write, so a transfer of any duration survives; only
+	// a silent one expires. Default 300s. Zero selects the default: a slot
+	// unbounded in time is not an option a caller may choose.
+	IdleTimeout time.Duration
+	// ResponseHeaderTimeout bounds how long a forwarded request may wait for
+	// its response headers after the request is sent. Separate from
+	// IdleTimeout, and strictly tighter: it treats a silent upstream that has
+	// been asked a question as a fault sooner than the idle bound would.
+	//
+	// It defaults to IdleTimeout rather than to something shorter, because
+	// shorter is a policy call with a real cost and no safety benefit here. The
+	// slot is already bounded without it — the idle clock covers the upstream
+	// conn from the dial, so an upstream that never answers expires anyway —
+	// while a tighter value turns legitimate slow thinking into a 502: a plain
+	// HTTP inference endpoint can take minutes before its first header byte,
+	// and so can a forge packing a large repo. An operator who would rather
+	// fail fast sets MOCA_EGRESS_RESPONSE_HEADER_TIMEOUT_S below the idle
+	// bound; nothing stops them, and no default guesses on their behalf.
+	ResponseHeaderTimeout time.Duration
 }
 
 const (
 	defaultDialTimeout = 10 * time.Second
+	// defaultIdleTimeout matches squid's request_timeout. It has to outlast
+	// the quiet stretch of a real upstream doing work — a large repo being
+	// packed server-side before the first byte of the pack arrives, an
+	// inference endpoint thinking — because it is refreshed per read, not per
+	// request.
+	defaultIdleTimeout = 300 * time.Second
+	// defaultResponseHeaderTimeout is the idle bound: see the field's doc for
+	// why this knob does not default tighter than the bound it refines.
+	defaultResponseHeaderTimeout = defaultIdleTimeout
 	// sessionIdle is how long a session counter survives without a request.
 	sessionIdle = time.Hour
 	// sweepEvery bounds how often the lazy session sweep runs.
@@ -67,6 +107,13 @@ type vmBinding struct {
 	ln     net.Listener
 	closed bool
 	conns  map[*proxyConn]struct{}
+
+	// capRefusals is the number of connection-cap refusals in flight for this
+	// VM; capSuppressed and capLastEvent coalesce their audit events. All
+	// three are guarded by Proxy.mu.
+	capRefusals   int
+	capSuppressed uint64
+	capLastEvent  time.Time
 }
 
 type sessionCount struct {
@@ -87,15 +134,30 @@ func NewProxy(cfg Config) (*Proxy, error) {
 		return nil, errors.New("egress: nil Audit")
 	case cfg.Credentials == nil:
 		return nil, errors.New("egress: nil Credentials")
+	case cfg.interceptor == nil && !isNoCredentials(cfg.Credentials):
+		return nil, errors.New("egress: a credential policy needs an interceptor")
 	case cfg.MaxConnsPerVM <= 0:
 		return nil, fmt.Errorf("egress: MaxConnsPerVM %d must be positive", cfg.MaxConnsPerVM)
 	case cfg.MaxRequestsPerSession <= 0:
 		return nil, fmt.Errorf("egress: MaxRequestsPerSession %d must be positive", cfg.MaxRequestsPerSession)
 	case cfg.DialTimeout < 0:
 		return nil, fmt.Errorf("egress: negative DialTimeout %v", cfg.DialTimeout)
+	case cfg.IdleTimeout < 0:
+		return nil, fmt.Errorf("egress: negative IdleTimeout %v", cfg.IdleTimeout)
+	case cfg.ResponseHeaderTimeout < 0:
+		return nil, fmt.Errorf("egress: negative ResponseHeaderTimeout %v", cfg.ResponseHeaderTimeout)
 	}
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = defaultDialTimeout
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
+	}
+	if cfg.ResponseHeaderTimeout == 0 {
+		// The effective idle bound, not defaultIdleTimeout: an operator who
+		// raises only the idle bound must not be left with a tighter header
+		// timeout hiding behind it.
+		cfg.ResponseHeaderTimeout = cfg.IdleTimeout
 	}
 	cfg.Allow = append([]AllowEntry(nil), cfg.Allow...)
 	cfg.PermitCIDRs = append([]netip.Prefix(nil), cfg.PermitCIDRs...)
@@ -223,12 +285,34 @@ func (p *Proxy) admit(b *vmBinding, c *boundConn) {
 		return
 	}
 	if len(b.conns) >= p.cfg.MaxConnsPerVM {
+		// Both decisions are taken under p.mu, which this branch already holds:
+		// whether to spend a refusal socket, and whether this refusal is the
+		// one that reports the interval. A guest in a tight loop must not be
+		// able to grow either fds or audit volume without bound.
+		drain := b.capRefusals < maxCapRefusalsPerVM
+		if drain {
+			b.capRefusals++
+			p.wg.Add(1)
+		}
+		ev, report := b.chargeCapRefusal(p.now())
 		p.mu.Unlock()
-		p.cfg.Audit.Emit(Event{VMID: caller.VMID, SID: caller.SessionID, Sub: caller.Subject,
-			Status: 429, Decision: DecisionConnCap})
-		p.wg.Add(1)
+		if report {
+			ev.VMID, ev.SID, ev.Sub = caller.VMID, caller.SessionID, caller.Subject
+			p.cfg.Audit.Emit(ev)
+		}
+		if !drain {
+			// Past the bound the 429 is not written at all: shedding the fd
+			// matters more than the guest reading its refusal.
+			_ = c.Close()
+			return
+		}
 		go func() {
 			defer p.wg.Done()
+			defer func() {
+				p.mu.Lock()
+				b.capRefusals--
+				p.mu.Unlock()
+			}()
 			// Not parsed: the cap exists to shed load. The bounded drain, as
 			// for every refusal, lets a guest that pipelined its request see
 			// the named 429 rather than a reset.
@@ -250,6 +334,21 @@ func (p *Proxy) admit(b *vmBinding, c *boundConn) {
 		}()
 		pc.serve()
 	}()
+}
+
+// chargeCapRefusal charges one connection-cap refusal to b and reports the
+// event to emit, if any. The first refusal in an interval is reported, and
+// carries however many were suppressed since the last report; the rest are
+// only counted. Caller holds Proxy.mu.
+func (b *vmBinding) chargeCapRefusal(now time.Time) (Event, bool) {
+	if !b.capLastEvent.IsZero() && now.Sub(b.capLastEvent) < capEventEvery {
+		b.capSuppressed++
+		return Event{}, false
+	}
+	b.capLastEvent = now
+	n := b.capSuppressed
+	b.capSuppressed = 0
+	return Event{Status: 429, Decision: DecisionConnCap, Coalesced: n}, true
 }
 
 // countRequest charges one request to sid and reports whether it is within
@@ -302,7 +401,10 @@ type proxyConn struct {
 }
 
 func (pc *proxyConn) event(e Event) Event {
-	e.VMID, e.SID, e.Sub = pc.caller.VMID, pc.caller.SessionID, pc.caller.Subject
+	e.VMID, e.SID = pc.caller.VMID, pc.caller.SessionID
+	if e.Sub == "" { // an intercepted request carries the credential owner from the lookup
+		e.Sub = pc.caller.Subject
+	}
 	return e
 }
 
@@ -365,4 +467,9 @@ func (pc *proxyConn) finish() {
 	if up != nil {
 		_ = up.Close()
 	}
+}
+
+func isNoCredentials(p CredentialPolicy) bool {
+	_, ok := p.(NoCredentials)
+	return ok
 }

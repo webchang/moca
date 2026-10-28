@@ -48,6 +48,12 @@ spec:
               valueFrom: { configMapKeyRef: { name: sbx-settings, key: SH_SANDBOX_MAX_TOTAL } }
       volumes:
         - name: credentials
+          # The base (ADR-0045) makes this a PROJECTED volume so the test-user secret can come from
+          # an `optional` source of its own. Volumes merge by name, so without this the strategic
+          # merge would keep the base's `projected:` ALONGSIDE the `secret:` below -- a volume with
+          # two types, which the API server refuses, and which would also mount the KEK and
+          # exchange token that SBX0 §4.1 deliberately removes here.
+          projected: null
           secret:
             secretName: moca-mu1
             items:

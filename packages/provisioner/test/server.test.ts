@@ -391,6 +391,22 @@ describe('the bundle hand-off and the seed port (spec §5.2)', () => {
     expect(deps.bundles.heldBytes).toBe(0);
   });
 
+  it('a resend that fails mid-body or is shorter than declared leaves the held bundle fetchable', async () => {
+    const gen = randomUUID();
+    await putBundle(gen, BUNDLE);
+    for (const end of ['destroy', 'short'] as const) {
+      const resend = rawHandOff(gen, apiToken('github:alice'), 100);
+      resend.req.write(Buffer.alloc(10));
+      await until(() => deps.bundles.reservedBytes === 100);
+      if (end === 'destroy') resend.req.destroy();
+      else resend.req.socket?.end();
+      await until(() => deps.bundles.reservedBytes === 0);
+      const got = await seed(attachFor('github:alice', gen));
+      expect(got.status).toBe(200);
+      expect(Buffer.from(await got.arrayBuffer())).toEqual(BUNDLE);
+    }
+  });
+
   it('counts a bundle a seed GET is still sending, even once it is dropped', async () => {
     const gen = randomUUID();
     await putBundle(gen, BUNDLE);

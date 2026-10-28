@@ -61,6 +61,13 @@ spec:
               valueFrom: { configMapKeyRef: { name: moca-settings, key: SH_GITHUB_CLIENT_ID } }
             - name: SH_ADMIN_SUBJECTS
               valueFrom: { configMapKeyRef: { name: moca-settings, key: SH_ADMIN_SUBJECTS } }
+            # ADR-0045: the COUNT is a setting; the secret beside it is a file (see volumes).
+            # `optional`, like the tier keys below: a moca-settings written by an older setup.sh has
+            # no SH_TEST_USERS, and a required ref would stop the control plane from starting at all
+            # on an upgraded stack. Absent means unset, which configFromEnv reads as 0 (off).
+            - name: SH_TEST_USERS
+              valueFrom:
+                { configMapKeyRef: { name: moca-settings, key: SH_TEST_USERS, optional: true } }
             # P6.3 sandbox tiers: written to moca-settings by setup.sh ONLY on a stack with both
             # tiers; optional, so a stack without them renders exactly as before (untiered).
             # Must match the supervisor's: one list validates a session, the other places its turns.
@@ -118,14 +125,29 @@ spec:
             - { name: credentials, mountPath: /run/credentials, readOnly: true }
       volumes:
         - { name: tmp, emptyDir: {} }
+        # A PROJECTED volume, not a plain `secret` one, so the test-user secret can live in a
+        # Secret of its own marked `optional`. ADR-0045: credentialValue (systemd-credentials.ts)
+        # returns "unset" only for ENOENT and THROWS on an empty file, so an empty
+        # SH_TEST_USER_SECRET key in moca-mu1 crash-loops the control plane before identity.ts
+        # runs. A `secret` volume's `optional` is whole-source, never per item, so the key cannot
+        # be made optional inside moca-mu1; a second, optional source can. setup.sh writes
+        # moca-test-users only when SH_TEST_USERS > 0 and deletes it when they go off, so with test
+        # users off the file is absent (ENOENT -> unset), which is what the code already handles.
         - name: credentials
-          secret:
-            secretName: moca-mu1
-            items:
-              - { key: SH_SESSION_TOKEN_PRIVATE_KEY, path: SH_SESSION_TOKEN_PRIVATE_KEY }
-              - { key: SH_CREDENTIAL_KEK, path: SH_CREDENTIAL_KEK }
-              - { key: SH_EXCHANGE_TOKEN, path: SH_EXCHANGE_TOKEN }
+          projected:
             defaultMode: 256 # 0400
+            sources:
+              - secret:
+                  name: moca-mu1
+                  items:
+                    - { key: SH_SESSION_TOKEN_PRIVATE_KEY, path: SH_SESSION_TOKEN_PRIVATE_KEY }
+                    - { key: SH_CREDENTIAL_KEK, path: SH_CREDENTIAL_KEK }
+                    - { key: SH_EXCHANGE_TOKEN, path: SH_EXCHANGE_TOKEN }
+              - secret:
+                  name: moca-test-users
+                  optional: true
+                  items:
+                    - { key: SH_TEST_USER_SECRET, path: SH_TEST_USER_SECRET }
 ---
 apiVersion: v1
 kind: Service

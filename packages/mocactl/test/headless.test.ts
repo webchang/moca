@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CONFIG, loadAuth, resolvePaths, saveAuth } from '../src/config.js';
 import { HarnessUntrustedError } from '../src/core/session-manager.js';
 import {
@@ -9,6 +9,8 @@ import {
   cmdDoctor,
   cmdLogin,
   cmdLogout,
+  COPY_TIMEOUT_MS,
+  devicePrompt,
   cmdPromote,
   cmdRun,
   type Io,
@@ -397,6 +399,132 @@ describe('cmdLogin', () => {
     expect(o.stderr[0]).not.toMatch(/[\u0007\u001b]/);
     expect(o.stderr[0]).toContain('https://github.com/login/device');
     expect(o.stderr[0]).toContain('ABCD-1234');
+  });
+
+  it('with login helpers, copies the code and then opens the raw verification URL', async () => {
+    const o = io();
+    const steps: string[] = [];
+    const rt = runtime({
+      auth: null,
+      cp: fakeControlPlane({
+        pollDeviceAuth: async () => ({
+          token: 'new-api',
+          subject: 'github:9',
+          roles: [],
+          expiresAt: 4_000_000_000,
+        }),
+      }),
+    });
+    const helpers = {
+      copy: async (t: string) => void steps.push(`copy ${t}`),
+      openUrl: (u: string) => void steps.push(`open ${u}`),
+    };
+    expect(await cmdLogin(rt, o, undefined, helpers)).toBe(0);
+    await new Promise((r) => setImmediate(r));
+    expect(steps).toEqual(['copy ABCD-1234', 'open https://github.com/login/device']);
+    expect(o.stderr.join('\n')).toContain('copied to the clipboard');
+  });
+
+  it('still opens the browser when the clipboard fails, and says nothing was copied', async () => {
+    const o = io();
+    const opened: string[] = [];
+    const rt = runtime({
+      auth: null,
+      cp: fakeControlPlane({
+        pollDeviceAuth: async () => ({
+          token: 'new-api',
+          subject: 'github:9',
+          roles: [],
+          expiresAt: 4_000_000_000,
+        }),
+      }),
+    });
+    const helpers = {
+      copy: async () => {
+        throw new Error('no clipboard');
+      },
+      openUrl: (u: string) => void opened.push(u),
+    };
+    expect(await cmdLogin(rt, o, undefined, helpers)).toBe(0);
+    await new Promise((r) => setImmediate(r));
+    expect(opened).toEqual(['https://github.com/login/device']);
+    expect(o.stderr.join('\n')).not.toContain('clipboard');
+    expect(o.stderr.join('\n')).toContain('Opening the browser');
+  });
+
+  describe('the clipboard and browser (devicePrompt)', () => {
+    const start = (userCode = 'ABCD-1234') => ({
+      deviceCode: 'd',
+      userCode,
+      verificationUri: 'https://github.com/login/device',
+      interval: 5,
+      expiresIn: 900,
+    });
+    const flush = () => new Promise((r) => setImmediate(r));
+
+    it('opens the browser after COPY_TIMEOUT_MS when the clipboard helper hangs', async () => {
+      vi.useFakeTimers();
+      try {
+        const o = io();
+        const opened: string[] = [];
+        devicePrompt(o, {
+          copy: () => new Promise<void>(() => undefined),
+          openUrl: (u) => void opened.push(u),
+        })(start(), 1);
+        await vi.advanceTimersByTimeAsync(COPY_TIMEOUT_MS - 1);
+        expect(opened).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(opened).toEqual(['https://github.com/login/device']);
+        expect(o.stderr.join('\n')).not.toContain('clipboard');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not copy a code that is not device-code shaped, but still opens the browser', async () => {
+      const o = io();
+      const steps: string[] = [];
+      devicePrompt(o, {
+        copy: async (t) => void steps.push(`copy ${t}`),
+        openUrl: (u) => void steps.push(`open ${u}`),
+      })(start('ABCD-1234\nrm -rf ~\n'), 1);
+      await flush();
+      expect(steps).toEqual(['open https://github.com/login/device']);
+      expect(o.stderr.join('\n')).not.toContain('clipboard');
+    });
+
+    it('neither opens nor mentions a browser for a URL openUrl would refuse', async () => {
+      const o = io();
+      const steps: string[] = [];
+      devicePrompt(o, {
+        copy: async (t) => void steps.push(`copy ${t}`),
+        openUrl: (u) => void steps.push(`open ${u}`),
+      })({ ...start(), verificationUri: 'file:///etc/passwd' }, 1);
+      await flush();
+      expect(steps).toEqual(['copy ABCD-1234']);
+      expect(o.stderr.join('\n')).not.toContain('browser');
+      expect(o.stderr.at(-1)).toBe('The code is copied to the clipboard.');
+    });
+
+    it('swallows an openUrl that throws rather than leaving an unhandled rejection', async () => {
+      const o = io();
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown) => void unhandled.push(e);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        devicePrompt(o, {
+          copy: async () => undefined,
+          openUrl: () => {
+            throw new Error('spawn failed');
+          },
+        })(start(), 1);
+        await flush();
+        await flush();
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+    });
   });
 
   it('exits 130 quietly when cancelled during the device-flow poll', async () => {

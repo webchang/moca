@@ -118,6 +118,22 @@ describe('K8sSecretStore', () => {
     store = new K8sSecretStore({ namespace: NS, keks: [KEK], run: cluster.run });
   });
 
+  it('round-trips a two-header binding and a host:port/prefix destination', async () => {
+    const c = cred('multi', {
+      kind: 'api-key',
+      destination: { hosts: ['svc.corp:8443/a'] },
+      secret: { key: 'k' }, // notsecret
+      binding: [
+        { header: 'X-API-Key', format: '{key}' },
+        { header: 'X-Org', format: 'acme-{key}' },
+      ],
+    });
+    await store.put(ALICE, c);
+    expect((await store.get(ALICE, 'multi'))?.descriptor).toEqual(c.descriptor);
+    expect((await store.list(ALICE)).find((d) => d.name === 'multi')).toEqual(c.descriptor);
+    expect(c.descriptor.destination.hosts).toEqual(['svc.corp:8443/a']);
+  });
+
   it('round-trips put/get', async () => {
     await store.put(ALICE, cred('github-work'));
     const got = await store.get(ALICE, 'github-work');

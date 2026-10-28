@@ -1,7 +1,13 @@
 import { CpError } from './errors.js';
-import { asRecord, auditBestEffort, isAdmin, seconds } from './handler-util.js';
+import {
+  asRecord,
+  auditBestEffort,
+  isAdmin,
+  requireEnrolledPrincipal,
+  seconds,
+} from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import { isEnrolled, notEnrolled, type SandboxConfig } from './sandbox-config.js';
+import type { SandboxConfig } from './sandbox-config.js';
 import {
   viewOf,
   type SandboxRecord,
@@ -52,15 +58,8 @@ function sandboxId(raw: string): string {
   return `sbx-${hex.slice(0, ID_HEX)}`;
 }
 
-/** Spec §4.2: the allow list (plus admins) gates every /v1/templates and /v1/sandboxes* call. */
-function requireEnrolled(ctx: RequestCtx, deps: CpDeps): TokenClaims {
-  const p = ctx.principal;
-  if (!p) throw new CpError('token_required', 'this route requires a token');
-  if (!isEnrolled(p.sub, p.roles ?? [], deps.config)) {
-    throw notEnrolled(p.sub);
-  }
-  return p;
-}
+const requireEnrolled = (ctx: RequestCtx, deps: CpDeps): TokenClaims =>
+  requireEnrolledPrincipal(ctx, deps.config);
 
 /**
  * The sandbox ownership choke point, as assertOwner is for sessions. Every `sandboxScoped` route

@@ -96,6 +96,7 @@ describe('the kind registry', () => {
       parseCredentialBody('aws', {
         ...bearerBody(),
         kind: 'sigv4',
+        binding: { header: 'Authorization', format: 'AWS4-HMAC-SHA256 {accessKeyId}' },
         secret: { accessKeyId: 'AKIAFAKE', secretAccessKey: 'fake' }, // notsecret
       }).descriptor.kind,
     ).toBe('sigv4');
@@ -308,6 +309,44 @@ describe('parseCredentialBody', () => {
         String(bad),
       ).toBe('invalid_request');
     }
+  });
+});
+
+describe('sandbox-egress destination and default-binding validation', () => {
+  afterEach(() => {
+    unregisterKind('badkind');
+  });
+
+  it('accepts 16 destinations and refuses 17', () => {
+    const hosts = (n: number) => Array.from({ length: n }, (_, i) => `h${i}.example.com`);
+    expect(
+      parseCredentialBody('x', bearerBody({ destination: { hosts: hosts(16) } })).descriptor
+        .destination.hosts,
+    ).toHaveLength(16);
+    expect(
+      codeOf(() => parseCredentialBody('x', bearerBody({ destination: { hosts: hosts(17) } }))),
+    ).toBe('invalid_request');
+  });
+
+  it.each([[['GitHub.com', 'github.com.']], [['h:443', 'h']]])(
+    'refuses destinations that are duplicates after normalization: %j',
+    (hosts) => {
+      expect(codeOf(() => parseCredentialBody('x', bearerBody({ destination: { hosts } })))).toBe(
+        'invalid_request',
+      );
+    },
+  );
+
+  it('validates the kind default binding for sandbox-egress only', () => {
+    registerKind('badkind', {
+      secretFields: ['token'],
+      defaultBinding: { header: 'Authorization', format: 'Bearer {nope}' },
+    });
+    const body = bearerBody({ kind: 'badkind', binding: undefined });
+    expect(codeOf(() => parseCredentialBody('x', body))).toBe('invalid_request');
+    expect(
+      parseCredentialBody('x', { ...body, consumer: 'control-plane' }).descriptor.consumer,
+    ).toBe('control-plane');
   });
 });
 

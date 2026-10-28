@@ -5,7 +5,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { MAX_STDIN_BYTES, q, WORKSPACE } from '@moca/sandbox-client';
 import { loadConfig, normalizeUrl, resolvePaths, type Paths, type TuiConfig } from '../config.js';
 import { sanitizeRemote } from '../core/sanitize.js';
-import type { Io } from '../headless.js';
+import type { Io, LoginHelpers } from '../headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from '../runtime.js';
 import { SandboxApiClient } from './api.js';
 import {
@@ -23,13 +23,24 @@ import {
 } from './commands.js';
 import { cmdDoctor } from './doctor.js';
 import { type ExecFactory } from './exec.js';
+import { cmdCodex, type CodexDeps } from './codex.js';
+import {
+  addCredential,
+  addProblem,
+  deleteCredential,
+  listCredentials,
+  listPresets,
+} from './credentials.js';
 import { cmdMcp, cmdPut, cmdRun, parseTimeout, workspacePath } from './run.js';
 import { PushError, repoRoot } from './push.js';
 import { findSandboxFile, readBinding, readBoundSandbox, SANDBOX_ID_RE } from './state.js';
 import { checkBeforeRm, cmdPull, cmdPush, cmdUp, DEFAULT_TEMPLATE, unbind } from './sync.js';
+import { type AgentopExec } from './agentop.js';
 
 export const SBX_USAGE = `usage (the sandbox service, SBX0):
-  mocactl sbx login [--control-plane-url URL]    log in with the GitHub device flow (the URL is remembered)
+  mocactl sbx login [--control-plane-url URL] [--no-browser]
+                                                 log in with the GitHub device flow (the URL is remembered;
+                                                 in a local terminal: copies the code, opens the browser)
   mocactl sbx logout                             end the sandbox-service login (deletes sbx-auth.json)
   mocactl sbx templates [--json]                 the templates a sandbox can be created from
   mocactl sbx create [--template ID] [--name N] [--label k=v ...] [--json]
@@ -51,7 +62,13 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  the sandbox token's lifetime minus 60 s)
   mocactl sbx put PATH [--sandbox ID]            write stdin to PATH under /workspace
   mocactl sbx mcp [--sandbox ID]                 the stdio MCP server for Claude Code / OpenCode
-  mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config]
+  mocactl sbx codex [-- CODEX_ARGS ...]          run Codex CLI on this sandbox's MCP tools, for one
+                                                 run (-c, nothing written: Codex reads no
+                                                 project-local config, so up cannot configure it).
+                                                 Its shell tool is off, but unified_exec cannot be
+                                                 disabled, so local execution is restricted, not
+                                                 denied: use Codex's own sandbox_mode as well
+  mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config] [--cortex]
                                                  in a git repository: create or reuse its sandbox,
                                                  push the working tree, bind it in .sbx/sandbox.json,
                                                  and point Claude Code and OpenCode at the sandbox's
@@ -61,6 +78,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  that conflicts stops up before anything is done)
                                                  (a reused sandbox with changes not yet pulled is
                                                  left unpushed, with a warning, and up exits 0)
+                                                 (--cortex: Cortex v0.9.3+ blocks the local tools
+                                                 instead of a deny list, so Claude Code loads the
+                                                 project's CLAUDE.md; kept by later runs)
   mocactl sbx push [--force] [--include-secrets] [--max-push MiB]   push the working tree again
                                                  (refused while the sandbox has changes not yet
                                                  pulled, unless --force; .env*, *.pem, *.key and
@@ -68,6 +88,14 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx pull [--apply] [-o FILE]           the sandbox's changes as a patch, on stdout or in
                                                  FILE (--apply: apply it here, then advance the
                                                  sandbox's baseline)
+  mocactl sbx credentials [list] [--json]       the credentials the host swaps into your sandboxes' HTTPS requests
+  mocactl sbx credentials add NAME (--host DEST ... [--kind K] | --preset ID)
+                                                 store one (the secret is read from stdin, never argv);
+                                                 DEST is host[:port][/prefix]; K: bearer (default), basic,
+                                                 api-key, oauth2-token (basic: stdin is username=...
+                                                 and password=... lines)
+  mocactl sbx credentials presets [--json]       the presets \`add --preset\` knows
+  mocactl sbx credentials delete NAME            delete one
   mocactl sbx doctor [--sandbox ID] [--json]     check login, sandbox, agent config, exec and recent
                                                  calls (exit 0 when every check passes, else 1)
 ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json. The control plane
@@ -90,8 +118,14 @@ export interface SbxDeps {
   execFactory?: ExecFactory;
   /** `doctor`'s `claude --version` (default: asked of the `claude` on PATH). */
   claudeVersion?: () => Promise<string | undefined> | string | undefined;
+  /** Cortex's agentop, for `up --cortex` and `doctor` in Cortex mode (default: the one on PATH). */
+  agentop?: AgentopExec;
   /** `mcp`'s transport (default stdio). */
   mcpTransport?: Transport;
+  /** `codex`'s child process (default: the `codex` on PATH). */
+  codex?: CodexDeps;
+  /** `login`'s clipboard and browser; absent when nobody is at this machine's screen. */
+  loginHelpers?: LoginHelpers;
 }
 
 export function resolveSbxUrl(
@@ -196,7 +230,18 @@ export async function openSbx(
 }
 
 /** The commands with no --json output (R5i): refused with exit 2 rather than ignored. */
-const NO_JSON = new Set(['login', 'logout', 'env', 'run', 'put', 'mcp', 'up', 'push', 'pull']);
+const NO_JSON = new Set([
+  'login',
+  'logout',
+  'env',
+  'run',
+  'put',
+  'mcp',
+  'codex',
+  'up',
+  'push',
+  'pull',
+]);
 /** The commands that open without the login check: they log in, out, or check it themselves (R7). */
 const OWN_LOGIN = new Set(['login', 'logout', 'doctor']);
 /** The commands that act on one sandbox: `[ID]` as an argument (or `--sandbox ID`). */
@@ -206,6 +251,7 @@ const TAKES_SANDBOX_FLAG = new Set([
   'run',
   'put',
   'mcp',
+  'codex',
   'push',
   'pull',
   'doctor',
@@ -215,7 +261,17 @@ const TAKES_SANDBOX_FLAG = new Set([
 const IN_REPO = new Set(['up', 'push', 'pull', 'doctor']);
 /** Flags that belong to some commands only: refused elsewhere rather than silently ignored. */
 const SYNC_FLAGS: [
-  'force' | 'include-secrets' | 'max-push' | 'apply' | 'out' | 'no-agent-config' | 'keep-config',
+  (
+    | 'force'
+    | 'include-secrets'
+    | 'max-push'
+    | 'apply'
+    | 'out'
+    | 'no-agent-config'
+    | 'cortex'
+    | 'keep-config'
+    | 'no-browser'
+  ),
   string[],
 ][] = [
   ['force', ['push', 'rm']],
@@ -224,7 +280,9 @@ const SYNC_FLAGS: [
   ['apply', ['pull']],
   ['out', ['pull']],
   ['no-agent-config', ['up']],
+  ['cortex', ['up']],
   ['keep-config', ['rm']],
+  ['no-browser', ['login']],
 ];
 /** `--max-push` in MiB: up to 4 GiB, far above what a push should ever be. */
 const MAX_PUSH_MIB = 4096;
@@ -271,7 +329,12 @@ export async function sbxMain(
         apply: { type: 'boolean' },
         out: { type: 'string', short: 'o' },
         'no-agent-config': { type: 'boolean' },
+        cortex: { type: 'boolean' },
         'keep-config': { type: 'boolean' },
+        'no-browser': { type: 'boolean' },
+        host: { type: 'string', multiple: true },
+        kind: { type: 'string' },
+        preset: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -301,10 +364,12 @@ export async function sbxMain(
     'run',
     'put',
     'mcp',
+    'codex',
     'up',
     'push',
     'pull',
     'doctor',
+    'credentials',
   ];
   if (!known.includes(command)) {
     io.err(`sbx: unknown command '${command}'\n${SBX_USAGE}`);
@@ -329,6 +394,17 @@ export async function sbxMain(
   );
   if (flagMisuse) {
     io.err(`sbx: --${flagMisuse[0]} only applies to ${flagMisuse[1].join(' and ')}\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  const credFlag = (['host', 'kind', 'preset'] as const).find((f) => values[f] !== undefined);
+  if (credFlag && !(command === 'credentials' && arg === 'add')) {
+    io.err(`sbx: --${credFlag} only applies to credentials add\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (values.cortex && values['no-agent-config']) {
+    io.err(
+      `sbx: --cortex is a choice about the agent configuration, which --no-agent-config does not write\n${SBX_USAGE}`,
+    );
     return SBX_EXIT.usage;
   }
   if (values.template !== undefined && !values.template.trim()) {
@@ -357,10 +433,19 @@ export async function sbxMain(
   // `run` takes everything after the command (after `--`) as CMD; `put` exactly one PATH; rm, token
   // and env at most one ID; every other command no argument at all.
   const argsOk =
+    // run quotes its CMD; codex forwards its own flags and prompt to the child.
     command === 'run' ||
-    (command === 'put'
-      ? arg !== undefined && extra.length === 0
-      : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
+    command === 'codex' ||
+    (command === 'credentials'
+      ? arg === undefined ||
+        (arg === 'presets'
+          ? extra.length === 0
+          : arg === 'list'
+            ? extra.length === 0
+            : ['add', 'delete'].includes(arg) && extra.length === 1)
+      : command === 'put'
+        ? arg !== undefined && extra.length === 0
+        : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
   if (!argsOk) {
     io.err(
       `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${SBX_USAGE}`,
@@ -372,9 +457,11 @@ export async function sbxMain(
   // checked, whether it came from an argument, --sandbox or .sbx/sandbox.json: it goes into URLs
   // and the flight recorder's file name.
   let root: string | undefined;
+  // What `up`/`push` were run from, so the plan can say when that is not the work-tree root (#611).
+  const cwd = deps.cwd ?? process.cwd();
   if (IN_REPO.has(command) && !(command === 'pull' && !values.apply && values.sandbox)) {
     try {
-      root = await repoRoot(deps.cwd ?? process.cwd());
+      root = await repoRoot(cwd);
     } catch (err) {
       if (!(err instanceof PushError)) throw err;
       // doctor with --sandbox has checks that need no repository: it runs them, and says so.
@@ -417,6 +504,15 @@ export async function sbxMain(
       return SBX_EXIT.usage;
     }
   }
+  const addOpts = (name: string) => ({
+    name,
+    ...(values.preset !== undefined ? { preset: values.preset } : {}),
+    ...(values.kind !== undefined ? { kind: values.kind } : {}),
+    hosts: (values.host ?? [])
+      .flatMap((h) => h.split(','))
+      .map((h) => h.trim())
+      .filter(Boolean),
+  });
   const timeout = parseTimeout(io, values.timeout);
   if (timeout === null) return SBX_EXIT.usage;
   let script: string | undefined;
@@ -469,6 +565,32 @@ export async function sbxMain(
     };
   }
 
+  if (command === 'credentials') {
+    if (arg !== undefined && !['add', 'delete', 'presets', 'list'].includes(arg)) {
+      io.err(`sbx: unknown credentials command '${sanitizeRemote(arg)}'\n${SBX_USAGE}`);
+      return SBX_EXIT.usage;
+    }
+    // The catalog is local: no login, no request, no stdin.
+    if (arg === 'presets') return listPresets({ io, json: values.json === true });
+    if (arg === 'add' || arg === 'delete') {
+      if (!extra[0]) {
+        io.err(`sbx: credentials ${arg} needs a NAME\n${SBX_USAGE}`);
+        return SBX_EXIT.usage;
+      }
+    }
+    if (arg === 'add') {
+      const bad = addProblem({
+        ...addOpts(extra[0]!),
+        readStdin: async () => '',
+        stdinIsTTY: false,
+      });
+      if (bad) {
+        io.err(`sbx: ${bad}`);
+        return SBX_EXIT.usage;
+      }
+    }
+  }
+
   // A sandbox bound by .sbx/sandbox.json lives on the control plane `sbx up` used, which may not be
   // the one remembered at login (a `sbx mcp` started by an agent has no MOCACTL_SBX_URL): the flag
   // and the environment still win (R5j).
@@ -483,7 +605,11 @@ export async function sbxMain(
 
   switch (command) {
     case 'login':
-      return cmdLogin(ctx, values['control-plane-url'] !== undefined);
+      return cmdLogin(
+        ctx,
+        values['control-plane-url'] !== undefined,
+        values['no-browser'] ? undefined : deps.loginHelpers,
+      );
     case 'logout':
       return cmdLogout(ctx);
     case 'templates':
@@ -511,8 +637,17 @@ export async function sbxMain(
       if (code !== SBX_EXIT.ok || values['keep-config'] || !bound) return code;
       return unbind(ctx, bindingRoot!);
     }
+    case 'credentials':
+      if (arg === 'add') {
+        return addCredential(ctx, {
+          ...addOpts(extra[0]!),
+          readStdin: deps.readStdin ?? (async () => ''),
+          stdinIsTTY: deps.stdinIsTTY === true || !deps.readStdin,
+        });
+      }
+      return arg === 'delete' ? deleteCredential(ctx, extra[0]!) : listCredentials(ctx);
     case 'doctor':
-      return cmdDoctor(ctx, root, id, deps.execFactory, deps.claudeVersion);
+      return cmdDoctor(ctx, root, id, deps.execFactory, deps.claudeVersion, deps.agentop);
     case 'token':
       return cmdToken(ctx, id!);
     case 'run':
@@ -521,6 +656,19 @@ export async function sbxMain(
       return cmdPut(ctx, id!, target!, content!, deps.execFactory);
     case 'mcp':
       return cmdMcp(ctx, id!, deps.mcpTransport, deps.execFactory);
+    case 'codex':
+      // Only an explicit --sandbox is passed on: without one, the `mocactl sbx mcp` that codex
+      // starts resolves the binding itself, so the agent follows .sbx/sandbox.json as it changes.
+      // --control-plane-url is forwarded (as the normalized ctx.url) because codex does not give
+      // the server its environment, so the server cannot see MOCACTL_SBX_URL or the flag (#639
+      // review); FORWARDED_ENV carries the env-var case.
+      return cmdCodex(
+        ctx,
+        positionals.slice(1),
+        deps.codex ?? {},
+        values.sandbox,
+        values['control-plane-url'] !== undefined ? ctx.url : undefined,
+      );
     case 'up':
       return cmdUp(
         ctx,
@@ -532,9 +680,12 @@ export async function sbxMain(
           ...(values.template ? { template: values.template } : {}),
           ...(values.name ? { name: values.name } : {}),
           noAgentConfig: values['no-agent-config'] === true,
+          cortex: values.cortex === true,
           ...(upBound ? { boundId: upBound } : {}),
+          cwd,
         },
         deps.execFactory,
+        deps.agentop,
       );
     case 'push':
       return cmdPush(
@@ -545,6 +696,7 @@ export async function sbxMain(
           force: values.force === true,
           includeSecrets: values['include-secrets'] === true,
           ...(maxPush !== undefined ? { maxPush } : {}),
+          cwd,
         },
         deps.execFactory,
       );

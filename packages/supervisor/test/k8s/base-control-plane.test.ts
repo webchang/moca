@@ -52,18 +52,37 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s base: control plane', () => {
     expect(podRules).toEqual([]);
   });
 
-  it('mounts its three secrets as files and reads settings from the ConfigMap', () => {
-    for (const k of ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN']) {
+  it('mounts its secrets as files from a projected volume, and reads settings from the ConfigMap', () => {
+    for (const k of [
+      'SH_SESSION_TOKEN_PRIVATE_KEY',
+      'SH_CREDENTIAL_KEK',
+      'SH_EXCHANGE_TOKEN',
+      // ADR-0045: a password on a login path, so it is a FILE like the others -- never an env
+      // line, which every kubectl child would inherit.
+      'SH_TEST_USER_SECRET',
+    ]) {
       expect(envVar(cp(), k)).toBeUndefined();
     }
     expect(envVar(cp(), 'CREDENTIALS_DIRECTORY')?.value).toBe('/run/credentials');
+    // A PROJECTED volume (ADR-0045), so the test-user secret can come from a source of its own
+    // marked `optional`: the credential loader errors on an empty file and treats only an absent
+    // one as "unset", so an empty required key in moca-mu1 crash-loops the control plane.
     const vol = podSpec(dep()).volumes.find((v: { name: string }) => v.name === 'credentials');
-    expect(vol.secret.secretName).toBe('moca-mu1');
-    expect(vol.secret.items.map((i: { key: string }) => i.key).sort()).toEqual([
+    expect(vol.secret).toBeUndefined();
+    const sources = vol.projected.sources as Array<{
+      secret: { name: string; optional?: boolean; items: Array<{ key: string }> };
+    }>;
+    const mu1 = sources.find((x) => x.secret.name === 'moca-mu1')!;
+    expect(mu1.secret.optional).toBeUndefined(); // required: the stack cannot run without these
+    expect(mu1.secret.items.map((i) => i.key).sort()).toEqual([
       'SH_CREDENTIAL_KEK',
       'SH_EXCHANGE_TOKEN',
       'SH_SESSION_TOKEN_PRIVATE_KEY',
     ]);
+    const tu = sources.find((x) => x.secret.name === 'moca-test-users')!;
+    // Optional, so a stack with test users off -- where setup.sh deletes this Secret -- still boots.
+    expect(tu.secret.optional).toBe(true);
+    expect(tu.secret.items.map((i) => i.key)).toEqual(['SH_TEST_USER_SECRET']);
     for (const k of [
       'SH_GITHUB_CLIENT_ID',
       'SH_ADMIN_SUBJECTS',
@@ -77,6 +96,15 @@ describe.skipIf(NO_KUBECTL)('deploy/k8s base: control plane', () => {
         valueFrom: { configMapKeyRef: { name: 'moca-settings', key: k } },
       });
     }
+    // ADR-0045: the test-user count is OPTIONAL, like the tier keys. A moca-settings written by an
+    // older setup.sh has no SH_TEST_USERS, and a required ref would stop the control plane from
+    // starting at all on an upgraded stack; absent reads as 0 (off).
+    expect(envVar(cp(), 'SH_TEST_USERS')).toEqual({
+      name: 'SH_TEST_USERS',
+      valueFrom: {
+        configMapKeyRef: { name: 'moca-settings', key: 'SH_TEST_USERS', optional: true },
+      },
+    });
   });
 
   it('keeps the existing probes and needs its ServiceAccount token for the kube API', () => {

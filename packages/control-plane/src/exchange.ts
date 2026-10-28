@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { defaultAuditLog } from './audit-log.js';
 import { touchBundle } from './bundle-budget.js';
-import { inferenceAuthHeader, type InferenceAuthHeader } from './credential-store.js';
+import { firstBinding, inferenceAuthHeader, type InferenceAuthHeader } from './credential-store.js';
 import { CpError } from './errors.js';
 import type { CpConfig, CpDeps } from './handlers.js';
 import type { InferenceTarget } from './model-catalog.js';
@@ -190,7 +190,7 @@ export async function resolveInference(
     secretValue = Object.values(stored.secret)[0];
     endpoint = stored.descriptor.endpoint;
     const [field] = Object.keys(stored.secret);
-    const header = field ? inferenceAuthHeader(stored.descriptor.binding, field) : undefined;
+    const header = field ? inferenceAuthHeader(firstBinding(stored.descriptor), field) : undefined;
     if (!header) {
       // Written before parseCredentialBody refused unsendable bindings (#368). Falling back to Bearer
       // would send the secret in a header its binding never named -- refuse, attributably.

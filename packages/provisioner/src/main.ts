@@ -5,15 +5,21 @@ import {
   parseKeyset,
   parseStorageClasses,
   publicKeyFromBase64,
+  redisClientOptions,
   storageMiB,
 } from '@moca/control-plane';
 import type { KeyObject } from 'node:crypto';
+import { createClient } from 'redis';
 import { inClusterOptions, RestKube } from './kube.js';
 import {
+  DEFAULT_ORPHAN_GRACE_S,
+  DEFAULT_REDIS_TIMEOUT_MS,
   remintExpiring,
   settleSeeds,
+  sweepOrphans,
   type ProvisionerConfig,
   type ProvisionerDeps,
+  type RecordStore,
 } from './provisioner.js';
 import { BundleStore, DEFAULT_SEED_HOLD_S } from './seed.js';
 import { startSeedServer, startServer, type ServerDeps } from './server.js';
@@ -21,8 +27,10 @@ import { startSeedServer, startServer, type ServerDeps } from './server.js';
 /**
  * moca-provisioner (ADR-0043): the only MOCA component with Kubernetes permissions in the sandbox
  * namespace. Secrets are files under CREDENTIALS_DIRECTORY (credentialValue), as the control
- * plane's are: MOCA_ATTACH_PRIVATE_KEY (its own Ed25519 key, PKCS#8 base64 or PEM) and
- * MOCA_PROVISIONER_TOKEN (the workers' service token).
+ * plane's are: MOCA_ATTACH_PRIVATE_KEY (its own Ed25519 key, PKCS#8 base64 or PEM),
+ * MOCA_PROVISIONER_TOKEN (the workers' service token) and REDIS_URL (the deployment's one Redis
+ * credential, read-write like every caller's (spec §9), used by the orphan sweep only, for GETs;
+ * unset, there is no sweep).
  */
 
 function required(value: string | undefined, name: string): string {
@@ -56,9 +64,40 @@ export function configFromEnv(env: NodeJS.ProcessEnv): ProvisionerConfig {
   };
 }
 
+/**
+ * The workload records the orphan sweep reads (spec §6.2): this code only GETs, though the
+ * credential could write. No offline queue, so a read while Redis is down fails at once (that
+ * workload is skipped this pass) instead of waiting for a reconnect; the sweep runs only while the
+ * client is ready anyway (orphanSweeper). A read on a socket that stops answering while the client
+ * still looks ready is bounded by the sweep itself (MOCA_PROVISIONER_REDIS_TIMEOUT_MS).
+ */
+export function redisRecords(
+  url: string,
+): RecordStore & { ready: () => boolean; close: () => void } {
+  const client = createClient({ ...redisClientOptions(url), disableOfflineQueue: true });
+  // The message only, never the error object: the URL carries the password (as the control plane).
+  client.on('error', (err: unknown) =>
+    console.error('provisioner: redis client error:', (err as Error)?.message ?? String(err)),
+  );
+  void client
+    .connect()
+    .catch((err: unknown) =>
+      console.error('provisioner: redis connect failed:', (err as Error)?.message ?? String(err)),
+    );
+  return {
+    get: (key) => client.get(key),
+    ready: () => client.isReady,
+    // destroy, not close: close() waits on queued commands, which never drain while disconnected.
+    close: () => client.destroy(),
+  };
+}
+
 export function depsFromEnv(env: NodeJS.ProcessEnv): ServerDeps & {
   reconcileS: number;
+  orphanGraceS: number;
+  redisTimeoutMs: number;
   attachKeys: Map<string, KeyObject>;
+  records?: RecordStore & { ready: () => boolean; close: () => void };
 } {
   const signer = makeSigner(
     required(credentialValue(env, 'MOCA_ATTACH_PRIVATE_KEY'), 'MOCA_ATTACH_PRIVATE_KEY'),
@@ -74,8 +113,10 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): ServerDeps & {
       'MOCA_PROVISIONER_SEED_BUDGET_BYTES must be at least twice MOCA_CONTEXT_BUNDLE_MAX_BYTES',
     );
   }
+  const redisUrl = credentialValue(env, 'REDIS_URL');
   return {
     kube: new RestKube(inClusterOptions(env, namespace)),
+    ...(redisUrl ? { records: redisRecords(redisUrl) } : {}),
     signer,
     // The seed port verifies attach tokens with this provisioner's own public key.
     attachKeys: new Map([[signer.kid, publicKeyFromBase64(signer.publicKeyBase64)]]),
@@ -95,6 +136,47 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): ServerDeps & {
     ),
     userKeys,
     reconcileS: positiveIntEnv(env, 'MOCA_PROVISIONER_RECONCILE_S', 300),
+    orphanGraceS: positiveIntEnv(env, 'MOCA_PROVISIONER_ORPHAN_GRACE_S', DEFAULT_ORPHAN_GRACE_S),
+    redisTimeoutMs: positiveIntEnv(
+      env,
+      'MOCA_PROVISIONER_REDIS_TIMEOUT_MS',
+      DEFAULT_REDIS_TIMEOUT_MS,
+    ),
+  };
+}
+
+/**
+ * The orphan sweep (sweepOrphans, spec §6.2), on the reconcile tick: one pass at a time, and none
+ * while Redis is not ready (every record would read as unknown, so nothing could be decided). Every
+ * record read is bounded by `timeoutMs`, so a pass always ends and the next one can start.
+ */
+export function orphanSweeper(
+  deps: ProvisionerDeps & { records: RecordStore & { ready: () => boolean } },
+  graceS: number,
+  timeoutMs = DEFAULT_REDIS_TIMEOUT_MS,
+) {
+  let running: Promise<void> | null = null;
+  return (): Promise<void> => {
+    if (!deps.records.ready()) {
+      console.error('provisioner: orphan sweep skipped: Redis is not ready');
+      return Promise.resolve();
+    }
+    return (running ??= sweepOrphans(deps, graceS, timeoutMs)
+      .then((r) => {
+        if (r.swept > 0) console.log(`provisioner: swept ${r.swept} orphaned workload(s)`);
+        if (r.kept > 0) {
+          console.error(
+            `provisioner: ${r.kept} PVC(s) kept on missing records; they count against the ` +
+              'moca-sandbox ResourceQuota until deleted by hand (docs/context-service.md)',
+          );
+        }
+      })
+      .catch((err: unknown) =>
+        console.error('provisioner: orphan sweep failed:', (err as Error)?.message ?? String(err)),
+      )
+      .finally(() => {
+        running = null;
+      }));
   };
 }
 
@@ -137,13 +219,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     positiveIntEnv(process.env, 'MOCA_PROVISIONER_SEED_PORT', 8081),
   );
   const settle = seedSettler(deps);
-  // Re-mint attach tokens nearing expiry (spec §3.1), and finish seeds a restart left behind
-  // (spec §5.3). The orphan sweep of spec §6.2 joins this loop in a later PR.
+  const records = deps.records;
+  const sweep = records
+    ? orphanSweeper({ ...deps, records }, deps.orphanGraceS, deps.redisTimeoutMs)
+    : null;
+  if (!sweep) console.error('provisioner: REDIS_URL is not set: no orphan sweep (spec §6.2)');
+  // Re-mint attach tokens nearing expiry (spec §3.1), finish seeds a restart left behind (spec
+  // §5.3), then sweep orphaned workloads (spec §6.2).
   const tick = () => {
     void settle.run();
     return remintExpiring(deps)
       .then((n) => n > 0 && console.log(`provisioner: re-minted ${n} attach token(s)`))
-      .catch((err: unknown) => console.error('provisioner: re-mint pass failed:', err));
+      .catch((err: unknown) => console.error('provisioner: re-mint pass failed:', err))
+      .then(() => sweep?.());
   };
   void tick();
   const timer = setInterval(tick, deps.reconcileS * 1000);
@@ -152,6 +240,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     clearInterval(timer);
     clearInterval(seedTimer);
     seedServer.close();
+    records?.close();
     server.close(() => process.exit(0));
   });
 }

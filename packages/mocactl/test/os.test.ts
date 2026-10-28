@@ -10,7 +10,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { resolvePaths } from '../src/config.js';
-import { editorArgv, editorCommand, openCommand, realOs, writeExport } from '../src/os.js';
+import {
+  editorArgv,
+  editorCommand,
+  loginHelpers,
+  openCommand,
+  realOs,
+  writeExport,
+} from '../src/os.js';
 
 describe('editorCommand', () => {
   it('prefers VISUAL, then EDITOR, then vi', () => {
@@ -20,14 +27,98 @@ describe('editorCommand', () => {
   });
 });
 
+describe('loginHelpers', () => {
+  const os = { copy: async () => undefined, openUrl: () => undefined };
+  const tty = { stdin: true, stderr: true };
+
+  it('offers the clipboard and browser in a local terminal', () => {
+    expect(loginHelpers({}, tty, os, 'darwin')).toBeDefined();
+    expect(loginHelpers({}, tty, os, 'win32')).toBeDefined();
+    expect(loginHelpers({ DISPLAY: ':0' }, tty, os, 'linux')).toBeDefined();
+    expect(loginHelpers({ WAYLAND_DISPLAY: 'wayland-0' }, tty, os, 'linux')).toBeDefined();
+  });
+
+  it('offers nothing when stdin or stderr is not a terminal', () => {
+    expect(loginHelpers({}, { stdin: false, stderr: true }, os, 'darwin')).toBeUndefined();
+    expect(loginHelpers({}, { stdin: true, stderr: false }, os, 'darwin')).toBeUndefined();
+  });
+
+  it('offers nothing over SSH', () => {
+    expect(loginHelpers({ SSH_CONNECTION: '1 2 3 4' }, tty, os, 'darwin')).toBeUndefined();
+    expect(loginHelpers({ SSH_TTY: '/dev/ttys001' }, tty, os, 'darwin')).toBeUndefined();
+    expect(loginHelpers({ SSH_CLIENT: '1 2 3' }, tty, os, 'darwin')).toBeUndefined();
+  });
+
+  it('offers nothing under sudo, which strips SSH_* and would open the browser as root', () => {
+    expect(loginHelpers({ SUDO_USER: 'ed' }, tty, os, 'darwin')).toBeUndefined();
+    expect(loginHelpers({ SUDO_USER: 'ed', DISPLAY: ':0' }, tty, os, 'linux')).toBeUndefined();
+  });
+
+  it('offers the given copy and openUrl, and is busy only while a copy is unsettled', async () => {
+    const opened: string[] = [];
+    let release!: () => void;
+    const copies: string[] = [];
+    const h = loginHelpers(
+      {},
+      tty,
+      {
+        copy: (t) => {
+          copies.push(t);
+          return new Promise<void>((r) => (release = r));
+        },
+        openUrl: (u) => void opened.push(u),
+      },
+      'darwin',
+    )!;
+    expect(h.busy()).toBe(false);
+    const p = h.copy('ABCD-1234');
+    expect(h.busy()).toBe(true);
+    release();
+    await p;
+    expect(h.busy()).toBe(false);
+    expect(copies).toEqual(['ABCD-1234']);
+    h.openUrl('https://x/');
+    expect(opened).toEqual(['https://x/']);
+  });
+
+  it('is not left busy by a copy that fails', async () => {
+    const h = loginHelpers(
+      {},
+      tty,
+      {
+        copy: async () => {
+          throw new Error('no clipboard');
+        },
+        openUrl: () => undefined,
+      },
+      'darwin',
+    )!;
+    await expect(h.copy('ABCD-1234')).rejects.toThrow('no clipboard');
+    expect(h.busy()).toBe(false);
+  });
+
+  it('offers nothing off macOS and Windows without a display (headless, container, console)', () => {
+    expect(loginHelpers({}, tty, os, 'linux')).toBeUndefined();
+    expect(loginHelpers({}, tty, os, 'freebsd')).toBeUndefined();
+  });
+});
+
 describe('openCommand', () => {
   it('uses the platform opener', () => {
     expect(openCommand('darwin', 'https://x')).toEqual({ cmd: 'open', args: ['https://x/'] });
     expect(openCommand('linux', 'https://x')).toEqual({ cmd: 'xdg-open', args: ['https://x/'] });
     expect(openCommand('win32', 'https://x')).toEqual({
-      cmd: 'cmd',
-      args: ['/c', 'start', '', 'https://x/'],
+      cmd: 'rundll32',
+      args: ['url.dll,FileProtocolHandler', 'https://x/'],
     });
+  });
+
+  it('never hands a Windows URL to cmd.exe, which would parse & | and %VAR% in it', () => {
+    const url = 'https://evil.example/?a&calc.exe|x%PATH%';
+    const command = openCommand('win32', url);
+    expect(command).toEqual({ cmd: 'rundll32', args: ['url.dll,FileProtocolHandler', url] });
+    expect(command?.cmd).not.toMatch(/^cmd/i);
+    expect(command?.args).not.toContain('/c');
   });
 });
 

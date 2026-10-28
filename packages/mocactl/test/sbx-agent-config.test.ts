@@ -18,6 +18,7 @@ import { MCP_INSTRUCTIONS } from '@moca/sandbox-client';
 import {
   CLAUDE_DENY,
   CLAUDE_MIN_VERSION,
+  CLAUDE_RETIRED,
   ConfigConflict,
   MARK_BEGIN,
   MARK_END,
@@ -132,12 +133,133 @@ describe('agent configuration (SBX0 §6.3)', () => {
     }
   });
 
-  it("writes the MCP server's own instructions as the block, so both say the same (#568)", () => {
-    expect(RULES).toBe(`## Working in the MOCA sandbox\n\n${MCP_INSTRUCTIONS}`);
+  it("writes the MCP server's own instructions, then the GH_TOKEN steering line, as the block (#568)", () => {
+    expect(RULES).toBe(
+      `## Working in the MOCA sandbox\n\n${MCP_INSTRUCTIONS}\n\n` +
+        "GH_TOKEN in the sandbox is a placeholder that the host replaces with the user's token; never set, print or ask for a token.",
+    );
   });
 
   it('names only tools current Claude Code knows: an unknown deny name warns at every start (#568)', () => {
     for (const t of ['MultiEdit', 'LS', 'NotebookRead']) expect(CLAUDE_DENY).not.toContain(t);
+  });
+
+  describe('the retired denies a pre-#572 run left behind (#574)', () => {
+    /**
+     * A repository configured by a mocactl from before #572: the three pre-2.0 tools are in the
+     * deny list, and the record says `sbx up` is what put them there. `byHand` go in the list
+     * without a record, as the developer's own entries do.
+     */
+    const pre572 = (d: string, byHand: string[] = []) => {
+      mkdirSync(join(d, '.claude'));
+      writeFileSync(
+        join(d, '.claude/settings.json'),
+        '{\n  "permissions": {\n    "deny": []\n  }\n}\n',
+      );
+      writeAgentConfig(d);
+      const s = json(d, '.claude/settings.json');
+      s.permissions.deny.push(...CLAUDE_RETIRED, ...byHand);
+      writeFileSync(join(d, '.claude/settings.json'), JSON.stringify(s, null, 2) + '\n');
+      const rec = json(d, '.sbx/agent-config.json');
+      for (const t of CLAUDE_RETIRED) {
+        rec.json.push({
+          file: '.claude/settings.json',
+          op: 'item',
+          path: ['permissions', 'deny'],
+          value: t,
+        });
+      }
+      writeFileSync(join(d, '.sbx/agent-config.json'), JSON.stringify(rec, null, 2) + '\n');
+    };
+    const denies = (d: string) => json(d, '.claude/settings.json').permissions.deny as string[];
+    const recorded = (d: string) =>
+      (json(d, '.sbx/agent-config.json').json as { op: string; value?: unknown }[])
+        .filter((r) => r.op === 'item')
+        .map((r) => r.value);
+
+    it('names the three #572 dropped, and none of them is a deny to add', () => {
+      expect([...CLAUDE_RETIRED]).toEqual(['MultiEdit', 'LS', 'NotebookRead']);
+      for (const t of CLAUDE_RETIRED) expect(CLAUDE_DENY).not.toContain(t);
+    });
+
+    it('a re-run takes them back and updates the record, leaving the rest of the list alone', () => {
+      const d = dir();
+      pre572(d);
+      expect(denies(d)).toEqual([...CLAUDE_DENY, ...CLAUDE_RETIRED]);
+      expect(writeAgentConfig(d).changed).toContain('.claude/settings.json');
+      expect(denies(d)).toEqual([...CLAUDE_DENY]);
+      for (const t of CLAUDE_RETIRED) expect(recorded(d)).not.toContain(t);
+      expect(recorded(d)).toContain('Bash');
+      expect(checkAgentConfig(d)).toEqual([]);
+      // And a second re-run is a no-op: there is nothing left to take back.
+      expect(writeAgentConfig(d).changed).toEqual([]);
+    });
+
+    it('keeps one the developer wrote: it is in the list, not in the record', () => {
+      const d = dir();
+      mkdirSync(join(d, '.claude'));
+      writeFileSync(
+        join(d, '.claude/settings.json'),
+        JSON.stringify({ permissions: { deny: ['MultiEdit', 'LS(src/*)'] } }),
+      );
+      writeAgentConfig(d);
+      writeAgentConfig(d);
+      expect(denies(d)).toEqual(['MultiEdit', 'LS(src/*)', ...CLAUDE_DENY]);
+      expect(writeAgentConfig(d).changed).toEqual([]);
+    });
+
+    it('takes back only the recorded ones when the list holds both', () => {
+      const d = dir();
+      pre572(d, ['NotebookRead']);
+      expect(denies(d)).toEqual([...CLAUDE_DENY, ...CLAUDE_RETIRED, 'NotebookRead']);
+      writeAgentConfig(d);
+      // One NotebookRead is recorded and goes; the developer's copy stays.
+      expect(denies(d)).toEqual([...CLAUDE_DENY, 'NotebookRead']);
+    });
+
+    it('drops the record of one already taken back by hand, changing no file', () => {
+      const d = dir();
+      pre572(d);
+      const s = json(d, '.claude/settings.json');
+      s.permissions.deny = s.permissions.deny.filter((t: string) => t !== 'LS');
+      writeFileSync(join(d, '.claude/settings.json'), JSON.stringify(s, null, 2) + '\n');
+      writeAgentConfig(d);
+      expect(denies(d)).toEqual([...CLAUDE_DENY]);
+      expect(recorded(d).filter((v) => CLAUDE_RETIRED.includes(v as string))).toEqual([]);
+    });
+
+    it('a dry run reports the file and takes nothing back', () => {
+      const d = dir();
+      pre572(d);
+      const before = text(d, '.claude/settings.json');
+      expect(writeAgentConfig(d, { dryRun: true }).changed).toContain('.claude/settings.json');
+      expect(text(d, '.claude/settings.json')).toBe(before);
+      expect(recorded(d)).toContain('MultiEdit');
+    });
+
+    it('rm after the take-back still restores the file the developer had', () => {
+      const d = dir();
+      const mine = '{\n  "permissions": {\n    "deny": [\n      "Bash(rm -rf *)"\n    ]\n  }\n}\n';
+      mkdirSync(join(d, '.claude'));
+      writeFileSync(join(d, '.claude/settings.json'), mine);
+      writeAgentConfig(d);
+      const s = json(d, '.claude/settings.json');
+      s.permissions.deny.push(...CLAUDE_RETIRED);
+      writeFileSync(join(d, '.claude/settings.json'), JSON.stringify(s, null, 2) + '\n');
+      const rec = json(d, '.sbx/agent-config.json');
+      for (const t of CLAUDE_RETIRED) {
+        rec.json.push({
+          file: '.claude/settings.json',
+          op: 'item',
+          path: ['permissions', 'deny'],
+          value: t,
+        });
+      }
+      writeFileSync(join(d, '.sbx/agent-config.json'), JSON.stringify(rec, null, 2) + '\n');
+      writeAgentConfig(d);
+      removeAgentConfig(d);
+      expect(denies(d)).toEqual(['Bash(rm -rf *)']);
+    });
   });
 
   it('tells a Claude Code older than the deny list covers (#568)', () => {

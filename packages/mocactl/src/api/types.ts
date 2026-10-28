@@ -87,12 +87,18 @@ export interface CreatedSession extends SessionToken {
 
 export type CredentialConsumer = 'inference' | 'sandbox-egress' | 'control-plane';
 
+/** Where a credential goes on the wire; `sandbox-egress` may hold a list of 1-4. */
+export interface CredentialBinding {
+  header: string;
+  format: string;
+}
+
 export interface CredentialDescriptor {
   name: string;
   kind: string;
   consumer: CredentialConsumer;
   destination: { hosts: string[] };
-  binding: { header: string; format: string };
+  binding: CredentialBinding | CredentialBinding[];
   endpoint?: string | null;
 }
 
@@ -100,7 +106,7 @@ export interface PutCredentialRequest {
   kind: string;
   consumer: CredentialConsumer;
   destination: { hosts: string[] };
-  binding?: { header: string; format: string };
+  binding?: CredentialBinding | CredentialBinding[];
   endpoint?: string | null;
   secret: Record<string, string>;
 }
@@ -121,6 +127,8 @@ export interface ControlPlaneApi {
   startDeviceAuth(): Promise<DeviceStart>;
   /** 'pending' until approved; 'expired' once the code lapsed unapproved (start a new one). */
   pollDeviceAuth(deviceCode: string): Promise<ApiLogin | 'pending' | 'expired'>;
+  /** ADR-0045: a test-user login, gated by the control plane's shared secret. */
+  testUserToken(index: number, secret: string): Promise<ApiLogin>;
   /** The next API token and refresh token. ApiError `invalid_grant` means "log in again". */
   refreshAuth(refreshToken: string): Promise<ApiLogin>;
   /** End the login this refresh token belongs to (RFC 7009: answers alike for an unknown one). */

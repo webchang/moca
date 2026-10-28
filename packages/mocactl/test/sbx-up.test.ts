@@ -354,6 +354,24 @@ describe('mocactl sbx push and pull (SBX0 §6.2, §10.3)', () => {
     expect(readFileSync(join(h.r, 'src/app.py'), 'utf8')).toBe('print(2)\n');
   });
 
+  it('up and push from a subdirectory say the whole work tree is what gets pushed, not just that directory (#611)', async () => {
+    const h = harness();
+    expect(await h.run(['up'])).toBe(0);
+    expect(h.err()).not.toContain('the whole work tree'); // from the root there is nothing to say
+    writeFileSync(join(h.ws.get(NEW).ws, 'src/app.py'), 'print(2)\n');
+    expect(await h.run(['pull', '--apply'], { cwd: join(h.r, 'src') })).toBe(0);
+    expect(await h.run(['push'], { cwd: join(h.r, 'src') })).toBe(0);
+    // The count is pinned by the 'pushed 12 files' assertion above; here only the scope is the
+    // subject, so the line is matched on the part that does not depend on it.
+    expect(h.err()).toMatch(
+      /the whole work tree at .* is what gets pushed, not just the current directory/,
+    );
+    expect(await h.run(['up'], { cwd: join(h.r, 'src') })).toBe(0);
+    expect(h.err()).toMatch(
+      /the whole work tree at .* is what gets pushed, not just the current directory/,
+    );
+  });
+
   it('a terminated sandbox is the control plane answer (exit 1), never a sandbox failure', async () => {
     const h = harness({ boxes: [sandbox({ id: SBX, state: 'terminated', reason: 'deleted' })] });
     expect(await h.run(['push', '--sandbox', SBX])).toBe(1);

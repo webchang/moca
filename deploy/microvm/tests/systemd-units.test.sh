@@ -80,11 +80,28 @@ echo "== the shipped unit files actually pass systemd-analyze verify"
 # unit that fails to load -- prints its own line and fails this. The exit status IS
 # asserted directly wherever it is meaningful: for the slice (which has no ExecStart),
 # and for the service on a host that actually has the binary installed.
+#
+# Scoped to lines naming the unit under test, which is what "about the unit itself" means
+# and what keeps this honest across host upgrades. `systemd-analyze verify` also reports
+# on units it pulls in transitively, and the ubuntu-latest move to Ubuntu 26 (systemd 258)
+# made that non-empty on a stock runner:
+#
+#   /usr/lib/systemd/system/walinuxagent.service:21: Support for option CPUAccounting=
+#   has been removed and it is ignored
+#
+# walinuxagent, xfs_scrub_all and system-xfs_scrub are the runner image's own units. An
+# unfiltered assertion reads those as our problem and goes red on every PR -- the exact
+# failure mode the comment above says got this check deleted once already.
+unit_diagnostics() { # <verify output> <unit path>
+  printf '%s\n' "$1" | grep -F "$(basename "$2")" |
+    grep -vF 'is not executable: No such file or directory' | grep -v '^$'
+}
+
 if command -v systemd-analyze >/dev/null 2>&1; then
   sa_out="$(systemd-analyze verify "$SERVICE" 2>&1)"
   sa_rc=$?
   sa_exec_start="$(grep -oE '^ExecStart=[^ ]+' "$SERVICE" | head -n1 | cut -d= -f2-)"
-  sa_real="$(printf '%s\n' "$sa_out" | grep -vF 'is not executable: No such file or directory' | grep -v '^$')"
+  sa_real="$(unit_diagnostics "$sa_out" "$SERVICE")"
   check "systemd-analyze verify microvm-worker.service reports nothing about the unit itself" \
     "$sa_real" ""
   if [ -n "$sa_exec_start" ] && [ -x "$sa_exec_start" ]; then
@@ -261,7 +278,7 @@ check "the worker runs as root (no User=), which is why the 0600 control socket 
   "$(grep -cE '^User=' "$SERVICE")" "0"
 check "no secret literal in moca-egress.service" "$(grep -cE 'TOKEN=|ghp_|AKIA' "$EGRESS")" "0"
 if command -v systemd-analyze >/dev/null 2>&1; then
-  eg_real="$(systemd-analyze verify "$EGRESS" 2>&1 | grep -vF 'is not executable: No such file or directory' | grep -v '^$')"
+  eg_real="$(unit_diagnostics "$(systemd-analyze verify "$EGRESS" 2>&1)" "$EGRESS")"
   check "systemd-analyze verify moca-egress.service reports nothing about the unit itself" "$eg_real" ""
 fi
 

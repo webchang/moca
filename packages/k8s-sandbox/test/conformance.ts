@@ -5,6 +5,7 @@ import {
   type FastTier,
   type SandboxTransport,
 } from '../src/transport.js';
+import { createCapacityLatch } from '../src/capacity-latch.js';
 
 /**
  * A scripted sandbox backend, transport-agnostic. Each transport's conformance
@@ -228,10 +229,22 @@ export function runConformance(
       // #245. The battery cannot MEASURE this from one exec — it is a claim about the cost
       // of N ops, and a scripted fake's process count is the factory's fiction. What it
       // can pin is that the value a caller reads is the value the transport claims, so a
-      // fourth transport cannot ship without choosing one, and a wrapper (the capacity
-      // latch wraps BOTH tiers) cannot quietly answer for the thing it wraps.
+      // fourth transport cannot ship without choosing one.
       const { transport } = make({ stdout: [], exitCode: 0 });
       expect(transport.fastTier).toBe(caps.fastTier);
+    });
+
+    it('still declares that fast tier through a capacity latch', async () => {
+      // #245, the half the assertion above cannot reach. `extension.ts` never hands a tool
+      // the raw transport on a harness turn: `watch` wraps BOTH tiers, so the value a
+      // caller actually reads comes off the WRAPPER. A wrapper that hardcoded either
+      // literal would make every latched transport claim the same tier and contradict the
+      // thing it wraps — and the per-transport assertion above cannot see that, because it
+      // reads the unwrapped object. Run here, in the battery, rather than once over one
+      // transport in capacity-latch's own tests: forwarding must hold for whichever
+      // transport is latched, including a fourth, and this is the only list of all of them.
+      const { transport } = make({ stdout: [], exitCode: 0 });
+      expect(createCapacityLatch().watch(transport).fastTier).toBe(caps.fastTier);
     });
 
     it('close() resolves and is idempotent', async () => {

@@ -2,9 +2,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CpError } from '../src/errors.js';
 import {
   GithubOAuthProvider,
+  TEST_SUBJECT_RE,
+  TEST_USERS_MAX,
+  TEST_USER_SECRET_MIN_CHARS,
+  TestUserProvider,
   adminSubjectsFromEnv,
   rolesFor,
+  secretMatches,
   shortClientId,
+  testSubject,
+  testUserSecretFromEnv,
+  testUsersFromEnv,
   type FetchLike,
 } from '../src/identity.js';
 
@@ -322,5 +330,134 @@ describe('GithubOAuthProvider.rolesFor', () => {
     const p = new GithubOAuthProvider({ clientId: 'Iv1.x', adminSubjects: ['github:1'] });
     expect(p.rolesFor('github:1')).toEqual(['admin']);
     expect(p.rolesFor('github:2')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------- test users (ADR-0045)
+
+describe('testUsersFromEnv', () => {
+  it('is 0 when unset or empty, so the feature is off by default', () => {
+    for (const raw of [undefined, '', '   ']) {
+      expect(testUsersFromEnv(raw), String(raw)).toBe(0);
+    }
+  });
+
+  it('accepts a whole number', () => {
+    expect(testUsersFromEnv('10')).toBe(10);
+    expect(testUsersFromEnv(' 3 ')).toBe(3);
+    expect(testUsersFromEnv('0')).toBe(0);
+  });
+
+  // Refused rather than coerced: a silent 0 from `SH_TEST_USERS=ten` would read as "the feature is
+  // off" to an operator who had just switched it on.
+  it('refuses junk rather than coercing it to 0', () => {
+    for (const raw of ['ten', '1.5', '-1', '1e3', '0x10', '1,2']) {
+      expect(() => testUsersFromEnv(raw), raw).toThrow(/SH_TEST_USERS/);
+    }
+  });
+
+  it('refuses more than the cap, so a typo cannot mint a huge subject space', () => {
+    expect(testUsersFromEnv(String(TEST_USERS_MAX))).toBe(TEST_USERS_MAX);
+    expect(() => testUsersFromEnv(String(TEST_USERS_MAX + 1))).toThrow(/at most/);
+    expect(() => testUsersFromEnv('100000')).toThrow(/at most/);
+  });
+});
+
+describe('testUserSecretFromEnv', () => {
+  const good = 'a'.repeat(TEST_USER_SECRET_MIN_CHARS); // notsecret
+
+  it('requires a secret whenever test users are on', () => {
+    // The whole point of the gate: the endpoint issues a real login for an arbitrary subject.
+    expect(() => testUserSecretFromEnv(undefined, 10)).toThrow(/SH_TEST_USER_SECRET is required/);
+    expect(() => testUserSecretFromEnv('', 10)).toThrow(/SH_TEST_USER_SECRET is required/);
+  });
+
+  it('refuses a short secret', () => {
+    expect(() => testUserSecretFromEnv('short', 10)).toThrow(/at least/);
+    expect(testUserSecretFromEnv(good, 10)).toBe(good);
+  });
+
+  it('refuses a secret with no test users: the operator thinks they enabled something', () => {
+    expect(() => testUserSecretFromEnv(good, 0)).toThrow(/SH_TEST_USERS is not/);
+  });
+
+  it('is empty when neither is set', () => {
+    expect(testUserSecretFromEnv(undefined, 0)).toBe('');
+  });
+});
+
+describe('secretMatches', () => {
+  const s = 'correct-horse-battery-staple'; // notsecret
+
+  it('matches only the exact secret', () => {
+    expect(secretMatches(s, s)).toBe(true);
+    expect(secretMatches(s + 'x', s)).toBe(false);
+    expect(secretMatches(s.slice(0, -1), s)).toBe(false);
+    expect(secretMatches('', s)).toBe(false);
+  });
+
+  // A length mismatch must not throw (timingSafeEqual does on unequal buffers) nor short-circuit:
+  // both sides are hashed to 32 bytes first, so the comparison is always over the same width.
+  it('handles any length without throwing', () => {
+    for (const presented of ['', 'x', 'y'.repeat(10_000)]) {
+      expect(() => secretMatches(presented, s)).not.toThrow();
+      expect(secretMatches(presented, s)).toBe(false);
+    }
+  });
+
+  it('never matches when no secret is configured', () => {
+    expect(secretMatches('', '')).toBe(false);
+    expect(secretMatches('anything', '')).toBe(false);
+  });
+});
+
+describe('TestUserProvider', () => {
+  const secret = 'a'.repeat(TEST_USER_SECRET_MIN_CHARS); // notsecret
+  const p = (count = 10, adminSubjects: string[] = []) =>
+    new TestUserProvider({ count, secret, adminSubjects });
+
+  it('refuses a non-positive count or a short secret', () => {
+    expect(() => new TestUserProvider({ count: 0, secret })).toThrow(/positive/);
+    expect(() => new TestUserProvider({ count: 1.5, secret })).toThrow(/positive/);
+    expect(() => new TestUserProvider({ count: 1, secret: 'tiny' })).toThrow(/at least/);
+  });
+
+  it('mints test:<index> subjects with a readable display name', () => {
+    expect(p().principalFor(1)).toEqual({
+      subject: 'test:1',
+      displayName: 'Test User 1',
+      roles: [],
+    });
+    expect(p().principalFor(10).subject).toBe('test:10');
+    expect(TEST_SUBJECT_RE.test(p().principalFor(7).subject)).toBe(true);
+    expect(testSubject(3)).toBe('test:3');
+  });
+
+  it('bounds the index to 1..count', () => {
+    const provider = p(10);
+    expect(provider.has(1)).toBe(true);
+    expect(provider.has(10)).toBe(true);
+    for (const bad of [0, -1, 11, 1.5, Number.NaN]) {
+      expect(provider.has(bad), String(bad)).toBe(false);
+    }
+    expect(() => provider.principalFor(11)).toThrow(/1\.\.10/);
+  });
+
+  // A test user is configured like a GitHub user, roles included.
+  it('gives a test subject admin when SH_ADMIN_SUBJECTS names it', () => {
+    expect(p(10, ['test:2']).principalFor(2).roles).toEqual(['admin']);
+    expect(p(10, ['test:2']).principalFor(1).roles).toEqual([]);
+    expect(p(10, ['test:2']).rolesFor('test:2')).toEqual(['admin']);
+  });
+
+  it('authenticates only the configured secret', () => {
+    expect(p().authenticates(secret)).toBe(true);
+    expect(p().authenticates('wrong')).toBe(false);
+    expect(p().authenticates('')).toBe(false);
+  });
+
+  it('refuses the device flow: a test user has no browser', async () => {
+    expect(await codeOf(() => p().startDeviceAuth())).toBe('unauthorized');
+    expect(await codeOf(() => p().completeDeviceAuth())).toBe('unauthorized');
   });
 });

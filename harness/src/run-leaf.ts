@@ -516,10 +516,15 @@ async function runPromptLeaf(
     return { status: 'failed', reason: 'error', message: 'invalid internal context reference' };
   }
   try {
+    // The per-session <WorkspaceRoot>/<sid> dir is unused when the agent's only writable dir is
+    // the context view (a copy overlay, or a writable workload mount). A read-only context --
+    // whether overlay or mounted -- still writes to <WorkspaceRoot>/<sid> as scratch, per the note
+    // appended to the prompt by contextNote, so keep the key then.
     selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
       cap: promptTimings.cap,
       ttlMs: promptTimings.ttlMs,
       remoteSandbox: process.env.SH_REMOTE_SANDBOX === '1',
+      agentWritesInContext: env.internalContext !== undefined && contextMode(env) !== 'read-only',
       ...(workload ? { workload, ownerScope } : {}),
     });
   } catch (err) {

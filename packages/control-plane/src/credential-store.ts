@@ -1,4 +1,6 @@
 import { CpError } from './errors.js';
+import { checkEgressBindings } from './egress-binding.js';
+import { formatDestination, parseDestination } from './egress-destination.js';
 
 /**
  * The credential model, keyed on the CONSUMER TIER rather than the service (spec §6.1): which trust
@@ -104,9 +106,15 @@ export interface CredentialDescriptor {
   consumer: Consumer;
   /** A host ALLOW-LIST, not a base URL (spec §6.3) -- the input slice 3's forward proxy needs. */
   destination: { hosts: string[] };
-  binding: CredentialBinding;
+  /** An array (1-4, one header each) only for consumer `sandbox-egress`; else exactly one. */
+  binding: CredentialBinding | CredentialBinding[];
   /** Full gateway origin; meaningful only for consumer `inference`, else null (spec §6.2). */
   endpoint: string | null;
+}
+
+/** The single binding every non-egress consumer holds (parse refuses an array for them). */
+export function firstBinding(d: CredentialDescriptor): CredentialBinding {
+  return Array.isArray(d.binding) ? d.binding[0]! : d.binding;
 }
 
 export interface StoredCredential {
@@ -230,6 +238,9 @@ function invalid(why: string): never {
 /** The longest `endpoint` a credential may store (PR #540 review R3). */
 export const MAX_ENDPOINT_LENGTH = 2048;
 
+/** The most destinations one `sandbox-egress` credential may hold. */
+export const MAX_EGRESS_DESTINATIONS = 16;
+
 /** A host allow-list entry is a HOST, never a URL: `api.github.com`, not `https://api.github.com/x`. */
 function validateHost(h: unknown): string {
   if (typeof h !== 'string' || h.length === 0 || /[:/?#]/.test(h)) {
@@ -266,13 +277,34 @@ export function parseCredentialBody(name: string, body: unknown): StoredCredenti
   if (!isRecord(dest) || !Array.isArray(dest.hosts) || dest.hosts.length === 0) {
     invalid('destination.hosts must be a non-empty array');
   }
-  const hosts = (dest as { hosts: unknown[] }).hosts.map(validateHost);
-
-  let binding = spec.defaultBinding;
-  if (body.binding !== undefined) {
-    if (!isCredentialBinding(body.binding)) invalid('binding must be { header, format }');
-    binding = body.binding;
+  const rawHosts = (dest as { hosts: unknown[] }).hosts;
+  let hosts: string[];
+  if (consumer === 'sandbox-egress') {
+    if (rawHosts.length > MAX_EGRESS_DESTINATIONS) {
+      invalid(`a sandbox-egress credential holds at most ${MAX_EGRESS_DESTINATIONS} destinations`);
+    }
+    hosts = rawHosts.map((h) => formatDestination(parseDestination(h as string)));
+    const dup = hosts.find((h, i) => hosts.indexOf(h) !== i);
+    if (dup !== undefined) invalid(`destination '${dup}' is listed twice`);
+  } else {
+    hosts = rawHosts.map(validateHost);
   }
+
+  let binding: CredentialBinding | CredentialBinding[] = spec.defaultBinding;
+  if (body.binding !== undefined) {
+    if (Array.isArray(body.binding)) {
+      if (consumer !== 'sandbox-egress') {
+        invalid('a list of bindings is only valid for consumer: sandbox-egress');
+      }
+      if (!body.binding.every(isCredentialBinding)) invalid('binding must be { header, format }');
+      // A single binding is stored as an object, so existing documents compare equal.
+      binding = body.binding.length === 1 ? body.binding[0]! : body.binding;
+    } else {
+      if (!isCredentialBinding(body.binding)) invalid('binding must be { header, format }');
+      binding = body.binding;
+    }
+  }
+  if (consumer === 'sandbox-egress') checkEgressBindings(binding, spec.secretFields);
 
   // `endpoint` is meaningful ONLY for inference. Accepting it elsewhere would create a second,
   // silently ignored notion of "where this credential goes" alongside destination.hosts.
@@ -318,7 +350,7 @@ export function parseCredentialBody(name: string, body: unknown): StoredCredenti
   if (consumer === 'inference') {
     // Exactly one secret field here: the single-field refusal above guarantees it.
     const field = spec.secretFields[0]!;
-    checkInferenceShape(field, binding, endpoint, secret[field]!);
+    checkInferenceShape(field, binding as CredentialBinding, endpoint, secret[field]!);
   }
 
   return {

@@ -12,3 +12,17 @@ spec:
       ports:
         - { protocol: UDP, port: 5353 }
         - { protocol: TCP, port: 5353 }
+---
+# The same for the provisioner, which resolves redis.moca.svc for its orphan sweep (spec §6.2).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-openshift-dns-provisioner, namespace: moca }
+spec:
+  podSelector: { matchLabels: { app: moca-provisioner } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: openshift-dns } }
+      ports:
+        - { protocol: UDP, port: 5353 }
+        - { protocol: TCP, port: 5353 }

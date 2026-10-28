@@ -26,8 +26,9 @@ export const DEFAULT_SEED_HOLD_S = 600;
  * Bundles held for seeding, and the bytes reserved for hand-offs still being read. A hand-off
  * reserves its Content-Length before its body is read (reserve), so held bundles, hand-offs in
  * flight and bundles dropped while a seed GET still sends them (serve) together never pass the
- * budget, and one owner's never pass `ownerBudget`, half of it: one owner's
- * stuck workloads cannot starve every other owner. Every bundle is dropped `holdS` after its last
+ * budget, and one owner's never pass `ownerBudget`, half of it: one owner's stuck workloads cannot
+ * starve every other owner. A resend keeps the bundle it replaces held, and fetchable, until the
+ * new one is held (put), so both count until then. Every bundle is dropped `holdS` after its last
  * hand-off, whether or not its seed ran (expire): a seed that never starts (a Pending claim, a
  * crash-looping init container) frees its share, and GET reports `seed: bundle_missing` until the
  * next activate resends it.
@@ -39,7 +40,8 @@ export class BundleStore {
   private reservedBy = new Map<string, number>();
   /** Buffers a seed GET is sending, and how many GETs; one dropped meanwhile still counts. */
   private serving = new Map<Buffer, number>();
-  private lingering = new Set<Buffer>();
+  /** Dropped while still being sent, with the owner they count against. */
+  private lingering = new Map<Buffer, string>();
   private lingeringBytes = 0;
   /** Workloads DELETE removed, with when: a late hand-off for one is never held again. */
   private retiredAt = new Map<string, number>();
@@ -57,21 +59,19 @@ export class BundleStore {
   private ownerBytes(own: string): number {
     let n = this.reservedBy.get(own) ?? 0;
     for (const b of this.held.values()) if (b.own === own) n += b.bytes.length;
+    for (const [bytes, o] of this.lingering) if (o === own) n += bytes.length;
     return n;
   }
 
   /**
-   * Reserve `n` bytes for a hand-off to `wl` before reading it. A bundle already held for `wl` (the
-   * same owner's earlier activate) does not count against it: it is dropped here, since the new one
-   * replaces it, so the bytes in memory never pass what is held and reserved. False when it does not
-   * fit the budget or the owner's share of it; nothing is reserved or dropped then.
+   * Reserve `n` bytes for a hand-off before reading it. A bundle already held for the same
+   * workload (an earlier activate) still counts: it stays held, and fetchable, until the new one is
+   * (put), so a hand-off that fails or is refused leaves it as it was. False when it does not fit
+   * the budget or the owner's share of it; nothing is reserved then.
    */
-  reserve(wl: string, own: string, n: number): boolean {
-    const prev = this.held.get(wl);
-    const replaced = prev && prev.own === own ? prev.bytes.length : 0;
-    if (this.inMemory - replaced + n > this.budget) return false;
-    if (this.ownerBytes(own) - replaced + n > this.ownerBudget) return false;
-    if (replaced) this.drop(wl);
+  reserve(own: string, n: number): boolean {
+    if (this.inMemory + n > this.budget) return false;
+    if (this.ownerBytes(own) + n > this.ownerBudget) return false;
     this.reservedTotal += n;
     this.reservedBy.set(own, (this.reservedBy.get(own) ?? 0) + n);
     return true;
@@ -85,7 +85,10 @@ export class BundleStore {
     else this.reservedBy.delete(own);
   }
 
-  /** Hold `bundle` for `wl`, replacing an earlier one. Its bytes were reserved before the read. */
+  /**
+   * Hold `bundle` for `wl`, replacing an earlier one only now that the new one has arrived. Its
+   * bytes were reserved before the read, with the earlier one's still counted.
+   */
   put(wl: string, bundle: HeldBundle): void {
     this.drop(wl);
     this.bytes += bundle.bytes.length;
@@ -103,7 +106,7 @@ export class BundleStore {
     this.held.delete(wl);
     // Still being sent: in memory until the last GET ends, so it stays counted until then.
     if (this.serving.has(b.bytes) && !this.lingering.has(b.bytes)) {
-      this.lingering.add(b.bytes);
+      this.lingering.set(b.bytes, b.own);
       this.lingeringBytes += b.bytes.length;
     }
   }

@@ -98,6 +98,52 @@ describe('the edit guards', () => {
     expect(existsSync(join(d, '.sbx'))).toBe(false);
   });
 
+  // #574: taking back a retired deny is a tidy-up, not a correctness fix, so a guard refusing it
+  // leaves the entry and its record alone instead of failing the whole up.
+  it('keeps up working when the retired-deny take-back is refused', () => {
+    const d = dir();
+    mkdirSync(join(d, '.claude'));
+    writeFileSync(
+      join(d, '.claude/settings.json'),
+      '{\n  "permissions": {\n    "deny": []\n  }\n}\n',
+    );
+    writeAgentConfig(d);
+    const s = JSON.parse(readFileSync(join(d, '.claude/settings.json'), 'utf8'));
+    s.permissions.deny.push('MultiEdit');
+    writeFileSync(join(d, '.claude/settings.json'), JSON.stringify(s, null, 2) + '\n');
+    const rec = JSON.parse(readFileSync(join(d, '.sbx/agent-config.json'), 'utf8'));
+    rec.json.push({
+      file: '.claude/settings.json',
+      op: 'item',
+      path: ['permissions', 'deny'],
+      value: 'MultiEdit',
+    });
+    writeFileSync(join(d, '.sbx/agent-config.json'), JSON.stringify(rec, null, 2) + '\n');
+    // Takes the entry out and re-indents a line of theirs: a cut, plus a byte they wrote.
+    broken.remove = (real, text, path, o) =>
+      (real as Real)
+        .remove(text as string, path as never, o as never)
+        .replace('\n  "perm', '\n\t"perm');
+    expect(() => writeAgentConfig(d)).not.toThrow();
+    const after = JSON.parse(readFileSync(join(d, '.claude/settings.json'), 'utf8'));
+    expect(after.permissions.deny).toContain('MultiEdit');
+    expect(readFileSync(join(d, '.claude/settings.json'), 'utf8')).not.toContain('\n\t"perm');
+    // The record is kept, so a later run can try again.
+    const kept = JSON.parse(readFileSync(join(d, '.sbx/agent-config.json'), 'utf8'));
+    expect(kept.json).toContainEqual({
+      file: '.claude/settings.json',
+      op: 'item',
+      path: ['permissions', 'deny'],
+      value: 'MultiEdit',
+    });
+    // And once the edit behaves, the take-back goes through.
+    broken.remove = undefined;
+    writeAgentConfig(d);
+    expect(
+      JSON.parse(readFileSync(join(d, '.claude/settings.json'), 'utf8')).permissions.deny,
+    ).not.toContain('MultiEdit');
+  });
+
   it('refuses a removal that loses a comment, keeping the file and the record', () => {
     const d = dir();
     const body = '{\n  "model": "x" // mine\n}\n';
