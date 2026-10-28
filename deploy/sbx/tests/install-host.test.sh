@@ -46,6 +46,8 @@ snap py312
 export SBX_BIN_DIR="$TMP/usrbin" MOCA_EGRESS_SOCKET="$TMP/run/control.sock" MOCA_EGRESS_READY_TIMEOUT=2
 mkdir -p "$SBX_BIN_DIR" "$TMP/run"
 fake_egress() { : >"$SBX_BIN_DIR/moca-egress"; chmod +x "$SBX_BIN_DIR/moca-egress"; }
+export SBX_WORKER_BIN="$SBX_BIN_DIR/microvm-worker"
+: >"$SBX_WORKER_BIN"; chmod +x "$SBX_WORKER_BIN"
 fake_socket() { rm -f "$MOCA_EGRESS_SOCKET"; python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$MOCA_EGRESS_SOCKET"; }
 fake_egress
 fake_socket
@@ -609,3 +611,15 @@ for case in field file; do
   ! grep -q systemctl "$MOCK_LOG" || fail "touched systemd before refusing no guest_ram_mb ($case)"
 done
 pass "the worker's SH_GUEST_RAM_MB is its snapshot's guest_ram_mb; a manifest without it, or a budget below one session, is refused"
+
+# SBX_WORKER_BIN: the unit runs that binary (beside a P4 worker, never /usr/local/bin/microvm-worker),
+# and a missing one is refused before systemd is touched.
+bash "$INSTALL" "$(bundle sbx_bin)" --snapshot default >"$TMP/out" 2>&1 || fail 'install with SBX_WORKER_BIN'
+grep -qx "ExecStart=$SBX_WORKER_BIN" "$SBX_UNIT_DIR/sbx-worker@.service" || fail 'the unit does not run SBX_WORKER_BIN'
+bash "$INSTALL" --uninstall sbx_bin >"$TMP/out" 2>&1 || fail 'uninstall sbx_bin'
+: >"$MOCK_LOG"
+! SBX_WORKER_BIN="$TMP/nowhere/microvm-worker" bash "$INSTALL" "$(bundle sbx_bin)" --snapshot default >"$TMP/out" 2>&1 ||
+  fail 'installed with a missing SBX_WORKER_BIN'
+grep -q "no worker binary $TMP/nowhere/microvm-worker" "$TMP/out" || fail 'the missing-binary refusal does not name the path'
+! grep -q systemctl "$MOCK_LOG" || fail 'touched systemd before refusing a missing worker binary'
+pass 'the unit runs SBX_WORKER_BIN; a missing one is refused before systemd'

@@ -12,6 +12,8 @@
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
 # Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
 # moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
+# SBX_WORKER_BIN (an absolute path) runs another microvm-worker build, so SBX0 beside deploy/microvm's
+# P4 worker never replaces the binary that one runs; a missing one is refused before systemd.
 #
 # Guest egress (#623, P4.1): a worker install also installs and starts moca-egress, the host's
 # allowlisted egress proxy, before the worker, and wires the worker to its control socket
@@ -60,6 +62,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SBX_ATTACH_TIMEOUT:=120}"
 : "${SBX_ATTACH_SETTLE:=5}"
 : "${SBX_BIN_DIR:=/usr/local/bin}"
+# The worker binary the template unit runs. A host that also runs deploy/microvm's P4 worker shares
+# /usr/local/bin/microvm-worker with it; another path keeps SBX0's build from replacing that one's.
+: "${SBX_WORKER_BIN:=/usr/local/bin/microvm-worker}"
 # moca-egress's control socket: the path inside the unit is fixed (RuntimeDirectory=moca-egress); the
 # override exists for tests only. The wait is as setup-microvm.sh's.
 : "${MOCA_EGRESS_SOCKET:=/run/moca-egress/control.sock}"
@@ -391,7 +396,8 @@ uninstall_egress_credentials() {
 install_units() {
   install -d -m 0755 "$SBX_UNIT_DIR"
   install -m 0644 "$SCRIPT_DIR/sbx.slice" "$SBX_UNIT_DIR/sbx.slice"
-  sed "s#^EnvironmentFile=/etc/sbx/#EnvironmentFile=$SBX_ENV_DIR/#" "$SCRIPT_DIR/sbx-worker@.service" \
+  sed -e "s#^EnvironmentFile=/etc/sbx/#EnvironmentFile=$SBX_ENV_DIR/#" \
+    -e "s#^ExecStart=/usr/local/bin/microvm-worker\$#ExecStart=$SBX_WORKER_BIN#" "$SCRIPT_DIR/sbx-worker@.service" \
     >"$SBX_UNIT_DIR/sbx-worker@.service"
   chmod 0644 "$SBX_UNIT_DIR/sbx-worker@.service"
   record "unit $SBX_UNIT_DIR/sbx.slice"
@@ -417,6 +423,8 @@ validate_worker() {
   image_mb="$(env_value SH_WORKSPACE_IMAGE_MB "$env")"
   image_mb="${image_mb:-$DEFAULT_IMAGE_MB}"
   [[ "$image_mb" =~ ^[1-9][0-9]*$ ]] || die "SH_WORKSPACE_IMAGE_MB in $env must be a whole number of MiB"
+  [[ "$SBX_WORKER_BIN" == /* && -x "$SBX_WORKER_BIN" ]] ||
+    die "no worker binary $SBX_WORKER_BIN: build it with CGO_ENABLED=0 go build -o $SBX_WORKER_BIN ./remote-worker/cmd/microvm-worker (SBX_WORKER_BIN must be an absolute path)"
   [[ -n "$SNAPSHOT" ]] || die '--snapshot IMAGE is required'
   [[ "$SNAPSHOT" =~ ^[A-Za-z0-9._-]+$ ]] || die '--snapshot must be a directory name'
   [[ -d "$SBX_SRV/snapshots/$SNAPSHOT" ]] || die "no snapshot $SBX_SRV/snapshots/$SNAPSHOT (build it with deploy/microvm/build-snapshot.sh)"
