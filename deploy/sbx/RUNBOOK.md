@@ -145,6 +145,21 @@ Edit the list and re-run `setup.sh`. The control plane rolls with the new list:
 Admins (`SBX_ADMIN_SUBJECTS`) may list, read and delete every sandbox, but never mint a token for
 another user's: they cannot run commands in another user's code.
 
+**A test login without GitHub.** A deployment whose `SBX_GITHUB_CLIENT_ID` is a placeholder (no OAuth
+app) has no device flow. To test it, an operator mints a login for an enrolled subject with the
+deployment's own signing key:
+
+```bash
+deploy/sbx/mint-login.sh --env-file <env file> --subject github:<id> --home <dir> [--ttl-minutes N]
+HOME=<dir> mocactl sbx templates
+```
+
+It reads `moca-mu1` with `kubectl` and writes `<dir>/.config/mocactl/sbx-auth.json` (0600), the
+cache `mocactl sbx` reads, with `XDG_CONFIG_HOME` unset. The key and the token reach no argv, log
+or output. The login cannot refresh: mint another when it ends (60 minutes by default, at most a
+day). Anyone who can read Secrets in the namespace can do this, so it grants nothing an operator
+lacks. Give each test user a `<dir>` of their own, as the smoke's two `HOME`s (§13).
+
 ## 5. Adding a template
 
 1. Build its snapshot on the KVM host (§1 step 3), named `<image>`.
