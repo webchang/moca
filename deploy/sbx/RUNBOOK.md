@@ -475,6 +475,27 @@ The Redis volume (the StatefulSet's `data` claim, `data-redis-0`) is kept by the
 with `kubectl delete pvc data-redis-0 -n <namespace>` to delete every sandbox record and every
 login (the refresh families live there too).
 
+## 13a. Checking the templates
+
+`deploy/sbx/templates-check.sh` checks that a client chooses the template its sandbox runs on: the
+list, a create of each template, each sandbox's token naming its own template's worker, a command in
+each answering on its template's image, a token refused at another template's worker, and `sbx up`
+refusing a bound sandbox of another template. Run it after adding or updating a template. Like the
+smoke, it reads only the environment, never prints a token, and deletes only the sandboxes it
+created; without `SBX_LIVE_CHECK=1` it does nothing.
+
+```bash
+SBX_LIVE_CHECK=1 SBX_API_URL=https://<api host> \
+  SBX_CHECK_HOME_A=<home A> SBX_CHECK_HOME_B=<home B> SBX_CHECK_TEMPLATES=default,<template> \
+  SBX_CHECK_PROBE_<TEMPLATE>='<a command that prints yes only on that template>' \
+  deploy/sbx/templates-check.sh
+```
+
+The two `HOME`s are two enrolled users' logins (§13, or `mint-login.sh`, §4). Each `SBX_CHECK_PROBE_<ID>`
+(the id upper-cased, dashes as underscores) runs in every template's sandboxes: it must print `yes`
+in its own template's and anything else in the others'. `SBX_CHECK_EXEC=0` checks the control plane
+alone, before any worker is installed. `--help` lists every input and check.
+
 ## 13. Live smoke
 
 `deploy/sbx/smoke.sh` runs the spec's live checks (§10.6) against a deployed service. Run it after
