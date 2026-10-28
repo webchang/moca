@@ -222,6 +222,70 @@ describe('sandbox handlers (SBX0 §5)', () => {
     expect(c).toMatchObject({ sub: 'github:1234', sbx: id, wrk: 'sbx_node22', wsk: id });
   });
 
+  it("routes each sandbox to its own template's worker", async () => {
+    const d = sbxDeps();
+    const py = await create(d, alice, { template: 'default' });
+    const node = await create(d, alice, { template: 'node22' });
+    const wrk = async (id: unknown) =>
+      ((await HANDLERS.mintSandboxToken!(on(alice, id), d)).body as { wrk: string }).wrk;
+    expect(await wrk(py.id)).toBe('sbx_default');
+    expect(await wrk(node.id)).toBe('sbx_node22');
+  });
+
+  it('keeps a sandbox on the worker it was created with when its template moves (a versioned update)', async () => {
+    const d = sbxDeps();
+    const old = await create(d, alice, { template: 'node22' });
+    // The operator points node22 at a new worker: a new control plane with the new list, the same store.
+    const moved = {
+      ...d,
+      config: {
+        ...d.config,
+        sandbox: {
+          ...d.config.sandbox!,
+          templates: d.config.sandbox!.templates.map((t) =>
+            t.id === 'node22' ? { ...t, worker: 'sbx_node22_v2' } : t,
+          ),
+        },
+      },
+    };
+    const fresh = await create(moved, alice, { template: 'node22' });
+    const mint = async (id: unknown) =>
+      (await HANDLERS.mintSandboxToken!(on(alice, id), moved)).body as { wrk: string };
+    expect((await mint(old.id)).wrk).toBe('sbx_node22');
+    expect((await mint(fresh.id)).wrk).toBe('sbx_node22_v2');
+    // Both still read as the same template, and the janitor sees each on its own worker.
+    expect([old.template, fresh.template]).toEqual(['node22', 'node22']);
+    const b = (await HANDLERS.janitorSandboxes!(ctx({ janitorAuthorized: true }), moved)).body as {
+      live: { wsk: string; wrk: string }[];
+    };
+    expect(b.live).toEqual(
+      expect.arrayContaining([
+        { wsk: old.id, wrk: 'sbx_node22' },
+        { wsk: fresh.id, wrk: 'sbx_node22_v2' },
+      ]),
+    );
+  });
+
+  it('keeps minting for a sandbox whose template was removed, and refuses new creates', async () => {
+    const d = sbxDeps();
+    const old = await create(d, alice, { template: 'node22' });
+    const removed = {
+      ...d,
+      config: {
+        ...d.config,
+        sandbox: {
+          ...d.config.sandbox!,
+          templates: d.config.sandbox!.templates.filter((t) => t.id !== 'node22'),
+        },
+      },
+    };
+    expect(await codeOf(() => create(removed, alice, { template: 'node22' }))).toBe(
+      'unknown_template',
+    );
+    const r = await HANDLERS.mintSandboxToken!(on(alice, old.id), removed);
+    expect((r.body as { wrk: string }).wrk).toBe('sbx_node22');
+  });
+
   it('returns the exec CA when one is configured, and caps a token at the sandbox expiry', async () => {
     const execCa = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n';
     const d = sbxDeps({ config: { sandbox: { ...makeDeps().config.sandbox!, execCa } } });
