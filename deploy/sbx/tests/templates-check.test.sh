@@ -14,6 +14,9 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; [[ -f "$TMP/out" ]] && sed 's/^/  | /' "$TMP/out" >&2; exit 1; }
 pass() { echo "ok - $*"; }
 command -v node >/dev/null && command -v jq >/dev/null || { echo 'SKIP: templates-check.test.sh needs node and jq'; exit 0; }
+# The check keeps a failed run's logs under $TMPDIR: this test's own, removed with it.
+export TMPDIR="$TMP/tmp"
+mkdir -p "$TMPDIR"
 export MOCK_DIR="$TMP/state" MOCK_LOG="$TMP/mock.log" TOKEN_CANARY="tok-canary-$$"
 mkdir -p "$MOCK_DIR/sb" "$TMP/home-a" "$TMP/home-b" "$TMP/bin"
 echo a >"$TMP/home-a/.user"
@@ -126,8 +129,9 @@ pass 'passes all checks against a correct service; deletes every sandbox; XDG un
 # SBX_CHECK_EXEC=0: no command in a sandbox, the hands check is a SKIP.
 run_check SBX_CHECK_EXEC=0 || fail 'SBX_CHECK_EXEC=0 did not pass'
 grep -q '^ok [0-9]* - hands: .* # SKIP SBX_CHECK_EXEC=0' "$TMP/out" || fail 'hands is not a SKIP with SBX_CHECK_EXEC=0'
-! grep -q ' run ' "$MOCK_LOG" || fail 'ran a command with SBX_CHECK_EXEC=0'
-pass 'SBX_CHECK_EXEC=0 runs no command and skips the hands check'
+grep -q '^ok [0-9]* - up: .* # SKIP SBX_CHECK_EXEC=0' "$TMP/out" || fail 'up is not a SKIP with SBX_CHECK_EXEC=0'
+! grep -qE ' (run|up) ' "$MOCK_LOG" || fail 'ran a command or sbx up with SBX_CHECK_EXEC=0'
+pass 'SBX_CHECK_EXEC=0 runs no command and no sbx up, skipping both checks'
 
 # Each broken service fails its own check, exits 1, and still deletes its sandboxes.
 for c in 'MOCK_ONE_WORKER=1:routing: every template has its own worker' \

@@ -17,7 +17,8 @@
 #                           exactly `yes`. It shows the commands ran on that template's image. Run in
 #                           every other template's sandboxes too, where it must print anything else.
 #   SBX_CHECK_EXEC          1 (default) or 0: 0 checks the control plane alone (no worker needed):
-#                           everything below except the commands in the sandboxes
+#                           everything below except the commands in the sandboxes (4) and `sbx up`
+#                           (6), which pushes into the sandbox
 #   MOCACTL                 a mocactl to test (default: this checkout's packages/mocactl/dist/mocactl.mjs)
 #   SBX_CHECK_PYTHON        Python 3.10+ with grpcio and grpcio-tools (default python3), for the
 #                           direct-client checks (the cross-template refusal)
@@ -272,6 +273,13 @@ fi
 rm -f "$LOGS/b-tok.out"
 
 # 6. up --------------------------------------------------------------------------------------
+# `sbx up` pushes the working tree, a command in the sandbox: it needs a worker.
+if [[ "$EXEC" != 1 ]]; then
+  skip "up: sbx up --template refuses a bound sandbox of another template" 'SBX_CHECK_EXEC=0 (up pushes into the sandbox)'
+  echo "# $N checks, $FAILS failed"
+  ((FAILS == 0)) || exit 1
+  exit 0
+fi
 repo="$WORK/repo"
 git init -q "$repo" && (cd "$repo" && git config user.email tc@example.invalid && git config user.name tc &&
   echo x >f && git add f && git commit -qm init)
