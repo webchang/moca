@@ -37,7 +37,10 @@ chmod +x "$TMP/bin/systemctl" "$TMP/bin/journalctl"
 export PATH="$TMP/bin:$PATH" SBX_UNIT_DIR="$TMP/units" SBX_ENV_DIR="$TMP/etc" SBX_SRV="$TMP/srv"
 export SBX_SKIP_ROOT_CHECK=1 SBX_ATTACH_TIMEOUT=2 SBX_ATTACH_SETTLE=1
 INSTALL="$SRC/deploy/sbx/install-host.sh"
-mkdir -p "$SBX_SRV/snapshots/default" "$SBX_SRV/snapshots/py312"
+# A snapshot as build-snapshot.sh writes it, as far as install-host.sh reads one: its guest RAM.
+snap() { mkdir -p "$SBX_SRV/snapshots/$1"; printf '{\n  "hash": "x",\n  "guest_ram_mb": %s\n}\n' "${2:-256}" >"$SBX_SRV/snapshots/$1/manifest.json"; }
+snap default
+snap py312
 # moca-egress is the operator's binary, and the worker waits for its control socket: fake both, so
 # every install below passes the binary check and the socket wait. A socket FILE is all `-S` tests.
 export SBX_BIN_DIR="$TMP/usrbin" MOCA_EGRESS_SOCKET="$TMP/run/control.sock" MOCA_EGRESS_READY_TIMEOUT=2
@@ -107,6 +110,7 @@ grep -qx 'SH_WORKSPACE_IMAGE_MB=2048' "$SBX_ENV_DIR/workers/sbx_old.env" || fail
 bash "$INSTALL" --uninstall sbx_old >"$TMP/out" 2>&1 || fail 'uninstall sbx_old'
 pass 'a bundle without the image size gets the 2048 MiB default'
 
+
 [[ -f "$SBX_UNIT_DIR/sbx-worker@.service" && -f "$SBX_UNIT_DIR/sbx.slice" ]] || fail 'template unit or parent slice missing'
 [[ -f "$SBX_UNIT_DIR/sbx-sbx_py312.slice" ]] || fail 'per-worker slice missing'
 grep -qx 'Slice=sbx-%i.slice' "$SBX_UNIT_DIR/sbx-worker@.service" || fail 'unit is not in its worker slice'
@@ -118,6 +122,7 @@ grep -qx 'systemctl enable sbx-worker@sbx_py312.service' "$MOCK_LOG" || fail 'un
 [[ "$(grep -cx 'systemctl restart sbx-worker@sbx_py312.service' "$MOCK_LOG")" == 1 ]] || fail 'the worker is not restarted exactly once'
 grep -q 'sbx-worker@sbx_py312' "$SBX_ENV_DIR/manifest" || fail 'manifest does not record the worker'
 pass 'installs the template unit, the slices, enables and restarts the worker once and records it'
+
 
 # A worker that crash-looped into `failed` refuses a restart until reset: reset-failed comes first.
 grep -A1 -x 'systemctl reset-failed sbx-worker@sbx_py312.service' "$MOCK_LOG" | grep -qx 'systemctl restart sbx-worker@sbx_py312.service' ||
@@ -473,7 +478,11 @@ ebundle() { # ebundle [API_CA]: an egress bundle as setup.sh writes it
 fp_of() { openssl x509 -in "$1" -outform DER | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1; }
 snap_with() { # snap_with NAME FINGERPRINT-or-empty
   mkdir -p "$SBX_SRV/snapshots/$1"
-  if [[ -n "$2" ]]; then printf '{\n  "hash": "x",\n  "egress_ca_sha256": "sha256:%s"\n}\n' "$2" >"$SBX_SRV/snapshots/$1/manifest.json"; else rm -f "$SBX_SRV/snapshots/$1/manifest.json"; fi
+  if [[ -n "$2" ]]; then
+    printf '{\n  "hash": "x",\n  "guest_ram_mb": 256,\n  "egress_ca_sha256": "sha256:%s"\n}\n' "$2" >"$SBX_SRV/snapshots/$1/manifest.json"
+  else
+    printf '{\n  "hash": "x",\n  "guest_ram_mb": 256\n}\n' >"$SBX_SRV/snapshots/$1/manifest.json"
+  fi
 }
 [[ ! -s "$EM" ]] || fail 'the credentials block does not start from a clean host'
 bash "$INSTALL" "$(bundle sbx_cr)" --snapshot default >"$TMP/out" 2>&1 || fail 'install the worker before --egress'
@@ -576,3 +585,27 @@ pass '--egress refuses a moca-egress.service this script did not install'
 # Clean up the kept CA: the host is empty again.
 rm -rf "$CD"; sed -i.bak '/^egress credential /d' "$EM"; rm -f "$EM.bak"
 [[ ! -s "$EM" ]] || fail "manifest not empty at the end of the credentials block: $(cat "$EM")"
+
+# The guest RAM comes from the snapshot's manifest, never the unit's 256: a 4096 MiB snapshot sized as
+# 256 would be admitted at a sixteenth of its cost and run in a cgroup too small for its memfile.
+snap swe 4096
+bash "$INSTALL" "$(bundle sbx_swe)" --snapshot swe --budget-mb 16384 >"$TMP/out" 2>&1 || fail 'install a 4096 MiB snapshot'
+grep -qx 'SH_GUEST_RAM_MB=4096' "$SBX_ENV_DIR/workers/sbx_swe.env" || fail 'SH_GUEST_RAM_MB is not the manifest guest_ram_mb'
+bash "$INSTALL" "$(bundle sbx_small)" --snapshot default >"$TMP/out" 2>&1 || fail 'install a 256 MiB snapshot'
+grep -qx 'SH_GUEST_RAM_MB=256' "$SBX_ENV_DIR/workers/sbx_small.env" || fail "sbx_small: SH_GUEST_RAM_MB is not its snapshot's 256"
+for w in sbx_swe sbx_small; do bash "$INSTALL" --uninstall "$w" >"$TMP/out" 2>&1 || fail "uninstall $w"; done
+# A budget that cannot hold one session ((4096 + 32) x 3 + 1024 = 13408) is refused, naming the need.
+: >"$MOCK_LOG"
+! bash "$INSTALL" "$(bundle sbx_swe)" --snapshot swe --budget-mb 8192 >"$TMP/out" 2>&1 || fail 'accepted a budget below one session'
+grep -q 'needs at least 13408 MiB' "$TMP/out" || fail 'the budget refusal does not name the 13408 MiB need'
+! grep -q systemctl "$MOCK_LOG" || fail 'touched systemd before refusing a small budget'
+# A manifest without guest_ram_mb, or no manifest at all, is refused before systemd is touched.
+for case in field file; do
+  mkdir -p "$SBX_SRV/snapshots/noram"
+  if [[ $case == field ]]; then printf '{"hash": "x"}\n' >"$SBX_SRV/snapshots/noram/manifest.json"; else rm -f "$SBX_SRV/snapshots/noram/manifest.json"; fi
+  : >"$MOCK_LOG"
+  ! bash "$INSTALL" "$(bundle sbx_noram)" --snapshot noram >"$TMP/out" 2>&1 || fail "installed a snapshot with no guest_ram_mb ($case)"
+  grep -q 'has no guest_ram_mb' "$TMP/out" || fail "the no-guest_ram_mb refusal ($case) does not say why"
+  ! grep -q systemctl "$MOCK_LOG" || fail "touched systemd before refusing no guest_ram_mb ($case)"
+done
+pass "the worker's SH_GUEST_RAM_MB is its snapshot's guest_ram_mb; a manifest without it, or a budget below one session, is refused"

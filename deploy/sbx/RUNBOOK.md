@@ -49,7 +49,11 @@ gitignored).
    ssh <host> rm -r sbx-<id>
    ```
 
-   It waits up to 120 s for the worker's attach to hold (`SBX_ATTACH_TIMEOUT`).
+   It waits up to 120 s for the worker's attach to hold (`SBX_ATTACH_TIMEOUT`). The worker's guest
+   RAM (`SH_GUEST_RAM_MB`) is taken from the snapshot's `manifest.json` (`guest_ram_mb`), never set
+   by hand: a snapshot without it is refused. `--budget-mb` (default 8192) must hold at least one
+   session, (guest RAM + 32) × 3 + 1024 MiB at the unit's standby depth of 2: 13408 MiB for a
+   4096 MiB guest. A smaller budget is refused, naming the minimum.
 
 6. **The janitor,** once per KVM host:
 

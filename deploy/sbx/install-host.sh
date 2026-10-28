@@ -70,6 +70,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the image size defaults to microvm-worker's own.
 DEFAULT_IMAGE_MB=2048
 DEFAULT_BUDGET_MB=8192
+# The unit's own values (sbx-worker@.service: SH_STANDBY_DEPTH, SH_MEMORY_RESERVE_MB) and the VMM's
+# fixed per-VM cost outside guest RAM (vmpool.DefaultVMOverheadBytes), for check_snapshot_ram.
+STANDBY_DEPTH=2 MEMORY_RESERVE_MB=1024 VM_OVERHEAD_MB=32
 
 log() { printf '==> %s\n' "$*"; }
 die() { echo "deploy/sbx/install-host.sh: $*" >&2; exit 1; }
@@ -257,6 +260,28 @@ snapshot_ca_fingerprint() {
 }
 
 # check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
+# snapshot_guest_ram_mb IMAGE -> the guest_ram_mb recorded in the snapshot's manifest.json, or nothing.
+snapshot_guest_ram_mb() {
+  local m="$SBX_SRV/snapshots/$1/manifest.json"
+  [[ -f "$m" ]] || return 0
+  sed -n 's/.*"guest_ram_mb"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$m" | head -1
+}
+
+# The guest RAM is the snapshot's, not a setting: the memfile IS the guest's RAM image, and the worker
+# sizes admission and each VM's cgroup by SH_GUEST_RAM_MB (the unit's 256 otherwise), which nothing
+# checks against the snapshot. And the budget must hold one session: the VM it runs on plus its
+# standbys (SH_STANDBY_DEPTH), each the guest RAM plus the VMM's fixed overhead
+# (vmpool.DefaultVMOverheadBytes), over the unit's SH_MEMORY_RESERVE_MB.
+check_snapshot_ram() {
+  local m="$SBX_SRV/snapshots/$SNAPSHOT/manifest.json" need
+  W_GUEST_MB="$(snapshot_guest_ram_mb "$SNAPSHOT")"
+  [[ "$W_GUEST_MB" =~ ^[1-9][0-9]*$ ]] ||
+    die "snapshot $SNAPSHOT has no guest_ram_mb in $m: rebuild it with deploy/microvm/build-snapshot.sh"
+  need=$(((W_GUEST_MB + VM_OVERHEAD_MB) * (1 + STANDBY_DEPTH) + MEMORY_RESERVE_MB))
+  ((BUDGET_MB >= need)) ||
+    die "--budget-mb $BUDGET_MB cannot hold one session of snapshot $SNAPSHOT (guest $W_GUEST_MB MiB): it needs at least $need MiB ((guest + $VM_OVERHEAD_MB) x (1 + $STANDBY_DEPTH standbys) + the $MEMORY_RESERVE_MB reserve)"
+}
+
 check_snapshot_ca() {
   [[ -f "$(egress_dropin)" ]] || return 0
   local crt m want got
@@ -373,8 +398,8 @@ install_units() {
   record "unit $SBX_UNIT_DIR/sbx-worker@.service"
 }
 
-# validate_worker reads and checks the bundle and the flags, setting W_ID, W_ADDR, W_TOK, W_IDLE and
-# W_IMAGE_MB. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
+# validate_worker reads and checks the bundle and the flags, setting W_ID, W_ADDR, W_TOK, W_IDLE,
+# W_IMAGE_MB and (check_snapshot_ram) W_GUEST_MB. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
 validate_worker() {
   local env="$BUNDLE/worker.env" id addr tok idle image_mb
   [[ -f "$env" ]] || die "no $env: pass the bundle directory deploy/sbx/setup.sh wrote (workers/<id>)"
@@ -397,11 +422,12 @@ validate_worker() {
   [[ -d "$SBX_SRV/snapshots/$SNAPSHOT" ]] || die "no snapshot $SBX_SRV/snapshots/$SNAPSHOT (build it with deploy/microvm/build-snapshot.sh)"
   [[ "$BUDGET_MB" =~ ^[1-9][0-9]*$ ]] && ((BUDGET_MB > 1024)) || die '--budget-mb must be a whole number of MiB above 1024 (the unit reserve)'
   check_snapshot_ca
+  check_snapshot_ram
   W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb"
 }
 
 install_worker() {
-  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" ca=''
+  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" guest_mb="$W_GUEST_MB" ca=''
   install -d -m 0700 "$SBX_ENV_DIR" "$SBX_ENV_DIR/workers"
   if [[ -f "$BUNDLE/relay-ca.crt" ]]; then
     grep -q -- '-----BEGIN CERTIFICATE-----' "$BUNDLE/relay-ca.crt" || die "$BUNDLE/relay-ca.crt holds no PEM certificate"
@@ -415,7 +441,7 @@ install_worker() {
     {
       printf 'RELAY_ADDR=%s\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\n' "$addr" "$id" "$tok"
       [[ -z "$ca" ]] || printf 'RELAY_CA_FILE=%s\n' "$ca"
-      printf 'SH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\n' "$SBX_SRV/snapshots" "$SNAPSHOT"
+      printf 'SH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\nSH_GUEST_RAM_MB=%s\n' "$SBX_SRV/snapshots" "$SNAPSHOT" "$guest_mb"
       printf 'SH_WORKSPACE_ROOT=%s\nSH_CHROOT_BASE=%s\n' "$SBX_SRV/workspaces/$id" "$SBX_SRV/jail/$id"
       printf 'SH_PARENT_CGROUP=sbx.slice/sbx-%s.slice\n' "$id"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_WORKSPACE_IDLE=%s\nSH_WORKSPACE_IMAGE_MB=%s\n' "$BUDGET_MB" "$idle" "$image_mb"
