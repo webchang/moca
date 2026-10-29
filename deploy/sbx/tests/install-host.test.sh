@@ -201,8 +201,14 @@ bash "$INSTALL" "$(bundle sbx_default)" --snapshot default >"$TMP/out" 2>&1 || f
 : >"$MOCK_LOG"
 bash "$INSTALL" --uninstall sbx_default >"$TMP/out" 2>&1 || fail 'uninstall sbx_default again'
 [[ "$(tail -1 "$MOCK_LOG")" == 'systemctl daemon-reload' ]] || fail "daemon-reload is not the last step of the undo: $(tail -1 "$MOCK_LOG")"
+# sbx.slice is stopped before its file goes: removed alone, it stays loaded in systemd until a reboot
+# (seen on a real host, 2026-10-29).
+grep -qx 'systemctl stop sbx.slice' "$MOCK_LOG" || fail 'the last uninstall does not stop sbx.slice'
+[[ "$(grep -n 'systemctl stop sbx.slice' "$MOCK_LOG" | cut -d: -f1)" -lt "$(grep -n 'systemctl daemon-reload' "$MOCK_LOG" | tail -1 | cut -d: -f1)" ]] ||
+  fail 'sbx.slice is stopped after the daemon-reload'
+! grep -q 'systemctl stop sbx-worker@.service' "$MOCK_LOG" || fail 'tried to stop the template unit file itself'
 [[ ! -e "$SBX_UNIT_DIR/sbx-worker@.service" ]] || fail 'reinstall + uninstall left the template unit'
-pass '--uninstall of the last worker removes the shared unit and sbx.slice, then daemon-reloads; workspace data stays'
+pass '--uninstall of the last worker stops sbx.slice, removes it and the shared unit, then daemon-reloads; workspace data stays'
 
 # The janitor (spec §8.3): --janitor BUNDLE_DIR installs the script, its env, its token and the two
 # units, enables the timer and records all of it as its own manifest kind; --uninstall-janitor

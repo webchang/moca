@@ -536,6 +536,9 @@ remove_shared_units() {
   ! grep -q '^worker ' "$SBX_ENV_DIR/manifest" || return 0
   while read -r kind path; do
     [[ "$kind" == unit && -n "$path" ]] || continue
+    # Removing a slice's file leaves the slice loaded in systemd (empty) until a reboot: stop it
+    # first. Its worker slices were stopped by their own uninstalls, so nothing runs in it.
+    [[ "$path" != *.slice ]] || systemctl stop "$(basename "$path")" || true
     rm -f "$path"
     drop_manifest_lines -x -e "unit $path"
     log "removed $path (no SBX0 worker left on this host)"
