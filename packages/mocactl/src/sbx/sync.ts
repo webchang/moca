@@ -380,14 +380,16 @@ export async function cmdUp(
       const { changed } = writeAgentConfig(root, { cortex });
       if (cortex) c.io.err(CORTEX_NOTE);
       if (changed.length) {
-        c.io.err(`configured Claude Code and OpenCode: ${changed.join(', ')}`);
+        c.io.err(`configured Claude Code, OpenCode and IBM Bob: ${changed.join(', ')}`);
         // enabledMcpjsonServers does not suppress the prompt on a first session (#577), and its
         // highlighted default declines, which leaves the agent with no tools at all. Say so here:
         // by the time it appears, this output is the only place the recovery was ever named.
         c.io.err(
           `start claude in ${root} (not a subdirectory); the first session asks about the ` +
             `sandbox MCP server, and the highlighted default declines — choose ` +
-            `"${CLAUDE_PROMPT_PICK}", or mocactl sbx doctor tells you how to undo it`,
+            `"${CLAUDE_PROMPT_PICK}", or start it with mocactl sbx claude, which registers the ` +
+            `server for that run and asks nothing about it — Claude Code may still ask once ` +
+            `whether you trust the folder (mocactl sbx doctor tells you how to undo a decline)`,
         );
       }
     } catch (err) {

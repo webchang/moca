@@ -24,6 +24,7 @@ import {
 import { cmdDoctor } from './doctor.js';
 import { type ExecFactory } from './exec.js';
 import { cmdCodex, type CodexDeps } from './codex.js';
+import { cmdClaude, type ClaudeDeps } from './claude.js';
 import {
   addCredential,
   addProblem,
@@ -62,6 +63,14 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  the sandbox token's lifetime minus 60 s)
   mocactl sbx put PATH [--sandbox ID]            write stdin to PATH under /workspace
   mocactl sbx mcp [--sandbox ID]                 the stdio MCP server for Claude Code / OpenCode
+  mocactl sbx claude [-- CLAUDE_ARGS ...]        run Claude Code on this sandbox's MCP tools, for
+                                                 one run (--mcp-config + --strict-mcp-config,
+                                                 nothing written, no approval asked: the first
+                                                 bare claude session's approval question is why
+                                                 this exists, #577; Claude Code still asks once
+                                                 whether you trust the folder. The session loads
+                                                 no MCP server but the sandbox's; run claude
+                                                 yourself for your own servers)
   mocactl sbx codex [-- CODEX_ARGS ...]          run Codex CLI on this sandbox's MCP tools, for one
                                                  run (-c, nothing written: Codex reads no
                                                  project-local config, so up cannot configure it).
@@ -71,11 +80,13 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config] [--cortex]
                                                  in a git repository: create or reuse its sandbox,
                                                  push the working tree, bind it in .sbx/sandbox.json,
-                                                 and point Claude Code and OpenCode at the sandbox's
-                                                 MCP tools with their local tools denied (merged
+                                                 and point Claude Code, OpenCode and IBM Bob at the
+                                                 sandbox's MCP tools, with their local tools denied
+                                                 (Bob's cannot be: it has no deny list) (merged
                                                  into .mcp.json, .claude/settings.json,
-                                                 opencode.json, CLAUDE.md, AGENTS.md; a value there
-                                                 that conflicts stops up before anything is done)
+                                                 opencode.json, .bob/settings.json, CLAUDE.md,
+                                                 AGENTS.md; a value there that conflicts stops up
+                                                 before anything is done)
                                                  (a reused sandbox with changes not yet pulled is
                                                  left unpushed, with a warning, and up exits 0)
                                                  (--cortex: Cortex v0.9.3+ blocks the local tools
@@ -124,6 +135,8 @@ export interface SbxDeps {
   mcpTransport?: Transport;
   /** `codex`'s child process (default: the `codex` on PATH). */
   codex?: CodexDeps;
+  /** `claude`'s child process (default: the `claude` on PATH). */
+  claude?: ClaudeDeps;
   /** `login`'s clipboard and browser; absent when nobody is at this machine's screen. */
   loginHelpers?: LoginHelpers;
 }
@@ -237,6 +250,7 @@ const NO_JSON = new Set([
   'run',
   'put',
   'mcp',
+  'claude',
   'codex',
   'up',
   'push',
@@ -251,6 +265,7 @@ const TAKES_SANDBOX_FLAG = new Set([
   'run',
   'put',
   'mcp',
+  'claude',
   'codex',
   'push',
   'pull',
@@ -364,6 +379,7 @@ export async function sbxMain(
     'run',
     'put',
     'mcp',
+    'claude',
     'codex',
     'up',
     'push',
@@ -433,8 +449,9 @@ export async function sbxMain(
   // `run` takes everything after the command (after `--`) as CMD; `put` exactly one PATH; rm, token
   // and env at most one ID; every other command no argument at all.
   const argsOk =
-    // run quotes its CMD; codex forwards its own flags and prompt to the child.
+    // run quotes its CMD; claude and codex forward their own flags and prompt to the child.
     command === 'run' ||
+    command === 'claude' ||
     command === 'codex' ||
     (command === 'credentials'
       ? arg === undefined ||
@@ -656,6 +673,19 @@ export async function sbxMain(
       return cmdPut(ctx, id!, target!, content!, deps.execFactory);
     case 'mcp':
       return cmdMcp(ctx, id!, deps.mcpTransport, deps.execFactory);
+    case 'claude':
+      // As for codex: only an explicit --sandbox is passed on — without one, the `mocactl sbx mcp`
+      // that claude starts resolves the binding itself, so the agent follows .sbx/sandbox.json as
+      // it changes. Claude Code passes its whole environment to a stdio server, so the env-var
+      // URL case needs no help (#639 was Codex-specific); an explicit --control-plane-url is
+      // forwarded (as the normalized ctx.url) because a flag is not the environment.
+      return cmdClaude(
+        ctx,
+        positionals.slice(1),
+        deps.claude ?? {},
+        values.sandbox,
+        values['control-plane-url'] !== undefined ? ctx.url : undefined,
+      );
     case 'codex':
       // Only an explicit --sandbox is passed on: without one, the `mocactl sbx mcp` that codex
       // starts resolves the binding itself, so the agent follows .sbx/sandbox.json as it changes.

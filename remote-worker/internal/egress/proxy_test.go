@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/moca/remote-worker/internal/egress/control"
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 )
 
 // recSink records events and their JSON form; safe for concurrent use.
@@ -218,11 +219,7 @@ func allow(t *testing.T, s string) []AllowEntry {
 
 func newHarness(t *testing.T, allowList string, mod func(*Config)) *harness {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "eg")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	dir := shortdir.New(t, "eg", len("/vm-quiet.sock"))
 	h := &harness{t: t, sink: &recSink{}, res: newResolver(), dir: dir}
 	cfg := Config{
 		Allow:                 allow(t, allowList),
@@ -515,16 +512,35 @@ func TestCapRefusalsAreBoundedPerVM(t *testing.T) {
 	// in flight for drainTimeout -- which is what makes the bound observable.
 	const offered = maxCapRefusalsPerVM * 6
 	peak := 0
+	sample := func(at string) {
+		n := h.capRefusalsInFlight("vm-1")
+		if n > peak {
+			peak = n
+		}
+		if n > maxCapRefusalsPerVM {
+			t.Fatalf("%s: %d in flight, over the bound of %d: a guest can grow host fds without limit",
+				at, n, maxCapRefusalsPerVM)
+		}
+	}
 	for i := 0; i < offered; i++ {
 		c := dial(t, path)
 		fmt.Fprintf(c, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
-		if n := h.capRefusalsInFlight("vm-1"); n > peak {
-			peak = n
+		sample(fmt.Sprintf("refusal %d", i))
+	}
+	// The offer loop never blocks -- the kernel completes the dials into the
+	// listener backlog and the requests fit the socket buffers -- so on a
+	// loaded runner it can finish before the accept goroutine has charged a
+	// single refusal. The backlog still holds the offers, and a charged
+	// refusal stays in flight for ~2*drainTimeout, so wait until every offer
+	// has been charged: the bound must hold as they land, too, not only at
+	// the first one the poll happens to see.
+	if peak == 0 {
+		deadline := time.Now().Add(3 * time.Second)
+		for h.capCharged("vm-1") < offered && time.Now().Before(deadline) {
+			sample("catch-up")
+			time.Sleep(2 * time.Millisecond)
 		}
-		if n := h.capRefusalsInFlight("vm-1"); n > maxCapRefusalsPerVM {
-			t.Fatalf("refusal %d: %d in flight, over the bound of %d: a guest can grow host fds without limit",
-				i, n, maxCapRefusalsPerVM)
-		}
+		sample("catch-up")
 	}
 	if peak == 0 {
 		t.Fatal("no refusal was ever in flight: the test did not exercise the refusal path")
