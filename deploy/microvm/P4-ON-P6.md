@@ -151,6 +151,20 @@ sudo deploy/microvm/build-snapshot.sh --kernel /path/to/vmlinux-6.18.44 \
   --image default --vmm firecracker --guest-ram-mb 256 --out /srv/snapshots/default
 ```
 
+Opt-in flags, all off by default (a default build is unchanged):
+
+- `--vcpus N` (1-32, default 1): the guest's vCPUs, for both VMMs, recorded in the manifest as
+  `vcpus`.
+- `--skip-git-identity-check`: build an image with no git identity, one that refuses agent commits on
+  purpose (a benchmark testbed whose patch must stay a diff against a fixed baseline). The skip is
+  logged.
+- `--guest-home /tmp/DIR`: give guest commands a writable `HOME`, created by init on the `/tmp`
+  tmpfs. The default `HOME=/` is on the read-only rootfs.
+
+`--guest-ram-mb` is recorded as `guest_ram_mb`. The worker must run with the same `SH_GUEST_RAM_MB`:
+SBX0's `install-host.sh` takes it from the manifest; `setup-microvm.sh` does not, so set it in
+`microvm-worker.env` for a snapshot other than 256 MiB.
+
 `/srv/snapshots/default` is where the shipped unit looks (`SH_SNAPSHOT_DIR` plus
 `SH_SNAPSHOT_IMAGE`). The script boots the VM, probes the guest for its tools, snapshots it, then
 proves the artifact by restoring one VM and running `true` in it.

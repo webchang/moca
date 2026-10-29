@@ -31,6 +31,8 @@ Environment=SH_JAILER_BIN=/usr/local/bin/jailer
 Environment=SH_FIRECRACKER_BIN=/usr/local/bin/firecracker
 Environment=SH_VMM=firecracker
 Environment=SH_STANDBY_DEPTH=2
+# A fallback only: install-host.sh writes the snapshot manifest's guest_ram_mb into the env file,
+# which overrides it.
 Environment=SH_GUEST_RAM_MB=256
 Environment=SH_MAX_RUNS=64
 Environment=SH_MEMORY_RESERVE_MB=1024

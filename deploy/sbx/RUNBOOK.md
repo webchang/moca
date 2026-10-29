@@ -166,21 +166,53 @@ GitHub. Once a real OAuth app is configured, whoever owns that id on GitHub coul
 enrolled user. So drop a made-up id from the list when the test ends, and use a real second account
 on a deployment with an OAuth app.
 
-## 5. Adding a template
+## 5. Adding, updating and removing a template
 
-1. Build its snapshot on the KVM host (§1 step 3), named `<image>`.
+A template is an id clients choose (`mocactl sbx create --template <id>`, `POST /v1/sandboxes
+{template}`), served by one worker running one snapshot. A sandbox keeps the worker it was created
+on for its whole life, whatever later happens to its template's entry.
+
+**Adding a template:**
+
+1. Build its snapshot on the KVM host (§1 step 3), named `<image>`. An image built from a container
+   image for a benchmark (one that refuses agent commits, with a read-only rootfs) usually needs
+   `build-snapshot.sh --skip-git-identity-check --guest-home /tmp/home`, and `--vcpus N
+--guest-ram-mb M` for its size ([P4-ON-P6](../microvm/P4-ON-P6.md#build-the-golden-snapshot)).
 2. Pick a worker id (`^[A-Za-z_][A-Za-z0-9_]*$`, say `sbx_node22`) and add it to `SBX_WORKERS`.
 3. Add its entry, `{ "id", "worker", "description", "tools" }`, to `SBX_TEMPLATES_FILE`. One
    template per worker; every worker in the list.
 4. Re-run `setup.sh`: it mints the worker's token and writes its bundle.
 5. Install the worker with that bundle and `--snapshot <image>` (§1 step 5). A new worker's token
    reaches the relay when the kubelet syncs the Secret, about a minute, so its first attaches may be
-   refused; `install-host.sh` waits.
+   refused; `install-host.sh` waits. Pass `--budget-mb` for a guest larger than 256 MiB (§1 step 5).
+6. Check it with `deploy/sbx/templates-check.sh` (§14).
 
-Removing a template is the reverse: drop it from both, re-run `setup.sh` (which revokes the worker's
-token and deletes its bundle; it cannot attach again), then
-`sudo <checkout>/deploy/sbx/install-host.sh --uninstall <id>` on its host. Its sandboxes stop
-working at once (no worker serves them): tell their owners to pull first.
+**Updating a template** (a new image or snapshot) is versioned: never re-point a worker that serves
+sandboxes at another snapshot, or their commands change environment mid-work. Instead:
+
+1. Build the new snapshot under a new `<image>` name.
+2. Add a new worker id for it (say `sbx_node22_v2`) to `SBX_WORKERS`, keeping the old one.
+3. Change the template's `worker` in `SBX_TEMPLATES_FILE` to the new id. The old worker serves no
+   template now, but stays in `SBX_WORKERS`, so it keeps its token and its sandboxes keep working.
+4. Re-run `setup.sh`, install the new worker (steps 4-5 above), and check it (step 6). New sandboxes
+   of the template go to the new worker; existing ones stay on the old.
+5. Retire the old worker once it serves no live sandbox: `GET /v1/janitor/sandboxes` (the janitor's
+   token) lists each live sandbox with its `wrk`, and `mocactl sbx ls --all` (an admin) shows their
+   templates. Then remove it as below.
+
+Both workers hold their snapshot's memory file in RAM (it is the guest's whole RAM image) until the
+old one is retired, so the host needs room for both.
+
+**Removing a template** (or a retired worker) is the reverse of adding one: drop it from both lists,
+re-run `setup.sh` (which revokes the worker's token and deletes its bundle; it cannot attach again),
+then `sudo <checkout>/deploy/sbx/install-host.sh --uninstall <id>` on its host. Its sandboxes stop
+working at once (no worker serves them): tell their owners to pull first. With egress credentials on
+(`SBX_EGRESS_CREDENTIALS=1`), a worker that serves no template is no egress worker, so its
+remaining sandboxes get no stored credential (as if their owners had none) and credentialed hosts
+answer them `401` until it is retired.
+
+Every template change re-runs `setup.sh`, which restarts the relay and so ends every running
+`Exec`, on every template (§2): change templates when nothing long is running.
 
 ## 6. Rotating the signing key
 
@@ -481,27 +513,6 @@ The Redis volume (the StatefulSet's `data` claim, `data-redis-0`) is kept by the
 with `kubectl delete pvc data-redis-0 -n <namespace>` to delete every sandbox record and every
 login (the refresh families live there too).
 
-## 13a. Checking the templates
-
-`deploy/sbx/templates-check.sh` checks that a client chooses the template its sandbox runs on: the
-list, a create of each template, each sandbox's token naming its own template's worker, a command in
-each answering on its template's image, a token refused at another template's worker, and `sbx up`
-refusing a bound sandbox of another template. Run it after adding or updating a template. Like the
-smoke, it reads only the environment, never prints a token, and deletes only the sandboxes it
-created; without `SBX_LIVE_CHECK=1` it does nothing.
-
-```bash
-SBX_LIVE_CHECK=1 SBX_API_URL=https://<api host> \
-  SBX_CHECK_HOME_A=<home A> SBX_CHECK_HOME_B=<home B> SBX_CHECK_TEMPLATES=default,<template> \
-  SBX_CHECK_PROBE_<TEMPLATE>='<a command that prints yes only on that template>' \
-  deploy/sbx/templates-check.sh
-```
-
-The two `HOME`s are two enrolled users' logins (§13, or `mint-login.sh`, §4). Each `SBX_CHECK_PROBE_<ID>`
-(the id upper-cased, dashes as underscores) runs in every template's sandboxes: it must print `yes`
-in its own template's and anything else in the others'. `SBX_CHECK_EXEC=0` checks the control plane
-alone, before any worker is installed. `--help` lists every input and check.
-
 ## 13. Live smoke
 
 `deploy/sbx/smoke.sh` runs the spec's live checks (§10.6) against a deployed service. Run it after
@@ -615,3 +626,24 @@ What each step does:
 What it cannot check for you: the agents' own logs (kept on a failure) show whether an agent
 fixed the test by the shortest route, or tried its local tools first and was denied. The
 `no network in the guest` claim is not one of its steps (`docs/sbx/security-review.md` §2).
+
+## 14. Checking the templates
+
+`deploy/sbx/templates-check.sh` checks that a client chooses the template its sandbox runs on: the
+list, a create of each template, each sandbox's token naming its own template's worker, a command in
+each answering on its template's image, a token refused at another template's worker, and `sbx up`
+refusing a bound sandbox of another template. Run it after adding or updating a template. Like the
+smoke, it reads only the environment, never prints a token, and deletes only the sandboxes it
+created; without `SBX_LIVE_CHECK=1` it does nothing.
+
+```bash
+SBX_LIVE_CHECK=1 SBX_API_URL=https://<api host> \
+  SBX_CHECK_HOME_A=<home A> SBX_CHECK_HOME_B=<home B> SBX_CHECK_TEMPLATES=default,<template> \
+  SBX_CHECK_PROBE_<TEMPLATE>='<a command that prints yes only on that template>' \
+  deploy/sbx/templates-check.sh
+```
+
+The two `HOME`s are two enrolled users' logins (§13, or `mint-login.sh`, §4). Each `SBX_CHECK_PROBE_<ID>`
+(the id upper-cased, dashes as underscores) runs in every template's sandboxes: it must print `yes`
+in its own template's and anything else in the others'. `SBX_CHECK_EXEC=0` checks the control plane
+alone, before any worker is installed. `--help` lists every input and check.
