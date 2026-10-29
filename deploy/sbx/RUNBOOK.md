@@ -86,9 +86,12 @@ and no sandbox profile; 1b added the control-plane inputs (`SBX_API_HOST`, `SBX_
 ## 2. Upgrading
 
 **An image upgrade** (a new `SBX_IMAGE`): set it in `<env file>` and re-run `setup.sh`. A changed
-image, or any changed setting, rolls the control plane and the relay. Workers keep running, and
-reattach when the relay comes back; Execs running through the old relay pod end with it (the worker
-kills a dropped stream's Execs), so apply changes when nothing long is running.
+image rolls the control plane and the relay, and so does a change to what the relay reads (the
+token issuer, `SBX_MAX_INFLIGHT`, the signing keyset, the attach or exec certificate). Workers keep
+running, and reattach when the relay comes back; Execs running through the old relay pod end with it
+(the worker kills a dropped stream's Execs), so apply those when nothing long is running. Any other
+setting (templates, subjects, quotas, lifetimes) rolls the control plane alone, and running Execs
+carry on.
 
 **From 1a:** unset `SBX_CLIENTS` (the run refuses it), move `SBX_IMAGE` off the team-only 1a image,
 and run with `SBX_ACK_HOSTS=1`, because every 1a worker bundle lacks the workspace idle time and
@@ -211,8 +214,9 @@ working at once (no worker serves them): tell their owners to pull first. With e
 remaining sandboxes get no stored credential (as if their owners had none) and credentialed hosts
 answer them `401` until it is retired.
 
-Every template change re-runs `setup.sh`, which restarts the relay and so ends every running
-`Exec`, on every template (§2): change templates when nothing long is running.
+Every template change re-runs `setup.sh`, which rolls the control plane but not the relay (§2), so
+running `Exec`s on every template carry on. A worker added or retired at the same time is a token
+change, which the relay reads on each attach without a restart.
 
 ## 6. Rotating the signing key
 
@@ -229,8 +233,8 @@ deploy/sbx/setup.sh --env-file <env file>
 
 Remove that one key only: `moca-mu1` also holds the janitor's token (`SH_JANITOR_TOKEN`), which
 deleting the whole Secret would rotate too. The run generates a new key, publishes its public half
-as the whole keyset, and rolls the relay and the control plane (the settings hash covers the
-keyset). `setup.sh` does not keep the old key beside the new one, and nothing else does.
+as the whole keyset, and rolls the relay and the control plane (both pods' settings hashes cover
+the keyset). `setup.sh` does not keep the old key beside the new one, and nothing else does.
 
 What users see: `mocactl` mints a fresh sandbox token for its calls, and re-mints once when the
 relay refuses a token before the call started, so sessions carry on with the new key. A token

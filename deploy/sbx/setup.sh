@@ -504,10 +504,14 @@ apply_configmap() {
 }
 
 # moca-settings (the keys base/control-plane.yaml reads) and sbx-settings (the sandbox profile's and
-# the relay's), then SETTINGS_HASH: what both pods read at boot, with the public keyset, so a change
-# to any of it rolls both (write_overlay). Runs after route_cert: it reads exec-ca.crt.
+# the relay's), then two hashes of what each pod reads at boot (write_overlay stamps them, so a change
+# rolls the pod that reads it): SETTINGS_HASH, the control plane's, covers every setting, the public
+# keyset and the certificates; RELAY_HASH covers only the relay's (ocp-sbx/patch-relay.yaml: the
+# issuer and the in-flight cap) with the keyset and the certificates. So a template, subject or quota
+# change rolls the control plane alone and leaves running Execs be (RUNBOOK §5). Runs after
+# route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx keys attach_crt exec_crt egress
+  local ca='' moca sbx relay keys attach_crt exec_crt egress
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   moca=("SH_GITHUB_CLIENT_ID=$SBX_GITHUB_CLIENT_ID" "SH_ADMIN_SUBJECTS=${SBX_ADMIN_SUBJECTS:-}"
@@ -542,6 +546,15 @@ ensure_settings() {
     [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
   [[ "$SETTINGS_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the settings (openssl dgst)'
+  # The relay's env from sbx-settings, by key, as patch-relay.yaml names them.
+  relay=('SH_SANDBOX_TOKEN_ISSUER=sbx-control-plane' "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT")
+  RELAY_HASH="$({
+    printf '%s\n' "${relay[@]}"
+    json_value "$keys" PUBLIC_KEYS
+    json_value "$attach_crt" tls.crt
+    json_value "$exec_crt" tls.crt
+  } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
+  [[ "$RELAY_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the relay settings (openssl dgst)'
 }
 
 # route_cert SECRET HOST CERT KEY CAFILE: install the operator's certificate, or make a self-signed one
@@ -612,12 +625,12 @@ write_overlay() {
     printf '  - target: { kind: Route, name: sbx-exec }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_EXEC_HOST"
     printf '  - target: { kind: Route, name: sbx-api }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_API_HOST"
     # Both pods read their settings and keys only at boot: a new hash changes their pod templates,
-    # so the apply rolls them. The control plane's template has no annotations map; p4-relay gives
-    # the relay's one, so there this adds a key.
+    # so the apply rolls them, each on its own hash (ensure_settings). The control plane's template
+    # has no annotations map; p4-relay gives the relay's one, so there this adds a key.
     printf '  - target: { kind: Deployment, name: moca-control-plane }\n    patch: |-\n'
     printf '      - { op: add, path: /spec/template/metadata/annotations, value: { sbx.moca.dev/settings-hash: "%s" } }\n' "$SETTINGS_HASH"
     printf '  - target: { kind: Deployment, name: sandbox-relay }\n    patch: |-\n'
-    printf '      - { op: add, path: /spec/template/metadata/annotations/sbx.moca.dev~1settings-hash, value: "%s" }\n' "$SETTINGS_HASH"
+    printf '      - { op: add, path: /spec/template/metadata/annotations/sbx.moca.dev~1settings-hash, value: "%s" }\n' "$RELAY_HASH"
     printf 'images:\n'
     image_entry ghcr.io/rossoctl/moca "$SBX_IMAGE"
   } >"$GEN/kustomization.yaml"
