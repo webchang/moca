@@ -148,6 +148,8 @@ export interface AcquiredTurnSandbox {
 export interface TurnPlacement {
   sandboxId: string;
   tier: string;
+  /** The session's sandbox template; absent for none (session-templates spec §6). */
+  template?: string;
   workspaceReset?: WorkspaceReset;
 }
 
@@ -286,6 +288,7 @@ export async function acquireTurnSandbox(
           placement: {
             sandboxId: selected.sandboxId,
             tier: selected.tier ?? '',
+            ...(template ? { template: template.id } : {}),
             ...(selected.workspaceReset ? { workspaceReset: selected.workspaceReset } : {}),
           },
         }
@@ -366,6 +369,7 @@ function placementView(p: TurnPlacement): NonNullable<TurnResult['sandbox']> {
   return {
     id: p.sandboxId,
     tier: p.tier,
+    ...(p.template ? { template: p.template } : {}),
     ...(p.workspaceReset ? { workspaceReset: p.workspaceReset } : {}),
   };
 }
@@ -698,7 +702,7 @@ export interface TurnResult {
   stopReason: string;
   errorMessage?: string;
   usage?: LeafUsage;
-  sandbox?: { id: string; tier: string; workspaceReset?: WorkspaceReset };
+  sandbox?: { id: string; tier: string; template?: string; workspaceReset?: WorkspaceReset };
 }
 
 /**

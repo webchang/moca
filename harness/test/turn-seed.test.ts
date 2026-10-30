@@ -199,6 +199,8 @@ describe('acquireTurnSandbox seeds a templated session (session-templates spec ย
     const r = await acquire({ id: 'py312', seed: 'echo hi' });
     const got = await r.got;
     expect(got.placement?.sandboxId).toBe('py-1');
+    // The result's placement names the template (session-templates spec ยง6).
+    expect(got.placement?.template).toBe('py312');
     expect(r.commands).toHaveLength(1);
     expect(r.commands[0]).toContain('.moca-seeded');
     expect(r.commands[0]).toContain('echo hi');
