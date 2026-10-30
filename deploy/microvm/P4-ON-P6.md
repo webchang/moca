@@ -160,6 +160,11 @@ Opt-in flags, all off by default (a default build is unchanged):
   logged.
 - `--guest-home /tmp/DIR`: give guest commands a writable `HOME`, created by init on the `/tmp`
   tmpfs. The default `HOME=/` is on the read-only rootfs.
+- `--verify-command CMD` (with `--verify-timeout-s N`, 1-86400, default 600): what the last step
+  runs in the restored VM in place of `true`. It's a bash command, run in `/workspace` once it's
+  mounted the way a worker mounts it, so it can seed a template's workspace and probe it (say, run a
+  test suite). A nonzero exit fails the build, and the last 16 KiB of its output are logged.
+  Nothing is published, so a snapshot that can't do its job never reaches a worker.
 
 `--guest-ram-mb` is recorded as `guest_ram_mb`. The worker must run with the same `SH_GUEST_RAM_MB`:
 SBX0's `install-host.sh` takes it from the manifest; `setup-microvm.sh` does not, so set it in
@@ -167,7 +172,7 @@ SBX0's `install-host.sh` takes it from the manifest; `setup-microvm.sh` does not
 
 `/srv/snapshots/default` is where the shipped unit looks (`SH_SNAPSHOT_DIR` plus
 `SH_SNAPSHOT_IMAGE`). The script boots the VM, probes the guest for its tools, snapshots it, then
-proves the artifact by restoring one VM and running `true` in it.
+proves the artifact by restoring one VM and running `true` (or `--verify-command`) in it.
 
 **What the manifest must advertise:** `capabilities` must include the container tier's full set,
 `bash rg base64 file python3 git`. The verified run's manifest listed

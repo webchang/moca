@@ -1891,5 +1891,49 @@ check "the host file behind the symlink is untouched" "$(cat "$t/host/init")" "H
 check "the tree gets a regular file" "$([ -f "$t/tree/sbin/init" ] && [ ! -L "$t/tree/sbin/init" ] && echo yes || echo no)" "yes"
 rm -rf "$t"
 
+echo "== --verify-command is opt-in: by default the verify step still runs \`true\`"
+usage_text="$(bash "$SCRIPT" --help 2>&1)"
+check "usage names --verify-command" "$(printf '%s' "$usage_text" | grep -c -- '--verify-command')" "3"
+check "usage names --verify-timeout-s" "$(printf '%s' "$usage_text" | grep -c -- '--verify-timeout-s')" "2"
+check "by default no verify command is set" "$(grep -c '^VERIFY_COMMAND=""$' "$SCRIPT")" "1"
+check "both verify arms run the one helper" "$(grep -c '^  run_verify_command "$vsock_uds" || exit_code=$?$' "$SCRIPT")" "2"
+check "no verify arm runs a hardcoded \`true\` any more" \
+  "$(grep -c -- '-timeout-s 30 -command true' "$SCRIPT")" "0"
+for bad in 0 86401 ten -5; do
+  rc=0
+  out="$(bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --verify-command true --verify-timeout-s "$bad" 2>&1)" || rc=$?
+  check "--verify-timeout-s $bad is refused before any build step (exit 2)" "$rc" "2"
+done
+check "the refusal names the rule" "$(printf '%s' "$out" | grep -c 'from 1 to 86400')" "1"
+rc=0
+bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --verify-command '' >/dev/null 2>&1 || rc=$?
+check "an empty --verify-command is a usage error (exit 2)" "$rc" "2"
+
+# The guest command itself, from the script's own functions, run here under bash with the mount
+# lines stubbed (no guest): the command's exit code comes back, and only its log's tail.
+# shellcheck disable=SC2034 # VERIFY_COMMAND is read by the eval'd verify_guest_command
+{
+eval "$(fn_body verify_guest_command)"
+VERIFY_COMMAND=""
+check "without --verify-command the guest runs exactly \`true\`" "$(verify_guest_command firecracker)" "true"
+VERIFY_COMMAND='echo seeded; printf "x%.0s" $(seq 1 20000); echo; echo "42 passed"; exit 3'
+for vmm in firecracker cloud-hypervisor; do
+  g="$(verify_guest_command "$vmm")"
+  case "$vmm" in
+    firecracker) want_mount='mount -o rw,noatime /dev/vdb /workspace' ;;
+    cloud-hypervisor) want_mount='mount -t virtiofs workspace /workspace' ;;
+  esac
+  check "$vmm: the workspace is mounted as the worker mounts it, before the command" \
+    "$(printf '%s\n' "$g" | head -n1 | grep -cF "$want_mount")" "1"
+  t="$(mktemp -d)"
+  g_local="$(printf '%s\n' "$g" | sed -e '1d' -e "s|cd /workspace|cd $t|" -e "s|/tmp/.verify-command.log|$t/log|g")"
+  rc=0; out="$(bash -c "$g_local")" || rc=$?
+  check "$vmm: the command's exit code comes back" "$rc" "3"
+  check "$vmm: the output's tail comes back" "$(printf '%s\n' "$out" | tail -n1)" "42 passed"
+  check "$vmm: at most 16 KiB of it" "$([ "${#out}" -le 16384 ] && echo yes || echo no)" "yes"
+  rm -rf "$t"
+done
+}
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

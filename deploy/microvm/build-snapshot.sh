@@ -136,6 +136,11 @@ GUEST_HOME=""
 # benchmark comparing this tier with containers of N CPUs builds with --vcpus N so the comparison
 # measures the tier, not the CPU count. Restore takes the count from the snapshot itself.
 VCPUS=1
+# VERIFY_COMMAND: opt-in, what verify_restore runs in the restored VM instead of `true` (a template's
+# seed and probe, so a snapshot whose image cannot do its job is never published). See
+# verify_guest_command. VERIFY_TIMEOUT_S bounds it in the guest.
+VERIFY_COMMAND=""
+VERIFY_TIMEOUT_S=600
 
 usage() {
   cat >&2 <<'USAGE'
@@ -143,6 +148,7 @@ build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR] [--egress-ca PATH]
                   [--skip-git-identity-check] [--guest-home /tmp/DIR] [--vcpus 1]
+                  [--verify-command CMD [--verify-timeout-s 600]]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
 restore requires identical hardware and software). --instance-type is an OVERRIDE:
@@ -166,6 +172,12 @@ artifact works.
                            read-only rootfs). Must be a path under /tmp.
 --vcpus N                  the guest's vCPU count, 1-32 (default 1, as before), recorded in the
                            manifest; every VM restored from the snapshot has it.
+--verify-command CMD       what the verify step runs in the restored VM, in place of `true`: a
+                           bash command, run in /workspace once it is mounted as a worker mounts
+                           it (an empty workspace), so it can seed and probe a template. Nonzero
+                           exit fails the build and publishes nothing. The last 16 KiB of its
+                           output are logged. Default: unset, so the check is `true` as before.
+--verify-timeout-s N       the guest-side timeout for --verify-command, 1-86400 s (default 600).
 USAGE
   exit 2
 }
@@ -218,6 +230,15 @@ while [ $# -gt 0 ]; do
       ;;
     --vcpus)
       VCPUS="${2:-}"
+      shift 2
+      ;;
+    --verify-command)
+      VERIFY_COMMAND="${2:-}"
+      [ -n "$VERIFY_COMMAND" ] || usage
+      shift 2
+      ;;
+    --verify-timeout-s)
+      VERIFY_TIMEOUT_S="${2:-}"
       shift 2
       ;;
     -h | --help)
@@ -277,6 +298,11 @@ fi
 
 if ! printf '%s' "$VCPUS" | grep -Eq '^([1-9]|[12][0-9]|3[0-2])$'; then
   echo "build-snapshot.sh: --vcpus must be an integer from 1 to 32, got '$VCPUS'" >&2
+  exit 2
+fi
+
+if ! printf '%s' "$VERIFY_TIMEOUT_S" | grep -Eq '^[1-9][0-9]{0,4}$' || [ "$VERIFY_TIMEOUT_S" -gt 86400 ]; then
+  echo "build-snapshot.sh: --verify-timeout-s must be an integer from 1 to 86400, got '$VERIFY_TIMEOUT_S'" >&2
   exit 2
 fi
 
@@ -1930,8 +1956,49 @@ lock_down() {
 # ---------------------------------------------------------------------------
 # 7. verify_restore
 # ---------------------------------------------------------------------------
+# verify_guest_command VMM: the command verify_restore runs in the restored VM. Without
+# --verify-command it is `true`, exactly as before. With it, the workspace is mounted first the way
+# the worker's launcher mounts it (launcher_firecracker.go's Resume: the ext4 drive /dev/vdb;
+# launcher_chv.go's chvWrapCommand: virtio-fs tag `workspace`), then the command runs in /workspace
+# with its output in /tmp (the guest agent caps each stream at 32 KiB), and only the log's tail is
+# returned, with the command's exit code.
+verify_guest_command() {
+  if [ -z "$VERIFY_COMMAND" ]; then
+    printf 'true'
+    return
+  fi
+  case "$1" in
+    firecracker) printf '%s\n' 'mountpoint -q /workspace || mount -o rw,noatime /dev/vdb /workspace || exit 97' ;;
+    cloud-hypervisor) printf '%s\n' 'mountpoint -q /workspace || mount -t virtiofs workspace /workspace || exit 97' ;;
+  esac
+  printf 'cd /workspace || exit 97\n(\n%s\n) >/tmp/.verify-command.log 2>&1\n' "$VERIFY_COMMAND"
+  printf '%s\n' 'rc=$?; tail -c 16384 /tmp/.verify-command.log; exit $rc'
+}
+
+# run_verify_command VSOCK_UDS: run verify_guest_command in the restored VM; its exit code is the
+# command's. The output goes to the log, so a failed probe shows why.
+run_verify_command() {
+  local uds="$1" out rc timeout_s=30
+  [ -z "$VERIFY_COMMAND" ] || timeout_s="$VERIFY_TIMEOUT_S"
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s "$timeout_s" \
+    -command "$(verify_guest_command "$VMM")" 2>&1)" && rc=0 || rc=$?
+  if [ -n "$VERIFY_COMMAND" ]; then
+    log "verify command exited $rc; the last of its output:"
+    printf '%s\n' "$out" >&2
+  fi
+  return "$rc"
+}
+
+verify_what() {
+  if [ -n "$VERIFY_COMMAND" ]; then printf 'the --verify-command'; else printf '`true`'; fi
+}
+
 verify_restore() {
-  log "verifying: restoring one VM from $PENDING and running \`true\` in it"
+  if [ -n "$VERIFY_COMMAND" ]; then
+    log "verifying: restoring one VM from $PENDING and running the --verify-command in it"
+  else
+    log "verifying: restoring one VM from $PENDING and running \`true\` in it"
+  fi
   case "$VMM" in
     firecracker) verify_restore_firecracker ;;
     cloud-hypervisor) verify_restore_cloud_hypervisor ;;
@@ -2046,12 +2113,12 @@ verify_restore_firecracker() {
     "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
 
   local exit_code=0
-  "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
+  run_verify_command "$vsock_uds" || exit_code=$?
   teardown_jail "$jail"
   rm_rf_jail "$verify_root"
   CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
-    echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
+    echo "build-snapshot.sh: the fresh snapshot restored but $(verify_what) exited $exit_code" >&2
     exit 1
   fi
 }
@@ -2137,7 +2204,7 @@ verify_restore_cloud_hypervisor() {
     '{"source_url":"file:///ch-snapshot","resume":true}'
 
   local exit_code=0
-  "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
+  run_verify_command "$vsock_uds" || exit_code=$?
   teardown_jail "$jail"
   # Fix-round-12: VMM first (teardown_jail above), then virtiofsd -- see
   # teardown_virtiofsd's own comment. Must run before rm_rf_jail: virtiofsd
@@ -2146,7 +2213,7 @@ verify_restore_cloud_hypervisor() {
   rm_rf_jail "$verify_root"
   CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
-    echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
+    echo "build-snapshot.sh: the fresh snapshot restored but $(verify_what) exited $exit_code" >&2
     exit 1
   fi
 }
