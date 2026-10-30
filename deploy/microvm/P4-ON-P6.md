@@ -316,6 +316,35 @@ Before #452, a refusal at this ceiling did not surface as a 503 at all: it was d
 model as its command's output, so a turn answered 200 with the host's memory arithmetic quoted back
 as prose. If you are reading an older worker's logs, that is what a budget ceiling looked like.
 
+### A templated P4 worker (session templates)
+
+A session can name a **sandbox template** (`mocactl run --option sandboxTemplate=ID`; the design is
+[`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../docs/specs/2026-10-30-session-sandbox-templates-design.md)).
+To make this host's worker serve a template:
+
+1. Build the template's snapshot, for example with `deploy/sbx/template-build.sh`
+   ([`deploy/sbx/ONBOARDING.md`](../sbx/ONBOARDING.md)), into `/srv/snapshots/<snapshot>`.
+2. Add two lines to `/etc/serverless-harness/microvm-worker.env` (the installer keeps lines it does
+   not own) and restart the worker:
+
+   ```bash
+   SANDBOX_TEMPLATE=<id>          # the template id sessions name: the label moca.dev/template
+   SH_SNAPSHOT_IMAGE=<snapshot>   # its snapshot under /srv/snapshots
+   ```
+
+   If the snapshot's guest is not 256 MiB, set `SH_GUEST_RAM_MB` to its `guest_ram_mb` too.
+
+3. Declare it to the control plane: `SH_SANDBOX_TEMPLATES` in `control-plane.env`, a JSON list of
+   `{id, worker, description, tools, seed?}`, then restart `sh-control-plane`.
+
+From then on this worker serves only sessions of that template: **a session with no template never
+lands on it.** Leaves (`/runs`) name no template either, so keep at least one untemplated worker (a
+container sandbox, or a second P4 worker) for them. The template's `seed`, if any, runs once in each
+new session's workspace before the agent's first tool call.
+
+This installer manages one P4 worker per host. Several templates on one host need one worker each;
+`deploy/sbx/install-host.sh` does that for SBX0, and a multi-worker install for P6 is not built yet.
+
 ## Run a turn
 
 These are single-user, **unauthenticated** `/turn` calls, and they need `SH_REQUIRE_AUTH=false` in
