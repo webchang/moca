@@ -70,9 +70,11 @@ letters, digits and dashes, and unique; `tools` is what `mocactl sbx` shows:
 The run refuses, before applying anything, when `SBX_MAX_TOTAL` × `SBX_WORKSPACE_IMAGE_MB` exceeds
 80 % of `SBX_WORKSPACE_FS_GIB`: the quota is the disk control.
 
-Re-run it after any change; tokens, the signing key and certificates are kept. A change to any
-setting, the public keyset or a route certificate rolls the control plane and the relay, which read
-them only at boot.
+Re-run it after any change; tokens, the signing key and certificates are kept. Both pods read
+their settings only at boot, and each rolls only when what it reads changes. A change to the public
+keyset, a route certificate, the token issuer or `SBX_MAX_INFLIGHT` rolls the control plane and the
+relay. Any other setting (templates, subjects, quotas, lifetimes) rolls the control plane alone, so
+running commands carry on ([the runbook](RUNBOOK.md#2-upgrading)).
 
 **One namespace per SBX stack.** The run refuses a `moca-mu1` Secret it did not create: a MOCA
 control plane's signing key, in a shared namespace or copied in. The two stacks also mint API tokens
@@ -132,7 +134,8 @@ Otherwise every janitor run logs `skipped`.
 The host needs what `deploy/microvm/P4-ON-P6.md` lists for P4 (`/dev/kvm`, Firecracker, jailer,
 `microvm-worker`), `/usr/local/bin/moca-egress` (the install refuses without it, unless `--no-egress`)
 and outbound TCP 443 to the attach host. Build each template's snapshot under
-`/srv/sbx/snapshots/<image>` with `deploy/microvm/build-snapshot.sh`, then per worker:
+`/srv/sbx/snapshots/<image>` with `deploy/sbx/template-build.sh`, which also checks it in a microVM
+([ONBOARDING.md](ONBOARDING.md)), or by hand with `deploy/microvm/build-snapshot.sh`. Then, per worker:
 
     scp -r deploy/sbx/.generated/workers/<id> <host>:sbx-<id>
     ssh <host> sudo <checkout>/deploy/sbx/install-host.sh sbx-<id> --snapshot <image> [--budget-mb N]
