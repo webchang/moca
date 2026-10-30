@@ -93,6 +93,40 @@ export const sandboxTierField: SessionOptionField = {
   toRequest: (value, req) => ({ ...req, sandbox: { ...req.sandbox, tier: value } }),
 };
 
+/**
+ * The session's sandbox template (session-templates spec §6). 'none' is a real choice, offered
+ * first and preselected: a session with no template runs on untemplated workers, so a deployment
+ * that declares one template must not have it picked for every session (the one-choice shortcut).
+ * '' means "send no template".
+ */
+export const sandboxTemplateField: SessionOptionField = {
+  key: 'sandboxTemplate',
+  label: 'Sandbox template',
+  emptyHint: 'this deployment declares no sandbox templates',
+  serverMayResolve: true,
+  serverDefaults: true,
+  async source(api, _values) {
+    let templates: Discovery['sandboxTemplates'];
+    try {
+      templates = (await api.discovery()).sandboxTemplates;
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return [];
+      throw err;
+    }
+    if (!Array.isArray(templates)) return [];
+    const ids = templates
+      .map((t) => (t && typeof t === 'object' ? (t as { id?: unknown }).id : undefined))
+      .filter((id): id is string => typeof id === 'string' && id !== '');
+    if (ids.length === 0) return [];
+    return [
+      { value: '', label: 'none', isDefault: true },
+      ...ids.map((id) => ({ value: id, label: sanitizeRemote(id) })),
+    ];
+  },
+  toRequest: (value, req) =>
+    value === '' ? req : { ...req, sandbox: { ...req.sandbox, template: value } },
+};
+
 function isSandboxTiers(v: unknown): v is NonNullable<Discovery['sandboxTiers']> {
   if (typeof v !== 'object' || v === null) return false;
   const { names, default: def } = v as Record<string, unknown>;
@@ -169,6 +203,7 @@ export const SESSION_OPTION_FIELDS: readonly SessionOptionField[] = [
   inferenceCredentialField,
   modelField,
   sandboxTierField,
+  sandboxTemplateField,
 ];
 
 export type Resolution =
