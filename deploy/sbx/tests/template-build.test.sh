@@ -89,6 +89,8 @@ bad=(
   '.probe.expect = ["("] => invalid extended regex'
   '.tools = ["git", "git"] => tools'
   '.etc_hosts_sha256 = "abc" => etc_hosts_sha256'
+  '.probe_status = "unmeasured" => has not been measured'
+  '.probe_status = "none" => has not been measured'
 )
 for case_ in "${bad[@]}"; do
   filter="${case_% => *}" want="${case_#* => }"
@@ -194,7 +196,18 @@ rc=0; run --force || rc=$?
 ! grep -q build-snapshot "$MOCK_LOG" || fail 'a wrong etc_hosts_sha256 still built the snapshot'
 pass 'checks the rootfs /etc/hosts against etc_hosts_sha256 before building the snapshot'
 
-# 7. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
+# 7. --registry: an image without a registry host is pulled from HOST; one with a host as it is.
+spec '.image = "team/moca-microvm@'"$DIGEST"'"'
+run --force --registry registry.example.invalid:5000 || fail "--registry failed: $(cat "$TMP/out")"
+grep -qx "podman pull registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail "--registry did not prefix the pull: $(grep pull "$MOCK_LOG")"
+grep -q -- "--image registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail 'build-rootfs did not get the pulled reference'
+jq -e --arg i "team/moca-microvm@$DIGEST" '.image == $i' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'the record does not keep the spec image (host-free)'
+spec
+run --force --registry other.example.invalid || fail '--registry with a hosted image failed'
+grep -qx "podman pull registry.example.invalid/moca-microvm@$DIGEST" "$MOCK_LOG" || fail '--registry changed an image that names its registry'
+pass '--registry pulls a host-free image from HOST and keeps the record host-free; a hosted image is pulled as is'
+
+# 8. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
 spec '.egress = true | .seed = ""'
 run || fail 'an egress spec did not build'
 ! grep -q -- '--no-egress' "$TMP/out" || fail 'egress true still says --no-egress'

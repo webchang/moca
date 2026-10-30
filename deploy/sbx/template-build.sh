@@ -3,7 +3,11 @@
 # golden snapshot, checked in a microVM before it is published (deploy/sbx/ONBOARDING.md, steps 1-2).
 #
 #   sudo deploy/sbx/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
-#                                     [--keep-image] [--force]
+#                                     [--registry HOST] [--keep-image] [--force]
+#
+# --registry HOST pulls a spec image that names no registry (`team/image@sha256:...`, as image
+# builders write them so that no registry host is committed) from HOST. An image that names one
+# (its first part has a dot or a colon, or is localhost) is pulled as it is.
 #
 # SPEC is a template spec, JSON (schema moca-sbx-template-spec/1; ONBOARDING.md has the fields):
 #   id                       the template id clients ask for, ^[a-z0-9][a-z0-9-]{0,30}$
@@ -65,17 +69,18 @@ STANDBY_DEPTH=2 MEMORY_RESERVE_MB=1024 VM_OVERHEAD_MB=32
 log() { printf '==> %s\n' "$*"; }
 die() { echo "deploy/sbx/template-build.sh: $*" >&2; exit 1; }
 usage() {
-  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--keep-image] [--force]' >&2
+  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--keep-image] [--force]' >&2
   exit 2
 }
 spec_error() { echo "deploy/sbx/template-build.sh: $SPEC: $*" >&2; exit 2; }
 
-SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker KEEP_IMAGE='' FORCE=''
+SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker REGISTRY='' KEEP_IMAGE='' FORCE=''
 while (($#)); do
   case "$1" in
   --kernel) [[ $# -ge 2 ]] || usage; KERNEL="$2"; shift 2 ;;
   --agent) [[ $# -ge 2 ]] || usage; AGENT="$2"; shift 2 ;;
   --vmm) [[ $# -ge 2 ]] || usage; VMM="$2"; shift 2 ;;
+  --registry) [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || usage; REGISTRY="$2"; shift 2 ;;
   --keep-image) KEEP_IMAGE=1; shift ;;
   --force) FORCE=1; shift ;;
   -h | --help) usage ;;
@@ -96,6 +101,13 @@ ID="$(field id)"
 IMAGE="$(field image)"
 [[ "$IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || spec_error "image must be pinned as repository@sha256:<64 hex>, got '$IMAGE'"
 DIGEST="${IMAGE##*@}"
+# What podman pulls: the spec's image, or with --registry and no registry in it, HOST/image. The
+# record keeps the spec's own reference, so it carries no registry host either.
+PULL="$IMAGE"
+first="${IMAGE%%/*}"
+if [[ -n "$REGISTRY" && "$IMAGE" == */* && "$first" != *.* && "$first" != *:* && "$first" != localhost ]]; then
+  PULL="$REGISTRY/$IMAGE"
+fi
 RAM="$(field guest_ram_mb)" VCPUS="$(field vcpus)"
 [[ "$RAM" =~ ^[1-9][0-9]*$ ]] && ((RAM >= 128)) || spec_error "guest_ram_mb must be a whole number of MiB, at least 128, got '$RAM'"
 [[ "$VCPUS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || spec_error "vcpus must be 1-32, got '$VCPUS'"
@@ -118,6 +130,9 @@ for re in $(jq -r '.probe.expect // [] | .[] | @base64' "$SPEC"); do
   rc=0; printf '' | grep -Eq -- "$re" 2>/dev/null || rc=$?
   ((rc <= 1)) || spec_error "probe.expect has an invalid extended regex: $re"
 done
+case "$(field probe_status)" in
+unmeasured | none) spec_error "probe_status is '$(field probe_status)': its expected result has not been measured, so it cannot be checked (measure it first)" ;;
+esac
 HOSTS_SHA="$(field etc_hosts_sha256)"
 [[ -z "$HOSTS_SHA" || "$HOSTS_SHA" =~ ^[0-9a-f]{64}$ ]] || spec_error "etc_hosts_sha256 must be 64 hex digits, got '$HOSTS_SHA'"
 
@@ -188,7 +203,7 @@ free_kb="$(df -Pk "$SBX_SRV/snapshots" | awk 'NR == 2 {print $4}')"
 BUILD="$SBX_SRV/build/$NAME"
 cleanup() {
   rm -rf "$BUILD"
-  [[ -n "$KEEP_IMAGE" || -z "${PULLED:-}" ]] || podman rmi "$IMAGE" >/dev/null 2>&1 || true
+  [[ -n "$KEEP_IMAGE" || -z "${PULLED:-}" ]] || podman rmi "$PULL" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -196,15 +211,15 @@ trap cleanup EXIT
 # makes a registry or a local tag that says otherwise fail here, not in a sandbox.
 log "pulling $IMAGE"
 PULLED=''
-podman image exists "$IMAGE" || { podman pull "$IMAGE" >/dev/null && PULLED=1; }
-got="$(podman image inspect --format '{{.Digest}}' "$IMAGE")"
+podman image exists "$PULL" || { podman pull "$PULL" >/dev/null && PULLED=1; }
+got="$(podman image inspect --format '{{.Digest}}' "$PULL")"
 [[ "$got" == "$DIGEST" ]] || die "pulled $IMAGE but its digest is $got"
 
 # 3. The rootfs and the snapshot, with the seed and the probe as the verify step.
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
 log "building the rootfs of $NAME"
-"$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$IMAGE"
+"$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$PULL"
 if [[ -n "$HOSTS_SHA" ]]; then
   got="$(sha256sum "$BUILD/rootfs/etc/hosts" 2>/dev/null || shasum -a 256 "$BUILD/rootfs/etc/hosts")" || die "the rootfs has no /etc/hosts"
   [[ "${got%% *}" == "$HOSTS_SHA" ]] || die "the rootfs's /etc/hosts has sha256 ${got%% *}, not the spec's $HOSTS_SHA"
