@@ -20,12 +20,18 @@
 #                            in /workspace; it passes when it exits expect_rc and its output matches
 #                            every extended regex in expect
 #   description, tools       the template's entry, as clients see it (GET /v1/templates)
+#   etc_hosts_sha256         optional: the sha256 the image's /etc/hosts must have in the rootfs (an
+#                            image builder's own check, e.g. image-factory's; a mismatch stops the build)
+#
+# The probe's command and counts must be ones that may be shared: for a benchmark, a public test
+# target, never the tests that grade a fix (their counts would be answer-key material).
 #
 # What it does, each step failing the whole build:
 #   1. checks the spec, and that $SBX_SRV has SBX_MIN_FREE_GB free (default 50: a 4 GiB guest's
 #      snapshot is 7-11 GB, and the rootfs and image are on top while it builds);
 #   2. pulls the image by digest and checks the digest it got;
-#   3. deploy/microvm/build-rootfs.sh, then deploy/microvm/build-snapshot.sh with the spec's flags and
+#   3. deploy/microvm/build-rootfs.sh (then, with etc_hosts_sha256, that check on the tree), then
+#      deploy/microvm/build-snapshot.sh with the spec's flags and
 #      --verify-command: the seed and the probe, run in the restored VM. A probe that fails publishes
 #      nothing;
 #   4. writes the template record, $SBX_SRV/templates/<snapshot>.json (schema moca-sbx-template/1): the
@@ -112,6 +118,8 @@ for re in $(jq -r '.probe.expect // [] | .[] | @base64' "$SPEC"); do
   rc=0; printf '' | grep -Eq -- "$re" 2>/dev/null || rc=$?
   ((rc <= 1)) || spec_error "probe.expect has an invalid extended regex: $re"
 done
+HOSTS_SHA="$(field etc_hosts_sha256)"
+[[ -z "$HOSTS_SHA" || "$HOSTS_SHA" =~ ^[0-9a-f]{64}$ ]] || spec_error "etc_hosts_sha256 must be 64 hex digits, got '$HOSTS_SHA'"
 
 TAG12="${DIGEST#sha256:}"; TAG12="${TAG12:0:12}"
 NAME="$ID-$TAG12"
@@ -197,6 +205,11 @@ rm -rf "$BUILD"
 mkdir -p "$BUILD"
 log "building the rootfs of $NAME"
 "$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$IMAGE"
+if [[ -n "$HOSTS_SHA" ]]; then
+  got="$(sha256sum "$BUILD/rootfs/etc/hosts" 2>/dev/null || shasum -a 256 "$BUILD/rootfs/etc/hosts")" || die "the rootfs has no /etc/hosts"
+  [[ "${got%% *}" == "$HOSTS_SHA" ]] || die "the rootfs's /etc/hosts has sha256 ${got%% *}, not the spec's $HOSTS_SHA"
+  log 'etc/hosts as the spec says'
+fi
 args=(--kernel "$KERNEL" --rootfs "$BUILD/rootfs" --agent "$AGENT" --image "$NAME" --vmm "$VMM"
   --guest-ram-mb "$RAM" --vcpus "$VCPUS" --out "$OUT"
   --verify-command "$(verify_command)" --verify-timeout-s "$(jq -r '.probe.timeout_s' "$SPEC")")

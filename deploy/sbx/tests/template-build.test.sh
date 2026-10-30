@@ -33,6 +33,7 @@ MOCK
 cat >"$TMP/bin/build-rootfs" <<'MOCK'
 #!/usr/bin/env bash
 printf 'build-rootfs %s\n' "$*" >>"$MOCK_LOG"
+mkdir -p "$2/etc"; printf '127.0.0.1 localhost\n' >"$2/etc/hosts"
 MOCK
 cat >"$TMP/bin/build-snapshot" <<'MOCK'
 #!/usr/bin/env bash
@@ -87,6 +88,7 @@ bad=(
   '.probe.cmd = "" => probe must be'
   '.probe.expect = ["("] => invalid extended regex'
   '.tools = ["git", "git"] => tools'
+  '.etc_hosts_sha256 = "abc" => etc_hosts_sha256'
 )
 for case_ in "${bad[@]}"; do
   filter="${case_% => *}" want="${case_#* => }"
@@ -181,7 +183,18 @@ rc=0; MOCK_SNAPSHOT_FAIL=1 run || rc=$?
 [[ ! -e "$SBX_SRV/templates/$NAME.json" && ! -e "$SBX_SRV/build/$NAME" ]] || fail 'a failed build left a record or a build dir'
 pass 'refuses low disk before pulling, a digest mismatch before building, and a failed probe writes no record'
 
-# 6. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
+# 6. etc_hosts_sha256: the rootfs's /etc/hosts must have it, checked before the snapshot is built.
+HOSTS_SHA="$(printf '127.0.0.1 localhost\n' | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)"
+spec ".etc_hosts_sha256 = \"$HOSTS_SHA\""
+run --force || fail "a matching etc_hosts_sha256 did not build: $(cat "$TMP/out")"
+grep -q 'etc/hosts as the spec says' "$TMP/out" || fail 'the hosts check did not run'
+spec ".etc_hosts_sha256 = \"$(printf 'f%.0s' {1..64})\""
+rc=0; run --force || rc=$?
+[[ "$rc" == 1 ]] && grep -q "/etc/hosts has sha256 $HOSTS_SHA, not the spec's" "$TMP/out" || fail "a wrong etc_hosts_sha256 was not refused: $(cat "$TMP/out")"
+! grep -q build-snapshot "$MOCK_LOG" || fail 'a wrong etc_hosts_sha256 still built the snapshot'
+pass 'checks the rootfs /etc/hosts against etc_hosts_sha256 before building the snapshot'
+
+# 7. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
 spec '.egress = true | .seed = ""'
 run || fail 'an egress spec did not build'
 ! grep -q -- '--no-egress' "$TMP/out" || fail 'egress true still says --no-egress'
