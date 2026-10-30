@@ -1,5 +1,9 @@
 # Onboarding a sandbox template
 
+The walk-through, with two worked examples (MOCA's public image and a SWE-bench instance) and a
+client choosing between them, is the [Template Onboarding Guide](../../docs/sbx/template-onboarding-guide.md)
+([PDF](../../docs/sbx/template-onboarding-guide.pdf)). This page is the short reference.
+
 This page turns a container image into an SBX0 template that clients can ask for by id, and checks
 it. It is the long form of [RUNBOOK §5](RUNBOOK.md#5-adding-updating-and-removing-a-template), and
 uses two tools:
