@@ -511,8 +511,8 @@ Every curated template ships `tar` and `git` (§8.2).
     leaves one the developer wrote (#574).
 - **OpenCode:** `opencode.json` gets `mcp.sandbox = { "type": "local", "command": ["mocactl", "sbx", "mcp"], "enabled": true }`,
   and `tools` set to `false` for `bash`, `read`, `edit`, `write`, `patch`, `apply_patch`
-  (`patch`'s newer name), `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`, and
-  older versions' `multiedit`.
+  (`patch`'s newer name), `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`,
+  older versions' `multiedit`, and `skill` (it reads the laptop's SKILL.md files into the session).
 - **IBM Bob:** `.bob/settings.json` (its project scope, which `bob mcp add` writes by default) gets
   `mcpServers.sandbox = { "command": "mocactl", "args": ["sbx", "mcp"] }`, the same entry
   `.mcp.json` holds. **No tool list:** Bob has no equivalent of Claude Code's `permissions.deny` —
