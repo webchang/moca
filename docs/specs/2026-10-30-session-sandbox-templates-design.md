@@ -115,8 +115,9 @@ workspace is not seeded yet**. "Seeded" is a marker file the seed leaves in the 
 
 guarded by `[ -e /workspace/.moca-seeded ] || …`. The marker lives in the workspace, so it travels
 with it: a session that keeps its sandbox is seeded once; a workspace reset (a new, empty
-workspace) is seeded again. A failed seed fails the turn with `SandboxSeedError` (a 502, not
-retryable) naming the template and the exit code. The seed's output is not shown to the agent.
+workspace) is seeded again. A failed seed fails the turn with `SandboxSeedError` (a 500, not
+retryable: the template's image cannot serve the session) naming the template and the exit code,
+and the lease is returned. The seed's output is not shown to the agent.
 
 ## 6. User surface
 

@@ -69,5 +69,22 @@ saturated the turn gets 503 `sandbox_unavailable` with `Retry-After`.
   with reason `detached`. If the sandbox has been relabelled to another declared tier, the session falls
   back immediately with reason `retiered`.
 
+## Templates
+
+- A **template** is a sandbox image a session can name, such as one SWE-bench instance's environment. A
+  worker serves one template's snapshot and advertises it as the label `moca.dev/template`
+  (`SANDBOX_TEMPLATE` in its environment). The control plane declares the templates in
+  `SH_SANDBOX_TEMPLATES`, a JSON list of `{id, worker, description, tools, seed?}`.
+- A user picks a template once, at session creation (`mocactl run --option sandboxTemplate=ID`), beside the
+  tier. Every turn then runs on a worker of that template. A session that names none runs only on workers
+  with no template, so it never gets a benchmark image by accident.
+- If the template has a `seed` (for SWE-bench, `cp -a /opt/testbed-src/. /workspace/`), the harness runs
+  it once, on the session's first turn, before the agent's first tool call. A marker in the workspace
+  (`.moca-seeded`) keeps it from running again; after a workspace reset it runs again.
+- An affine sandbox that now serves another template (or none) moves the session at once, with reason
+  `retiered`. The design is
+  [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../specs/2026-10-30-session-sandbox-templates-design.md);
+  turning an image into a template's snapshot is [`deploy/sbx/ONBOARDING.md`](../../deploy/sbx/ONBOARDING.md).
+
 An affinity move never loses a workspace silently: the session either waits or is told it was reset. Idle
 reclaim (`SH_WORKSPACE_IDLE`) is still silent on both tiers (#338).
