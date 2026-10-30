@@ -94,17 +94,20 @@ export function viewTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers']): s
 }
 
 /**
- * The template a session runs on (session-templates spec §3.3): its stored one, while the
- * deployment still declares it. Undefined otherwise: a template dropped from SH_SANDBOX_TEMPLATES
- * is no longer served, so naming it would claim a placement that cannot happen, as for a tier.
+ * The template a session runs on (session-templates spec §3.3): its stored one, always, with the
+ * seed while the deployment still declares it. FAIL CLOSED: unlike a tier, there is no default
+ * template to fall back to, so a template dropped from SH_SANDBOX_TEMPLATES (or the variable unset)
+ * is still named. The data plane then finds no worker of it and refuses the turn
+ * (SandboxPoolEmptyError naming the template) rather than quietly moving a benchmark session to an
+ * untemplated worker on an empty workspace.
  */
 export function sessionTemplate(
   rec: SessionRecord,
   templates: CpConfig['sessionTemplates'],
 ): { id: string; seed?: string } | undefined {
-  if (!rec.sandboxTemplate || !templates) return undefined;
-  const t = templates.find((x) => x.id === rec.sandboxTemplate);
-  return t ? { id: t.id, ...(t.seed ? { seed: t.seed } : {}) } : undefined;
+  if (!rec.sandboxTemplate) return undefined;
+  const t = templates?.find((x) => x.id === rec.sandboxTemplate);
+  return { id: rec.sandboxTemplate, ...(t?.seed ? { seed: t.seed } : {}) };
 }
 
 /**

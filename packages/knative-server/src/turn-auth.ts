@@ -247,6 +247,20 @@ async function exchange(token: string, deps: TurnAuthDeps): Promise<ExchangeResp
   if (body.model !== undefined && !isSessionModel(body.model)) {
     throw new CpError('credential_unavailable', 'control plane returned a malformed model');
   }
+  // A present template that is not a non-empty string would be dropped, and the session's turn run
+  // on an untemplated worker: refuse instead (session-templates spec §3.4). The seed likewise.
+  if (
+    body.sandboxTemplate !== undefined &&
+    (typeof body.sandboxTemplate !== 'string' || body.sandboxTemplate === '')
+  ) {
+    throw new CpError(
+      'credential_unavailable',
+      'control plane returned a malformed sandboxTemplate',
+    );
+  }
+  if (body.sandboxSeed !== undefined && typeof body.sandboxSeed !== 'string') {
+    throw new CpError('credential_unavailable', 'control plane returned a malformed sandboxSeed');
+  }
   return body as unknown as ExchangeResponse;
 }
 

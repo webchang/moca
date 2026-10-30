@@ -140,10 +140,14 @@ describe('the exchange and the views', () => {
     expect(plain).not.toHaveProperty('sandboxTemplate');
   });
 
-  it('a template no longer declared is not named (nothing serves it)', () => {
+  it('fails closed: a template no longer declared is still named, without a seed', () => {
+    // No default template exists, so dropping one must not move its sessions to untemplated workers.
     const rec = { sandboxTemplate: 'gone' } as SessionRecord;
-    expect(sessionTemplate(rec, TEMPLATES)).toBeUndefined();
-    expect(sessionTemplate({ sandboxTemplate: 'py312' } as SessionRecord, null)).toBeUndefined();
+    expect(sessionTemplate(rec, TEMPLATES)).toEqual({ id: 'gone' });
+    expect(sessionTemplate({ sandboxTemplate: 'py312' } as SessionRecord, null)).toEqual({
+      id: 'py312',
+    });
+    expect(sessionTemplate({} as SessionRecord, TEMPLATES)).toBeUndefined();
   });
 
   it('the session view shows the template on a templated deployment only', async () => {

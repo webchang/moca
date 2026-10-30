@@ -254,11 +254,19 @@ export async function acquireTurnSandbox(
   // A templated workspace is seeded before the turn's first tool call (session-templates spec §5).
   // The lease is held: a seed that throws must return it, as every other failure after the acquire.
   if (template?.seed && selected.transport) {
+    // The seed may outlast the lease TTL (a clone, an install): renew while it runs, as executeTurn
+    // renews for the turn, or the slot is reaped and over-filled under a still-running seed.
+    const renew = setInterval(
+      () => void selected.heartbeat().catch(() => {}),
+      leaseTimings(env).heartbeatMs,
+    );
     try {
-      await seedWorkspace(selected.transport, template.id, template.seed);
+      await seedWorkspace(selected.transport, template.id, template.seed, selected.config.podCwd);
     } catch (err) {
       await selected.release().catch(() => {});
       throw err;
+    } finally {
+      clearInterval(renew);
     }
   }
 
@@ -285,24 +293,35 @@ export async function acquireTurnSandbox(
   };
 }
 
-/** The marker a seeded workspace carries (session-templates spec §5); it travels with the workspace. */
-export const SEED_MARKER = '/workspace/.moca-seeded';
+/**
+ * The marker a seeded workspace carries (session-templates spec §5), relative to the workspace (the
+ * session's podCwd: `/workspace` on a microVM, `/workspace/<sid>` on a container worker), so it
+ * travels with that workspace and no other session's.
+ */
+export const SEED_MARKER = '.moca-seeded';
+/** The seed's own output, kept in the workspace for the operator; the agent never reads it. */
+export const SEED_LOG = '.moca-seed.log';
 
 /** A template's seed failed: the turn cannot start on a workspace that is not the template's. */
 export class SandboxSeedError extends Error {
-  constructor(template: string, exitCode: number | null) {
+  constructor(template: string, why: number | null | string) {
     super(
-      `seeding the workspace of sandbox template '${template}' failed (exit ${exitCode ?? 'none: output cap or signal'})`,
+      `seeding the workspace of sandbox template '${template}' failed (${typeof why === 'string' ? why : `exit ${why ?? 'none: signal'}`}; see ${SEED_LOG} in the workspace)`,
     );
     this.name = 'SandboxSeedError';
   }
 }
 
+const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
 /**
- * Runs a template's seed in the session's workspace unless the marker says it has run (spec §5).
- * The guard is in the same command, so a workspace is seeded once however many turns race to it;
- * a workspace reset (a new, empty workspace) has no marker and is seeded again. The seed's output
- * is not the agent's: only the exit code is read.
+ * Runs a template's seed in the session's workspace (`workspace`, its podCwd) unless the marker
+ * says it has run (spec §5). An exclusive `flock` on the marker's lock file holds concurrent first
+ * turns of one session to one seed run: the second waits, then finds the marker. A failed seed
+ * leaves no marker, so the next turn runs it again on whatever it left: a seed must be safe to
+ * re-run (`cp -a` is; a bare `git clone` into the workspace is not). A workspace reset has no
+ * marker and is seeded again. The seed's output goes to SEED_LOG, never into the turn: only the
+ * exit code is read, so a chatty seed cannot trip the output cap.
  */
 export async function seedWorkspace(
   transport: {
@@ -310,10 +329,20 @@ export async function seedWorkspace(
   },
   template: string,
   seed: string,
+  workspace = '/workspace',
 ): Promise<void> {
-  const quoted = `'${seed.replace(/'/g, `'\\''`)}'`;
-  const command = `[ -e ${SEED_MARKER} ] || { bash -c ${quoted} && touch ${SEED_MARKER}; }`;
-  const res = await transport.exec(command, { timeout: 600 });
+  const body = `[ -e ${SEED_MARKER} ] || { bash -c ${shq(seed)} >${SEED_LOG} 2>&1 && touch ${SEED_MARKER}; }`;
+  // flock(1) is util-linux, in every shipped sandbox image; without it the guard still runs, unlocked.
+  const command =
+    `cd ${shq(workspace)} && if command -v flock >/dev/null 2>&1; then ` +
+    `flock .moca-seed.lock bash -c ${shq(body)}; else ${body}; fi`;
+  let res: { exitCode: number | null };
+  try {
+    res = await transport.exec(command, { timeout: 600 });
+  } catch (err) {
+    // A transport failure or the worker's timeout (`timeout:600`): still the seed's failure.
+    throw new SandboxSeedError(template, (err as Error)?.message ?? String(err));
+  }
   if (res.exitCode !== 0) throw new SandboxSeedError(template, res.exitCode);
 }
 

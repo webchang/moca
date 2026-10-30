@@ -35,13 +35,83 @@ function bashTransport() {
   };
 }
 
+/** Runs the command under bash with no path mapping: for tests that pass a real workspace dir. */
+const realBash = {
+  exec: async (command: string) => {
+    try {
+      execFileSync('bash', ['-c', command], { stdio: 'pipe' });
+      return { exitCode: 0 };
+    } catch (e) {
+      return { exitCode: (e as { status: number }).status };
+    }
+  },
+};
+const scratch = () => {
+  const d = mkdtempSync(join(tmpdir(), 'seed-sub-'));
+  dirs.push(d);
+  return d;
+};
+
 describe('seedWorkspace', () => {
   it('runs the seed, then leaves the marker', async () => {
     const t = bashTransport();
     await seedWorkspace(t, 'py312', 'echo seeded > /workspace/file');
     expect(readFileSync(join(t.ws, 'file'), 'utf8')).toBe('seeded\n');
     expect(existsSync(join(t.ws, '.moca-seeded'))).toBe(true);
-    expect(SEED_MARKER).toBe('/workspace/.moca-seeded');
+    expect(SEED_MARKER).toBe('.moca-seeded');
+  });
+
+  it('the marker is per workspace: two sessions on one container worker each get their seed', async () => {
+    // A container worker gives each session /workspace/<sid> (workspace-subdir): one marker per dir.
+    const root = scratch();
+    for (const sid of ['s-1', 's-2']) {
+      execFileSync('mkdir', ['-p', join(root, sid)]);
+      await seedWorkspace(realBash, 'py312', 'echo seeded > file', join(root, sid));
+    }
+    expect(readFileSync(join(root, 's-1', 'file'), 'utf8')).toBe('seeded\n');
+    expect(readFileSync(join(root, 's-2', 'file'), 'utf8')).toBe('seeded\n');
+    expect(existsSync(join(root, '.moca-seeded'))).toBe(false);
+  });
+
+  it("keeps the seed's output out of the turn, in the workspace's seed log", async () => {
+    const ws = scratch();
+    await seedWorkspace(realBash, 'py312', 'echo loud; echo louder >&2', ws);
+    expect(readFileSync(join(ws, '.moca-seed.log'), 'utf8')).toBe('loud\nlouder\n');
+  });
+
+  it('concurrent first turns run the seed once (flock, where the image has it)', async () => {
+    const ws = scratch();
+    const hasFlock = (() => {
+      try {
+        execFileSync('bash', ['-c', 'command -v flock'], { stdio: 'pipe' });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    const seed = 'echo run >> runs; sleep 1';
+    const async = (cmd: string) =>
+      new Promise<{ exitCode: number | null }>((res) => {
+        import('node:child_process').then(({ execFile }) =>
+          execFile('bash', ['-c', cmd], (err) => res({ exitCode: err ? 1 : 0 })),
+        );
+      });
+    await Promise.all([1, 2].map(() => seedWorkspace({ exec: async }, 'py312', seed, ws)));
+    const runs = readFileSync(join(ws, 'runs'), 'utf8').trim().split('\n').length;
+    // macOS has no flock(1): the guard still runs, unlocked, so only Linux pins the single run.
+    if (hasFlock) expect(runs).toBe(1);
+    else expect(runs).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a transport failure or the worker's timeout is still a SandboxSeedError naming the template", async () => {
+    const err = await seedWorkspace(
+      { exec: async () => Promise.reject(new Error('timeout:600')) },
+      'django-django-11133',
+      'sleep 9999',
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxSeedError);
+    expect((err as Error).message).toContain("'django-django-11133'");
+    expect((err as Error).message).toContain('timeout:600');
   });
 
   it('runs once: a second turn finds the marker and runs nothing', async () => {
@@ -131,13 +201,69 @@ describe('acquireTurnSandbox seeds a templated session (session-templates spec Â
     expect(got.placement?.sandboxId).toBe('py-1');
     expect(r.commands).toHaveLength(1);
     expect(r.commands[0]).toContain('.moca-seeded');
-    expect(r.commands[0]).toContain("bash -c 'echo hi'");
+    expect(r.commands[0]).toContain('echo hi');
+    // It runs in the session's workspace (the record's podCwd), not a fixed path.
+    expect(r.commands[0].startsWith("cd '/workspace' && ")).toBe(true);
   });
 
   it('a template without a seed runs nothing', async () => {
     const r = await acquire({ id: 'py312' });
     await r.got;
     expect(r.commands).toHaveLength(0);
+  });
+
+  it('renews the lease while a long seed runs', async () => {
+    const { acquireTurnSandbox } = await import('../src/run-turn.js');
+    let beats = 0;
+    const lease = {
+      load: async () => 0,
+      acquire: async () => true,
+      heartbeat: async () => void beats++,
+      release: async () => {},
+    };
+    const rec = {
+      sandboxId: 'py-1',
+      labels: { 'moca.dev/template': 'py312' },
+      capabilities: [],
+      capacityMax: 4,
+      transport: 'grpc' as const,
+    };
+    const transport = {
+      exec: async () => {
+        await new Promise((r) => setTimeout(r, 120));
+        return { stdout: Buffer.alloc(0), exitCode: 0, truncated: false };
+      },
+      close: async () => {},
+      fastTier: 'per-call-exec' as const,
+    };
+    await acquireTurnSandbox(
+      undefined,
+      {
+        KAGENTI_SANDBOX_POOL_SELECTOR: 'app=sbx',
+        SH_SANDBOX_DISCOVERY: 'records',
+        SH_REMOTE_SANDBOX: '1',
+        // The floor is 1 s, so a 3 s TTL renews every 1 s; the heartbeat knob caps it lower.
+        KAGENTI_SANDBOX_LEASE_TTL_MS: '3000',
+        KAGENTI_SANDBOX_HEARTBEAT_MS: '20',
+      } as NodeJS.ProcessEnv,
+      '/h',
+      's-1',
+      {
+        records: { put: async () => {}, remove: async () => {}, list: async () => [rec] },
+        lease,
+        makeExecClient: () => ({}) as never,
+        makeTransport: () => transport,
+        affinity: {
+          get: async () => null,
+          claim: async (_s: string, e: { sandboxId: string; tier: string }) => e,
+          replace: async () => {},
+          detachedSince: async (_id: string, now: number) => now,
+        },
+      },
+      undefined,
+      { id: 'py312', seed: 'sleep 1' },
+    );
+    expect(beats).toBeGreaterThanOrEqual(2);
   });
 
   it('a failed seed fails the turn and returns the lease', async () => {

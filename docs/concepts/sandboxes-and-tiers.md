@@ -78,9 +78,14 @@ saturated the turn gets 503 `sandbox_unavailable` with `Retry-After`.
 - A user picks a template once, at session creation (`mocactl run --option sandboxTemplate=ID`), beside the
   tier. Every turn then runs on a worker of that template. A session that names none runs only on workers
   with no template, so it never gets a benchmark image by accident.
+- Leaves (`/runs`) and unauthenticated turns name no template either: keep at least one untemplated
+  worker for them. If every worker is templated they fail with `sandbox_unavailable`.
+- A session's template is fixed. If the operator drops it from `SH_SANDBOX_TEMPLATES`, its turns fail
+  (no worker of it) rather than move to an untemplated worker on an empty workspace.
 - If the template has a `seed` (for SWE-bench, `cp -a /opt/testbed-src/. /workspace/`), the harness runs
   it once, on the session's first turn, before the agent's first tool call. A marker in the workspace
-  (`.moca-seeded`) keeps it from running again; after a workspace reset it runs again.
+  (`.moca-seeded`) keeps it from running again; after a workspace reset it runs again. Its output is in
+  the workspace's `.moca-seed.log`. A seed must be safe to re-run: a failed one leaves no marker.
 - An affine sandbox that now serves another template (or none) moves the session at once, with reason
   `retiered`. The design is
   [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../specs/2026-10-30-session-sandbox-templates-design.md);

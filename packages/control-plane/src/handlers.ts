@@ -386,8 +386,9 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     turns: runtime.turns ? Number(runtime.turns) : 0,
     sandboxTier: tier,
     // Shown only on a deployment that declares templates, so a view elsewhere is unchanged.
-    ...(deps.config.sessionTemplates
-      ? { sandboxTemplate: sessionTemplate(rec, deps.config.sessionTemplates)?.id ?? null }
+    // Shown wherever the session named one, so a dropped template is visible too (it fails closed).
+    ...(deps.config.sessionTemplates || rec.sandboxTemplate
+      ? { sandboxTemplate: rec.sandboxTemplate || null }
       : {}),
     model: rec.model || null,
   };

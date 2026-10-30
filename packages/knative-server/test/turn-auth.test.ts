@@ -296,8 +296,16 @@ describe('the one rule /turn enforces', () => {
     // A seed without a template is not a seed; a non-string template is no template.
     const seedOnly = await turn(exchangeWith({ sandboxSeed: 'echo hi' }));
     expect(seedOnly).not.toHaveProperty('sandboxSeed');
-    const odd = await turn(exchangeWith({ sandboxTemplate: 7 }));
-    expect(odd).not.toHaveProperty('sandboxTemplate');
+    // A malformed template fails the turn rather than running it untemplated.
+    await expect(turn(exchangeWith({ sandboxTemplate: 7 }))).rejects.toThrow(
+      'malformed sandboxTemplate',
+    );
+    await expect(turn(exchangeWith({ sandboxTemplate: '' }))).rejects.toThrow(
+      'malformed sandboxTemplate',
+    );
+    await expect(turn(exchangeWith({ sandboxTemplate: 'py312', sandboxSeed: 7 }))).rejects.toThrow(
+      'malformed sandboxSeed',
+    );
   });
 });
 

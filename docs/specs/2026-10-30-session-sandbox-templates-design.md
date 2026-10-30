@@ -69,10 +69,15 @@ shared-pool worker's labels are its own word today, the tier included.
   the declared ids; with none declared, any template is a 400 (`this deployment declares no sandbox
 templates`). Omitted: `''`, no template.
 - **`SessionRecord.sandboxTemplate: string`**, stored in the session hash beside `sandboxTier`.
-- **`ExchangeResponse.sandboxTemplate?`** and **`sandboxSeed?`**: the stored template and its seed,
-  omitted when the session has none or the deployment declares no templates (so a deployment
-  without templates sends byte-identical responses).
-- **Views** (`GET /v1/sessions`, `GET /v1/sessions/{id}`) include `sandboxTemplate` (`null` when none).
+- **`ExchangeResponse.sandboxTemplate?`** and **`sandboxSeed?`**: the stored template, and its seed
+  while the deployment declares it. Omitted when the session named none, so a deployment without
+  templates sends byte-identical responses. **Fail closed:** a template dropped from
+  `SH_SANDBOX_TEMPLATES` (or the variable unset) is still named, without a seed. Unlike a tier there
+  is no default template, so the data plane finds no worker of it and refuses the turn, rather than
+  moving the session to an untemplated worker on an empty workspace. The data plane refuses a
+  present `sandboxTemplate` that is not a non-empty string, and a non-string `sandboxSeed`.
+- **Views** (`GET /v1/sessions`, `GET /v1/sessions/{id}`) include `sandboxTemplate` on a deployment
+  that declares templates (`null` when none), and for any session that named one.
 - **`GET /v1/discovery`** gains `sandboxTemplates: [{id, description, tools}] | null`.
 
 ### 3.4 Data plane (`packages/knative-server`, `harness`)
@@ -105,19 +110,35 @@ else in P6.3 §4 is unchanged.
 The template filter is applied whenever the records path is on. It needs no deployment setting: a
 deployment whose workers carry no template label is unaffected.
 
+**Leaves and unauthenticated turns** pass no template, so they too run only on untemplated
+workers. A deployment that templates some workers must keep at least one untemplated worker (per
+tier it uses) for them, as the tier design keeps a default tier; with every worker templated, a
+leaf fails with `SandboxPoolEmptyError`, which names no template.
+
 ## 5. The seed
 
-When the session has a template with a seed, `acquireTurnSandbox` runs the seed in the selected
-sandbox, through the same relay exec client, before the turn's first tool call, **only if the
-workspace is not seeded yet**. "Seeded" is a marker file the seed leaves in the workspace:
+When the session has a template with a seed, `acquireTurnSandbox` runs it in the selected sandbox,
+through the same relay exec client, before the turn's first tool call, **in the session's
+workspace** (the selection's `podCwd`: `/workspace` on a microVM, `/workspace/<sessionId>` on a
+container worker), and only if that workspace is not seeded yet:
 
-    bash -c '<seed>' && touch /workspace/.moca-seeded
+    cd <workspace> && flock .moca-seed.lock bash -c \
+      '[ -e .moca-seeded ] || { bash -c <seed> >.moca-seed.log 2>&1 && touch .moca-seeded; }'
 
-guarded by `[ -e /workspace/.moca-seeded ] || …`. The marker lives in the workspace, so it travels
-with it: a session that keeps its sandbox is seeded once; a workspace reset (a new, empty
-workspace) is seeded again. A failed seed fails the turn with `SandboxSeedError` (a 500, not
-retryable: the template's image cannot serve the session) naming the template and the exit code,
-and the lease is returned. The seed's output is not shown to the agent.
+- **The marker** (`.moca-seeded`) lives in the workspace, so it travels with it: a session that keeps
+  its sandbox is seeded once; a workspace reset (a new, empty workspace) is seeded again.
+- **`flock`** holds concurrent first turns of one session (affinity puts them on one workspace) to
+  one run; the second waits and finds the marker. Without `flock(1)` in the image the guard runs
+  unlocked.
+- **A failed seed leaves no marker**, so the next turn runs it again on whatever it left: a seed must
+  be safe to re-run (`cp -a` is; a bare `git clone` into the workspace is not).
+- **Output** goes to `.moca-seed.log` in the workspace, never into the turn, so a chatty seed cannot
+  trip the output cap. Only the exit code is read.
+- **The lease is renewed** while the seed runs, as for the turn, since a seed (a clone, an install) may
+  outlast the lease TTL. The worker's timeout is 600 s.
+- **A failed seed** fails the turn with `SandboxSeedError` (a 500, not retryable: the template's image
+  cannot serve the session), naming the template, the exit code or the error, and the log. The lease
+  is returned.
 
 ## 6. User surface
 
