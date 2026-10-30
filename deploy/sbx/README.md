@@ -7,7 +7,8 @@ resource), **attach** (passthrough, KVM hosts' workers dial in) and **exec** (pa
 [`docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md`](../../docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md).
 
 This page is the install reference. Day-to-day operation (users, templates, key rotation, outages,
-disk, status and upgrades) is [the runbook](RUNBOOK.md); users have
+disk, status and upgrades) is [the runbook](RUNBOOK.md); onboarding a template is
+[ONBOARDING.md](ONBOARDING.md); users have
 [the user guide](../../docs/sbx/user-guide.md); the security gate's checklist is
 [the security review](../../docs/sbx/security-review.md).
 

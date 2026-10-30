@@ -171,6 +171,9 @@ on a deployment with an OAuth app.
 
 ## 5. Adding, updating and removing a template
 
+[ONBOARDING.md](ONBOARDING.md) is the long form, with the tools that do the steps below:
+`template-build.sh` (the snapshot, checked in a microVM) and `template-register.sh` (the two lists).
+
 A template is an id clients choose (`mocactl sbx create --template <id>`, `POST /v1/sandboxes
 {template}`), served by one worker running one snapshot. A sandbox keeps the worker it was created
 on for its whole life, whatever later happens to its template's entry.
