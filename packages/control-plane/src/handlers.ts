@@ -44,6 +44,7 @@ import {
   resolveInference,
   targetOf,
   viewTier,
+  sessionTemplate,
 } from './exchange.js';
 import { MODEL_ID_RE } from './models.js';
 import {
@@ -61,7 +62,12 @@ import { isRefreshTokenShape, type RefreshStore } from './refresh-store.js';
 import { projectResources, resolveSandbox } from './resources.js';
 import type { SandboxTiers } from './sandbox-tiers.js';
 import type { RouteProfile } from './routes.js';
-import { isEnrolled, notEnrolled, type SandboxConfig } from './sandbox-config.js';
+import {
+  isEnrolled,
+  notEnrolled,
+  type SandboxConfig,
+  type SandboxTemplate,
+} from './sandbox-config.js';
 import type { SandboxStore } from './sandbox-store.js';
 import { SANDBOX_HANDLERS } from './sandbox-handlers.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
@@ -123,6 +129,11 @@ export interface CpConfig {
    * configFromEnv refuses a list it cannot serve, so a session is never validated against a typo.
    */
   sandboxTiers: SandboxTiers | null;
+  /**
+   * The declared session templates (session-templates spec §3.3), harness profile only: absent or
+   * null when the deployment declares none, and then sessions are exactly as before.
+   */
+  sessionTemplates?: SandboxTemplate[] | null;
   /** Stored config-bundle bytes one subject may hold (`SH_BUNDLE_SUBJECT_BYTES`). */
   bundleSubjectBytes: number;
   /** Stored config-bundle bytes the whole deployment may hold (`SH_BUNDLE_TOTAL_BYTES`). */
@@ -374,6 +385,10 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     lastTurnAt: runtime.lastTurnAt ? Number(runtime.lastTurnAt) : null,
     turns: runtime.turns ? Number(runtime.turns) : 0,
     sandboxTier: tier,
+    // Shown only on a deployment that declares templates, so a view elsewhere is unchanged.
+    ...(deps.config.sessionTemplates
+      ? { sandboxTemplate: sessionTemplate(rec, deps.config.sessionTemplates)?.id ?? null }
+      : {}),
     model: rec.model || null,
   };
 }
@@ -468,6 +483,17 @@ export const HANDLERS: Record<string, Handler> = {
       body: {
         harnessUrl: deps.config.publicHarnessUrl ?? null,
         sandboxTiers: deps.config.sandboxTiers,
+        // Only when declared (session-templates spec §3.3), so discovery elsewhere is byte-identical.
+        // The seed is the harness's business: clients see what they choose between.
+        ...(deps.config.sessionTemplates
+          ? {
+              sandboxTemplates: deps.config.sessionTemplates.map((t) => ({
+                id: t.id,
+                description: t.description,
+                tools: t.tools,
+              })),
+            }
+          : {}),
         version: deps.config.version ?? null,
         profile: deps.config.routeProfile ?? 'harness',
       },
@@ -675,6 +701,27 @@ export const HANDLERS: Record<string, Handler> = {
       );
     }
     const sandboxTier = requestedTier ?? tiers?.default ?? '';
+    // The sandbox template (session-templates spec §3.3), recorded like the tier. Omitted: none, and
+    // the session runs only on untemplated workers (§4).
+    const requestedTemplate = asRecord(sandbox).template;
+    if (requestedTemplate !== undefined && typeof requestedTemplate !== 'string') {
+      throw new CpError('invalid_request', 'sandbox.template must be a string');
+    }
+    const templates = deps.config.sessionTemplates;
+    if (requestedTemplate !== undefined && !templates) {
+      throw new CpError('invalid_request', 'this deployment declares no sandbox templates');
+    }
+    if (
+      requestedTemplate !== undefined &&
+      templates &&
+      !templates.some((t) => t.id === requestedTemplate)
+    ) {
+      throw new CpError(
+        'invalid_request',
+        `unknown sandbox template '${requestedTemplate}': this deployment declares ${templates.map((t) => t.id).join(', ')}`,
+      );
+    }
+    const sandboxTemplate = requestedTemplate ?? '';
 
     if (configRef) {
       let found: boolean;
@@ -712,6 +759,7 @@ export const HANDLERS: Record<string, Handler> = {
       credentialName,
       configRef,
       sandboxTier,
+      ...(sandboxTemplate ? { sandboxTemplate } : {}),
       tombstone: false,
       model: choice?.model ?? '',
       ...(choice?.limits ? { modelLimits: choice.limits } : {}),

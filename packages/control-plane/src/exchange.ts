@@ -45,6 +45,13 @@ export interface ExchangeResponse {
    */
   sandboxTier?: string;
   /**
+   * The session's sandbox template and its seed (session-templates spec §3.3), which the data plane
+   * filters sandboxes on and seeds a new workspace with. Both absent when the session names no
+   * template or the deployment declares none, so that response is unchanged.
+   */
+  sandboxTemplate?: string;
+  sandboxSeed?: string;
+  /**
    * The session's model and the limits snapshotted when it was chosen (per-session model spec
    * §4.5). Absent when the session names none, so that response is unchanged.
    */
@@ -84,6 +91,20 @@ export function sessionTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers'])
  */
 export function viewTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers']): string | null {
   return sessionTier(rec, tiers) || null;
+}
+
+/**
+ * The template a session runs on (session-templates spec §3.3): its stored one, while the
+ * deployment still declares it. Undefined otherwise: a template dropped from SH_SANDBOX_TEMPLATES
+ * is no longer served, so naming it would claim a placement that cannot happen, as for a tier.
+ */
+export function sessionTemplate(
+  rec: SessionRecord,
+  templates: CpConfig['sessionTemplates'],
+): { id: string; seed?: string } | undefined {
+  if (!rec.sandboxTemplate || !templates) return undefined;
+  const t = templates.find((x) => x.id === rec.sandboxTemplate);
+  return t ? { id: t.id, ...(t.seed ? { seed: t.seed } : {}) } : undefined;
 }
 
 /**
@@ -385,6 +406,7 @@ export async function exchangeCredential(
   }
 
   const tier = sessionTier(rec, deps.config.sandboxTiers);
+  const template = sessionTemplate(rec, deps.config.sessionTemplates);
   return {
     mode,
     anthropicAuthToken: mode === 'placeholder' ? placeholderFor(rec.owner) : secretValue,
@@ -396,6 +418,8 @@ export async function exchangeCredential(
     ...(mode === 'direct' && authHeader === 'x-api-key' ? { authHeader } : {}),
     ...(rec.configRef ? { configRef: rec.configRef } : {}),
     ...(tier ? { sandboxTier: tier } : {}),
+    ...(template ? { sandboxTemplate: template.id } : {}),
+    ...(template?.seed ? { sandboxSeed: template.seed } : {}),
     ...(rec.model ? { model: { id: rec.model, ...rec.modelLimits } } : {}),
   };
 }
