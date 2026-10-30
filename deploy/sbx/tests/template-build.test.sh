@@ -132,7 +132,8 @@ run_verify() {
   rm -rf "$t"; mkdir -p "$t/workspace" "$t/opt/testbed-src" "$t/tmp"
   echo src >"$t/opt/testbed-src/file"
   cmd="$(sed -e "s|/opt/testbed-src|$t/opt/testbed-src|g" -e "s|/workspace|$t/workspace|g" \
-    -e "s|/tmp/.template-probe.log|$t/tmp/probe.log|g" "$MOCK_STATE/verify-command")"
+    -e "s|/tmp/.template-probe.log|$t/tmp/probe.log|g" -e "s|/tmp/.template-probe.txt|$t/tmp/probe.txt|g" \
+    "$MOCK_STATE/verify-command")"
   (cd "$t/workspace" && bash -c "$cmd") >"$TMP/vout" 2>&1
 }
 spec '.probe.cmd = "ls /workspace/file && echo \"=== 42 passed in 0.70s ===\""'
@@ -140,6 +141,13 @@ run || fail 'the probe spec did not build'
 run_verify || fail "the verify command failed on a passing probe: $(cat "$TMP/vout")"
 grep -q 'the probe passed' "$TMP/vout" || fail 'a passing probe does not say so'
 pass 'the verify command seeds /workspace, runs the probe and passes on the expected result'
+# pytest colours its summary when it thinks it has a terminal: ESC[32mESC[1m42 passedESC[0m. A \b before
+# the count would never match the raw log (the "m" before the digit is a word character).
+spec '.probe.cmd = "printf \"\\033[32m\\033[1m42 passed\\033[0m\\033[32m, 1 skipped in 0.07s\\033[0m\\n\""'
+run || fail 'the coloured probe spec did not build'
+run_verify || fail "a coloured summary did not match \\b42 passed\\b: $(cat "$TMP/vout")"
+! grep -q $'\033' "$TMP/vout" || fail 'the tail shown still has ANSI escapes'
+pass 'matches the patterns against the probe output with ANSI colours stripped'
 spec '.probe.cmd = "echo \"=== 178 passed, 1 failed in 0.70s ===\"; exit 1"'
 run || fail 'the probe spec did not build'
 rc=0; run_verify || rc=$?

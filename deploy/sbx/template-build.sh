@@ -156,11 +156,14 @@ verify_command() {
     printf 'bash -c %q || { echo "template-build: the seed failed ($?)"; exit 90; }\n' "$seed"
   fi
   printf 'bash -c %q >/tmp/.template-probe.log 2>&1; rc=$?\n' "$cmd"
-  printf '%s\n' 'tail -c 12288 /tmp/.template-probe.log' 'echo "template-build: the probe exited $rc"'
+  # Test runners colour their summaries (pytest: ESC[32m8 passed ESC[0m), so the patterns are
+  # matched against the log with ANSI escapes stripped, and the tail shown is the plain text too.
+  printf '%s\n' "sed 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/.template-probe.log >/tmp/.template-probe.txt"
+  printf '%s\n' 'tail -c 12288 /tmp/.template-probe.txt' 'echo "template-build: the probe exited $rc"'
   printf '[ "$rc" = %q ] || { echo "template-build: want exit %s"; exit 91; }\n' "$want" "$want"
   for re in $(jq -r '.probe.expect // [] | .[] | @base64' "$SPEC"); do
     re="$(printf '%s' "$re" | base64 --decode)"
-    printf 'grep -Eq -- %q /tmp/.template-probe.log || { echo %q; exit 92; }\n' "$re" "template-build: no match for $re"
+    printf 'grep -Eq -- %q /tmp/.template-probe.txt || { echo %q; exit 92; }\n' "$re" "template-build: no match for $re"
   done
   printf '%s\n' 'echo "template-build: the probe passed"'
 }
