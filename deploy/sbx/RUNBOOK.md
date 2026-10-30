@@ -171,7 +171,7 @@ on a deployment with an OAuth app.
 
 ## 5. Adding, updating and removing a template
 
-[ONBOARDING.md](ONBOARDING.md) is the long form, with the tools that do the steps below:
+[template-onboarding/](template-onboarding/README.md) is the long form, with the tools that do the steps below:
 `template-build.sh` (the snapshot, checked in a microVM) and `template-register.sh` (the two lists).
 
 A template is an id clients choose (`mocactl sbx create --template <id>`, `POST /v1/sandboxes

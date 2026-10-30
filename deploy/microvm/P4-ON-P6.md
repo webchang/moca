@@ -322,8 +322,8 @@ A session can name a **sandbox template** (`mocactl run --option sandboxTemplate
 [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../docs/specs/2026-10-30-session-sandbox-templates-design.md)).
 To make this host's worker serve a template:
 
-1. Build the template's snapshot, for example with `deploy/sbx/template-build.sh`
-   ([`deploy/sbx/ONBOARDING.md`](../sbx/ONBOARDING.md)), into `/srv/snapshots/<snapshot>`.
+1. Build the template's snapshot, for example with `deploy/sbx/template-onboarding/template-build.sh`
+   ([`deploy/sbx/template-onboarding/ONBOARDING.md`](../sbx/template-onboarding/ONBOARDING.md)), into `/srv/snapshots/<snapshot>`.
 2. Add two lines to `/etc/serverless-harness/microvm-worker.env` (the installer keeps lines it does
    not own) and restart the worker:
 

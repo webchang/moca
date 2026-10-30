@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Tests for deploy/sbx/template-build.sh with podman, df and the two builders mocked: the spec checks
+# Tests for deploy/sbx/template-onboarding/template-build.sh with podman, df and the two builders mocked: the spec checks
 # (each refused before anything is pulled), the names, the flags build-snapshot.sh gets, the guest
 # verify command (run here under bash), the record, the free-space check, the digest check, and the
 # "already built" short cut.
 set -euo pipefail
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export MOCK_LOG="$TMP/mock.log"
@@ -57,7 +57,7 @@ export SBX_BUILD_ROOTFS="$TMP/bin/build-rootfs" SBX_BUILD_SNAPSHOT="$TMP/bin/bui
 export MOCK_STATE="$TMP/state" MOCK_DIGEST="$DIGEST" MOCK_FREE_KB=$((200 * 1024 * 1024))
 mkdir -p "$MOCK_STATE" "$TMP/agent"
 : >"$TMP/vmlinux"
-BUILD="$SRC/deploy/sbx/template-build.sh"
+BUILD="$SRC/deploy/sbx/template-onboarding/template-build.sh"
 
 # The spec of a SWE-bench instance, as image-factory's records give it.
 spec() {

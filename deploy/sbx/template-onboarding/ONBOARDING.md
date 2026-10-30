@@ -1,11 +1,11 @@
 # Onboarding a sandbox template
 
 The walk-through, with two worked examples (MOCA's public image and a SWE-bench instance) and a
-client choosing between them, is the [Template Onboarding Guide](../../docs/sbx/template-onboarding-guide.md)
-([PDF](../../docs/sbx/template-onboarding-guide.pdf)). This page is the short reference.
+client choosing between them, is the [Template Onboarding Guide](GUIDE.md)
+([PDF](GUIDE.pdf)). This page is the short reference.
 
 This page turns a container image into an SBX0 template that clients can ask for by id, and checks
-it. It is the long form of [RUNBOOK §5](RUNBOOK.md#5-adding-updating-and-removing-a-template), and
+it. It is the long form of [RUNBOOK §5](../RUNBOOK.md#5-adding-updating-and-removing-a-template), and
 uses two tools:
 
 - [`template-build.sh`](template-build.sh) runs on the KVM host. It turns a spec into a snapshot
@@ -56,19 +56,19 @@ A spec is a JSON file, schema `moca-sbx-template-spec/1`:
 }
 ```
 
-| Field                     | Rule                                                                                                                                                                                                                                   |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                      | What clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`. It stays the same across versions of the template.                                                                                                                                  |
-| `image`                   | Pinned: `repository@sha256:<digest>`, never a tag. A repository with no registry host takes its host from `--registry` at build time, so a spec written by an image builder commits no host.                                           |
-| `guest_ram_mb`, `vcpus`   | The guest's size (at least 128 MiB; 1-32 vCPUs). Every VM restored from the snapshot has it.                                                                                                                                           |
-| `guest_home`              | Optional, a path under `/tmp`: a writable `HOME` for guest commands. The rootfs is read-only.                                                                                                                                          |
-| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose (a benchmark testbed).                                                                                                                                                       |
-| `egress`                  | `false` installs the worker with `--no-egress`, so the guest has no network at all. Use it for a benchmark whose upstream fix must stay out of reach. `true` gives the host's allowlisted egress ([RUNBOOK](RUNBOOK.md#guest-egress)). |
-| `seed`                    | A bash command that fills a new sandbox's empty `/workspace`, or `""` for none. **SBX0 does not run it:** the client runs it as its first command in each new sandbox. It is in the record so the client can read it.                  |
-| `probe`                   | A bash command, run after the seed in `/workspace` in the restored VM. It passes when it exits `expect_rc` and its output matches every regex in `expect`.                                                                             |
-| `description`, `tools`    | The template's entry as clients list it.                                                                                                                                                                                               |
-| `etc_hosts_sha256`        | Optional. If set, the build stops unless the rootfs's `/etc/hosts` has this sha256.                                                                                                                                                    |
-| `probe_status`            | Optional, an image builder's note. `unmeasured` or `none` means nobody has measured the probe's expected result, and the build refuses the spec.                                                                                       |
+| Field                     | Rule                                                                                                                                                                                                                                      |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                      | What clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`. It stays the same across versions of the template.                                                                                                                                     |
+| `image`                   | Pinned: `repository@sha256:<digest>`, never a tag. A repository with no registry host takes its host from `--registry` at build time, so a spec written by an image builder commits no host.                                              |
+| `guest_ram_mb`, `vcpus`   | The guest's size (at least 128 MiB; 1-32 vCPUs). Every VM restored from the snapshot has it.                                                                                                                                              |
+| `guest_home`              | Optional, a path under `/tmp`: a writable `HOME` for guest commands. The rootfs is read-only.                                                                                                                                             |
+| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose (a benchmark testbed).                                                                                                                                                          |
+| `egress`                  | `false` installs the worker with `--no-egress`, so the guest has no network at all. Use it for a benchmark whose upstream fix must stay out of reach. `true` gives the host's allowlisted egress ([RUNBOOK](../RUNBOOK.md#guest-egress)). |
+| `seed`                    | A bash command that fills a new sandbox's empty `/workspace`, or `""` for none. **SBX0 does not run it:** the client runs it as its first command in each new sandbox. It is in the record so the client can read it.                     |
+| `probe`                   | A bash command, run after the seed in `/workspace` in the restored VM. It passes when it exits `expect_rc` and its output matches every regex in `expect`.                                                                                |
+| `description`, `tools`    | The template's entry as clients list it.                                                                                                                                                                                                  |
+| `etc_hosts_sha256`        | Optional. If set, the build stops unless the rootfs's `/etc/hosts` has this sha256.                                                                                                                                                       |
+| `probe_status`            | Optional, an image builder's note. `unmeasured` or `none` means nobody has measured the probe's expected result, and the build refuses the spec.                                                                                          |
 
 Other fields are ignored, so an image builder may add its own (image-factory adds `notes`,
 `proved_in_vm` and `source_record_digest`).
@@ -98,7 +98,7 @@ jq '.template' platforms/moca/microvm/django__django-11133.json > django__django
 ## 1-2. Build and probe (the KVM host)
 
 ```bash
-sudo deploy/sbx/template-build.sh SPEC --kernel /path/to/vmlinux [--agent <checkout>/remote-worker] \
+sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel /path/to/vmlinux [--agent <checkout>/remote-worker] \
   [--registry HOST]
 ```
 
@@ -136,8 +136,8 @@ It holds no secret. Copy it to the operator's machine.
 ## 3. Register (the operator's machine)
 
 ```bash
-deploy/sbx/template-register.sh --env-file <env file> RECORD           # prints the setup.sh to run
-deploy/sbx/template-register.sh --env-file <env file> RECORD --apply   # and runs it
+deploy/sbx/template-onboarding/template-register.sh --env-file <env file> RECORD           # prints the setup.sh to run
+deploy/sbx/template-onboarding/template-register.sh --env-file <env file> RECORD --apply   # and runs it
 ```
 
 It edits the env file's `SBX_WORKERS` line and the `SBX_TEMPLATES_FILE` list, nothing else, and
@@ -148,7 +148,7 @@ writes each file whole. A re-run with nothing new changes nothing.
   in `SBX_WORKERS`, so the sandboxes it serves keep working.
 
 It refuses an env file whose `SBX_WORKERS` is not one plain line, and one that sets
-`SBX_EGRESS_HOSTS`. Edit those by hand ([RUNBOOK §5](RUNBOOK.md#5-adding-updating-and-removing-a-template)).
+`SBX_EGRESS_HOSTS`. Edit those by hand ([RUNBOOK §5](../RUNBOOK.md#5-adding-updating-and-removing-a-template)).
 
 `setup.sh` mints the worker's token and writes its bundle. A template change rolls the control
 plane only, so running commands on other templates carry on.
@@ -187,7 +187,7 @@ Once the old worker serves no live sandbox (`GET /v1/janitor/sandboxes` lists ea
 `wrk`), retire it:
 
 ```bash
-deploy/sbx/template-register.sh --env-file <env file> --retire <old worker id> --apply
+deploy/sbx/template-onboarding/template-register.sh --env-file <env file> --retire <old worker id> --apply
 sudo deploy/sbx/install-host.sh --uninstall <old worker id>       # on its host
 ```
 
@@ -205,7 +205,7 @@ for both.
 2. Runs the template's `seed` as its first command. The seed is in the record, and in the
    description for SWE-bench templates.
 3. Works through `mocactl sbx` (`run`, `put`, `pull`) or an agent wired to `mocactl sbx mcp`
-   (Claude Code, OpenCode: the [user guide](../../docs/sbx/user-guide.md)).
+   (Claude Code, OpenCode: the [user guide](../../../docs/sbx/user-guide.md)).
 
 **A template that brings its own repository (a seed), such as a SWE-bench template:** use
 `sbx create`, not `sbx up`. `sbx up` pushes the client's repository into `/workspace`, `.git`

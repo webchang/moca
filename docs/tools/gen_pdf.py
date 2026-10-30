@@ -8,7 +8,7 @@ Skia-produced -- with the styling checked in, so two people regenerating the sam
 the same file. Replaces the manual "preview in VS Code, print from the browser" flow.
 
     python3 docs/tools/gen_pdf.py                      # every pair in PAIRS below
-    python3 docs/tools/gen_pdf.py docs/sbx/template-onboarding-guide.md
+    python3 docs/tools/gen_pdf.py deploy/sbx/template-onboarding/GUIDE.md
     python3 docs/tools/gen_pdf.py docs/foo.md -o /tmp/foo.pdf
 
 Two pipelines, picked by extension:
@@ -54,7 +54,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]  # docs/tools/ -> the repo ro
 # EDIT PER PROJECT: the docs that ship a committed PDF beside their .md. Add a pair here and it
 # is picked up by a bare `python3 docs/tools/gen_pdf.py`. Paths are relative to the repo root.
 PAIRS = [
-    ("docs/sbx/template-onboarding-guide.md", "docs/sbx/template-onboarding-guide.pdf"),
+    ("deploy/sbx/template-onboarding/GUIDE.md", "deploy/sbx/template-onboarding/GUIDE.pdf"),
 ]
 
 SOFFICE_CANDIDATES = ["/Applications/LibreOffice.app/Contents/MacOS/soffice"]

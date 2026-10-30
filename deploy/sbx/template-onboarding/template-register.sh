@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# deploy/sbx/template-register.sh -- on the operator's machine, add a built template to SBX0's inputs,
-# or retire a worker from them (deploy/sbx/ONBOARDING.md, step 3; RUNBOOK §5).
+# deploy/sbx/template-onboarding/template-register.sh -- on the operator's machine, add a built template to SBX0's inputs,
+# or retire a worker from them (deploy/sbx/template-onboarding/ONBOARDING.md, step 3; RUNBOOK §5).
 #
-#   deploy/sbx/template-register.sh --env-file FILE RECORD [--apply]
-#   deploy/sbx/template-register.sh --env-file FILE --retire WORKER_ID [--apply]
-#   deploy/sbx/template-register.sh --env-file FILE --remove TEMPLATE_ID [--apply]
+#   deploy/sbx/template-onboarding/template-register.sh --env-file FILE RECORD [--apply]
+#   deploy/sbx/template-onboarding/template-register.sh --env-file FILE --retire WORKER_ID [--apply]
+#   deploy/sbx/template-onboarding/template-register.sh --env-file FILE --remove TEMPLATE_ID [--apply]
 #
 # FILE is setup.sh's env file. It must assign SBX_WORKERS on one line of its own and name
 # SBX_TEMPLATES_FILE; this script edits that line and that file, nothing else. RECORD is the
-# template record deploy/sbx/template-build.sh wrote on the KVM host
+# template record deploy/sbx/template-onboarding/template-build.sh wrote on the KVM host
 # ($SBX_SRV/templates/<snapshot>.json, schema moca-sbx-template/1), copied here.
 #
 #   RECORD          adds the record's worker to SBX_WORKERS and its {id, worker, description, tools}
@@ -27,14 +27,15 @@
 # Exit: 0 done (or nothing to do); 1 refused; 2 usage.
 set -euo pipefail
 
-SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SBX0's own scripts are one level up (deploy/sbx/): lib.sh and setup.sh.
+SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=deploy/sbx/lib.sh
 . "$SBX_DIR/lib.sh"
 TEMPLATE_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 : "${SBX_SETUP:=$SBX_DIR/setup.sh}"
 
 log() { printf '==> %s\n' "$*"; }
-die() { echo "deploy/sbx/template-register.sh: $*" >&2; exit 1; }
+die() { echo "deploy/sbx/template-onboarding/template-register.sh: $*" >&2; exit 1; }
 usage() {
   echo 'usage: template-register.sh --env-file FILE (RECORD | --retire WORKER_ID | --remove TEMPLATE_ID) [--apply]' >&2
   exit 2

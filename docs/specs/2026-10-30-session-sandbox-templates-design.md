@@ -4,7 +4,7 @@ Version: 1.0 — October 2026
 Status: Proposed — implementation on branch `sbx-template` (webchang/moca), not yet proposed upstream
 Builds on (reuse, no redesign): [P6.3](2026-10-04-p6-on-kubernetes-slice3-design.md) (sandbox tiers
 and session-to-sandbox affinity), [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (its
-templates: one `microvm-worker` per snapshot), `deploy/sbx/ONBOARDING.md` (turning an image into a
+templates: one `microvm-worker` per snapshot), `deploy/sbx/template-onboarding/ONBOARDING.md` (turning an image into a
 checked snapshot).
 
 > **The one-sentence thesis.** A session can name a sandbox template at creation, as it names a
@@ -33,7 +33,7 @@ affinity and seed, mocactl's session option, configuration, and tests.
 
 **Out of scope:** templates for workload sandboxes (Kubernetes provisioner); several templates per
 worker (one worker serves one snapshot, as in SBX0); a per-subject template allow-list; changing a
-session's template after creation; building snapshots (`deploy/sbx/template-build.sh` does that).
+session's template after creation; building snapshots (`deploy/sbx/template-onboarding/template-build.sh` does that).
 
 ## 2. Current state
 

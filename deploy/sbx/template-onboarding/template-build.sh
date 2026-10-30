@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# deploy/sbx/template-build.sh -- on the KVM host, turn a container image into an SBX0 template's
-# golden snapshot, checked in a microVM before it is published (deploy/sbx/ONBOARDING.md, steps 1-2).
+# deploy/sbx/template-onboarding/template-build.sh -- on the KVM host, turn a container image into an SBX0 template's
+# golden snapshot, checked in a microVM before it is published (deploy/sbx/template-onboarding/ONBOARDING.md, steps 1-2).
 #
-#   sudo deploy/sbx/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
+#   sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
 #                                     [--registry HOST] [--keep-image] [--force]
 #
 # --registry HOST pulls a spec image that names no registry (`team/image@sha256:...`, as image
@@ -39,7 +39,7 @@
 #      --verify-command: the seed and the probe, run in the restored VM. A probe that fails publishes
 #      nothing;
 #   4. writes the template record, $SBX_SRV/templates/<snapshot>.json (schema moca-sbx-template/1): the
-#      spec plus the snapshot, its worker id and its manifest hash. deploy/sbx/template-register.sh
+#      spec plus the snapshot, its worker id and its manifest hash. deploy/sbx/template-onboarding/template-register.sh
 #      reads it on the operator's machine; a client may read the seed from it;
 #   5. removes the rootfs tree and (unless --keep-image) the pulled image.
 #
@@ -54,8 +54,8 @@
 # Exit: 0 built (or already built); 1 a step failed; 2 a usage or spec error.
 set -euo pipefail
 
-SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SBX_DIR/../.." && pwd)"
+TPL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$TPL_DIR/../../.." && pwd)"
 : "${SBX_SRV:=/srv/sbx}"
 : "${SBX_MIN_FREE_GB:=50}"
 # The two builders, overridable for the tests only.
@@ -67,12 +67,12 @@ TEMPLATE_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 STANDBY_DEPTH=2 MEMORY_RESERVE_MB=1024 VM_OVERHEAD_MB=32
 
 log() { printf '==> %s\n' "$*"; }
-die() { echo "deploy/sbx/template-build.sh: $*" >&2; exit 1; }
+die() { echo "deploy/sbx/template-onboarding/template-build.sh: $*" >&2; exit 1; }
 usage() {
   echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--keep-image] [--force]' >&2
   exit 2
 }
-spec_error() { echo "deploy/sbx/template-build.sh: $SPEC: $*" >&2; exit 2; }
+spec_error() { echo "deploy/sbx/template-onboarding/template-build.sh: $SPEC: $*" >&2; exit 2; }
 
 SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker REGISTRY='' KEEP_IMAGE='' FORCE=''
 while (($#)); do
@@ -242,5 +242,5 @@ write_record
 egress_flag=''
 [[ "$(jq -r .egress "$SPEC")" == true ]] || egress_flag=' --no-egress'
 log "built template $ID: snapshot $NAME, worker $WORKER"
-log "record: $RECORD (copy it to the operator's machine for deploy/sbx/template-register.sh)"
+log "record: $RECORD (copy it to the operator's machine for deploy/sbx/template-onboarding/template-register.sh)"
 log "then, after setup.sh: sudo deploy/sbx/install-host.sh <bundle of $WORKER> --snapshot $NAME --budget-mb <at least $BUDGET_MIN>$egress_flag"

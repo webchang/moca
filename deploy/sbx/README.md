@@ -8,7 +8,7 @@ resource), **attach** (passthrough, KVM hosts' workers dial in) and **exec** (pa
 
 This page is the install reference. Day-to-day operation (users, templates, key rotation, outages,
 disk, status and upgrades) is [the runbook](RUNBOOK.md); onboarding a template is
-[ONBOARDING.md](ONBOARDING.md); users have
+[template-onboarding/](template-onboarding/README.md); users have
 [the user guide](../../docs/sbx/user-guide.md); the security gate's checklist is
 [the security review](../../docs/sbx/security-review.md).
 
@@ -134,8 +134,8 @@ Otherwise every janitor run logs `skipped`.
 The host needs what `deploy/microvm/P4-ON-P6.md` lists for P4 (`/dev/kvm`, Firecracker, jailer,
 `microvm-worker`), `/usr/local/bin/moca-egress` (the install refuses without it, unless `--no-egress`)
 and outbound TCP 443 to the attach host. Build each template's snapshot under
-`/srv/sbx/snapshots/<image>` with `deploy/sbx/template-build.sh`, which also checks it in a microVM
-([ONBOARDING.md](ONBOARDING.md)), or by hand with `deploy/microvm/build-snapshot.sh`. Then, per worker:
+`/srv/sbx/snapshots/<image>` with `deploy/sbx/template-onboarding/template-build.sh`, which also checks it in a microVM
+([template-onboarding/](template-onboarding/README.md)), or by hand with `deploy/microvm/build-snapshot.sh`. Then, per worker:
 
     scp -r deploy/sbx/.generated/workers/<id> <host>:sbx-<id>
     ssh <host> sudo <checkout>/deploy/sbx/install-host.sh sbx-<id> --snapshot <image> [--budget-mb N]

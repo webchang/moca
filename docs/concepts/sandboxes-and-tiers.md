@@ -89,7 +89,7 @@ saturated the turn gets 503 `sandbox_unavailable` with `Retry-After`.
 - An affine sandbox that now serves another template (or none) moves the session at once, with reason
   `retiered`. The design is
   [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../specs/2026-10-30-session-sandbox-templates-design.md);
-  turning an image into a template's snapshot is [`deploy/sbx/ONBOARDING.md`](../../deploy/sbx/ONBOARDING.md).
+  turning an image into a template's snapshot is [`deploy/sbx/template-onboarding/ONBOARDING.md`](../../deploy/sbx/template-onboarding/README.md).
 
 An affinity move never loses a workspace silently: the session either waits or is told it was reset. Idle
 reclaim (`SH_WORKSPACE_IDLE`) is still silent on both tiers (#338).

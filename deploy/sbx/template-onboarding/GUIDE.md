@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-10-30T21:27:00Z
+**Last modified:** 2026-10-30T21:47:52Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -14,18 +14,20 @@ the workers on a bare-metal KVM host.
 - **A template is one worker serving one snapshot.** Onboarding is: build a snapshot from the image,
   check it in a real microVM, give it a worker, register it, use it, and retire it when a new
   image replaces it.
-- The short reference for the same steps is [`deploy/sbx/ONBOARDING.md`](../../deploy/sbx/ONBOARDING.md).
-  Deploying SBX0 itself is [`deploy/sbx/README.md`](../../deploy/sbx/README.md) and
-  [`RUNBOOK.md`](../../deploy/sbx/RUNBOOK.md); using a sandbox is the
-  [user guide](user-guide.md); templates in MOCA's own agent sessions are designed in
-  [`2026-10-30-session-sandbox-templates-design.md`](../specs/2026-10-30-session-sandbox-templates-design.md).
+- **Everything for templates is in [this folder](README.md):** the tools, the two sample specs,
+  their tests, and links to the related files elsewhere.
+- The short reference for the same steps is [`deploy/sbx/template-onboarding/ONBOARDING.md`](ONBOARDING.md).
+  Deploying SBX0 itself is [`deploy/sbx/README.md`](../README.md) and
+  [`RUNBOOK.md`](../RUNBOOK.md); using a sandbox is the
+  [user guide](../../../docs/sbx/user-guide.md); templates in MOCA's own agent sessions are designed in
+  [`2026-10-30-session-sandbox-templates-design.md`](../../../docs/specs/2026-10-30-session-sandbox-templates-design.md).
 - **Every host and registry below is a placeholder:** `sbx-api.example.com`, `registry.example.com`.
   No real host, account id or token appears here.
 
 **In a hurry?** §2 is the whole flow on one page; §4 is the public-image example as
 copy-pasteable commands; §6 is a client choosing between the two sample templates.
 
-<!-- Regenerate this list: python3 docs/tools/gen_toc.py docs/sbx/template-onboarding-guide.md -->
+<!-- Regenerate this list: python3 docs/tools/gen_toc.py deploy/sbx/template-onboarding/GUIDE.md -->
 <!-- toc -->
 
 **Contents**
@@ -103,7 +105,7 @@ For a template id `ID` and an image digest `sha256:abcdef012345…`:
 ## 3. The template spec
 
 A JSON file, schema `moca-sbx-template-spec/1`. Every field is checked before anything runs
-([`template-build.sh`](../../deploy/sbx/template-build.sh)):
+([`template-build.sh`](template-build.sh)):
 
 | Field                     | Meaning                                                                                                                 |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -134,6 +136,8 @@ exact spec)_.
 
 ### 4.1 Write the spec
 
+This spec is [`examples/default.json`](examples/default.json) in this folder:
+
 ```json
 {
   "schema": "moca-sbx-template-spec/1",
@@ -155,12 +159,12 @@ exact spec)_.
 ```
 
 `egress: true` gives the guest the host's allowlisted egress (GitHub by default,
-[RUNBOOK](../../deploy/sbx/RUNBOOK.md#guest-egress)). Use `false` for a template that must stay offline.
+[RUNBOOK](../RUNBOOK.md#guest-egress)). Use `false` for a template that must stay offline.
 
 ### 4.2 Build and probe on the KVM host
 
 ```bash
-sudo deploy/sbx/template-build.sh default.json --kernel /path/to/vmlinux
+sudo deploy/sbx/template-onboarding/template-build.sh deploy/sbx/template-onboarding/examples/default.json --kernel /path/to/vmlinux
 ```
 
 Expected output, ending:
@@ -170,7 +174,7 @@ build-snapshot.sh: verify command exited 0; the last of its output:
 ...
 template-build: the probe passed
 ==> built template default: snapshot default-eed901b838bf, worker sbx_default_eed901b838bf
-==> record: /srv/sbx/templates/default-eed901b838bf.json (copy it to the operator's machine for deploy/sbx/template-register.sh)
+==> record: /srv/sbx/templates/default-eed901b838bf.json (copy it to the operator's machine for deploy/sbx/template-onboarding/template-register.sh)
 ==> then, after setup.sh: sudo deploy/sbx/install-host.sh <bundle of sbx_default_eed901b838bf> --snapshot default-eed901b838bf --budget-mb <at least 1888>
 ```
 
@@ -181,7 +185,7 @@ A 256 MiB guest's snapshot is small; a 4 GiB one is about 7.3 GB (§9).
 Copy the record over, then:
 
 ```bash
-deploy/sbx/template-register.sh --env-file <env file> default-eed901b838bf.json --apply
+deploy/sbx/template-onboarding/template-register.sh --env-file <env file> default-eed901b838bf.json --apply
 ```
 
 It adds the worker to `SBX_WORKERS` and the template to the templates file, then runs `setup.sh`.
@@ -214,6 +218,9 @@ instance, built, checked in a microVM, registered, used by a client and by an ag
 
 ### 5.1 The spec comes from image-factory
 
+The result, as it ran, is [`examples/django__django-11133.json`](examples/django__django-11133.json) in
+this folder (its image names no registry host; give it with `--registry`).
+
 image-factory's moca-microvm records carry the spec under `template`, so nothing is written by hand.
 Its `probe` is a **public** test target (`basic`), not the instance's grading tests, and its image
 names no registry host:
@@ -230,7 +237,7 @@ Verified image also in Lite gets `-v`), 4096 MiB and 2 vCPUs, `egress: false`, `
 ### 5.2 Build, register, install
 
 ```bash
-sudo deploy/sbx/template-build.sh django__django-11133.json --kernel /path/to/vmlinux --registry registry.example.com
+sudo deploy/sbx/template-onboarding/template-build.sh deploy/sbx/template-onboarding/examples/django__django-11133.json --kernel /path/to/vmlinux --registry registry.example.com
 ```
 
 As it ran on 2026-10-30 (about 3 minutes, plus the pull):
@@ -332,7 +339,7 @@ allowlisting proxy, so `git` and `curl` over HTTPS rather than raw TCP) is _(unv
 2026-10-29 `default` worker was installed with `--no-egress`.
 
 What SBX0 guarantees, as checked live with two templates on 2026-10-29
-([`deploy/sbx/templates-check.sh`](../../deploy/sbx/templates-check.sh), 7 checks, 0 failed):
+([`deploy/sbx/templates-check.sh`](../templates-check.sh), 7 checks, 0 failed):
 
 - the list names every template and **no worker id**;
 - each create records the template asked for; an **unknown template is refused** (`no such
@@ -348,7 +355,7 @@ template`) and creates nothing;
 The 2026-10-29 run used `default` and an earlier SWE-bench template, `swe-astropy-14995`; the 2026-10-30
 run repeated the choice and isolation checks with `django-django-11133` and `astropy-astropy-14995`.
 To check a deployment yourself, run `templates-check.sh` against two of its templates
-([RUNBOOK §14](../../deploy/sbx/RUNBOOK.md#14-checking-the-templates)).
+([RUNBOOK §14](../RUNBOOK.md#14-checking-the-templates)).
 
 ## 7. Update and retire
 
@@ -357,7 +364,7 @@ The record names a new worker; registering moves the template there and **keeps 
 its live sandboxes keep working. Once none is left:
 
 ```bash
-deploy/sbx/template-register.sh --env-file <env file> --retire <old worker id> --apply
+deploy/sbx/template-onboarding/template-register.sh --env-file <env file> --retire <old worker id> --apply
 sudo deploy/sbx/install-host.sh --uninstall <old worker id>
 ```
 
@@ -370,7 +377,7 @@ before kept running.
 MOCA's own agent sessions (Moca Pi, P6) can name a template too: `mocactl run --option
 sandboxTemplate=ID`. A worker serves a template when `SANDBOX_TEMPLATE` is set; a session with no
 template never lands on one; the harness runs the seed once, before the agent's first tool call.
-Set-up for a P4 worker is in [`P4-ON-P6.md`](../../deploy/microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
+Set-up for a P4 worker is in [`P4-ON-P6.md`](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
 This is tested by unit and relay-integration tests; **a live MOCA-VM check is still to come**
 _(unverified on a live stack)_.
 
@@ -398,9 +405,9 @@ A measured capacity test is planned; until then treat these as estimates.
 
 ## 11. Regenerating the documents
 
-| Artifact                                 | Generated by                                                          | Source of truth |
-| ---------------------------------------- | --------------------------------------------------------------------- | --------------- |
-| this guide's table of contents           | `python3 docs/tools/gen_toc.py docs/sbx/template-onboarding-guide.md` | the headings    |
-| `docs/sbx/template-onboarding-guide.pdf` | `python3 docs/tools/gen_pdf.py`                                       | this `.md`      |
+| Artifact                                   | Generated by                                                            | Source of truth |
+| ------------------------------------------ | ----------------------------------------------------------------------- | --------------- |
+| this guide's table of contents             | `python3 docs/tools/gen_toc.py deploy/sbx/template-onboarding/GUIDE.md` | the headings    |
+| `deploy/sbx/template-onboarding/GUIDE.pdf` | `python3 docs/tools/gen_pdf.py`                                         | this `.md`      |
 
 **If no generator rebuilds it, don't commit it.**

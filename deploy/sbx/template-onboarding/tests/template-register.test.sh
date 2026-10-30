@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Tests for deploy/sbx/template-register.sh with setup.sh mocked: an add, a versioned update (the old
+# Tests for deploy/sbx/template-onboarding/template-register.sh with setup.sh mocked: an add, a versioned update (the old
 # worker stays), a retire (refused while it serves a template), a remove, the no-op re-run, the
 # refusals, and that only SBX_WORKERS's line and the templates file change.
 set -euo pipefail
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; [[ -f "$TMP/out" ]] && sed 's/^/  | /' "$TMP/out" >&2; exit 1; }
 pass() { echo "ok - $*"; }
-REG="$SRC/deploy/sbx/template-register.sh"
+REG="$SRC/deploy/sbx/template-onboarding/template-register.sh"
 cat >"$TMP/setup.sh" <<'MOCK'
 #!/usr/bin/env bash
 printf 'setup.sh %s\n' "$*" >>"$TMP_LOG"
