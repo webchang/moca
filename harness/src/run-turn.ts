@@ -217,6 +217,7 @@ export async function acquireTurnSandbox(
   sessionId: string | undefined,
   deps: SelectDeps = {},
   tier?: string,
+  template?: { id: string; seed?: string },
 ): Promise<AcquiredTurnSandbox> {
   const noop = async () => {};
   if (injected) return { sandbox: injected, leased: false, heartbeat: noop, release: noop };
@@ -238,11 +239,28 @@ export async function acquireTurnSandbox(
     // a one-off. Sharing a literal 'anon' workspace across unrelated turns would be the cross-turn
     // bleed spec §2.3 is about, and an EMPTY key is refused outright by microvm-worker (§3.4).
     sessionId ?? holderId,
-    { cap, ttlMs, holderId, remoteSandbox: env.SH_REMOTE_SANDBOX === '1', tier },
+    {
+      cap,
+      ttlMs,
+      holderId,
+      remoteSandbox: env.SH_REMOTE_SANDBOX === '1',
+      tier,
+      ...(template ? { template: template.id } : {}),
+    },
     deps,
   );
   if (!selected)
     return { sandbox: { config: null }, leased: false, heartbeat: noop, release: noop };
+  // A templated workspace is seeded before the turn's first tool call (session-templates spec §5).
+  // The lease is held: a seed that throws must return it, as every other failure after the acquire.
+  if (template?.seed && selected.transport) {
+    try {
+      await seedWorkspace(selected.transport, template.id, template.seed);
+    } catch (err) {
+      await selected.release().catch(() => {});
+      throw err;
+    }
+  }
 
   // `leased` comes from the seam rather than from re-reading the environment here. It is false on the
   // single-pod path even though selectPoolSandbox returned a value: that branch has no lease behind
@@ -265,6 +283,38 @@ export async function acquireTurnSandbox(
         }
       : {}),
   };
+}
+
+/** The marker a seeded workspace carries (session-templates spec §5); it travels with the workspace. */
+export const SEED_MARKER = '/workspace/.moca-seeded';
+
+/** A template's seed failed: the turn cannot start on a workspace that is not the template's. */
+export class SandboxSeedError extends Error {
+  constructor(template: string, exitCode: number | null) {
+    super(
+      `seeding the workspace of sandbox template '${template}' failed (exit ${exitCode ?? 'none: output cap or signal'})`,
+    );
+    this.name = 'SandboxSeedError';
+  }
+}
+
+/**
+ * Runs a template's seed in the session's workspace unless the marker says it has run (spec §5).
+ * The guard is in the same command, so a workspace is seeded once however many turns race to it;
+ * a workspace reset (a new, empty workspace) has no marker and is seeded again. The seed's output
+ * is not the agent's: only the exit code is read.
+ */
+export async function seedWorkspace(
+  transport: {
+    exec: (command: string, opts?: { timeout?: number }) => Promise<{ exitCode: number | null }>;
+  },
+  template: string,
+  seed: string,
+): Promise<void> {
+  const quoted = `'${seed.replace(/'/g, `'\\''`)}'`;
+  const command = `[ -e ${SEED_MARKER} ] || { bash -c ${quoted} && touch ${SEED_MARKER}; }`;
+  const res = await transport.exec(command, { timeout: 600 });
+  if (res.exitCode !== 0) throw new SandboxSeedError(template, res.exitCode);
 }
 
 /** The `workspace_reset` frame for a placement that moved the session, else null (P6.3 spec §6). */
@@ -361,6 +411,12 @@ export interface TurnConfig {
    * for every caller without a control plane; selectPoolSandbox then uses SH_SANDBOX_DEFAULT_TIER.
    */
   sandboxTier?: string;
+  /**
+   * The session's sandbox template and its seed, from the exchange (session-templates spec §3.4).
+   * Absent: the session runs only on untemplated workers, and nothing is seeded.
+   */
+  sandboxTemplate?: string;
+  sandboxSeed?: string;
   /**
    * The session's model, from the exchange (per-session model spec §5.1). Read by executeTurn only:
    * `model` above is also read by /runs, which must not inherit an id pi's registry may not know.
@@ -921,6 +977,12 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     opened.sessionManager.getSessionId(),
     {},
     input.config?.sandboxTier,
+    input.config?.sandboxTemplate
+      ? {
+          id: input.config.sandboxTemplate,
+          ...(input.config.sandboxSeed ? { seed: input.config.sandboxSeed } : {}),
+        }
+      : undefined,
   );
 
   // A null config would leave Pi's built-in tools running LOCALLY, in this process (MI1 §5 R3). Both

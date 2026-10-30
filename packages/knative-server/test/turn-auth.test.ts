@@ -272,6 +272,33 @@ describe('the one rule /turn enforces', () => {
     );
     expect(auth).not.toHaveProperty('sandboxTier');
   });
+
+  it('carries the session template and its seed, and only a non-empty string (session-templates spec §3.4)', async () => {
+    const exchangeWith = (extra: Record<string, unknown>) =>
+      deps({
+        fetchImpl: fakeExchange({
+          status: 200,
+          body: {
+            mode: 'direct',
+            anthropicAuthToken: 'sk-alice', // notsecret
+            anthropicBaseUrl: 'https://litellm.internal/v1',
+            sessionId: 'sid-1',
+            subject: 'github:1234',
+            ...extra,
+          },
+        }).fetchImpl,
+      });
+    const turn = (d: ReturnType<typeof deps>) =>
+      resolveTurnAuth({ authorization: `Bearer ${sessionToken()}` }, { sessionId: 'sid-1' }, d);
+    const auth = await turn(exchangeWith({ sandboxTemplate: 'py312', sandboxSeed: 'echo hi' }));
+    expect(auth?.sandboxTemplate).toBe('py312');
+    expect(auth?.sandboxSeed).toBe('echo hi');
+    // A seed without a template is not a seed; a non-string template is no template.
+    const seedOnly = await turn(exchangeWith({ sandboxSeed: 'echo hi' }));
+    expect(seedOnly).not.toHaveProperty('sandboxSeed');
+    const odd = await turn(exchangeWith({ sandboxTemplate: 7 }));
+    expect(odd).not.toHaveProperty('sandboxTemplate');
+  });
 });
 
 describe('authorizeRunRead (MI1 R7)', () => {

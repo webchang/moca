@@ -97,7 +97,9 @@ After P6.3's tier filter, a **template filter**:
 The empty-set error (`SandboxPoolEmptyError`) names the template when one was asked
 (`no attached sandbox for sandbox template 'X' …; check that a worker of this template sets
 SANDBOX_TEMPLATE=X`). Affinity: an affine sandbox that is present but now serves another template
-(or none) is a reset with `reason: 'retemplated'`, handled like `'retiered'` (no grace). Everything
+(or none) is handled exactly like one moved to another declared tier: an immediate reset, no
+grace, with the existing reason `'retiered'`, so the turn stream's `workspace_reset` frame is
+unchanged on the wire (mocactl's notice now says "moved to another tier or template"). Everything
 else in P6.3 §4 is unchanged.
 
 The template filter is applied whenever the records path is on. It needs no deployment setting: a
@@ -139,7 +141,7 @@ retryable) naming the template and the exit code. The seed's output is not shown
 - **Control plane, unit:** parse (the seed optional and a string), create (unknown, none declared,
   non-string, omitted), the stored field, the exchange (present only with a template), discovery.
 - **Harness, unit:** the template filter both ways, pods excluded for a template, the error wording,
-  affinity across a template change (`retemplated`), the seed (runs once, skipped with the marker,
+  affinity across a template change (an immediate reset), the seed (runs once, skipped with the marker,
   re-run after a reset, failure).
 - **mocactl, unit:** the option field and request shape.
 - **Acceptance, MOCA-VM on bm1:** one untemplated P4 worker and one templated worker; a session with
