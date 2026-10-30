@@ -203,6 +203,22 @@ for both.
 3. Works through `mocactl sbx` (`run`, `put`, `pull`) or an agent wired to `mocactl sbx mcp`
    (Claude Code, OpenCode: the [user guide](../../docs/sbx/user-guide.md)).
 
+**A template that brings its own repository (a seed), such as a SWE-bench template:** use
+`sbx create`, not `sbx up`. `sbx up` pushes the client's repository into `/workspace`, `.git`
+included, before the seed runs, so the workspace would not be the template's repository at its
+baseline. So:
+
+1. `mocactl sbx create --template <id> --json` and keep the sandbox id;
+2. `mocactl sbx run --sandbox <id> -- bash -c '<seed>'`;
+3. point the agent's MCP server at that sandbox: `mocactl sbx mcp --sandbox <id>` (for OpenCode,
+   in `opencode.json`'s `mcp.sandbox.command`, keeping `sbx up`'s `tools` block that switches the
+   local tools off);
+4. after the run, take the agent's change from the sandbox, for example with
+   `git diff --binary <baseline>` in `/workspace`, rather than `sbx pull`, which diffs against the
+   client's repository.
+
+A headless OpenCode run of a SWE-bench instance on SBX0 was driven this way (2026-10-30).
+
 Limits a long-running client meets:
 
 - a login minted with `mint-login.sh` lasts at most 24 h and cannot refresh;
