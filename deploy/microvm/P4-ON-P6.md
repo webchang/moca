@@ -164,8 +164,11 @@ Opt-in flags, all off by default (a default build is unchanged):
   the image still applies.
 
 Every snapshot's init also links `/dev/fd` and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` to
-`/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. The build
-checks both in the guest and fails without them.
+`/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. Its `/var`
+is the image's own `/var` with a tmpfs overlay on top: writable and fresh in every VM, and still
+holding what the image put there (a plain tmpfs used to hide it). Without overlayfs in the guest
+kernel, init copies the image's `/var` into a tmpfs instead. The build checks all three in the guest
+(a file the image has under `/var` is readable, and `/var` takes a write) and fails without them.
 
 - `--verify-command CMD` (with `--verify-timeout-s N`, 1-86400, default 600): what the last step
   runs in the restored VM in place of `true`. It's a bash command, run in `/workspace` once it's

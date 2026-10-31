@@ -665,7 +665,8 @@ assemble_rootfs() {
   # so a failed build never corrupts the caller's base image.
   cp -a "$ROOTFS/." "$STAGE/rootfs-tree/"
   mkdir -p "$STAGE/rootfs-tree/usr/local/bin" "$STAGE/rootfs-tree/sbin" \
-    "$STAGE/rootfs-tree/tmp" "$STAGE/rootfs-tree/var" "$STAGE/rootfs-tree/workspace"
+    "$STAGE/rootfs-tree/tmp" "$STAGE/rootfs-tree/var" "$STAGE/rootfs-tree/workspace" \
+    "$STAGE/rootfs-tree/.moca-var"
   # NEVER WRITE THROUGH THE IMAGE'S SYMLINKS. The tree is an image's filesystem, and paths in it
   # resolve on THIS host: Ubuntu-based images ship /sbin/init -> /lib/systemd/systemd (absolute), so
   # writing "$tree/sbin/init" opened the BUILD HOST's systemd (found 2026-10-14 on a moca-microvm
@@ -675,7 +676,7 @@ assemble_rootfs() {
   # following it.
   local tree_real d
   tree_real="$(realpath -e "$STAGE/rootfs-tree")"
-  for d in sbin usr/local/bin; do
+  for d in sbin usr/local/bin .moca-var; do
     case "$(realpath -e "$STAGE/rootfs-tree/$d")/" in
       "$tree_real"/*) ;;
       *)
@@ -684,20 +685,39 @@ assemble_rootfs() {
         ;;
     esac
   done
+  # check_var's probe: one regular file the image has under /var, a plain name (quoted into a
+  # guest command), smallest path first so it is stable between builds. None: the check only writes.
+  VAR_PROBE="$(cd "$STAGE/rootfs-tree/var" && find . -xdev -type f 2>/dev/null |
+    sed 's|^\./||' | grep -E '^[A-Za-z0-9._/+-]+$' | LC_ALL=C sort | head -1 || true)"
   rm -f "$STAGE/rootfs-tree/sbin/init" "$STAGE/rootfs-tree/usr/local/bin/agent"
   install -m 0555 "$STAGE/agent" "$STAGE/rootfs-tree/usr/local/bin/agent"
 
   # A minimal init: mount the ephemeral filesystems every run needs writable, then
   # EXEC (not fork) the agent as PID 1 so the agent's own exit tears the VM down
-  # instead of leaving an orphaned init for the next restore. /tmp and /var are
-  # tmpfs so nothing a run writes there survives past this VM's destruction.
+  # instead of leaving an orphaned init for the next restore. /tmp is a tmpfs, and /var
+  # an overlay with a tmpfs on top, so nothing a run writes there survives past this
+  # VM's destruction.
   cat >"$STAGE/rootfs-tree/sbin/init" <<'INIT'
 #!/bin/sh
 set -e
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs -o mode=1777 tmpfs /tmp
-mount -t tmpfs tmpfs /var
+# /var is writable and fresh in every VM, but keeps what the image put there: an overlay with the
+# image's own /var (on the read-only rootfs) underneath and a tmpfs on top. A plain tmpfs here hid
+# it all (TB's overfull-hbox: pdflatex's format under /var/lib/texmf, 2026-10-31). The tmpfs for the
+# overlay's upper and work dirs is /.moca-var, a mount point the build makes, outside /var. If the
+# kernel has no overlayfs, the image's /var is copied into that tmpfs and bound over /var; if even
+# that fails, an empty tmpfs as before. Never fatal: check_var fails the build instead.
+mount -t tmpfs -o mode=0700 tmpfs /.moca-var || true
+mkdir -p /.moca-var/upper /.moca-var/work || true
+if mount -t overlay overlay -o lowerdir=/var,upperdir=/.moca-var/upper,workdir=/.moca-var/work /var; then
+  :
+elif mkdir -p /.moca-var/copy && cp -a /var/. /.moca-var/copy/ && mount --bind /.moca-var/copy /var; then
+  :
+else
+  mount -t tmpfs tmpfs /var
+fi
 # The links a userspace /dev normally has and the kernel's devtmpfs does not: without /dev/fd,
 # bash's process substitution (<(...), >(...)) expands to /dev/fd/63 and fails "No such file or
 # directory", and tools reading /dev/stdin fail the same way (TB's rule-v5 check, 2026-10-31).
@@ -1134,6 +1154,27 @@ check_dev_fd() {
     echo "  bash's <(...) and >(...) would fail in every sandbox restored from this snapshot." >&2
     echo "  The init links /dev/fd -> /proc/self/fd; its /dev must be writable (devtmpfs) --" >&2
     echo "  or guest_client could not reach the guest at all. Output: $out" >&2
+    exit 1
+  fi
+}
+
+# check_var: the restored guest's /var shows the image's own files and takes writes (init's overlay).
+# VAR_PROBE is a file the image has under /var (found by assemble_rootfs's caller), or empty for an
+# image with an empty /var. The written file is removed in the same command: the snapshot captures
+# guest RAM, the tmpfs under /var included.
+VAR_PROBE=""
+check_var() {
+  local uds="$1"
+  local out rc cmd
+  cmd='echo x >/var/.moca-var-check && rm -f /var/.moca-var-check && echo var-writable'
+  [ -z "$VAR_PROBE" ] || cmd="test -r '/var/$VAR_PROBE' && echo var-kept && $cmd"
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 -command "$cmd" 2>&1)" && rc=0 || rc=$?
+  local want=var-writable
+  [ -z "$VAR_PROBE" ] || want=var-keptvar-writable
+  if [ "$rc" -ne 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "$want" ]; then
+    echo "build-snapshot.sh: the guest's /var is not the image's /var made writable (exit $rc)." >&2
+    echo "  init mounts an overlay (the image's /var under a tmpfs) on /var; probed /var/$VAR_PROBE" >&2
+    echo "  and a write. Output: $out" >&2
     exit 1
   fi
 }
@@ -1675,8 +1716,8 @@ boot_quiesce_snapshot_firecracker() {
   # which is how this was found, and vmpoolctl (which had no such check until this change)
   # went on measuring against a mutating image.
   #
-  # Nothing legitimate is lost. sbin/init mounts tmpfs on /tmp and /var (see assemble_
-  # rootfs) so everything a run writes there is ephemeral by design, and /workspace is a
+  # Nothing legitimate is lost. sbin/init mounts a tmpfs on /tmp and a tmpfs-backed overlay on
+  # /var (see assemble_rootfs), so everything a run writes there is ephemeral by design, and /workspace is a
   # SEPARATE rw drive. The Cloud Hypervisor path in this same script already passed
   # `readonly=on` for its rootfs -- this makes the Firecracker arm agree with it.
   api_put "$api_sock" /drives/rootfs \
@@ -1694,6 +1735,7 @@ boot_quiesce_snapshot_firecracker() {
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
   check_dev_fd "$vsock_uds"
+  check_var "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create; the VM stays paused because create has no resume field at all)"
@@ -1869,6 +1911,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
   check_dev_fd "$vsock_uds"
+  check_var "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (ch-remote pause + snapshot, no resume afterwards)"

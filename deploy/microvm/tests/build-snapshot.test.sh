@@ -1670,6 +1670,34 @@ check "check_dev_fd fails the build" \
   "$([ "$(fn_body check_dev_fd | grep -cF 'exit 1')" -ge 1 ] && echo yes || echo no)" "yes"
 check "check_dev_fd is called as often as check_git_identity" \
   "$(grep -c '^  check_dev_fd "' "$SCRIPT")" "$(grep -c '^  check_git_identity "' "$SCRIPT")"
+
+echo "== the guest's /var keeps the image's files and is writable (overlay, then copy, then tmpfs)"
+check "init mounts an overlay on /var with the image's /var as its lower dir" \
+  "$(printf '%s\n' "$init_text" | grep -cF 'mount -t overlay overlay -o lowerdir=/var,upperdir=/.moca-var/upper,workdir=/.moca-var/work /var')" "1"
+check "its upper and work dirs are on a tmpfs outside /var" \
+  "$(printf '%s\n' "$init_text" | grep -cF 'mount -t tmpfs -o mode=0700 tmpfs /.moca-var')" "1"
+check "without overlayfs it copies the image's /var and binds it" \
+  "$(printf '%s\n' "$init_text" | grep -cF 'cp -a /var/. /.moca-var/copy/ && mount --bind /.moca-var/copy /var')" "1"
+check "the last resort is the old empty tmpfs" \
+  "$(printf '%s\n' "$init_text" | grep -cxF '  mount -t tmpfs tmpfs /var')" "1"
+check "no unconditional tmpfs over /var is left" \
+  "$(printf '%s\n' "$init_text" | grep -cxF 'mount -t tmpfs tmpfs /var')" "0"
+check "the build makes the /.moca-var mount point and refuses one outside the tree" \
+  "$(asm="$(sed -n '/^assemble_rootfs() {/,/^}/p' "$SCRIPT")"; printf '%s' "$asm" | grep -cF '"$STAGE/rootfs-tree/.moca-var"'; printf '%s' "$asm" | grep -cF 'for d in sbin usr/local/bin .moca-var; do')" "$(printf '1\n1')"
+check "check_var reads the probe file and writes /var, removing what it wrote" \
+  "$([ "$(fn_body check_var | grep -cF 'echo x >/var/.moca-var-check && rm -f /var/.moca-var-check')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_var fails the build" "$([ "$(fn_body check_var | grep -cF 'exit 1')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_var is called as often as check_git_identity" \
+  "$(grep -c '^  check_var "' "$SCRIPT")" "$(grep -c '^  check_git_identity "' "$SCRIPT")"
+TMPDIR_PICK="$(mktemp)"
+# The probe pick, on a scratch tree: a plain-named regular file, smallest path; none for an empty /var.
+printf '%s\n' 'STAGE="$1"' "$(sed -n '/^  VAR_PROBE="\$(cd/,/head -1 || true)"$/p' "$SCRIPT")" 'printf "%s" "$VAR_PROBE"' >"$TMPDIR_PICK"
+w="$(mktemp -d)"; mkdir -p "$w/rootfs-tree/var/lib/texmf" "$w/rootfs-tree/var/cache"
+: >"$w/rootfs-tree/var/lib/texmf/pdflatex.fmt"; : >"$w/rootfs-tree/var/cache/a b"
+check "VAR_PROBE picks a plain-named file" "$(bash "$TMPDIR_PICK" "$w")" "lib/texmf/pdflatex.fmt"
+rm -rf "$w/rootfs-tree/var"/*
+check "VAR_PROBE is empty for an empty /var" "$(bash "$TMPDIR_PICK" "$w")" ""
+rm -rf "$w" "$TMPDIR_PICK"
 # T7 regression fence: a NIC arriving quietly would void the no-network property.
 check "no network-interfaces config anywhere in the build" \
   "$(grep -c 'network-interfaces' "$SCRIPT")" "0"
