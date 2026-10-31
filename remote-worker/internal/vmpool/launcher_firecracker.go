@@ -233,6 +233,40 @@ func firecrackerCgroupArgs(parentRel string) []string {
 	return []string{"--cgroup-version", "2", "--parent-cgroup", parentRel}
 }
 
+// jailerOutputTail bounds what a restore keeps of the jailer's and Firecracker's output.
+const jailerOutputTail = 4096
+
+// tailBuffer is an io.Writer keeping only the last max bytes written to it, safe for the two
+// os/exec copying goroutines (stdout and stderr) writing at once.
+type tailBuffer struct {
+	mu  sync.Mutex
+	max int
+	b   []byte
+}
+
+func newTailBuffer(max int) *tailBuffer { return &tailBuffer{max: max} }
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.b = append(t.b, p...)
+	if over := len(t.b) - t.max; over > 0 {
+		t.b = append(t.b[:0], t.b[over:]...)
+	}
+	return len(p), nil
+}
+
+// String is the tail on one line (newlines as " | "), or "(none)": it goes into an error.
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := strings.TrimSpace(string(t.b))
+	if s == "" {
+		return "(none)"
+	}
+	return strings.ReplaceAll(s, "\n", " | ")
+}
+
 // firecrackerLauncher is the Firecracker arm of Launcher.
 type firecrackerLauncher struct {
 	opts FirecrackerOptions
@@ -534,8 +568,14 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// that inherits a controlling terminal's stdin can be sent SIGTTIN and stop the
 	// moment it tries to read from it, which from this launcher's side is
 	// indistinguishable from a hang (coordinator finding #2).
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	// The jailer's own errors (before it execs) and Firecracker's log both go to stdout/stderr.
+	// They used to be discarded, so a jailer or Firecracker that failed left nothing but the
+	// socket timeout below (SBX0, 2026-10-31: diagnosing a too-long socket path took strace). A
+	// bounded tail keeps the last few KiB for the restore's error; like io.Discard it is not an
+	// *os.File, so os/exec's pipes and copying goroutines are the same as before.
+	jailerOut := newTailBuffer(jailerOutputTail)
+	cmd.Stdout = jailerOut
+	cmd.Stderr = jailerOut
 	fcIsolateProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err), cleanup())
@@ -564,7 +604,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		observe = boundary.observe
 	}
 	if err := waitForUnixSocketObserved(ctx, apiSockHost, 5*time.Second, observe); err != nil {
-		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err), cleanup())
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w (jailer output: %s)", req.ID, err, jailerOut.String()), cleanup())
 	}
 
 	phSock = time.Since(phaseStart) - phPrep - phWsImg - phSpawn

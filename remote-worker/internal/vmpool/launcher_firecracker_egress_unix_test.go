@@ -362,3 +362,43 @@ func TestLauncherFromEnvWiresEgressFromControlSock(t *testing.T) {
 		t.Error("egress must stay off when the control socket is unset")
 	}
 }
+
+// A jailer (or a Firecracker) that fails says why on stdout/stderr; the restore's error carries
+// the tail of it, instead of only the socket timeout (2026-10-31: strace was needed to see it).
+func TestFirecrackerRestoreErrorCarriesTheJailerOutput(t *testing.T) {
+	base := shortdir.New(t, "fcout", len("/firecracker/vm-6/root/run/firecracker.socket"))
+	jailer := filepath.Join(base, "jailer")
+	script := "#!/bin/sh\necho 'jailer: Failed to chroot: Os { code: 2 }' >&2\necho second line\nexit 1\n"
+	if err := os.WriteFile(jailer, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lc, err := NewFirecrackerLauncher(FirecrackerOptions{
+		JailerBin: jailer, FirecrackerBin: filepath.Join(base, "firecracker"),
+		ChrootBase: base, SnapshotDir: base, UID: os.Getuid(), GID: os.Getgid(),
+	})
+	if err != nil {
+		t.Fatalf("NewFirecrackerLauncher: %v", err)
+	}
+	seedSnapshot(t, base)
+	err = restoreShort(lc, base, "vm-5")
+	if err == nil {
+		t.Fatal("a restore whose jailer exits 1 succeeded")
+	}
+	for _, want := range []string{"API socket never appeared", "jailer output:", "Failed to chroot: Os { code: 2 }", "second line"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+}
+
+func TestTailBufferKeepsTheLastBytes(t *testing.T) {
+	tb := newTailBuffer(8)
+	if got := tb.String(); got != "(none)" {
+		t.Fatalf("empty = %q", got)
+	}
+	_, _ = tb.Write([]byte("abcdef\n"))
+	_, _ = tb.Write([]byte("ghij\n"))
+	if got := tb.String(); got != "ef | ghij" {
+		t.Fatalf("tail = %q, want the last 8 bytes on one line", got)
+	}
+}
