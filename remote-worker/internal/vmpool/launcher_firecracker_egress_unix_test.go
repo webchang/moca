@@ -279,22 +279,47 @@ func TestEgressOffLeavesRestoreUnchanged(t *testing.T) {
 }
 
 func TestFirecrackerRefusesAnEgressSocketPathTooLong(t *testing.T) {
-	base := "/tmp/" + strings.Repeat("a", 85) // 90 chars
+	// The egress path (<jail>/run/v.sock_<port>) is never longer than the API socket path
+	// (<jail>/run/firecracker.socket) for a port of up to 10 digits, so a base too long for it is
+	// refused by the API check whether egress is on or off; the egress check stays as a guard for
+	// a longer egress path. Both refuse a 90-byte base, naming sun_path and a length.
+	base := "/tmp/" + strings.Repeat("a", 85)
+	for _, egress := range []bool{false, true} {
+		opts := FirecrackerOptions{
+			JailerBin: "/j", FirecrackerBin: "/usr/bin/firecracker", ChrootBase: base, SnapshotDir: "/s",
+		}
+		if egress {
+			opts.Egress = &recordingBinder{}
+		}
+		_, err := NewFirecrackerLauncher(opts)
+		if err == nil || !strings.Contains(err.Error(), "sun_path") {
+			t.Fatalf("egress=%v: a 90-byte base was accepted or the error does not name sun_path: %v", egress, err)
+		}
+	}
+	opts := FirecrackerOptions{EgressPort: 4294967295, ChrootBase: base, FirecrackerBin: "/usr/bin/firecracker"}
+	if len(opts.maxEgressSocketPath()) > len(opts.maxAPISocketPath()) {
+		t.Fatal("the egress socket path can be longer than the API socket path: the API check no longer covers it")
+	}
+}
+
+func TestFirecrackerRefusesAnAPISocketPathTooLong(t *testing.T) {
+	// The API socket is dialled with egress off too. 66 + "/firecracker/vm-<20>/root/run/firecracker.socket"
+	// (61) = 127 bytes: refused. The SBX0 case that hit it: a base of 53 bytes fits only to vm-9.
 	opts := FirecrackerOptions{
-		JailerBin: "/j", FirecrackerBin: "/usr/bin/firecracker", ChrootBase: base, SnapshotDir: "/s",
+		JailerBin: "/j", FirecrackerBin: "/usr/bin/firecracker", SnapshotDir: "/s",
+		ChrootBase: "/srv/sbx/jail/sbx_scikit_learn_scikit_learn_13439_96d81f0b74e2",
 	}
-	if _, err := NewFirecrackerLauncher(opts); err != nil {
-		t.Fatalf("egress off must accept a long base: %v", err)
-	}
-	opts.Egress = &recordingBinder{}
 	_, err := NewFirecrackerLauncher(opts)
 	if err == nil {
-		t.Fatal("a too-long egress socket path was accepted")
+		t.Fatal("a too-long API socket path was accepted with egress off")
 	}
-	opts.setDefaults()
-	want := len(opts.maxEgressSocketPath())
-	if !strings.Contains(err.Error(), "sun_path") || !strings.Contains(err.Error(), strconvItoa(want)) {
-		t.Errorf("error %q should name sun_path and the length %d", err, want)
+	want := len(opts.maxAPISocketPath())
+	if !strings.Contains(err.Error(), "API socket path") || !strings.Contains(err.Error(), strconvItoa(want)) {
+		t.Errorf("error %q should name the API socket path and the length %d", err, want)
+	}
+	opts.ChrootBase = "/srv/sbx/jail/j0123456789ab"
+	if _, err := NewFirecrackerLauncher(opts); err != nil {
+		t.Fatalf("a short base was refused: %v", err)
 	}
 }
 

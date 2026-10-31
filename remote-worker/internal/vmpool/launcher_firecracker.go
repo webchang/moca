@@ -149,6 +149,14 @@ func (o FirecrackerOptions) maxEgressSocketPath() string {
 		"/root" + vsockRelPath + "_" + strconv.FormatUint(uint64(o.EgressPort), 10)
 }
 
+// maxAPISocketPath is the longest API socket path any VM id can produce under this
+// configuration, as maxEgressSocketPath: the launcher dials it on the host, so it must fit
+// sun_path whether egress is on or off.
+func (o FirecrackerOptions) maxAPISocketPath() string {
+	return o.ChrootBase + "/" + filepath.Base(o.FirecrackerBin) + "/vm-" + strings.Repeat("9", 20) +
+		"/root" + apiSockRelPath
+}
+
 // egressSocketPath is the host path of VM jailRoot's egress listener.
 func (o FirecrackerOptions) egressSocketPath(jailRoot string) string {
 	return filepath.Join(jailRoot, vsockRelPath) + "_" + strconv.FormatUint(uint64(o.EgressPort), 10)
@@ -175,10 +183,17 @@ func (o FirecrackerOptions) validate() error {
 			"restore would fail (spec §6 mitigation #3 would be unimplemented); set it from " +
 			"vmpool.PerVMBytes(cfg)")
 	}
-	// bind(2) fails on a path that does not fit sun_path (108 on Linux, 104 elsewhere), and it
-	// would do so per VM at restore time, as an opaque error. Refuse at construction instead,
-	// against the worst-case id. Only when egress is on: with it off the egress socket is never
-	// bound and this constraint does not exist.
+	// bind(2) and connect(2) fail on a path that does not fit sun_path (108 on Linux, 104
+	// elsewhere), and they would do so per VM at restore time, as an opaque error: Firecracker
+	// listens inside its chroot, and the launcher's dial of the host path times out as "API socket
+	// never appeared" once the VM id grows a digit (SBX0, 2026-10-31: a 31-character template's
+	// worker failed every restore from vm-10 on). Refuse at construction instead, against the
+	// worst-case id. The API socket is always dialled; the egress socket only with egress on.
+	if p := o.maxAPISocketPath(); len(p) >= len(syscall.RawSockaddrUnix{}.Path) {
+		return fmt.Errorf("firecracker: API socket path %q is %d bytes, which does not fit "+
+			"sun_path (%d bytes including the terminator); shorten ChrootBase (SH_CHROOT_BASE)",
+			p, len(p), len(syscall.RawSockaddrUnix{}.Path))
+	}
 	if o.Egress != nil {
 		if p := o.maxEgressSocketPath(); len(p) >= len(syscall.RawSockaddrUnix{}.Path) {
 			return fmt.Errorf("firecracker: egress socket path %q is %d bytes, which does not fit "+
