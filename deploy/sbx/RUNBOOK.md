@@ -436,7 +436,9 @@ before systemd is touched.
 **Fresh host** (no worker installed):
 
 1. `sudo deploy/sbx/install-host.sh --egress-ca-out` (generates the CA).
-2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<image>`.
+2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<image>`,
+   or for a template, `template-build.sh SPEC --egress-ca /etc/sbx/egress/ca.crt ...`
+   ([template-onboarding](template-onboarding/ONBOARDING.md)).
 3. `sudo deploy/sbx/install-host.sh WORKER_BUNDLE --snapshot <image>`.
 4. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
 

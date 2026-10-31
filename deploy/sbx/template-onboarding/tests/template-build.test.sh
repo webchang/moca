@@ -39,17 +39,19 @@ cat >"$TMP/bin/build-snapshot" <<'MOCK'
 #!/usr/bin/env bash
 printf 'build-snapshot\n' >>"$MOCK_LOG"
 printf '%s\n' "$@" >"$MOCK_STATE/snapshot-args"
-out=''
+out='' ca=''
 while (($#)); do
   case "$1" in
   --out) out="$2"; shift 2 ;;
   --verify-command) printf '%s' "$2" >"$MOCK_STATE/verify-command"; shift 2 ;;
+  --egress-ca) ca="sha256:$(openssl x509 -in "$2" -outform DER | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)"; shift 2 ;;
   *) shift ;;
   esac
 done
 [[ -z "${MOCK_SNAPSHOT_FAIL:-}" ]] || { echo 'build-snapshot.sh: the fresh snapshot restored but the --verify-command exited 91' >&2; exit 1; }
 mkdir -p "$out"
-printf '{"hash": "%s", "built_at": "2026-10-30T00:00:00Z", "guest_ram_mb": 4096}\n' "${MOCK_HASH:-h1}" >"$out/manifest.json"
+jq -n --arg h "${MOCK_HASH:-h1}" --arg ca "$ca" '{hash: $h, built_at: "2026-10-30T00:00:00Z", guest_ram_mb: 4096}
+  + (if $ca == "" then {} else {egress_ca_sha256: $ca} end)' >"$out/manifest.json"
 MOCK
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" SBX_SRV="$TMP/srv" SBX_SKIP_ROOT_CHECK=1
@@ -222,3 +224,29 @@ run || fail 'an egress spec did not build'
 ! grep -q 'bash -c .*seed' "$MOCK_STATE/verify-command" && ! grep -q 'the seed failed' "$MOCK_STATE/verify-command" ||
   fail 'an empty seed still runs a seed'
 pass 'egress true drops --no-egress from the hint; an empty seed runs nothing'
+
+# 9. --egress-ca: passed to build-snapshot, its fingerprint in the record; refused for an offline
+# template, for a private key, and a snapshot built with another CA (or none) is rebuilt.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=ca1 -days 1 \
+  -keyout "$TMP/ca1.key" -out "$TMP/ca1.crt" 2>/dev/null
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=ca2 -days 1 \
+  -keyout "$TMP/ca2.key" -out "$TMP/ca2.crt" 2>/dev/null
+CA1="sha256:$(openssl x509 -in "$TMP/ca1.crt" -outform DER | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)"
+spec
+rc=0; run --egress-ca "$TMP/ca1.crt" || rc=$?
+[[ "$rc" == 2 ]] && grep -q 'egress-ca is for a template with egress true' "$TMP/out" || fail "--egress-ca on an offline spec was not refused: $(cat "$TMP/out")"
+spec '.egress = true | .seed = ""'
+rc=0; run --egress-ca "$TMP/ca1.key" || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'holds a private key' "$TMP/out" || fail 'a private key was not refused'
+! grep -q podman "$MOCK_LOG" || fail 'a private key still pulled'
+run --force --egress-ca "$TMP/ca1.crt" || fail "--egress-ca failed: $(cat "$TMP/out")"
+grep -A1 -x -- --egress-ca "$MOCK_STATE/snapshot-args" | tail -n1 | grep -qx "$TMP/ca1.crt" || fail 'build-snapshot did not get --egress-ca'
+jq -e --arg ca "$CA1" '.egress_ca_sha256 == $ca' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'the record lacks the CA fingerprint'
+run --egress-ca "$TMP/ca1.crt" || fail 'the same CA re-run failed'
+grep -q 'already built' "$TMP/out" || fail 'the same CA was rebuilt'
+run --egress-ca "$TMP/ca2.crt" || fail 'another CA failed'
+grep -q build-snapshot "$MOCK_LOG" || fail 'another CA was not rebuilt'
+run || fail 'no CA failed'
+grep -q build-snapshot "$MOCK_LOG" || fail 'a CA snapshot was taken as built for no CA'
+jq -e 'has("egress_ca_sha256") | not' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'a record without a CA names one'
+pass '--egress-ca: passed through and recorded; refused offline or as a key; another CA or none rebuilds'

@@ -99,8 +99,12 @@ jq '.template' platforms/moca/microvm/django__django-11133.json > django__django
 
 ```bash
 sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel /path/to/vmlinux [--agent <checkout>/remote-worker] \
-  [--registry HOST]
+  [--registry HOST] [--egress-ca /etc/sbx/egress/ca.crt]
 ```
+
+`--egress-ca` is for a template whose sandboxes use egress credentials (`egress: true` only): it bakes
+the host's interception CA, from `install-host.sh --egress-ca-out`, into the snapshot, and the record
+keeps its fingerprint ([RUNBOOK, guest egress](../RUNBOOK.md#guest-egress)).
 
 It needs root, podman logged in to the image's registry, the kernel the host's workers run, and
 `SBX_MIN_FREE_GB` (default 50) free under `$SBX_SRV` (default `/srv/sbx`). A 4 GiB guest's snapshot

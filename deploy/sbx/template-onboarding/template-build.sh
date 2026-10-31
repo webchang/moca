@@ -3,7 +3,12 @@
 # golden snapshot, checked in a microVM before it is published (deploy/sbx/template-onboarding/ONBOARDING.md, steps 1-2).
 #
 #   sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
-#                                     [--registry HOST] [--keep-image] [--force]
+#                                     [--registry HOST] [--egress-ca PATH] [--keep-image] [--force]
+#
+# --egress-ca PATH bakes the KVM host's TLS-interception CA (the public certificate, from
+# `install-host.sh --egress-ca-out`) into the snapshot, for a template whose sandboxes use egress
+# credentials (RUNBOOK, guest egress). Only for a spec with egress true. The record keeps its
+# fingerprint (egress_ca_sha256), and a snapshot built with another CA, or none, is rebuilt.
 #
 # --registry HOST pulls a spec image that names no registry (`team/image@sha256:...`, as image
 # builders write them so that no registry host is committed) from HOST. An image that names one
@@ -69,18 +74,19 @@ STANDBY_DEPTH=2 MEMORY_RESERVE_MB=1024 VM_OVERHEAD_MB=32
 log() { printf '==> %s\n' "$*"; }
 die() { echo "deploy/sbx/template-onboarding/template-build.sh: $*" >&2; exit 1; }
 usage() {
-  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--keep-image] [--force]' >&2
+  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--egress-ca PATH] [--keep-image] [--force]' >&2
   exit 2
 }
 spec_error() { echo "deploy/sbx/template-onboarding/template-build.sh: $SPEC: $*" >&2; exit 2; }
 
-SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker REGISTRY='' KEEP_IMAGE='' FORCE=''
+SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker REGISTRY='' EGRESS_CA='' KEEP_IMAGE='' FORCE=''
 while (($#)); do
   case "$1" in
   --kernel) [[ $# -ge 2 ]] || usage; KERNEL="$2"; shift 2 ;;
   --agent) [[ $# -ge 2 ]] || usage; AGENT="$2"; shift 2 ;;
   --vmm) [[ $# -ge 2 ]] || usage; VMM="$2"; shift 2 ;;
   --registry) [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || usage; REGISTRY="$2"; shift 2 ;;
+  --egress-ca) [[ $# -ge 2 ]] || usage; EGRESS_CA="$2"; shift 2 ;;
   --keep-image) KEEP_IMAGE=1; shift ;;
   --force) FORCE=1; shift ;;
   -h | --help) usage ;;
@@ -115,6 +121,8 @@ GUEST_HOME="$(field guest_home)"
 [[ -z "$GUEST_HOME" || "$GUEST_HOME" =~ ^/tmp(/[A-Za-z0-9._-]+)+$ ]] || spec_error "guest_home must be a path under /tmp, got '$GUEST_HOME'"
 jq -e '(.skip_git_identity_check // false | type) == "boolean"' "$SPEC" >/dev/null || spec_error 'skip_git_identity_check must be true or false'
 jq -e '(.egress | type) == "boolean"' "$SPEC" >/dev/null || spec_error 'egress must be true or false (false: the worker is installed with --no-egress)'
+[[ -z "$EGRESS_CA" ]] || [[ "$(jq -r .egress "$SPEC")" == true ]] ||
+  spec_error '--egress-ca is for a template with egress true (this one has no network)'
 jq -e '(.seed | type) == "string"' "$SPEC" >/dev/null || spec_error 'seed must be a string ("" for none)'
 jq -e '(.probe | type) == "object" and (.probe.cmd | type) == "string" and (.probe.cmd | length) > 0
   and (.probe.expect_rc | type) == "number" and (.probe.expect_rc | floor) == .probe.expect_rc
@@ -176,10 +184,11 @@ write_record() {
   built="$(jq -r '.built_at // empty' "$OUT/manifest.json")"
   mkdir -p "$SBX_SRV/templates"
   jq -S --arg snapshot "$NAME" --arg worker "$WORKER" --arg hash "$hash" --arg built "$built" \
-    --argjson budget "$BUDGET_MIN" \
+    --argjson budget "$BUDGET_MIN" --arg ca "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" \
     '{schema: "moca-sbx-template/1", id, worker: $worker, snapshot: $snapshot, image, guest_ram_mb,
       vcpus, egress, seed, probe, description, tools, manifest_hash: $hash, built_at: $built,
-      min_budget_mb: $budget}' "$SPEC" >"$RECORD.tmp"
+      min_budget_mb: $budget}
+    + (if $ca == "" then {} else {egress_ca_sha256: $ca} end)' "$SPEC" >"$RECORD.tmp"
   mv "$RECORD.tmp" "$RECORD"
 }
 
@@ -189,10 +198,20 @@ spec_key() { jq -S '{id, image, guest_ram_mb, vcpus, egress, seed, probe, descri
 [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root (build-rootfs.sh and build-snapshot.sh do)'
 [[ -f "$KERNEL" ]] || die "no kernel at $KERNEL"
 [[ -d "$AGENT" ]] || die "no guest agent source at $AGENT (the remote-worker module)"
+# The CA's fingerprint as build-snapshot.sh records it (sha256 of the DER), for "already built".
+CA_SHA=''
+if [[ -n "$EGRESS_CA" ]]; then
+  [[ -f "$EGRESS_CA" ]] || die "no egress CA at $EGRESS_CA (install-host.sh --egress-ca-out prints its path)"
+  ! grep -q 'PRIVATE KEY' "$EGRESS_CA" || die "$EGRESS_CA holds a private key: pass the public certificate"
+  CA_SHA="$(openssl x509 -in "$EGRESS_CA" -outform DER | { sha256sum 2>/dev/null || shasum -a 256; })" ||
+    die "$EGRESS_CA is not a PEM certificate"
+  CA_SHA="sha256:${CA_SHA%% *}"
+fi
 
 if [[ -z "$FORCE" && -f "$OUT/manifest.json" && -f "$RECORD" ]] &&
   [[ "$(spec_key "$SPEC")" == "$(spec_key "$RECORD")" ]] &&
-  [[ "$(jq -r .manifest_hash "$RECORD")" == "$(jq -r .hash "$OUT/manifest.json")" ]]; then
+  [[ "$(jq -r .manifest_hash "$RECORD")" == "$(jq -r .hash "$OUT/manifest.json")" ]] &&
+  [[ "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" == "$CA_SHA" ]]; then
   log "already built: snapshot $NAME, record $RECORD (--force rebuilds)"
   exit 0
 fi
@@ -232,10 +251,13 @@ args=(--kernel "$KERNEL" --rootfs "$BUILD/rootfs" --agent "$AGENT" --image "$NAM
   --guest-ram-mb "$RAM" --vcpus "$VCPUS" --out "$OUT"
   --verify-command "$(verify_command)" --verify-timeout-s "$(jq -r '.probe.timeout_s' "$SPEC")")
 [[ -z "$GUEST_HOME" ]] || args+=(--guest-home "$GUEST_HOME")
+[[ -z "$EGRESS_CA" ]] || args+=(--egress-ca "$EGRESS_CA")
 [[ "$(jq -r '.skip_git_identity_check // false' "$SPEC")" != true ]] || args+=(--skip-git-identity-check)
 log "building and checking the snapshot $NAME (the probe runs in the restored VM)"
 "$SBX_BUILD_SNAPSHOT" "${args[@]}"
 [[ -f "$OUT/manifest.json" ]] || die "build-snapshot.sh left no $OUT/manifest.json"
+[[ "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" == "$CA_SHA" ]] ||
+  die "the snapshot's egress_ca_sha256 is not the CA's ($CA_SHA)"
 
 # 4. The record.
 write_record
