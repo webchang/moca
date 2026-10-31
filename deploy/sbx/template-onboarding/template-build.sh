@@ -20,6 +20,9 @@
 #   guest_ram_mb, vcpus      the guest's size (build-snapshot.sh --guest-ram-mb, --vcpus)
 #   guest_home               optional, a writable HOME under /tmp (build-snapshot.sh --guest-home)
 #   skip_git_identity_check  optional, true for an image that refuses agent commits on purpose
+#   guest_home_gitconfig     optional, true: copy the image's /root/.gitconfig into guest_home (an
+#                            identity set in the image applies). Refused with skip_git_identity_check:
+#                            an image that refuses commits must not get its root identity
 #   egress                   true or false: whether the worker gets guest egress (false: --no-egress,
 #                            no network at all, e.g. a benchmark whose upstream fix must stay out of
 #                            reach)
@@ -120,6 +123,12 @@ RAM="$(field guest_ram_mb)" VCPUS="$(field vcpus)"
 GUEST_HOME="$(field guest_home)"
 [[ -z "$GUEST_HOME" || "$GUEST_HOME" =~ ^/tmp(/[A-Za-z0-9._-]+)+$ ]] || spec_error "guest_home must be a path under /tmp, got '$GUEST_HOME'"
 jq -e '(.skip_git_identity_check // false | type) == "boolean"' "$SPEC" >/dev/null || spec_error 'skip_git_identity_check must be true or false'
+jq -e '(.guest_home_gitconfig // false | type) == "boolean"' "$SPEC" >/dev/null || spec_error 'guest_home_gitconfig must be true or false'
+if [[ "$(jq -r '.guest_home_gitconfig // false' "$SPEC")" == true ]]; then
+  [[ -n "$GUEST_HOME" ]] || spec_error 'guest_home_gitconfig needs guest_home'
+  [[ "$(jq -r '.skip_git_identity_check // false' "$SPEC")" != true ]] ||
+    spec_error 'guest_home_gitconfig with skip_git_identity_check: an image that refuses commits must not get its root identity'
+fi
 jq -e '(.egress | type) == "boolean"' "$SPEC" >/dev/null || spec_error 'egress must be true or false (false: the worker is installed with --no-egress)'
 [[ -z "$EGRESS_CA" ]] || [[ "$(jq -r .egress "$SPEC")" == true ]] ||
   spec_error '--egress-ca is for a template with egress true (this one has no network)'
@@ -186,14 +195,16 @@ write_record() {
   jq -S --arg snapshot "$NAME" --arg worker "$WORKER" --arg hash "$hash" --arg built "$built" \
     --argjson budget "$BUDGET_MIN" --arg ca "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" \
     '{schema: "moca-sbx-template/1", id, worker: $worker, snapshot: $snapshot, image, guest_ram_mb,
-      vcpus, egress, seed, probe, description, tools, manifest_hash: $hash, built_at: $built,
+      vcpus, egress, seed, probe, description, tools, guest_home_gitconfig: (.guest_home_gitconfig // false),
+      manifest_hash: $hash, built_at: $built,
       min_budget_mb: $budget}
     + (if $ca == "" then {} else {egress_ca_sha256: $ca} end)' "$SPEC" >"$RECORD.tmp"
   mv "$RECORD.tmp" "$RECORD"
 }
 
 # The spec's part of a record, for "already built": the same spec on the same snapshot.
-spec_key() { jq -S '{id, image, guest_ram_mb, vcpus, egress, seed, probe, description, tools}' "$1"; }
+spec_key() { jq -S '{id, image, guest_ram_mb, vcpus, egress, seed, probe, description, tools,
+  guest_home_gitconfig: (.guest_home_gitconfig // false)}' "$1"; }
 
 [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root (build-rootfs.sh and build-snapshot.sh do)'
 [[ -f "$KERNEL" ]] || die "no kernel at $KERNEL"
@@ -253,6 +264,7 @@ args=(--kernel "$KERNEL" --rootfs "$BUILD/rootfs" --agent "$AGENT" --image "$NAM
 [[ -z "$GUEST_HOME" ]] || args+=(--guest-home "$GUEST_HOME")
 [[ -z "$EGRESS_CA" ]] || args+=(--egress-ca "$EGRESS_CA")
 [[ "$(jq -r '.skip_git_identity_check // false' "$SPEC")" != true ]] || args+=(--skip-git-identity-check)
+[[ "$(jq -r '.guest_home_gitconfig // false' "$SPEC")" != true ]] || args+=(--guest-home-gitconfig)
 log "building and checking the snapshot $NAME (the probe runs in the restored VM)"
 "$SBX_BUILD_SNAPSHOT" "${args[@]}"
 [[ -f "$OUT/manifest.json" ]] || die "build-snapshot.sh left no $OUT/manifest.json"

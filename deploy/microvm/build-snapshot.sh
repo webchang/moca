@@ -131,6 +131,8 @@ EGRESS_CA=""
 # GUEST_HOME for a writable HOME, since init otherwise leaves the kernel's HOME=/ on a
 # read-only rootfs. See check_git_identity and assemble_rootfs.
 SKIP_GIT_IDENTITY_CHECK=0
+# GUEST_HOME_GITCONFIG: opt-in, with --guest-home: copy the image's root git config into the new HOME.
+GUEST_HOME_GITCONFIG=0
 GUEST_HOME=""
 # VCPUS: the guest's vCPU count, recorded in the manifest. Default 1, exactly as before; a
 # benchmark comparing this tier with containers of N CPUs builds with --vcpus N so the comparison
@@ -147,7 +149,7 @@ usage() {
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR] [--egress-ca PATH]
-                  [--skip-git-identity-check] [--guest-home /tmp/DIR] [--vcpus 1]
+                  [--skip-git-identity-check] [--guest-home /tmp/DIR [--guest-home-gitconfig]] [--vcpus 1]
                   [--verify-command CMD [--verify-timeout-s 600]]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
@@ -168,9 +170,13 @@ artifact works.
 --skip-git-identity-check  do not require a usable git identity in the guest (for images
                            that refuse agent commits on purpose; default: required, #415).
 --guest-home /tmp/DIR      export HOME=DIR to guest commands, created by init on the /tmp
-                           tmpfs, with the image's /root/.gitconfig and /root/.config/git copied
-                           in (default: unset, so commands see the kernel's HOME=/ on a
+                           tmpfs (default: unset, so commands see the kernel's HOME=/ on a
                            read-only rootfs). Must be a path under /tmp.
+--guest-home-gitconfig     with --guest-home: copy the image's /root/.gitconfig and
+                           /root/.config/git into that HOME, so an identity the image set with
+                           `git config --global` applies (default: off, so an image whose root
+                           identity must NOT reach the agent, e.g. a SWE-bench testbed whose
+                           commits are refused on purpose, keeps refusing).
 --vcpus N                  the guest's vCPU count, 1-32 (default 1, as before), recorded in the
                            manifest; every VM restored from the snapshot has it.
 --verify-command CMD       what the verify step runs in the restored VM, in place of `true`: a
@@ -228,6 +234,10 @@ while [ $# -gt 0 ]; do
     --guest-home)
       GUEST_HOME="${2:-}"
       shift 2
+      ;;
+    --guest-home-gitconfig)
+      GUEST_HOME_GITCONFIG=1
+      shift
       ;;
     --vcpus)
       VCPUS="${2:-}"
@@ -778,15 +788,19 @@ exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-list
 INIT
   # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
   # /tmp is already mounted; the agent inherits init's environment, and so does every command.
-  # The image's own HOME (root's, /root) keeps the user-level git config an image may carry
-  # there (its identity, safe.directory): the new HOME starts empty, so without the copy a
-  # `git commit` that works in the image fails in the guest with no identity (TB's fix-git
-  # check, 2026-10-31). Only git's files, and only if present; an image that refuses commits
-  # on purpose has none to copy.
-  if [ -n "$GUEST_HOME" ]; then
+  # --guest-home-gitconfig: the image's own HOME (root's, /root) may carry the user-level git
+  # config (its identity): the new HOME starts empty, so without the copy a `git commit` that works
+  # in the image fails in the guest with no identity (TB's fix-git, 2026-10-31). OPT-IN, because an
+  # image can carry a root identity that must not reach the agent: SWE-bench's base images have one
+  # (user SWE-bench), and their testbeds refuse commits by design (image-factory's rule D2, 2026-10-31).
+  # Only git's files, and only if present.
+  if [ -n "$GUEST_HOME" ] && [ "$GUEST_HOME_GITCONFIG" = 1 ]; then
     sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
 [ ! -f /root/.gitconfig ] || cp /root/.gitconfig $GUEST_HOME/.gitconfig || true\\
 [ ! -d /root/.config/git ] || { mkdir -p $GUEST_HOME/.config \\&\\& cp -R /root/.config/git $GUEST_HOME/.config/git; } || true\\
+export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
+  elif [ -n "$GUEST_HOME" ]; then
+    sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
 export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
     grep -qx "export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init" || {
       echo "build-snapshot.sh: could not add HOME=$GUEST_HOME to init" >&2

@@ -1869,7 +1869,7 @@ usage_text="$(bash "$SCRIPT" --help 2>&1)"
 check "usage names --skip-git-identity-check" \
   "$(printf '%s' "$usage_text" | grep -c -- '--skip-git-identity-check')" "2"
 check "usage names --guest-home" \
-  "$(printf '%s' "$usage_text" | grep -c -- '--guest-home')" "2"
+  "$(printf '%s' "$usage_text" | grep -c -- '--guest-home')" "3"
 check "the identity check is skipped only behind the flag" \
   "$(printf '%s' "$gitid_body" | grep -c 'if \[ "\$SKIP_GIT_IDENTITY_CHECK" = 1 \]; then')" "1"
 check "the skip is logged, never silent" \
@@ -1878,7 +1878,9 @@ check "by default the identity check is required" \
   "$(grep -c '^SKIP_GIT_IDENTITY_CHECK=0$' "$SCRIPT")" "1"
 check "by default no HOME is set for the guest" "$(grep -c '^GUEST_HOME=""$' "$SCRIPT")" "1"
 check "the HOME insertion is guarded by --guest-home" \
-  "$(grep -c '^  if \[ -n "\$GUEST_HOME" \]; then$' "$SCRIPT")" "1"
+  "$(grep -c '^  elif \[ -n "\$GUEST_HOME" \]; then$' "$SCRIPT")" "1"
+check "root's git config is copied only with --guest-home-gitconfig (off by default)" \
+  "$(grep -c '^GUEST_HOME_GITCONFIG=0$' "$SCRIPT") $(grep -c '^  if \[ -n "\$GUEST_HOME" \] && \[ "\$GUEST_HOME_GITCONFIG" = 1 \]; then$' "$SCRIPT")" "1 1"
 rc=0
 out="$(bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --guest-home /home/x 2>&1)" || rc=$?
 check "a --guest-home outside /tmp is refused before any build step (exit 2)" "$rc" "2"
@@ -1892,9 +1894,19 @@ if sed --version >/dev/null 2>&1; then
   GUEST_HOME=/tmp/home # read by the eval'd block below
   export GUEST_HOME
   STAGE="$(mktemp -d)"; mkdir -p "$STAGE/rootfs-tree/sbin"; cp "$t" "$STAGE/rootfs-tree/sbin/init"
-  eval "$(sed -n '/^  if \[ -n "\$GUEST_HOME" \]; then/,/^  fi/p' "$SCRIPT")"
+  blk="$(sed -n '/^  if \[ -n "\$GUEST_HOME" \] && \[ "\$GUEST_HOME_GITCONFIG" = 1 \]; then/,/^  fi/p' "$SCRIPT")"
+  init0="$(cat "$t")"
+  # Default: no copy of root's git config (an image whose root identity must not reach the agent).
+  GUEST_HOME_GITCONFIG=0 eval "$blk"
+  cp "$STAGE/rootfs-tree/sbin/init" "$t"
+  check "by default init gets only mkdir and export HOME right after PATH" \
+    "$(sed -n '4,5p' "$t" | tr '\n' '|')" "mkdir -p /tmp/home|export HOME=/tmp/home|"
+  check "by default root's git config is never copied" "$(grep -c '/root/.gitconfig' "$t")" "0"
+  # --guest-home-gitconfig: the copy of root's git config, between mkdir and export HOME.
+  printf '%s\n' "$init0" >"$STAGE/rootfs-tree/sbin/init"
+  GUEST_HOME_GITCONFIG=1 eval "$blk"
   cp "$STAGE/rootfs-tree/sbin/init" "$t"; rm -rf "$STAGE"
-  check "init gets mkdir, the copy of root's git config and export HOME right after PATH" \
+  check "with --guest-home-gitconfig init also copies root's git config" \
     "$(sed -n '4,7p' "$t" | tr '\n' '|')" \
     "mkdir -p /tmp/home|[ ! -f /root/.gitconfig ] || cp /root/.gitconfig /tmp/home/.gitconfig || true|[ ! -d /root/.config/git ] || { mkdir -p /tmp/home/.config && cp -R /root/.config/git /tmp/home/.config/git; } || true|export HOME=/tmp/home|"
   check "the init stays valid sh" "$(sh -n "$t" && echo yes || echo no)" "yes"

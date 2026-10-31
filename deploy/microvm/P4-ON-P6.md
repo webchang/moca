@@ -159,9 +159,10 @@ Opt-in flags, all off by default (a default build is unchanged):
   purpose (a benchmark testbed whose patch must stay a diff against a fixed baseline). The skip is
   logged.
 - `--guest-home /tmp/DIR`: give guest commands a writable `HOME`, created by init on the `/tmp`
-  tmpfs. The default `HOME=/` is on the read-only rootfs. Init copies the image's root git config
-  (`/root/.gitconfig`, `/root/.config/git`) into it, so an identity set with `git config --global` in
-  the image still applies.
+  tmpfs. The default `HOME=/` is on the read-only rootfs. That HOME starts empty, so an identity set
+  in the image with `git config --global` (as root) does not apply; `--guest-home-gitconfig` copies
+  the image's root git config (`/root/.gitconfig`, `/root/.config/git`) into it. It is off by default:
+  SWE-bench's base images carry a root identity, and their testbeds refuse agent commits on purpose.
 
 Every snapshot's init also links `/dev/fd` and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` to
 `/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. Its `/var`

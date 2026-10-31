@@ -250,3 +250,24 @@ run || fail 'no CA failed'
 grep -q build-snapshot "$MOCK_LOG" || fail 'a CA snapshot was taken as built for no CA'
 jq -e 'has("egress_ca_sha256") | not' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'a record without a CA names one'
 pass '--egress-ca: passed through and recorded; refused offline or as a key; another CA or none rebuilds'
+
+# 10. guest_home_gitconfig: opt-in, passed as --guest-home-gitconfig; refused without guest_home and
+# with skip_git_identity_check (an image that refuses commits must not get its root identity).
+spec
+run --force || fail 'the default spec failed'
+! grep -qx -- --guest-home-gitconfig "$MOCK_STATE/snapshot-args" || fail 'the copy of root git config is on by default'
+for bad in '.guest_home_gitconfig = true' '.guest_home_gitconfig = true | .skip_git_identity_check = false | del(.guest_home)' '.guest_home_gitconfig = "yes"'; do
+  spec "$bad"
+  rc=0; run --force || rc=$?
+  [[ "$rc" == 2 ]] || fail "spec '$bad' was not refused (rc $rc)"
+done
+spec '.guest_home_gitconfig = true'
+rc=0; run --force || rc=$?; grep -q 'must not get its root identity' "$TMP/out" || fail 'the skip-identity refusal does not say why'
+spec '.guest_home_gitconfig = true | .skip_git_identity_check = false'
+run --force || fail "a gitconfig spec failed: $(cat "$TMP/out")"
+grep -qx -- --guest-home-gitconfig "$MOCK_STATE/snapshot-args" || fail 'build-snapshot did not get --guest-home-gitconfig'
+jq -e '.guest_home_gitconfig == true' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'the record lacks guest_home_gitconfig'
+spec '.skip_git_identity_check = false'
+run || fail 'switching it off failed'
+grep -q build-snapshot "$MOCK_LOG" || fail 'switching guest_home_gitconfig off was taken as already built'
+pass 'guest_home_gitconfig: off by default, passed through, recorded; refused without guest_home or with skip_git_identity_check'
