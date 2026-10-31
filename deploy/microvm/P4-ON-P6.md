@@ -347,7 +347,7 @@ sessions that name no template and for leaves (`/runs`):
    It installs the template unit `microvm-worker@.service` and runs instance `tpl_<id>` (dashes as
    underscores) **in its own slice**, so neither worker's start-up sweep can kill the other's VMs.
    It gets its own relay token (a separate env file, loaded into `sh-relay` by its own drop-in), its
-   own workspace and jail roots (`<snapshot dir>/.tpl/tpl_<id>`, on the snapshot's filesystem, since
+   own workspace and jail roots (`<snapshot dir>/.tpl/t<12 hex of the worker id's sha256>`, on the snapshot's filesystem, since
    the worker hardlinks between them; `MICROVM_TPL_SRV` picks another directory there),
    `SANDBOX_TEMPLATE=<id>`, and the snapshot's guest RAM from its manifest. The budget defaults to one
    session's worth, `(guest + 32) × 3 + 1024` MiB; `--budget-mb N` raises it. It restarts `sh-relay`
@@ -358,8 +358,9 @@ sessions that name no template and for leaves (`/runs`):
      worker reuses, so two egress-on workers would cut each other's guests off.
    - **A new snapshot is a new template worker** (another id): re-running with another `--snapshot` is
      refused, so live sessions never change image under them.
-   - The jail path must stay short enough for the guest's egress socket (a Unix socket path, at most
-     107 bytes); a long one is refused before anything is written.
+   - The jail path must stay short enough for the VMs' API socket (a Unix socket path, at most 107
+     bytes, and longer than the egress socket's); the short key keeps it so under any snapshot
+     directory of up to about 40 characters, and a longer one is refused before anything is written.
    - Each templated worker's budget adds to the main worker's; nothing checks their sum against the
      host's memory, so size them together.
 

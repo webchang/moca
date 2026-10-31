@@ -721,13 +721,16 @@ template_main() {
     done
   fi
   # Workspaces and the jail must share the snapshot's filesystem (Restore hardlinks the snapshot and
-  # workspace files into each VM's jail), and the jail path must stay short: the egress socket's
-  # longest path is <jail>/firecracker/vm-<20 digits>/root/run/v.sock_1025 and must fit a Unix
-  # socket path (108 bytes). So the roots default to <snapshot dir>/.tpl/<sid>.
-  local root="${TPL_SRV_ROOT:-$snap_dir/.tpl}/$TPL_SID"
-  local longest="$root/jail/firecracker/vm-99999999999999999999/root/run/v.sock_1025"
+  # workspace files into each VM's jail), and the jail path must stay short: the VM's API socket,
+  # <jail>/firecracker/vm-<20 digits>/root/run/firecracker.socket, is the longest path under it (the
+  # egress socket's .../run/v.sock_1025 is shorter) and must fit a Unix socket path (at most 107
+  # bytes). So the roots are <snapshot dir>/.tpl/t<12 hex of the sid's sha256>: a short key whatever
+  # the template id (bm1, 2026-10-31: <snapshot dir>/.tpl/<sid> was 116 bytes for a 19-character id).
+  local key; key="t$(printf '%s' "$TPL_SID" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
+  local root="${TPL_SRV_ROOT:-$snap_dir/.tpl}/$key"
+  local longest="$root/jail/firecracker/vm-99999999999999999999/root/run/firecracker.socket"
   ((${#longest} < 108)) ||
-    die "the jail path $root/jail is too long for the guest's egress socket (${#longest} bytes, at most 107): set MICROVM_TPL_SRV to a shorter directory on the snapshot's filesystem"
+    die "the jail path $root/jail is too long for the VMs' API socket (${#longest} bytes, at most 107): set MICROVM_TPL_SRV to a shorter directory on the snapshot's filesystem"
   install -d -m 0700 "$root/workspaces" "$root/jail"
   local dev_snap dev_root
   dev_snap="$(stat -c %d "$TPL_SNAPSHOT" 2>/dev/null || stat -f %d "$TPL_SNAPSHOT")"
