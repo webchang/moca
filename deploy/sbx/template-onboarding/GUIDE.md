@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-10-31T03:16:43Z
+**Last modified:** 2026-10-31T03:47:42Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -379,6 +379,8 @@ sandboxTemplate=ID`. A worker serves a template when `SANDBOX_TEMPLATE` is set; 
 template never lands on one; the harness runs the seed once, before the agent's first tool call.
 A templated P4 worker is installed beside the main one with `setup-microvm.sh --template ID
 --snapshot DIR`; set-up is in [`P4-ON-P6.md`](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
+Only one worker per host may use guest egress (moca-egress keys VMs by id, which workers share), so
+the installer refuses `--egress` beside another worker that uses it.
 This is tested by unit and relay-integration tests; **a live MOCA-VM check is still to come**
 _(unverified on a live stack)_.
 
