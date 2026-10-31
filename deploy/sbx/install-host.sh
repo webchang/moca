@@ -28,7 +28,10 @@
 #   - $SBX_ENV_DIR/moca-egress.env (the allowlist; no secret, 0644) is written ONLY when absent,
 #     seeded from MOCA_EGRESS_ALLOW in the environment or else the GitHub hosts, so an operator's
 #     edit survives a re-run. Restart moca-egress by hand after editing it or rebuilding the binary.
-#   - --no-egress installs the worker without MOCA_EGRESS_CONTROL_SOCK and installs no egress unit.
+#   - The worker's Wants=/After=moca-egress.service is its own drop-in,
+#     sbx-worker@<id>.service.d/egress.conf, never the shared unit's.
+#   - --no-egress installs the worker without MOCA_EGRESS_CONTROL_SOCK, the drop-in or an egress unit,
+#     so it never starts any moca-egress.service the host has; --egress warns only about egress workers.
 #
 # Touches ONLY its own files: the template unit, sbx.slice, sbx-<id>.slice, $SBX_ENV_DIR, and the
 # worker's directories under $SBX_SRV. Never another install on the same host. Every file it writes
@@ -381,6 +384,9 @@ warn_untrusting_workers() {
     id="$(basename "$f" .env)"
     img="$(env_value SH_SNAPSHOT_IMAGE "$f")"
     [[ -n "$img" ]] || continue
+    # A --no-egress worker's guest has no network, so it never meets the CA: no warning for it
+    # (bm1, 2026-10-31: eight offline SWE-bench workers each got one).
+    [[ -n "$(env_value MOCA_EGRESS_CONTROL_SOCK "$f")" ]] || continue
     got="$(snapshot_ca_fingerprint "$img")"
     [[ -n "$got" && "$got" == "$want" ]] ||
       printf "WARNING: worker %s runs snapshot %s, which does not trust this host's CA; guests will see TLS failures on intercepted hosts until it is reinstalled on a snapshot built with --egress-ca\n" "$id" "$img" >&2
@@ -480,6 +486,18 @@ install_worker() {
   chmod 0600 "$SBX_ENV_DIR/workers/$id.env"
   printf '[Unit]\nDescription=SBX0 sandbox worker %s (slice)\n\n[Slice]\nMemorySwapMax=0\n' "$id" \
     >"$SBX_UNIT_DIR/sbx-$id.slice"
+  # The worker's dependency on moca-egress, only with egress: Wants= + After=, not Requires=, so a
+  # moca-egress restart does not stop the worker (why: deploy/microvm/moca-egress.service). A
+  # re-install with --no-egress removes it.
+  local dropin_dir="$SBX_UNIT_DIR/sbx-worker@$id.service.d"
+  if [[ -n "$NO_EGRESS" ]]; then
+    rm -f "$dropin_dir/egress.conf"
+    rmdir "$dropin_dir" 2>/dev/null || true
+  else
+    install -d -m 0755 "$dropin_dir"
+    printf '[Unit]\nAfter=moca-egress.service\nWants=moca-egress.service\n' >"$dropin_dir/egress.conf"
+    chmod 0644 "$dropin_dir/egress.conf"
+  fi
   record "worker sbx-worker@$id $SBX_ENV_DIR/workers/$id.env $SBX_UNIT_DIR/sbx-$id.slice"
   systemctl daemon-reload
   # enable, then exactly one restart: a first install starts the unit, a re-install picks up the new
@@ -701,7 +719,9 @@ uninstall_worker() {
   systemctl disable --now "sbx-worker@$id.service" || true
   # A stop that hit TimeoutStopSec can leave the worker's VMs in its slice; stopping the slice ends them.
   systemctl stop "sbx-$id.slice" || true
-  rm -f "$SBX_ENV_DIR/workers/$id.env" "$SBX_ENV_DIR/workers/$id-relay-ca.crt" "$SBX_UNIT_DIR/sbx-$id.slice"
+  rm -f "$SBX_ENV_DIR/workers/$id.env" "$SBX_ENV_DIR/workers/$id-relay-ca.crt" "$SBX_UNIT_DIR/sbx-$id.slice" \
+    "$SBX_UNIT_DIR/sbx-worker@$id.service.d/egress.conf"
+  rmdir "$SBX_UNIT_DIR/sbx-worker@$id.service.d" 2>/dev/null || true
   # Fixed strings, so worker `a` never takes `ba`'s lines: `@a ` and `/a-relay-ca.crt` are not
   # substrings of `@ba ` and `/ba-relay-ca.crt`.
   [[ ! -f "$SBX_ENV_DIR/manifest" ]] || drop_manifest_lines -e "worker sbx-worker@$id " -e "/$id-relay-ca.crt"

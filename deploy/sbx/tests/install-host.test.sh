@@ -355,14 +355,27 @@ grep -qx 'ExecStart=/usr/local/bin/moca-egress' "$U" || fail 'egress unit lost i
 [[ "$(mode "$E")" == 644 ]] || fail "the egress env file is not 0644 ($(mode "$E"))"
 grep -qx 'MOCA_EGRESS_ALLOW=api.github.com,github.com,codeload.github.com,objects.githubusercontent.com' "$E" || fail 'allowlist not seeded'
 grep -qx 'MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock' "$SBX_ENV_DIR/workers/sbx_eg.env" || fail 'worker not wired to the egress socket'
-grep '^After=' "$SBX_UNIT_DIR/sbx-worker@.service" | grep -q 'moca-egress.service' || fail 'worker not ordered after moca-egress'
-grep '^Wants=' "$SBX_UNIT_DIR/sbx-worker@.service" | grep -q 'moca-egress.service' || fail 'worker does not want moca-egress'
+D="$SBX_UNIT_DIR/sbx-worker@sbx_eg.service.d/egress.conf"
+[[ "$(cat "$D" 2>/dev/null)" == $'[Unit]\nAfter=moca-egress.service\nWants=moca-egress.service' ]] || fail "the egress worker's drop-in is not After=/Wants=moca-egress: $(cat "$D" 2>&1)"
+! grep -v '^#' "$SBX_UNIT_DIR/sbx-worker@.service" | grep -q 'moca-egress' || fail 'the shared worker unit names moca-egress: every worker would start it'
 grep -qx 'systemctl enable moca-egress.service' "$MOCK_LOG" || fail 'moca-egress not enabled'
 e="$(grep -nx 'systemctl restart moca-egress.service\|systemctl start moca-egress.service' "$MOCK_LOG" | head -1 | cut -d: -f1)"
 w="$(grep -nx 'systemctl restart sbx-worker@sbx_eg.service' "$MOCK_LOG" | cut -d: -f1)"
 [[ -n "$e" && -n "$w" ]] && ((e < w)) || fail "moca-egress not started before the worker (egress line '$e', worker line '$w')"
 grep -qx "egress unit $U $(sha_of "$U")" "$EM" && grep -qx "egress file $E $(sha_of "$E")" "$EM" || fail "egress files and their digests not in the manifest: $(cat "$EM")"
 pass 'installs moca-egress before the worker, seeds the allowlist, wires the socket, records it'
+
+# A --no-egress worker never depends on moca-egress, whatever unit of it the host has (bm1,
+# 2026-10-31: one did start another install's); re-installing the egress worker with --no-egress
+# drops its drop-in, and --uninstall removes it.
+bash "$INSTALL" "$(bundle sbx_noeg)" --snapshot default --no-egress >"$TMP/out" 2>&1 || fail "install --no-egress beside an egress worker: $(cat "$TMP/out")"
+[[ ! -e "$SBX_UNIT_DIR/sbx-worker@sbx_noeg.service.d" ]] || fail 'a --no-egress worker got a moca-egress drop-in'
+bash "$INSTALL" "$(bundle sbx_eg)" --snapshot default --no-egress >"$TMP/out" 2>&1 || fail 're-install the egress worker with --no-egress'
+[[ ! -e "$SBX_UNIT_DIR/sbx-worker@sbx_eg.service.d" ]] || fail 'a re-install with --no-egress kept the moca-egress drop-in'
+bash "$INSTALL" "$(bundle sbx_eg)" --snapshot default >"$TMP/out" 2>&1 || fail 're-install the egress worker with egress'
+[[ -f "$D" ]] || fail 'the drop-in did not come back with egress'
+bash "$INSTALL" --uninstall sbx_noeg >"$TMP/out" 2>&1 || fail 'uninstall the --no-egress worker'
+pass 'only an egress worker depends on moca-egress (its own drop-in); --no-egress drops it'
 
 # A second worker shares the one moca-egress: nothing to restart, and the unit stays when one worker goes.
 : >"$MOCK_LOG"
@@ -576,8 +589,15 @@ for case in missing mismatch; do
   grep -qF "WARNING: worker sbx_cr runs snapshot fpwarn, which does not trust this host's CA; guests will see TLS failures on intercepted hosts until it is reinstalled on a snapshot built with --egress-ca" "$TMP/out" ||
     fail "no warning for a $case fingerprint"
 done
+# A --no-egress worker's guest has no network: no warning for it, whatever its snapshot.
+cp "$SBX_ENV_DIR/workers/sbx_cr.env" "$SBX_ENV_DIR/workers/sbx_off.env"
+sed -i.bak -e '/^MOCA_EGRESS_CONTROL_SOCK=/d' "$SBX_ENV_DIR/workers/sbx_off.env" && rm -f "$SBX_ENV_DIR/workers/sbx_off.env.bak"
+bash "$INSTALL" --egress "$(ebundle)" >"$TMP/out" 2>&1 || fail '--egress beside a --no-egress worker'
+grep -q 'WARNING: worker sbx_cr runs snapshot fpwarn' "$TMP/out" || fail 'the egress worker on an untrusting snapshot is no longer warned about'
+! grep -q 'WARNING: worker sbx_off' "$TMP/out" || fail 'a --no-egress worker was warned about'
+rm -f "$SBX_ENV_DIR/workers/sbx_off.env"
 sed -i.bak 's/^SH_SNAPSHOT_IMAGE=.*/SH_SNAPSHOT_IMAGE=fpok/' "$SBX_ENV_DIR/workers/sbx_cr.env" && rm -f "$SBX_ENV_DIR/workers/sbx_cr.env.bak"
-pass '--egress warns for a worker whose snapshot lacks or mismatches the CA fingerprint, and stays quiet for a match'
+pass '--egress warns for a worker whose snapshot lacks or mismatches the CA fingerprint, and stays quiet for a match or a --no-egress worker'
 
 # Uninstall: the drop-in, token and api CA go; the CA stays.
 bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress for the uninstall case'

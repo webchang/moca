@@ -5,11 +5,12 @@
 # AssertMemory (the budget is per worker, set in the env file).
 [Unit]
 Description=SBX0 sandbox worker %i (microvm-worker)
-# moca-egress.service is the host's guest-egress proxy (install-host.sh installs it, or reuses the
-# P6 one). Wants= + After=, not Requires=: a moca-egress restart must not stop the workers. Why:
-# deploy/microvm/moca-egress.service. A --no-egress host has no such unit, and Wants= ignores that.
-After=network-online.target moca-egress.service
-Wants=network-online.target moca-egress.service
+# No dependency on moca-egress.service here: a worker installed with egress gets one from its own
+# drop-in (sbx-worker@<id>.service.d/egress.conf, install-host.sh), and a --no-egress worker gets
+# none. In this shared unit it made every worker, --no-egress ones too, start whatever
+# moca-egress.service the host had, another install's included (bm1, 2026-10-31).
+After=network-online.target
+Wants=network-online.target
 # As deploy/microvm/microvm-worker.service: fail loudly without KVM, and stop restarting a broken worker after 5 tries in 5 minutes.
 AssertPathExists=/dev/kvm
 StartLimitIntervalSec=300

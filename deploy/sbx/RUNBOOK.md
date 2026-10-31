@@ -393,7 +393,9 @@ adds each command's first 200 bytes as `cmd`.
 
 `install-host.sh` installs and starts one `moca-egress` per host (`moca-egress.service`) before the
 worker, and wires every template worker to its control socket
-(`MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock` in the worker env). A sandbox can then reach
+(`MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock` in the worker env), with a drop-in
+`sbx-worker@<id>.service.d/egress.conf` that orders the worker after `moca-egress`. A `--no-egress`
+worker gets neither, so it never starts a `moca-egress.service` that the host has. A sandbox can then reach
 only the hosts on the allowlist; everything else is refused with a named error (`destination_denied`),
 never a timeout. No credential is involved.
 
