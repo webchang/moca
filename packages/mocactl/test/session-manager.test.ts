@@ -207,6 +207,45 @@ describe('ActiveSession', () => {
     expect(events.at(-1)).toEqual({ kind: 'turn-end', outcome: 'done' });
   });
 
+  it("passes the 503's reason on to the retrying event", async () => {
+    const empty = new ApiError(
+      'harness',
+      503,
+      'sandbox_unavailable',
+      "no attached sandbox in sandbox tier 'container'",
+      5,
+    );
+    const { session, events } = await started([{ error: empty }, { frames: [doneFrame()] }]);
+    session.submit('p');
+    await session.idle();
+    expect(events).toContainEqual({
+      kind: 'retrying',
+      seconds: 5,
+      reason: "no attached sandbox in sandbox tier 'container'",
+    });
+  });
+
+  it('with maxCapacityWaitMs, stops waiting once the next wait would pass it, and fails with the 503', async () => {
+    const { session, slept, ends } = await started(
+      [
+        { error: harnessError(503, 'sandbox_unavailable', 5) },
+        { error: harnessError(503, 'sandbox_unavailable', 5) },
+        { error: harnessError(503, 'sandbox_unavailable', 5) },
+        { frames: [doneFrame()] },
+      ],
+      { maxCapacityWaitMs: 10_000 },
+    );
+    session.submit('p');
+    await session.idle();
+    expect(slept).toEqual([5000, 5000]);
+    const [end] = ends();
+    expect(end).toMatchObject({ kind: 'turn-end', outcome: 'error' });
+    expect((end as { error?: ApiError }).error).toMatchObject({
+      status: 503,
+      code: 'sandbox_unavailable',
+    });
+  });
+
   it('cancel during a Retry-After wait ends the turn as cancelled', async () => {
     const waitForAbort = (_ms: number, signal?: AbortSignal) =>
       new Promise<void>((r) => signal?.addEventListener('abort', () => r(), { once: true }));

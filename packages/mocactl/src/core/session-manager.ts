@@ -55,7 +55,7 @@ export type SessionEvent =
   | { kind: 'attach-none'; missed: boolean }
   | { kind: 'frame'; frame: TurnFrame }
   | { kind: 'notice'; text: string; tone: 'info' | 'warning' | 'error' }
-  | { kind: 'retrying'; seconds: number }
+  | { kind: 'retrying'; seconds: number; reason?: string }
   | { kind: 'turn-end'; outcome: 'done' | 'error' | 'cancelled'; error?: Error }
   | { kind: 'queue'; size: number };
 
@@ -74,6 +74,13 @@ export interface SessionDeps {
   cancelTimeoutMs?: number;
   /** How long an Esc before the first frame waits for it (default PENDING_CANCEL_MS). */
   pendingCancelMs?: number;
+  /**
+   * The most a turn waits, in total, on the harness's "no capacity, retry after N s" before it fails
+   * with that refusal (default: no bound, as the TUI, where a person can press Esc). Headless sets
+   * one: a script cannot, and a tier with no worker never gains capacity by waiting (bm1,
+   * 2026-10-31: a session retried an empty tier for 10 minutes).
+   */
+  maxCapacityWaitMs?: number;
 }
 
 type PromptJob = { kind: 'prompt'; prompt: string; resend: boolean; conflicts: number };
@@ -604,6 +611,7 @@ export class ActiveSession {
     this.emit({ kind: 'turn-start', prompt });
     let reminted = false;
     let streamed = false;
+    let waitedMs = 0;
     const ids: Cursor = { frames: 0 };
     try {
       for (;;) {
@@ -688,7 +696,14 @@ export class ActiveSession {
             throw err.code === 'session_mismatch' ? err : new HarnessUntrustedError();
           }
           if (err.status === 503 && err.retryAfterS !== undefined) {
-            this.emit({ kind: 'retrying', seconds: err.retryAfterS });
+            const max = this.deps.maxCapacityWaitMs;
+            if (max !== undefined && waitedMs + err.retryAfterS * 1000 > max) throw err;
+            this.emit({
+              kind: 'retrying',
+              seconds: err.retryAfterS,
+              ...(err.message && err.message !== err.code ? { reason: err.message } : {}),
+            });
+            waitedMs += err.retryAfterS * 1000;
             await this.deps.sleep(err.retryAfterS * 1000, controller.signal);
             if (controller.signal.aborted) throw new TurnCancelledError();
             continue;

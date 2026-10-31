@@ -13,6 +13,7 @@ import {
   devicePrompt,
   cmdPromote,
   cmdRun,
+  HEADLESS_CAPACITY_WAIT_MS,
   type Io,
 } from '../src/headless.js';
 import type { Runtime } from '../src/runtime.js';
@@ -235,6 +236,46 @@ describe('cmdRun', () => {
     const calls = (rt.cp as unknown as { calls: string[] }).calls;
     expect(calls).toContain('mintSessionToken');
     expect(calls).not.toContain('createSession');
+  });
+
+  it('refuses an empty --session instead of starting a new session', async () => {
+    const o = io();
+    const rt = runtime();
+    expect(await cmdRun(rt, o, { prompt: 'hi', session: '', options: {}, json: false })).toBe(2);
+    expect(o.stderr.join('\n')).toContain('--session needs a session id');
+    const calls = (rt.cp as unknown as { calls: string[] }).calls;
+    expect(calls).not.toContain('createSession');
+    expect(calls).not.toContain('mintSessionToken');
+  });
+
+  it("prints the harness's reason beside 'no capacity', terminal-safe", async () => {
+    const o = io();
+    const busy = new ApiError(
+      'harness',
+      503,
+      'sandbox_unavailable',
+      "no attached sandbox in sandbox tier 'container'\u001b[2J",
+      5,
+    );
+    const rt = runtime({
+      harness: fakeHarness([{ error: busy }, { frames: [doneFrame('s-new')] }]),
+    });
+    expect(await cmdRun(rt, o, { prompt: 'hi', options: {}, json: false })).toBe(0);
+    const line = o.stderr.find((l) => l.includes('no capacity')) ?? '';
+    expect(line).toContain("(no attached sandbox in sandbox tier 'container'");
+    expect(line).not.toMatch(/\u001b/);
+  });
+
+  it('gives up on "no capacity" after HEADLESS_CAPACITY_WAIT_MS and exits 1', async () => {
+    const o = io();
+    const busy = new ApiError('harness', 503, 'sandbox_unavailable', undefined, 600);
+    const rt = runtime({
+      harness: fakeHarness(Array.from({ length: 5 }, () => ({ error: busy }))),
+    });
+    expect(await cmdRun(rt, o, { prompt: 'hi', options: {}, json: false })).toBe(1);
+    // 600 s a wait: one fits in 15 min, the second would pass it.
+    expect(o.stderr.filter((l) => l.includes('retrying in 600s'))).toHaveLength(1);
+    expect(HEADLESS_CAPACITY_WAIT_MS).toBe(15 * 60 * 1000);
   });
 
   it('strips escape sequences from reply text written to the terminal', async () => {
