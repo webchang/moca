@@ -149,12 +149,14 @@ container worker), and only if that workspace is not seeded yet:
 ## 7. Configuration and deployment
 
 - Control plane: `SH_SANDBOX_TEMPLATES` (harness profile), alongside `SH_SANDBOX_TIERS`.
-- Workers: `SANDBOX_TEMPLATE=<id>` in a templated worker's env file. For a P4 worker on the VM path,
-  `microvm-worker.env`; the snapshot is any `template-build.sh` snapshot, named by
-  `SH_SNAPSHOT_IMAGE`.
-- One worker per template: a second template on a host is a second `microvm-worker` with its own
-  `SANDBOX_ID`, snapshot and template (the VM path's units are written for one worker today; a
-  multi-worker VM install is a follow-up, `deploy/sbx/install-host.sh` already does it for SBX0).
+- Workers: `SANDBOX_TEMPLATE=<id>` in a templated worker's env file. One worker per template.
+- On the VM path, a templated worker is a **second** P4 worker beside the untemplated main one:
+  `deploy/microvm/setup-microvm.sh --template <id> --snapshot <dir> [--budget-mb N] [--egress]`
+  installs it from a template unit (`microvm-worker@.service`, instance `tpl_<id>`) in its own slice
+  (a worker sweeps its parent cgroup at start, so two never share one), with its own relay token,
+  env file, and workspace and jail roots; `--uninstall-template <id>` removes exactly that. The
+  snapshot is any `template-build.sh` snapshot. SBX0's `deploy/sbx/install-host.sh` does the same for
+  its workers.
 
 ## 8. Testing
 

@@ -320,30 +320,38 @@ as prose. If you are reading an older worker's logs, that is what a budget ceili
 
 A session can name a **sandbox template** (`mocactl run --option sandboxTemplate=ID`; the design is
 [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../docs/specs/2026-10-30-session-sandbox-templates-design.md)).
-To make this host's worker serve a template:
+A templated worker is a **second** P4 worker beside the main one, which stays untemplated for
+sessions that name no template and for leaves (`/runs`):
 
-1. Build the template's snapshot, for example with `deploy/sbx/template-onboarding/template-build.sh`
-   ([`deploy/sbx/template-onboarding/ONBOARDING.md`](../sbx/template-onboarding/ONBOARDING.md)), into `/srv/snapshots/<snapshot>`.
-2. Add two lines to `/etc/serverless-harness/microvm-worker.env` (the installer keeps lines it does
-   not own) and restart the worker:
+1. Build the template's snapshot, for example with
+   [`template-build.sh`](../sbx/template-onboarding/template-build.sh)
+   ([the onboarding folder](../sbx/template-onboarding/README.md)). Any directory holding its
+   `manifest.json` will do; `template-build.sh` writes `/srv/sbx/snapshots/<snapshot>`.
+2. Install the worker, after the main install:
 
    ```bash
-   SANDBOX_TEMPLATE=<id>          # the template id sessions name: the label moca.dev/template
-   SH_SNAPSHOT_IMAGE=<snapshot>   # its snapshot under /srv/snapshots
+   sudo deploy/microvm/setup-microvm.sh --template <id> --snapshot /srv/sbx/snapshots/<snapshot>
    ```
 
-   If the snapshot's guest is not 256 MiB, set `SH_GUEST_RAM_MB` to its `guest_ram_mb` too.
+   It installs the template unit `microvm-worker@.service` and runs instance `tpl_<id>` (dashes as
+   underscores) **in its own slice**, so neither worker's start-up sweep can kill the other's VMs.
+   Its own relay token (a separate env file, loaded into `sh-relay` by its own drop-in), workspace
+   and jail roots (`/srv/moca-templates/<id>`), `SANDBOX_TEMPLATE=<id>`, and the snapshot's guest RAM
+   from its manifest. The budget defaults to one session's worth, `(guest + 32) × 3 + 1024` MiB;
+   `--budget-mb N` raises it. The guest has **no network** unless `--egress` is given. It restarts
+   `sh-relay` once to load the token, never the main worker, and waits until the new worker attaches.
+   A re-run changes nothing and keeps the token.
 
 3. Declare it to the control plane: `SH_SANDBOX_TEMPLATES` in `control-plane.env`, a JSON list of
    `{id, worker, description, tools, seed?}`, then restart `sh-control-plane`.
 
-From then on this worker serves only sessions of that template: **a session with no template never
-lands on it.** Leaves (`/runs`) name no template either, so keep at least one untemplated worker (a
-container sandbox, or a second P4 worker) for them. The template's `seed`, if any, runs once in each
-new session's workspace before the agent's first tool call.
+Remove it with `sudo deploy/microvm/setup-microvm.sh --uninstall-template <id>`. That removes exactly
+what `--template` wrote (the template unit and its parent slice go with the last templated worker)
+and keeps workspace data.
 
-This installer manages one P4 worker per host. Several templates on one host need one worker each;
-`deploy/sbx/install-host.sh` does that for SBX0, and a multi-worker install for P6 is not built yet.
+From then on that worker serves only sessions of that template: **a session with no template never
+lands on it.** The template's `seed`, if any, runs once in each new session's workspace before the
+agent's first tool call.
 
 ## Run a turn
 

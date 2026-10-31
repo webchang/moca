@@ -42,6 +42,7 @@ These are part of the same flow but live with the code they belong to.
 | [`../../microvm/build-rootfs.sh`](../../microvm/build-rootfs.sh)     | image → rootfs tree (called by `template-build.sh`)                                                                                          |
 | [`../../microvm/build-snapshot.sh`](../../microvm/build-snapshot.sh) | rootfs → golden snapshot; `--verify-command` runs the probe (called by `template-build.sh`)                                                  |
 | [`../../microvm/P4-ON-P6.md`](../../microvm/P4-ON-P6.md)             | building snapshots by hand, and [a templated P4 worker for MOCA sessions](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates) |
+| [`../../microvm/setup-microvm.sh`](../../microvm/setup-microvm.sh)   | MOCA-VM (P6+P4): `--template ID --snapshot DIR` installs a templated P4 worker for MOCA sessions; `--uninstall-template ID` removes it       |
 
 **Using a template:**
 
