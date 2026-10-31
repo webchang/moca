@@ -168,7 +168,8 @@ artifact works.
 --skip-git-identity-check  do not require a usable git identity in the guest (for images
                            that refuse agent commits on purpose; default: required, #415).
 --guest-home /tmp/DIR      export HOME=DIR to guest commands, created by init on the /tmp
-                           tmpfs (default: unset, so commands see the kernel's HOME=/ on a
+                           tmpfs, with the image's /root/.gitconfig and /root/.config/git copied
+                           in (default: unset, so commands see the kernel's HOME=/ on a
                            read-only rootfs). Must be a path under /tmp.
 --vcpus N                  the guest's vCPU count, 1-32 (default 1, as before), recorded in the
                            manifest; every VM restored from the snapshot has it.
@@ -697,6 +698,15 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 mount -t tmpfs tmpfs /var
+# The links a userspace /dev normally has and the kernel's devtmpfs does not: without /dev/fd,
+# bash's process substitution (<(...), >(...)) expands to /dev/fd/63 and fails "No such file or
+# directory", and tools reading /dev/stdin fail the same way (TB's rule-v5 check, 2026-10-31).
+# Never fatal: a /dev that cannot take them must not stop the guest booting;
+# check_dev_fd fails the build instead.
+[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd || true
+[ -e /dev/stdin ] || ln -s /proc/self/fd/0 /dev/stdin || true
+[ -e /dev/stdout ] || ln -s /proc/self/fd/1 /dev/stdout || true
+[ -e /dev/stderr ] || ln -s /proc/self/fd/2 /dev/stderr || true
 
 # Fix-round-4 item 1: the kernel hands init an essentially empty environment --
 # no PATH at all. This script never needed one (every command above is called
@@ -748,8 +758,15 @@ exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-list
 INIT
   # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
   # /tmp is already mounted; the agent inherits init's environment, and so does every command.
+  # The image's own HOME (root's, /root) keeps the user-level git config an image may carry
+  # there (its identity, safe.directory): the new HOME starts empty, so without the copy a
+  # `git commit` that works in the image fails in the guest with no identity (TB's fix-git
+  # check, 2026-10-31). Only git's files, and only if present; an image that refuses commits
+  # on purpose has none to copy.
   if [ -n "$GUEST_HOME" ]; then
     sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
+[ ! -f /root/.gitconfig ] || cp /root/.gitconfig $GUEST_HOME/.gitconfig || true\\
+[ ! -d /root/.config/git ] || { mkdir -p $GUEST_HOME/.config \\&\\& cp -R /root/.config/git $GUEST_HOME/.config/git; } || true\\
 export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
     grep -qx "export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init" || {
       echo "build-snapshot.sh: could not add HOME=$GUEST_HOME to init" >&2
@@ -1099,6 +1116,24 @@ check_egress_listener() {
     echo "  pointing at nothing (P4.1). The init must exec the agent with" >&2
     echo "  --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 -- or guest_client could" >&2
     echo "  not reach the guest at all, in which case its diagnostics follow. Output: $out" >&2
+    exit 1
+  fi
+}
+
+# check_dev_fd: the guest must have /dev/fd and /dev/std* (init links them), or every agent
+# command using bash process substitution fails in the sandbox. Same failure style as
+# check_egress_listener: loud, at build time.
+check_dev_fd() {
+  local uds="$1"
+  local out rc
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
+    -command 'cat <(echo fd-ok) && echo stdin-ok | cat /dev/stdin' \
+    2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "fd-okstdin-ok" ]; then
+    echo "build-snapshot.sh: the guest has no working /dev/fd or /dev/stdin (exit $rc)." >&2
+    echo "  bash's <(...) and >(...) would fail in every sandbox restored from this snapshot." >&2
+    echo "  The init links /dev/fd -> /proc/self/fd; its /dev must be writable (devtmpfs) --" >&2
+    echo "  or guest_client could not reach the guest at all. Output: $out" >&2
     exit 1
   fi
 }
@@ -1658,6 +1693,7 @@ boot_quiesce_snapshot_firecracker() {
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
+  check_dev_fd "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create; the VM stays paused because create has no resume field at all)"
@@ -1832,6 +1868,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
+  check_dev_fd "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (ch-remote pause + snapshot, no resume afterwards)"

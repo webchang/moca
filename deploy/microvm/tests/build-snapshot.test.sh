@@ -1655,6 +1655,21 @@ check "check_egress_listener is called as often as check_git_identity" \
   "$(grep -c '^  check_egress_listener "' "$SCRIPT")" "$(grep -c '^  check_git_identity "' "$SCRIPT")"
 check "at least one VMM arm calls check_egress_listener" \
   "$([ "$(grep -c '^  check_egress_listener "' "$SCRIPT")" -ge 2 ] && echo yes || echo no)" "yes"
+
+echo "== the guest has /dev/fd and /dev/std* (bash process substitution), checked at build time"
+init_text="$(sed -n "/^  cat >\"\$STAGE\/rootfs-tree\/sbin\/init\" <<'INIT'\$/,/^INIT\$/p" "$SCRIPT")"
+for l in '/proc/self/fd /dev/fd' '/proc/self/fd/0 /dev/stdin' '/proc/self/fd/1 /dev/stdout' '/proc/self/fd/2 /dev/stderr'; do
+  check "init links ${l#* } -> ${l%% *}, never fatally" \
+    "$(printf '%s\n' "$init_text" | grep -cF "ln -s $l || true")" "1"
+done
+check "the links come after /proc is mounted" \
+  "$(printf '%s\n' "$init_text" | awk '/^mount -t proc/{p=NR} /ln -s \/proc\/self\/fd \/dev\/fd/{l=NR} END{print (p && l > p) ? "yes" : "no"}')" "yes"
+check "check_dev_fd runs <(...) and reads /dev/stdin in the guest" \
+  "$([ "$(fn_body check_dev_fd | grep -cF 'cat <(echo fd-ok) && echo stdin-ok | cat /dev/stdin')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_dev_fd fails the build" \
+  "$([ "$(fn_body check_dev_fd | grep -cF 'exit 1')" -ge 1 ] && echo yes || echo no)" "yes"
+check "check_dev_fd is called as often as check_git_identity" \
+  "$(grep -c '^  check_dev_fd "' "$SCRIPT")" "$(grep -c '^  check_git_identity "' "$SCRIPT")"
 # T7 regression fence: a NIC arriving quietly would void the no-network property.
 check "no network-interfaces config anywhere in the build" \
   "$(grep -c 'network-interfaces' "$SCRIPT")" "0"
@@ -1846,11 +1861,15 @@ check "the refusal names the rule" \
 if sed --version >/dev/null 2>&1; then
   t="$(mktemp)"
   printf '#!/bin/sh\nmount -t tmpfs -o mode=1777 tmpfs /tmp\nexport PATH=/usr/bin:/bin\nexec agent\n' >"$t"
-  GUEST_HOME=/tmp/home
-  sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
-export HOME=$GUEST_HOME" "$t"
-  check "init gets mkdir + export HOME right after PATH" \
-    "$(sed -n '4,5p' "$t" | tr '\n' '|')" "mkdir -p /tmp/home|export HOME=/tmp/home|"
+  GUEST_HOME=/tmp/home # read by the eval'd block below
+  export GUEST_HOME
+  STAGE="$(mktemp -d)"; mkdir -p "$STAGE/rootfs-tree/sbin"; cp "$t" "$STAGE/rootfs-tree/sbin/init"
+  eval "$(sed -n '/^  if \[ -n "\$GUEST_HOME" \]; then/,/^  fi/p' "$SCRIPT")"
+  cp "$STAGE/rootfs-tree/sbin/init" "$t"; rm -rf "$STAGE"
+  check "init gets mkdir, the copy of root's git config and export HOME right after PATH" \
+    "$(sed -n '4,7p' "$t" | tr '\n' '|')" \
+    "mkdir -p /tmp/home|[ ! -f /root/.gitconfig ] || cp /root/.gitconfig /tmp/home/.gitconfig || true|[ ! -d /root/.config/git ] || { mkdir -p /tmp/home/.config && cp -R /root/.config/git /tmp/home/.config/git; } || true|export HOME=/tmp/home|"
+  check "the init stays valid sh" "$(sh -n "$t" && echo yes || echo no)" "yes"
   check "init still execs the agent last" "$(tail -1 "$t")" "exec agent"
   rm -f "$t"
 else
