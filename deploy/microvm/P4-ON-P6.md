@@ -159,7 +159,14 @@ Opt-in flags, all off by default (a default build is unchanged):
   purpose (a benchmark testbed whose patch must stay a diff against a fixed baseline). The skip is
   logged.
 - `--guest-home /tmp/DIR`: give guest commands a writable `HOME`, created by init on the `/tmp`
-  tmpfs. The default `HOME=/` is on the read-only rootfs.
+  tmpfs. The default `HOME=/` is on the read-only rootfs. Init copies the image's root git config
+  (`/root/.gitconfig`, `/root/.config/git`) into it, so an identity set with `git config --global` in
+  the image still applies.
+
+Every snapshot's init also links `/dev/fd` and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` to
+`/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. The build
+checks both in the guest and fails without them.
+
 - `--verify-command CMD` (with `--verify-timeout-s N`, 1-86400, default 600): what the last step
   runs in the restored VM in place of `true`. It's a bash command, run in `/workspace` once it's
   mounted the way a worker mounts it, so it can seed a template's workspace and probe it (say, run a
