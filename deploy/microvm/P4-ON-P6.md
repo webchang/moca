@@ -335,19 +335,30 @@ sessions that name no template and for leaves (`/runs`):
 
    It installs the template unit `microvm-worker@.service` and runs instance `tpl_<id>` (dashes as
    underscores) **in its own slice**, so neither worker's start-up sweep can kill the other's VMs.
-   Its own relay token (a separate env file, loaded into `sh-relay` by its own drop-in), workspace
-   and jail roots (`/srv/moca-templates/<id>`), `SANDBOX_TEMPLATE=<id>`, and the snapshot's guest RAM
-   from its manifest. The budget defaults to one session's worth, `(guest + 32) × 3 + 1024` MiB;
-   `--budget-mb N` raises it. The guest has **no network** unless `--egress` is given. It restarts
-   `sh-relay` once to load the token, never the main worker, and waits until the new worker attaches.
-   A re-run changes nothing and keeps the token.
+   It gets its own relay token (a separate env file, loaded into `sh-relay` by its own drop-in), its
+   own workspace and jail roots (`<snapshot dir>/.tpl/tpl_<id>`, on the snapshot's filesystem, since
+   the worker hardlinks between them; `MICROVM_TPL_SRV` picks another directory there),
+   `SANDBOX_TEMPLATE=<id>`, and the snapshot's guest RAM from its manifest. The budget defaults to one
+   session's worth, `(guest + 32) × 3 + 1024` MiB; `--budget-mb N` raises it. It restarts `sh-relay`
+   once to load the token, never the main worker, and waits until the new worker attaches. A re-run
+   changes nothing and keeps the token, the budget and the egress setting.
+   - **No network** unless `--egress`, and `--egress` is refused while another worker on the host uses
+     `moca-egress`, the main one included: moca-egress keys VM listeners by id (`vm-1`, …), which every
+     worker reuses, so two egress-on workers would cut each other's guests off.
+   - **A new snapshot is a new template worker** (another id): re-running with another `--snapshot` is
+     refused, so live sessions never change image under them.
+   - The jail path must stay short enough for the guest's egress socket (a Unix socket path, at most
+     107 bytes); a long one is refused before anything is written.
+   - Each templated worker's budget adds to the main worker's; nothing checks their sum against the
+     host's memory, so size them together.
 
 3. Declare it to the control plane: `SH_SANDBOX_TEMPLATES` in `control-plane.env`, a JSON list of
    `{id, worker, description, tools, seed?}`, then restart `sh-control-plane`.
 
-Remove it with `sudo deploy/microvm/setup-microvm.sh --uninstall-template <id>`. That removes exactly
-what `--template` wrote (the template unit and its parent slice go with the last templated worker)
-and keeps workspace data.
+Remove it with `sudo deploy/microvm/setup-microvm.sh --uninstall-template <id>`. That stops the worker
+and its slice (ending any VM still alive), removes exactly what `--template` wrote (the template unit
+and its parent slice go with the last templated worker), and keeps workspace data. `--template` is for
+a host with a local P6; `--remote` hosts are refused.
 
 From then on that worker serves only sessions of that template: **a session with no template never
 lands on it.** The template's `seed`, if any, runs once in each new session's workspace before the

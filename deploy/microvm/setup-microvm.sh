@@ -79,7 +79,7 @@ REMOTE_BUNDLE='' # --remote's directory; empty in local mode
 TPL_ID='' TPL_SNAPSHOT='' TPL_BUDGET_MB='' TPL_EGRESS='' TPL_UNINSTALL='' # --template / --uninstall-template
 TEMPLATE_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$' # the control plane's template id rule
 TPL_UNIT_SRC="microvm-worker@.service" # the template unit this script writes from microvm-worker.service
-TPL_SRV_ROOT="${MICROVM_TPL_SRV:-/srv/moca-templates}" # per-template workspace and jail roots
+TPL_SRV_ROOT="${MICROVM_TPL_SRV:-}" # per-template roots; default: beside the snapshot (template_main)
 B_ADDR='' B_ID='' B_TOKEN='' B_CA=''
 MEMORY_DROPIN="60-moca-memory.conf"
 TIERS_DROPIN="50-microvm-tiers.conf" # in sh-supervisor.service.d and sh-control-plane.service.d
@@ -672,6 +672,11 @@ install_template_unit() {
     -e 's|^Environment=SH_PARENT_CGROUP=.*|Environment=SH_PARENT_CGROUP=microvm.slice/microvm-tpl.slice/microvm-tpl-%i.slice|' \
     -e 's/^AssertMemory=.*/AssertMemory=>=4G/' \
     "$SCRIPT_DIR/microvm-worker.service" >"$stage/tpl.service"
+  # The two lines that keep this worker's VMs apart from the main worker's: if the shipped unit ever
+  # renames them, the sed above matches nothing and the instance would sweep the MAIN worker's slice.
+  grep -qx 'Slice=microvm-tpl-%i.slice' "$stage/tpl.service" &&
+    grep -qx 'Environment=SH_PARENT_CGROUP=microvm.slice/microvm-tpl.slice/microvm-tpl-%i.slice' "$stage/tpl.service" ||
+    die "could not derive the template unit from $SCRIPT_DIR/microvm-worker.service (its Slice= or SH_PARENT_CGROUP= line changed)"
   install_if_changed "$stage/tpl.service" "$SH_UNIT_DIR/$TPL_UNIT_SRC" 0644
 }
 
@@ -682,10 +687,53 @@ template_main() {
   # The main install is the prerequisite: its binary, its relay token drop-in pattern, its egress.
   [[ -f "$SH_UNIT_DIR/microvm-worker.service" && -x "$SH_BIN_DIR/microvm-worker" ]] ||
     die 'install the main P4 worker first: sudo deploy/microvm/setup-microvm.sh'
+  [[ -f "$SH_ENV_DIR/relay.env" && -f "$SH_UNIT_DIR/sh-relay.service" ]] ||
+    die "no local P6 relay ($SH_ENV_DIR/relay.env, sh-relay.service): a templated worker attaches to this host's relay"
   [[ -n "$TPL_SNAPSHOT" ]] || die '--template needs --snapshot DIR (a snapshot directory with manifest.json)'
   [[ -f "$TPL_SNAPSHOT/manifest.json" ]] || die "no snapshot at $TPL_SNAPSHOT (no manifest.json)"
   local snap_dir snap_name guest
   snap_dir="$(cd "$(dirname "$TPL_SNAPSHOT")" && pwd)" snap_name="$(basename "$TPL_SNAPSHOT")"
+  # A new snapshot is a new template worker (the versioned-update rule: old sandboxes drain on the
+  # old one), never this worker re-pointed under its live sessions.
+  local was
+  was="$(env_value SH_SNAPSHOT_IMAGE "$TPL_ENV" 2>/dev/null || true)"
+  [[ -z "$was" || "$was" == "$snap_name" ]] ||
+    die "template $TPL_ID's worker serves snapshot $was; a new snapshot is a new template worker (another id), or --uninstall-template $TPL_ID first"
+  # Unset flags keep what the install stored, so a re-run (to restart a failed worker, say) never
+  # changes its budget or egress behind the operator's back.
+  if [[ -z "$TPL_BUDGET_MB" ]]; then TPL_BUDGET_MB="$(env_value SH_MAX_COMMITTED_MB "$TPL_ENV" 2>/dev/null || true)"; fi
+  if [[ -z "$TPL_EGRESS" && -n "$(env_value MOCA_EGRESS_CONTROL_SOCK "$TPL_ENV" 2>/dev/null || true)" ]]; then TPL_EGRESS=1; fi
+  # moca-egress keys its listeners by VM id, and every worker names its VMs vm-1, vm-2, ...: two
+  # egress-on workers on one moca-egress would close each other's guests' listeners. Until moca-egress
+  # scopes ids per worker, a templated worker gets egress only while no other worker uses it.
+  if [[ -n "$TPL_EGRESS" ]]; then
+    local other
+    for other in "$SH_ENV_DIR/microvm-worker.env" "$SH_ENV_DIR"/microvm-worker-tpl_*.env; do
+      [[ -f "$other" && "$other" != "$TPL_ENV" ]] || continue
+      if [[ "$other" == "$SH_ENV_DIR/microvm-worker.env" ]]; then
+        # The main worker gets egress from the unit's Environment= (MOCA_EGRESS_CONTROL_SOCK), unless
+        # its env file blanks it.
+        grep -qx 'MOCA_EGRESS_CONTROL_SOCK=' "$other" && continue
+      else
+        [[ -n "$(env_value MOCA_EGRESS_CONTROL_SOCK "$other" 2>/dev/null || true)" ]] || continue
+      fi
+      die "--egress: $(basename "$other") already uses moca-egress, which keys VMs by id (vm-1, ...) across workers, so two egress-on workers would cut each other's guests off; leave this template offline"
+    done
+  fi
+  # Workspaces and the jail must share the snapshot's filesystem (Restore hardlinks the snapshot and
+  # workspace files into each VM's jail), and the jail path must stay short: the egress socket's
+  # longest path is <jail>/firecracker/vm-<20 digits>/root/run/v.sock_1025 and must fit a Unix
+  # socket path (108 bytes). So the roots default to <snapshot dir>/.tpl/<sid>.
+  local root="${TPL_SRV_ROOT:-$snap_dir/.tpl}/$TPL_SID"
+  local longest="$root/jail/firecracker/vm-99999999999999999999/root/run/v.sock_1025"
+  ((${#longest} < 108)) ||
+    die "the jail path $root/jail is too long for the guest's egress socket (${#longest} bytes, at most 107): set MICROVM_TPL_SRV to a shorter directory on the snapshot's filesystem"
+  install -d -m 0700 "$root/workspaces" "$root/jail"
+  local dev_snap dev_root
+  dev_snap="$(stat -c %d "$TPL_SNAPSHOT" 2>/dev/null || stat -f %d "$TPL_SNAPSHOT")"
+  dev_root="$(stat -c %d "$root" 2>/dev/null || stat -f %d "$root")"
+  [[ "$dev_snap" == "$dev_root" ]] ||
+    die "$root is on another filesystem than the snapshot $TPL_SNAPSHOT: the worker hardlinks between them"
   guest="$(sed -n 's/.*"guest_ram_mb"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$TPL_SNAPSHOT/manifest.json" | head -1)"
   [[ "$guest" =~ ^[1-9][0-9]*$ ]] || die "snapshot $TPL_SNAPSHOT has no guest_ram_mb in its manifest.json"
   # One session: the VM plus the unit's two standbys, each guest + 32 MiB, over a 1024 MiB reserve
@@ -713,7 +761,7 @@ template_main() {
       printf 'SANDBOX_TEMPLATE=%s\nSH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\nSH_GUEST_RAM_MB=%s\n' \
         "$TPL_ID" "$snap_dir" "$snap_name" "$guest"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_MEMORY_RESERVE_MB=1024\nSH_WORKSPACE_IDLE=%s\n' "$TPL_BUDGET_MB" "$MICROVM_WORKSPACE_IDLE"
-      printf 'SH_WORKSPACE_ROOT=%s/%s/workspaces\nSH_CHROOT_BASE=%s/%s/jail\n' "$TPL_SRV_ROOT" "$TPL_ID" "$TPL_SRV_ROOT" "$TPL_ID"
+      printf 'SH_WORKSPACE_ROOT=%s/workspaces\nSH_CHROOT_BASE=%s/jail\n' "$root" "$root"
       if [[ -n "$TPL_EGRESS" ]]; then printf 'MOCA_EGRESS_CONTROL_SOCK=%s\n' "$MOCA_EGRESS_SOCKET"; else printf 'MOCA_EGRESS_CONTROL_SOCK=\n'; fi
     } >"$stage/worker.env")
   unset token
@@ -726,7 +774,6 @@ template_main() {
     "$TPL_ID" "$TPL_ENV" >"$stage/worker.conf"
   install_if_changed "$stage/worker.conf" "$TPL_WORKER_DROPIN" 0644
   rm -rf "$stage"
-  install -d -m 0700 "$TPL_SRV_ROOT/$TPL_ID/workspaces" "$TPL_SRV_ROOT/$TPL_ID/jail"
   ((${#CHANGED[@]} == 0)) || systemctl daemon-reload
   if changed_any "$TPL_RELAY_DROPIN" "$TPL_RELAY_ENV"; then
     log "restarting sh-relay.service to load template $TPL_ID's worker token (in-flight turns fail and retry)"
@@ -748,7 +795,12 @@ template_main() {
 # Removes exactly what --template wrote for this id. The shared template unit and parent slice go only
 # with the last templated worker; workspace data is kept (as setup-microvm.sh never deletes data).
 template_uninstall() {
+  local root
+  root="$(env_value SH_WORKSPACE_ROOT "$TPL_ENV" 2>/dev/null || true)"
   systemctl disable --now "$TPL_UNIT" 2>/dev/null || true
+  # The VMs' cgroups are siblings of the unit under its slice, out of KillMode's reach: stopping the
+  # slice ends any VM still alive, or it would hold its memory with no worker left to sweep it.
+  systemctl stop "microvm-tpl-$TPL_SID.slice" 2>/dev/null || true
   remove_if_present "$TPL_WORKER_DROPIN"
   rmdir "$(dirname "$TPL_WORKER_DROPIN")" 2>/dev/null || true
   remove_if_present "$TPL_RELAY_DROPIN"
@@ -762,7 +814,7 @@ template_uninstall() {
     systemctl daemon-reload
     changed_any "$TPL_RELAY_DROPIN" && systemctl restart sh-relay.service
     podman exec sh-redis redis-cli HDEL sh:sandbox:records "$TPL_SID" >/dev/null || true
-    log "removed template $TPL_ID's worker $TPL_SID (workspace data kept under $TPL_SRV_ROOT/$TPL_ID)"
+    log "removed template $TPL_ID's worker $TPL_SID (workspace data kept${root:+ under ${root%/workspaces}})"
     log "changed: ${CHANGED[*]}"
   else
     log "nothing to change: no templated worker for $TPL_ID"
@@ -771,7 +823,13 @@ template_uninstall() {
 
 main() {
   parse_args "$@"
-  if [[ -n "$TPL_ID" ]]; then template_main; return; fi
+  if [[ -n "$TPL_ID" ]]; then
+    [[ -z "$REMOTE_BUNDLE" ]] || die '--template and --uninstall-template are for a local P6, not --remote'
+    [[ -z "$TPL_UNINSTALL" || -z "$TPL_SNAPSHOT$TPL_BUDGET_MB$TPL_EGRESS" ]] ||
+      die '--uninstall-template ID takes no --snapshot, --budget-mb or --egress'
+    template_main
+    return
+  fi
   [[ -z "$TPL_SNAPSHOT$TPL_BUDGET_MB$TPL_EGRESS" ]] || die '--snapshot, --budget-mb and --egress go with --template ID'
   preflight
   install_worker_binary

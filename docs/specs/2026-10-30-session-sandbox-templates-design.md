@@ -154,7 +154,10 @@ container worker), and only if that workspace is not seeded yet:
   `deploy/microvm/setup-microvm.sh --template <id> --snapshot <dir> [--budget-mb N] [--egress]`
   installs it from a template unit (`microvm-worker@.service`, instance `tpl_<id>`) in its own slice
   (a worker sweeps its parent cgroup at start, so two never share one), with its own relay token,
-  env file, and workspace and jail roots; `--uninstall-template <id>` removes exactly that. The
+  env file, and workspace and jail roots beside the snapshot; `--uninstall-template <id>` removes
+  exactly that. **Egress on one worker per host:** moca-egress keys VM listeners by id, which every
+  worker reuses (`vm-1`, …), so `--egress` is refused while another worker uses it, until moca-egress
+  scopes ids per worker. (The same limit applies to several egress-on SBX0 workers on one host.) The
   snapshot is any `template-build.sh` snapshot. SBX0's `deploy/sbx/install-host.sh` does the same for
   its workers.
 
