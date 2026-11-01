@@ -1,7 +1,8 @@
 # Sandbox templates for agent sessions — Design
 
 Version: 1.0 — October 2026
-Status: Proposed — implementation on branch `sbx-template` (webchang/moca), not yet proposed upstream
+Status: Implemented on branch `sbx-template` (webchang/moca), accepted live on a MOCA-VM on 2026-10-31
+(§8); not yet proposed upstream
 Builds on (reuse, no redesign): [P6.3](2026-10-04-p6-on-kubernetes-slice3-design.md) (sandbox tiers
 and session-to-sandbox affinity), [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (its
 templates: one `microvm-worker` per snapshot), `deploy/sbx/template-onboarding/ONBOARDING.md` (turning an image into a
@@ -173,4 +174,7 @@ container worker), and only if that workspace is not seeded yet:
 - **mocactl, unit:** the option field and request shape.
 - **Acceptance, MOCA-VM on bm1:** one untemplated P4 worker and one templated worker; a session with
   the template lands on the templated worker and finds the repository seeded; a session without
-  lands on the untemplated one.
+  lands on the untemplated one. **Passed on 2026-10-31** (templated worker installed with `setup-microvm.sh
+--template`, scripted mock model): the templated session ran on the templated worker with the
+  repository seeded, its second turn kept the workspace and did not seed again, the untemplated
+  session ran on the main worker, and an unknown template was refused at creation.

@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-10-31T03:47:42Z
+**Last modified:** 2026-11-01T02:05:23Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -114,6 +114,7 @@ A JSON file, schema `moca-sbx-template-spec/1`. Every field is checked before an
 | `guest_ram_mb`, `vcpus`   | the guest's size, fixed in the snapshot                                                                                 |
 | `guest_home`              | optional, a writable `HOME` under `/tmp` (the rootfs is read-only)                                                      |
 | `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose                                                               |
+| `guest_home_gitconfig`    | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check`         |
 | `egress`                  | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress                                       |
 | `seed`                    | a bash command that fills a new sandbox's empty `/workspace`, or `""`                                                   |
 | `probe`                   | `{cmd, timeout_s, expect_rc, expect[]}`: run after the seed in the restored VM; passes on the exit code and every regex |
@@ -131,8 +132,8 @@ wrong).
 
 MOCA's own sandbox image, `ghcr.io/rossoctl/moca-remote-worker`, is public, so this example needs no
 registry key. It is the image SBX0's `default` template ran on 2026-10-29 (built then with
-`build-snapshot.sh` directly); the same flow through `template-build.sh` is _(unverified with this
-exact spec)_.
+`build-snapshot.sh` directly). On 2026-10-31 this exact spec was built with `template-build.sh`
+(with `--egress-ca`, for egress credentials) and its probe passed in the restored VM.
 
 ### 4.1 Write the spec
 
@@ -335,8 +336,10 @@ bc34802 baseline
 
 The SWE-bench template also has no network (`egress: false`, checked on 2026-10-30:
 `connect: Network is unreachable`). `default`'s egress (`egress: true`, through the host's
-allowlisting proxy, so `git` and `curl` over HTTPS rather than raw TCP) is _(unverified)_: the
-2026-10-29 `default` worker was installed with `--no-egress`.
+allowlisting proxy, so `git` and `curl` over HTTPS rather than raw TCP) was checked on 2026-10-31
+with SBX0's egress credentials: a second user's sandbox cloned, committed and pushed a branch of a
+private repository with its stored PAT, which never entered the sandbox; another user's sandbox got
+`401`; deleting the credential revoked it within its cache TTL ([`smoke.sh`](../smoke.sh) step 7).
 
 What SBX0 guarantees, as checked live with two templates on 2026-10-29
 ([`deploy/sbx/templates-check.sh`](../templates-check.sh), 7 checks, 0 failed):
@@ -381,30 +384,39 @@ A templated P4 worker is installed beside the main one with `setup-microvm.sh --
 --snapshot DIR`; set-up is in [`P4-ON-P6.md`](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
 Only one worker per host may use guest egress (moca-egress keys VMs by id, which workers share), so
 the installer refuses `--egress` beside another worker that uses it.
-This is tested by unit and relay-integration tests; **a live MOCA-VM check is still to come**
-_(unverified on a live stack)_.
+Checked live on a MOCA-VM (P6+P4) on 2026-10-31, with a scripted mock model: a session naming
+`django-django-11133` ran on the templated worker with the repository seeded, its second turn kept
+the workspace and did not seed again, a session with no template ran on the untemplated worker, and
+an unknown template was refused at creation.
 
 ## 9. Capacity
 
-| Limit  | Rule                                                                                    | On a 188 GiB / ~100 GB-free host |
-| ------ | --------------------------------------------------------------------------------------- | -------------------------------- |
-| disk   | ~7.3 GB per 4 GiB-guest snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50) free | about 13 templates               |
-| memory | `--budget-mb` ≥ (guest + 32) × 3 + 1024 per worker; standbys charged at dirty-page cost | to be measured                   |
-| quotas | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                  | deployment settings              |
-| logins | a minted login lasts at most 24 h                                                       | —                                |
+Measured on one host (188 GiB, 93 GB free) on 2026-10-31, with SWE-bench templates of 4 GiB guests:
 
-A measured capacity test is planned; until then treat these as estimates.
+| Limit               | Rule                                                                                                                | Measured                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                          | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
+| memory per template | each attached worker keeps its snapshot's memory mapped, idle or not                                                | ~4.1 GiB each                                                                                           |
+| disk, sandboxes     | each seeded sandbox's workspace                                                                                     | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
+| commands at once    | `--budget-mb` ≥ (guest + 32) × 3 + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; 11 of 11 at 65536 MiB, with almost no real memory used                       |
+| quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                              | deployment settings                                                                                     |
+| logins              | a minted login lasts at most 24 h                                                                                   | —                                                                                                       |
+
+So on a host like this, disk limits templates and sandboxes before memory does, and the default
+budget allows far fewer commands at once than memory holds: raise `--budget-mb` for parallel runs.
 
 ## 10. Troubleshooting (what we actually hit)
 
-| Symptom                                                    | Cause                                                           | Fix                                                                         |
-| ---------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `no match for ^Ran 51 tests?\b`, though the tests passed   | an expected count rebuilt from "passed", but `Ran` counts skips | expect what the runner prints (`^OK\b`, or the `Ran` total)                 |
-| `no match for \b8 passed\b`, though pytest passed          | pytest coloured its summary (`ESC[32m8 passed`)                 | fixed in `template-build.sh`: it matches with ANSI stripped                 |
-| a probe expectation from the gate's counts                 | the gate counts include grading tests                           | use a public target (§3)                                                    |
-| `git checkout` fails part way as a non-root user           | root-owned files from earlier root builds in the checkout       | `chown -R` the checkout to its user first; check with `find … -not -user …` |
-| a worker restarts and fails                                | its env names a snapshot no longer on disk                      | point it at one that exists before starting                                 |
-| `sbx up` sandbox has the client's repo, not the template's | `up` pushes the client repository                               | `sbx create`, then the seed (§5.3)                                          |
+| Symptom                                                      | Cause                                                                 | Fix                                                                            |
+| ------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `no match for ^Ran 51 tests?\b`, though the tests passed     | an expected count rebuilt from "passed", but `Ran` counts skips       | expect what the runner prints (`^OK\b`, or the `Ran` total)                    |
+| `no match for \b8 passed\b`, though pytest passed            | pytest coloured its summary (`ESC[32m8 passed`)                       | fixed in `template-build.sh`: it matches with ANSI stripped                    |
+| a probe expectation from the gate's counts                   | the gate counts include grading tests                                 | use a public target (§3)                                                       |
+| `git checkout` fails part way as a non-root user             | root-owned files from earlier root builds in the checkout             | `chown -R` the checkout to its user first; check with `find … -not -user …`    |
+| a worker restarts and fails                                  | its env names a snapshot no longer on disk                            | point it at one that exists before starting                                    |
+| `sbx up` sandbox has the client's repo, not the template's   | `up` pushes the client repository                                     | `sbx create`, then the seed (§5.3)                                             |
+| every restore after `vm-9` fails "API socket never appeared" | the jail path overflowed a Unix socket for a 31-character template id | fixed (2026-10-31): jails are keyed by a short hash of the worker id           |
+| "no capacity" for minutes, never ending                      | the session's tier or template has no worker attached                 | the retry line (and the harness log) now name the cause; attach a worker of it |
 
 ## 11. Regenerating the documents
 
