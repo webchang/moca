@@ -3,13 +3,18 @@
 #
 # Turns the P6 sandbox IMAGE's filesystem into a directory tree for
 # `build-snapshot.sh --rootfs`, so a microVM built from it carries the same toolchain the
-# container tier does (bash, coreutils, findutils, file, git, python3, rg -- see
+# container tier does (bash, coreutils, findutils, file, git, python3, rg, gh -- see
 # remote-worker/Dockerfile). It only READS the image: `podman create` + `podman export`, then
 # the temporary container is removed. build-snapshot.sh layers the guest agent and its init
 # on top; nothing here adds either.
 #
 # Usage:
 #   sudo deploy/microvm/build-rootfs.sh --out /srv/rootfs/moca-sandbox [--image REF]
+#
+# Env:
+#   SH_SKIP_PULL  Non-empty: export the copy of IMAGE this host already has instead of pulling it
+#                 (an offline host, or an --image built here). Otherwise the pull is fail-closed --
+#                 see below.
 #
 # Root because the image's files have owners (the /workspace mount point is 1001:0, most of
 # the tree root:0) and the snapshot's rootfs must keep them; a non-root extraction would
@@ -22,7 +27,7 @@ OUT=""
 # The container tier's Hello.capabilities (cmd/worker's `probed`) plus the two coreutils the
 # harness's own file ops call. A tree missing one of these would boot, snapshot, advertise less,
 # and then fail the first tool call that needs it -- so refuse here instead.
-REQUIRED_TOOLS=(bash git rg python3 base64 file ls cat)
+REQUIRED_TOOLS=(bash git rg gh python3 base64 file ls cat)
 
 usage() {
   echo "usage: $0 --out DIR [--image REF]   (default image: $IMAGE)" >&2
@@ -51,7 +56,29 @@ if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
   exit 1
 fi
 
-podman image exists "$IMAGE" || podman pull "$IMAGE"
+# `podman image exists || podman pull` pulled only when the host had NO copy, so a :latest pulled
+# once -- weeks ago, before #372 moved HOME off the shared /workspace -- was exported into every
+# later snapshot unchanged (#414, the P4 half of it). The default IMAGE is a mutable tag that
+# build.yaml republishes on every push to main, and a snapshot is a long-lived artifact built from
+# it, so re-resolve the reference every time.
+#
+# Fatal on failure, with SH_SKIP_PULL as the documented way past it: an offline host, or an IMAGE
+# built on this machine that no registry serves (which `--image` makes a normal thing to do here).
+# The provenance file and the closing line below name the digest either way, so a tree built from a
+# skipped pull still says which image it came from.
+if [ -n "${SH_SKIP_PULL:-}" ]; then
+  echo "build-rootfs.sh: SH_SKIP_PULL is set; using this host's copy of $IMAGE without pulling" >&2
+  podman image exists "$IMAGE" || {
+    echo "build-rootfs.sh: SH_SKIP_PULL is set but this host has no copy of $IMAGE" >&2
+    exit 1
+  }
+elif ! podman pull "$IMAGE"; then
+  echo "build-rootfs.sh: could not pull $IMAGE. A snapshot is built once and run for a long time," \
+    "so exporting whatever copy this host already has is how a pre-#372 rootfs outlived the image" \
+    "it was meant to track (#414). Re-run with SH_SKIP_PULL=1 to accept the local copy, or fix" \
+    "this host's access to the registry." >&2
+  exit 1
+fi
 digest="$(podman image inspect --format '{{.Digest}}' "$IMAGE")"
 
 cid="$(podman create "$IMAGE")"
