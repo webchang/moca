@@ -1,0 +1,156 @@
+# Gating rules for sandbox images and templates
+
+**Draft, 2026-11-02.** Owned by image-factory (the user's decision, 2026-11-02); sbx-template writes
+the enforcement on MOCA's side to follow it. Read at `sbx-template` 22e19036 and image-factory
+`879d542`. The inventory of MOCA's existing rules, with file and line for each, is sbx-template's
+(2026-11-02); this document cites the tool, not the line.
+
+MOCA's gating rules are **MOCA's own rules (M) plus image-factory's extensions (X)**. An image gets
+into a template only through the template validation process, `template-build.sh`, and that process
+gates the image by these rules. Every deployed image and template is provenance-tracked, and the
+provenance is persistent, verifiable offline, and hosted in the **control plane**. The workload plane
+(the KVM host, the worker) is only where the evidence comes from.
+
+## How to read a rule
+
+| Column       | Meaning                                                                                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Tier**     | `ctr`: container sandboxes (the image runs as a container). `vm`: microVM sandboxes (the image is exported to a rootfs and snapshotted). `both`                                 |
+| **Evidence** | what passes it: a value seen, in which record                                                                                                                                   |
+| **Status**   | **enforced** (by which tool; a violation stops it) / **CI** (a test in MOCA's CI) / **documented** (written down, nothing checks it) / **gap** (should be enforced, is not yet) |
+
+A rule's evidence is kept in one of four records (see [Records](#records-and-what-each-holds)):
+
+- **G**: the image's gate record, written by the image builder (image-factory's `image-factory/<family>/1`);
+- **R**: `/etc/moca-rootfs-source` in the rootfs;
+- **S**: the snapshot's `manifest.json`;
+- **T**: the template record, `moca-sbx-template/1`.
+
+## 1. The image (before any template is built from it)
+
+### MOCA's own
+
+| #   | Rule                                                                                                              | Tier | Evidence                                              | Status                                                                 |
+| --- | ----------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------- | ---------------------------------------------------------------------- |
+| M1  | Pinned by digest: a template's image is `repository@sha256:<64 hex>`, never a tag                                 | vm   | spec `image`; the pulled digest equals it (T `image`) | enforced: `template-build.sh`                                          |
+| M2  | Re-pulled for every build; a stale local copy is never exported (#414)                                            | vm   | R `digest=`                                           | enforced: `build-rootfs.sh` (`SH_SKIP_PULL` is the explicit exception) |
+| M3  | The tools a template needs are in the image (see M3 below the table)                                              | vm   | `build-rootfs.sh` passes                              | enforced: `build-rootfs.sh`                                            |
+| M4  | Exported as root with owners kept, never merged into an existing tree                                             | vm   | `build-rootfs.sh` passes                              | enforced: `build-rootfs.sh`                                            |
+| M5  | MOCA's own sandbox image: the worker's tools present, both Dockerfiles alike, vendored rg and gh pinned by sha256 | ctr  | MOCA's CI                                             | CI                                                                     |
+| M6  | MOCA's own sandbox image: `/workspace` and `HOME` 1001:0 775, `USER 1001`                                         | ctr  | the Dockerfile                                        | documented (HOME: CI)                                                  |
+
+**M3, the required tools (changed by this draft):** a template's required tools are **its spec's
+`tools` plus the guest agent's minimum, `bash ls cat base64 file`**: `bash` runs every command
+(M17), the harness writes files with `base64 -d >` and `cat >`, lists with `ls`, and asks `file`
+for a mime type. A template whose client pushes a config or context overlay also needs `tar`,
+`gzip` and `flock`, and lists them in `tools`. `gh` is required only where the
+spec lists it. Today `build-rootfs.sh` requires `bash git rg gh python3 base64 file ls cat` of every
+image. Since `gh` was added to that list (494353b7, merged into `sbx-template` at 22e19036), it
+refuses every benchmark image, none of which ships `gh`. A template with `egress: false` cannot use
+`gh` anyway. MOCA's default image keeps today's list. sbx-template makes `build-rootfs.sh` take the
+list from its caller.
+
+### image-factory's extensions
+
+These apply to every image built by image-factory. The image builder enforces them, so a gate record
+that passed is the evidence. A template built from such an image must carry the record's digest
+(X10), so the evidence can be found.
+
+| #   | Rule                                                                                                                                                                                                                                                   | Tier | Evidence (in G)                                                                                                                         | Status                                                                                                                   |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| X1  | **Gated, and the gate passed in full**: an image is pushed only after its gate, reviewed, then read back from the registry by digest                                                                                                                   | both | `gate.passed: true`; `image.digest` equals the digest read back                                                                         | enforced: image-factory (`review-image-record.py`, `push-saved-image.py --pushed`)                                       |
+| X2  | **Built from a pinned base**: FROM a digest whose own gate record exists (testbed, agent testbed, or the task's environment)                                                                                                                           | both | `testbed_image.digest` / `environment_image.digest` / `base_image.digest`                                                               | enforced: image-factory (the recipe refuses a tag; tests check the base's record)                                        |
+| X3  | **Reproducible recipe**: the tag is derived from the recipe's hashes                                                                                                                                                                                   | both | `recipe.dockerfile_sha256`, `recipe.platform_layer_sha256`, `recipe.emitter`; `image.tag`                                               | enforced: image-factory                                                                                                  |
+| X4  | **The environment works at base**: the instance's own test command, unpatched, passes what the benchmark says passes; in the microVM layout, with the same counts as the container                                                                     | both | `observed.testbed.test_cmd_{rc,passed,failed}`                                                                                          | enforced: image-factory gate                                                                                             |
+| X5  | **Commits are refused**: one baseline commit, a clean tree, no git identity anywhere (no `/etc/gitconfig` identity, none in the guest HOME)                                                                                                            | both | `observed.testbed.commit_count: "1"`, `agent_can_commit: "no"`; vm: `observed.guest.git_identity: "none"`; ctr: `/etc/gitconfig` absent | enforced: image-factory gate (SWE-bench). MOCA's default image allows commits (#415): this rule is the benchmark images' |
+| X6  | **No answer key in the image**: no test or solution file a grader uses (TB: no file carrying their sha256, no `/tests` or `/solution`); the grading command appears in no record except as its sha256                                                  | both | TB: `gate.forbidden_sha256_checked`, `observed.absence`; SWE-bench: `gate_cmd_sha256` only                                              | enforced: image-factory gate                                                                                             |
+| X7  | **No credentials**: no credential-shaped variable in the image's environment or the guest's                                                                                                                                                            | both | `observed.*.credential_env_names: []`                                                                                                   | enforced: image-factory gate                                                                                             |
+| X8  | **The gate runs as the sandbox will**: vm, root, read-only root, `--network none`, `/workspace` seeded from `/opt/testbed-src`, `/tmp` and `/var` tmpfs, `HOME=/tmp/home`; ctr, the image's user (1001, or root for TB) with no network for the checks | both | `gate.kind`, `gate.network`, `gate.rootfs`, `gate.user`; `observed.guest.rootfs: "readonly"`                                            | enforced: image-factory gate                                                                                             |
+| X9  | **The guest can resolve localhost**: the exported `/etc/hosts` is the fixed file                                                                                                                                                                       | vm   | `observed.etc_hosts_exported_sha256`                                                                                                    | enforced: image-factory gate; MOCA checks it again (M10)                                                                 |
+
+## 2. The template (spec → snapshot → record)
+
+### MOCA's own
+
+| #   | Rule                                                                                                                                                                                                                             | Tier | Evidence                                 | Status                                                                   |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------- | ------------------------------------------------------------------------ |
+| M7  | The spec is well formed: id `^[a-z0-9][a-z0-9-]{0,30}$`; guest ≥ 128 MiB, 1-32 vCPUs; `guest_home` under `/tmp`; booleans typed; seed a string; probe `{cmd, timeout_s, expect_rc, expect}` with valid regexes; distinct `tools` | vm   | spec                                     | enforced: `template-build.sh`                                            |
+| M8  | `guest_home_gitconfig` needs `guest_home`, and is refused with `skip_git_identity_check`                                                                                                                                         | vm   | spec; T `guest_home_gitconfig`           | enforced: `template-build.sh` (57c8f7a5)                                 |
+| M9  | A probe whose expected result is unmeasured is refused (`probe_status` `unmeasured` or `none`)                                                                                                                                   | vm   | spec                                     | enforced: `template-build.sh`                                            |
+| M10 | The rootfs's `/etc/hosts` has the spec's sha256                                                                                                                                                                                  | vm   | spec `etc_hosts_sha256`                  | enforced: `template-build.sh`                                            |
+| M11 | In-guest checks before the snapshot: git identity (unless skipped), egress listener, `/dev/fd`, `/var`                                                                                                                           | vm   | build log                                | enforced: `build-snapshot.sh`                                            |
+| M12 | **The probe passes in a VM restored from the new snapshot**: the seed, then the probe, exit `expect_rc` and match every `expect` (colour codes stripped first); a failure publishes nothing                                      | vm   | T `probe` (what was required); build log | enforced: `template-build.sh` + `build-snapshot.sh --verify-command`     |
+| M13 | Published only after a verified restore, sealed root-owned, by rename                                                                                                                                                            | vm   | S                                        | enforced: `build-snapshot.sh`                                            |
+| M14 | At worker start: the manifest verifies, the instance type matches, the memory file pins, a restore runs `true`                                                                                                                   | vm   | S `hash`                                 | enforced: `microvm-worker` (instance type: fails open, with an override) |
+| M15 | Egress: `false` installs the worker with `--no-egress`; an egress CA only with `true`, a public certificate, its sha256 equal to the host's                                                                                      | vm   | S/T `egress_ca_sha256`                   | enforced: `template-build.sh`, `install-host.sh`                         |
+| M16 | One template per worker; budget ≥ (guest + 32) × 3 + 1024 MiB                                                                                                                                                                    | vm   | T `min_budget_mb`                        | enforced: `template-register.sh`, `install-host.sh`                      |
+| M17 | Commands run under `bash -c`                                                                                                                                                                                                     | both | —                                        | documented                                                               |
+
+### image-factory's extensions
+
+| #   | Rule                                                                                                                                                                                                 | Tier | Evidence                                                                                                                      | Status                                                                                                                                                                    |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| X10 | **A template names its image's gate record**: the spec's `source_record_digest` equals its `image` digest, and the gate record with that digest passed (X1)                                          | vm   | spec `source_record_digest`; G                                                                                                | **gap**: carried, never verified. Proposed: `template-build.sh` refuses a spec whose `source_record_digest` is not its image digest; `template-register.sh` keeps it in T |
+| X11 | **No network for a benchmark template**: `egress: false`                                                                                                                                             | vm   | spec/T `egress`                                                                                                               | enforced by the spec's value (image-factory writes `false`); **gap**: nothing requires a benchmark template to have it                                                    |
+| X12 | **Commits stay refused where the spec says**: `skip_git_identity_check: true` only with `guest_home_gitconfig: false`, and only for an image whose G shows X5                                        | vm   | spec; T; checked in a real guest (django-11133, moca 2deedc3b, 2026-10-31)                                                    | M8 enforces the pairing; **gap**: the skip records no reason. Proposed: T records `skip_git_identity_check` and the X5 evidence it relies on                              |
+| X13 | **The probe is public**: its target is never a test that grades a fix, and its expected counts are never the grading command's                                                                       | vm   | the probe's target is one of image-factory's public targets (`public-probes.json`); its command's sha256 ≠ the gate command's | enforced: image-factory (the target derivation and a test); **documented only** in MOCA                                                                                   |
+| X14 | **The probe's expectation was measured**: in a real VM (`vm`) or the guest emulation (`emulation`), on the same image digest and command; matched against the printed summary, colour codes stripped | vm   | spec `probe_status`, `proved_in_vm`; image-factory's probe record                                                             | enforced: image-factory (tests); M9 refuses an unmeasured one                                                                                                             |
+| X15 | **The template's size is the gate's envelope**: 4096 MiB, 2 vCPUs, `HOME=/tmp/home`                                                                                                                  | vm   | spec                                                                                                                          | enforced by the spec's values; nothing in MOCA checks them                                                                                                                |
+
+## 3. Provenance: what must be kept, where
+
+**The chain.** Each link is a digest, and each must be checkable offline from the records alone:
+
+```
+benchmark base (by digest) ─► image-factory gate record G (image digest, recipe hashes, gate result)
+    ─► template spec (image digest, source_record_digest) ─► rootfs (R: image, digest)
+    ─► snapshot manifest S (hash over kernel, rootfs, agent) ─► template record T (manifest_hash)
+    ─► the worker serving it (its id names the image digest)
+```
+
+**Where it lives.** The control plane holds the provenance; the workload plane only produces it.
+`template-register.sh` runs on the operator's machine and takes T from the host. Proposed, for
+sbx-template to build: the control plane stores T together with S and the G it cites (or G's
+digest and where it is published), so a deployed template can be verified without the host.
+
+### The fields MOCA should carry as gate evidence
+
+From G, copied into T at registration (all are in every image-factory record today):
+
+| Field                                   | From                                                                 | Why                                                                                          |
+| --------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `source_record_digest`                  | spec                                                                 | ties the template to its gate record (X10)                                                   |
+| `gate_record.schema`                    | G `schema`                                                           | which family's gate it passed (`image-factory/moca-microvm/1`, `image-factory/tb-microvm/1`) |
+| `gate_record.passed`                    | G `gate.passed`                                                      | X1                                                                                           |
+| `gate_record.kind`, `.network`, `.user` | G `gate`                                                             | X8: how it was gated                                                                         |
+| `gate_record.base_digest`               | G `testbed_image.digest` / `environment_image.digest`                | X2                                                                                           |
+| `gate_record.recipe`                    | G `recipe` (`dockerfile_sha256`, `platform_layer_sha256`, `emitter`) | X3                                                                                           |
+| `gate_record.builder`                   | G `builder` (`arch`, `engine`, `network`), `built_at`                | where and how it was built                                                                   |
+| `gate_record.sha256`                    | the sha256 of G as committed                                         | the record T was built against; a changed G is a different record                            |
+| `gate_record.commit`                    | the image-factory commit holding G                                   | where to fetch G for an offline check                                                        |
+| `probe_status`, `proved_in_vm`          | spec                                                                 | X14                                                                                          |
+
+Never carried: a registry host, an account id, a credential, or the grading command (only its
+sha256, already in G).
+
+### Records, and what each holds
+
+| Record                        | Written by                                  | Holds                                                                                                                             | Hosted                                                                         |
+| ----------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| G, `image-factory/<family>/1` | image-factory, committed after the readback | image digest, base digest, recipe hashes, builder, the gate's observations, `template` (the spec)                                 | image-factory's repository (persistent; offline: the file and its commit)      |
+| R, `/etc/moca-rootfs-source`  | `build-rootfs.sh`                           | `image=`, `digest=`                                                                                                               | inside the snapshot's rootfs (workload plane)                                  |
+| S, `manifest.json`            | `build-snapshot.sh`                         | image, vmm, instance type, kernel release, size, capabilities, `built_at`, kernel/rootfs/agent sha256, `hash`; `egress_ca_sha256` | beside the snapshot (workload plane)                                           |
+| T, `moca-sbx-template/1`      | `template-build.sh`                         | the spec's fields, snapshot, worker id, `manifest_hash`, `built_at`, `min_budget_mb`                                              | **proposed: the control plane** (today: the host, then the operator's machine) |
+
+## 4. Gaps, and who closes them
+
+From sbx-template's inventory; the ones these rules depend on, in order of what they protect:
+
+| Gap                                                                                                                                                                                            | Rules     | Proposed                                                                                                                              | Who                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `source_record_digest` and `proved_in_vm` are carried, never verified                                                                                                                          | X10, X14  | check `source_record_digest` = image digest at build; carry G's fields into T                                                         | sbx-template                            |
+| The manifest's capabilities, image, instance type, size and `egress_ca_sha256` are outside its `hash`; the record is unsigned; worker start does not compare T's `manifest_hash` or R's digest | the chain | bring them into the hash; at worker start, check T's `manifest_hash` and R's digest against the spec                                  | sbx-template                            |
+| `--skip-git-identity-check` records no reason                                                                                                                                                  | X12       | T records it with the X5 evidence it relies on                                                                                        | sbx-template                            |
+| "The probe is public" is unenforced in MOCA                                                                                                                                                    | X13       | image-factory's records state the target's derivation; MOCA may require `probe_status` `vm`/`emulation` and a G that names the target | image-factory documents; MOCA may check |
+| No signing, SBOM or registry allowlist                                                                                                                                                         | the chain | out of scope for this draft: the digest chain holds without them, as long as G is fetched from image-factory's repository             | later                                   |
+| The required-tools list refuses every benchmark image since 494353b7                                                                                                                           | M3        | the caller passes the list (spec `tools` + the guest agent's minimum)                                                                 | sbx-template (in progress)              |
