@@ -108,7 +108,7 @@ pass 'refuses a bad id, an unpinned image, bad sizes, egress, seed, probe or too
 spec
 run || fail 'a good spec did not build'
 grep -qx "podman pull registry.example.invalid/moca-microvm@$DIGEST" "$MOCK_LOG" || fail 'the image was not pulled by digest'
-grep -q "^build-rootfs --out $SBX_SRV/build/$NAME/rootfs --image registry.example.invalid/moca-microvm@$DIGEST$" "$MOCK_LOG" ||
+grep -q "^build-rootfs --out $SBX_SRV/build/$NAME/rootfs --image registry.example.invalid/moca-microvm@$DIGEST --require base64 bash cat file git ls python3$" "$MOCK_LOG" ||
   fail "build-rootfs did not get the build dir and the image: $(grep build-rootfs "$MOCK_LOG")"
 A="$MOCK_STATE/snapshot-args"
 want_args="$(printf '%s\n' --kernel "$TMP/vmlinux" --rootfs "$SBX_SRV/build/$NAME/rootfs" --agent "$TMP/agent" \
