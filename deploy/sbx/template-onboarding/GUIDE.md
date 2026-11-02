@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-01T02:05:23Z
+**Last modified:** 2026-11-02T06:07:15Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -33,6 +33,7 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
 **Contents**
 
 - [1. Mental model (read this first)](#1-mental-model-read-this-first)
+  - [What a snapshot holds](#what-a-snapshot-holds)
   - [Where things run](#where-things-run)
   - [Names](#names)
 - [2. The flow on one page](#2-the-flow-on-one-page)
@@ -69,6 +70,23 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
    image of a template is a new snapshot and a new worker; the old one drains.
 3. **The client chooses the template** when it creates a sandbox (`mocactl sbx create --template ID`,
    `POST /v1/sandboxes {template}`), and a sandbox keeps its worker for life.
+
+### What a snapshot holds
+
+Every template is its own bootable image: there is no common MOCA image underneath. What templates
+share is MOCA's thin boot layer, which `build-snapshot.sh` copies into each snapshot.
+
+| In a snapshot        | Shared by every template?                                                               | Size (a 4 GiB SWE-bench guest)    |
+| -------------------- | --------------------------------------------------------------------------------------- | --------------------------------- |
+| `kernel`             | yes: the host's one guest kernel (`--kernel`)                                           | ~28 MB                            |
+| `agent`              | yes: MOCA's guest agent, from `remote-worker`                                           | ~3 MB                             |
+| `/sbin/init`         | yes: MOCA's init (mounts, `/dev/fd`, `/var` overlay, `HOME`), inside the rootfs         | a few KB                          |
+| `rootfs`             | no: an ext4 image of the template's container image (OS, toolchain, repository, `/var`) | 3.5-9 GB                          |
+| `memfile`, `vmstate` | no: the guest's RAM and CPU state after it booted                                       | the guest's RAM (4 GiB), a few KB |
+
+So each template costs 7-14 GB of disk, mostly its rootfs and memfile, and disk is what limits how
+many templates a host holds (§9). Within one template every VM is restored from the same files by
+hardlink and gets only its own workspace disk, so more sandboxes of a template cost little.
 
 ### Where things run
 
