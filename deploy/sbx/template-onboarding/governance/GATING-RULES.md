@@ -1,5 +1,8 @@
 # Gating rules for sandbox images and templates
 
+> **Preview.** The gating rules for sandbox images and templates are implemented but not yet
+> declared Stable; interfaces and limits may change. Known limits: [§4](#4-gaps-and-who-closes-them).
+
 **Draft, 2026-11-02.** Owned by image-factory (the user's decision, 2026-11-02); sbx-template writes
 the enforcement on MOCA's side to follow it. Read at `sbx-template` 22e19036 and image-factory
 `879d542`. The inventory of MOCA's existing rules, with file and line for each, is sbx-template's
@@ -28,7 +31,7 @@ A rule's evidence is kept in one of four records (see [Records](#records-and-wha
 
 ## 1. The image (before any template is built from it)
 
-### MOCA's own
+### 1.1 MOCA's own image rules
 
 | #   | Rule                                                                                                              | Tier | Evidence                                              | Status                                                                 |
 | --- | ----------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -50,7 +53,7 @@ refuses every benchmark image, none of which ships `gh`. A template with `egress
 `gh` anyway. MOCA's default image keeps today's list. sbx-template makes `build-rootfs.sh` take the
 list from its caller.
 
-### image-factory's extensions
+### 1.2 image-factory's image extensions
 
 These apply to every image built by image-factory. The image builder enforces them, so a gate record
 that passed is the evidence. A template built from such an image must carry the record's digest
@@ -70,7 +73,7 @@ that passed is the evidence. A template built from such an image must carry the 
 
 ## 2. The template (spec → snapshot → record)
 
-### MOCA's own
+### 2.1 MOCA's own template rules
 
 | #   | Rule                                                                                                                                                                                                                             | Tier | Evidence                                 | Status                                                                   |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------- | ------------------------------------------------------------------------ |
@@ -86,7 +89,7 @@ that passed is the evidence. A template built from such an image must carry the 
 | M16 | One template per worker; budget ≥ (guest + 32) × 3 + 1024 MiB                                                                                                                                                                    | vm   | T `min_budget_mb`                        | enforced: `template-register.sh`, `install-host.sh`                      |
 | M17 | Commands run under `bash -c`                                                                                                                                                                                                     | both | —                                        | documented                                                               |
 
-### image-factory's extensions
+### 2.2 image-factory's template extensions
 
 | #   | Rule                                                                                                                                                                                                 | Tier | Evidence                                                                                                                      | Status                                                                                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

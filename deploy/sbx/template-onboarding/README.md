@@ -7,6 +7,9 @@ that a client asks for by id; its commands then run in microVMs restored from th
 Start with the [Template Onboarding Guide](GUIDE.md) ([PDF](GUIDE.pdf)). It walks through the
 whole flow with two sample templates and a client choosing between them.
 
+**Gating, provenance and the process** that govern these tools (which images may become templates,
+what each step records): [`governance/`](governance/README.md).
+
 ## In this folder
 
 | File                                                                       | What it is                                                                                                                           |
