@@ -315,6 +315,9 @@ refused 'did not pass (X1)' "$OK" '.gate.passed = false' --gate-record "$TMP/gat
 refused "is for image sha256:000" "$OK" '.image.digest = "sha256:'"$(printf '0%.0s' {1..64})"'"' --gate-record "$TMP/gate.json"
 refused 'does not show commits refused' "$OK" '.observed.testbed.agent_can_commit = "yes"' --gate-record "$TMP/gate.json"
 refused 'does not show commits refused' "$OK" '.observed.guest.git_identity = "SWE-bench <s@x>"' --gate-record "$TMP/gate.json"
+# Fails closed: a record that never measured the guest's identity is no evidence (image-factory, 2026-11-03).
+refused 'does not show commits refused' "$OK" 'del(.observed.guest.git_identity)' --gate-record "$TMP/gate.json"
+refused 'does not show commits refused' "$OK" 'del(.observed.guest)' --gate-record "$TMP/gate.json"
 refused 'needs --gate-record' . . --gate-commit c3ea3a4
 pass '--gate-record refuses, before any pull: a source_record_digest that is not the image (X10), a gated spec built without its record, a failed gate (X1), another image, commits not refused under skip_git_identity_check (X5, X12), --gate-commit alone'
 

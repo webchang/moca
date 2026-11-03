@@ -184,9 +184,9 @@ if [[ -n "$GATE_RECORD" ]]; then
   if [[ "$(jq -r '.skip_git_identity_check // false' "$SPEC")" == true ]]; then
     # A spec that skips the identity check says the image refuses agent commits on purpose; the gate
     # must have seen that (X5), or skipping the check would hide an image that commits.
-    jq -e '.observed.testbed.agent_can_commit == "no" and (.observed.guest.git_identity // "none") == "none"' \
+    jq -e '.observed.testbed.agent_can_commit == "no" and .observed.guest.git_identity == "none"' \
       "$GATE_RECORD" >/dev/null ||
-      spec_error 'skip_git_identity_check, but the gate record does not show commits refused (X5: agent_can_commit no, git_identity none) (X12)'
+      spec_error 'skip_git_identity_check, but the gate record does not show commits refused (X5: agent_can_commit no, git_identity none, both measured) (X12)'
   fi
   GATE_SHA="$({ sha256sum "$GATE_RECORD" 2>/dev/null || shasum -a 256 "$GATE_RECORD"; } | cut -d' ' -f1)"
   GATE_JSON="$(jq -c --arg sha "sha256:$GATE_SHA" --arg commit "$GATE_COMMIT" '{
