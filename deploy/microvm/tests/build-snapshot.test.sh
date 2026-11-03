@@ -1825,10 +1825,10 @@ for drift in real drifted; do
   fi
 done
 
-echo "== SBX0.2b: the manifest fingerprint is the DER sha256, outside hash"
+echo "== SBX0.2b: the manifest fingerprint is the DER sha256, inside hash (version 2)"
 mw="$EGT/mf"; mkdir -p "$mw/stage"
 for mode in with without; do
-  : >"$mw/stage/kernel"; : >"$mw/stage/rootfs"; : >"$mw/stage/agent"
+  : >"$mw/stage/kernel"; : >"$mw/stage/rootfs"; : >"$mw/stage/agent"; : >"$mw/stage/vmstate"; : >"$mw/stage/memfile"
   {
     echo 'log() { :; }'
     echo "STAGE='$mw/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; VCPUS=1; MANIFEST_CAPABILITIES=''"
@@ -1850,14 +1850,48 @@ done
 check "manifest carries egress_ca_sha256 with the flag" \
   "$(grep -cF "\"egress_ca_sha256\": \"$want_sha\"" "$mw/with.json")" "1"
 check "manifest has no egress_ca_sha256 without the flag" "$(grep -c egress_ca "$mw/without.json")" "0"
-check "the hash is unchanged by the field" \
-  "$(grep '"hash"' "$mw/with.json" | tr -d ',')" "$(grep '"hash"' "$mw/without.json")"
-check "the field comes after hash (outside it)" \
-  "$(awk '/"hash"/{h=NR} /egress_ca_sha256/{e=NR} END{print (h<e)?"yes":"no"}' "$mw/with.json")" "yes"
+check "the hash changes with the field (version 2 covers it)" \
+  "$([ "$(grep '"hash"' "$mw/with.json")" != "$(grep '"hash"' "$mw/without.json")" ] && echo yes || echo no)" "yes"
+check "the without-flag manifest is valid JSON" \
+  "$(python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$mw/without.json" && echo yes || echo no)" "yes"
 check "the with-flag manifest is valid JSON" \
   "$(python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$mw/with.json" && echo yes || echo no)" "yes"
 check "assemble_rootfs calls install_egress_ca only when the flag is set" \
   "$(fn_body assemble_rootfs | grep -cF '[ -n "$EGRESS_CA" ] && install_egress_ca')" "1"
+
+echo "== PV2-PV3: manifest hash version 2 matches vmpool.Manifest.ComputeHash"
+mv2="$EGT/mv2"; mkdir -p "$mv2/stage"
+for f in kernel rootfs agent vmstate memfile; do printf '%s-bytes' "$f" >"$mv2/stage/$f"; done
+{
+  echo 'log() { :; }'
+  echo "STAGE='$mv2/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; VCPUS=1; EGRESS_CA=''"
+  printf '%s\n' "MANIFEST_CAPABILITIES='git"$'\n'"bash'"
+  sed -n '/^write_manifest() {/,/^MANIFEST$/p' "$SCRIPT"
+  echo '}'
+  echo 'write_manifest'
+} >"$mv2/run.sh"
+bash "$mv2/run.sh" >/dev/null 2>&1
+check "the version-2 manifest is valid JSON with hash_version 2" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hash_version"])' "$mv2/stage/manifest.json" 2>/dev/null)" "2"
+# Recompute the hash from the manifest's own fields, in the line format the Go side pins
+# (TestManifestV2HashMatchesBuildSnapshot): a drift on either side fails one of the two.
+check "the hash is the version-2 lines' sha256, computed from the manifest's fields" \
+  "$(python3 - "$mv2/stage/manifest.json" <<'PY'
+import hashlib, json, sys
+m = json.load(open(sys.argv[1]))
+lines = ["moca-snapshot-manifest/2"] + [f"{k}:{v}" for k, v in [
+    ("image", m["image"]), ("vmm", m["vmm"]), ("instance_type", m["instance_type"]),
+    ("kernel_release", m["kernel_release"]), ("guest_ram_mb", m["guest_ram_mb"]), ("vcpus", m["vcpus"]),
+    ("capabilities", ",".join(sorted(m["capabilities"]))), ("built_at", m["built_at"]),
+    ("kernel", m["kernel_sha256"]), ("rootfs", m["rootfs_sha256"]), ("agent", m["agent_sha256"]),
+    ("vmstate", m["vmstate_sha256"]), ("memfile", m["memfile_sha256"]),
+    ("ch_config", m.get("ch_config_sha256", "")), ("egress_ca", m.get("egress_ca_sha256", ""))]]
+print("ok" if m["hash"] == "sha256:" + hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest() else "mismatch")
+PY
+)" "ok"
+check "the Go golden lines hash to the digest snapshot_test.go pins" \
+  "$(printf 'moca-snapshot-manifest/2\nimage:i\nvmm:firecracker\ninstance_type:t\nkernel_release:k\nguest_ram_mb:256\nvcpus:1\ncapabilities:bash,git\nbuilt_at:2026-11-03T00:00:00Z\nkernel:sha256:k\nrootfs:sha256:r\nagent:sha256:a\nvmstate:sha256:v\nmemfile:sha256:m\nch_config:\negress_ca:\n' | sha256sum | cut -d' ' -f1)" \
+  "$(sed -n 's/^const manifestV2Golden = "\([0-9a-f]*\)"$/\1/p' "$(dirname "$SCRIPT")/../../remote-worker/internal/vmpool/snapshot_test.go")"
 rm -rf "$EGT"
 
 echo "== --skip-git-identity-check and --guest-home are opt-in and off by default"
