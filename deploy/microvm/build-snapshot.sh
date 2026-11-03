@@ -1973,7 +1973,7 @@ write_manifest() {
   # boots -- both now need it in place at the jail-relative name "/kernel"
   # pre-boot, not just afterwards for hashing.
 
-  local khash rhash ahash vhash mhash chhash cahash hash caps_json caps_csv built_at krel egress_json f
+  local khash rhash ahash vhash mhash chhash cahash srcdig hash caps_json caps_csv built_at krel egress_json f
   khash="sha256:$(sha256sum "$STAGE/kernel" | cut -d' ' -f1)"
   rhash="sha256:$(sha256sum "$STAGE/rootfs" | cut -d' ' -f1)"
   ahash="sha256:$(sha256sum "$STAGE/agent" | cut -d' ' -f1)"
@@ -1986,6 +1986,14 @@ write_manifest() {
   # DER, not PEM, so it is independent of the file's encoding and line wrapping.
   cahash=""
   [ -n "$EGRESS_CA" ] && cahash="sha256:$(openssl x509 -in "$EGRESS_CA" -outform DER | sha256sum | cut -d' ' -f1)"
+
+  # The image digest build-rootfs.sh recorded in the rootfs (/etc/moca-rootfs-source, "R"),
+  # copied here so a worker can compare it with its template record without mounting the
+  # rootfs (PV4); empty for a rootfs from elsewhere.
+  srcdig=""
+  if [ -n "$ROOTFS" ] && [ -f "$ROOTFS/etc/moca-rootfs-source" ]; then
+    srcdig="$(sed -n 's/^digest=\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$ROOTFS/etc/moca-rootfs-source" | head -1)"
+  fi
 
   caps_json="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | sort | awk '{printf "%s\"%s\"", sep, $0; sep=","}')"
   caps_csv="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | sort | paste -sd, -)"
@@ -2003,14 +2011,17 @@ write_manifest() {
     esac
   done
   hash="sha256:$(
-    printf 'moca-snapshot-manifest/2\nimage:%s\nvmm:%s\ninstance_type:%s\nkernel_release:%s\nguest_ram_mb:%s\nvcpus:%s\ncapabilities:%s\nbuilt_at:%s\nkernel:%s\nrootfs:%s\nagent:%s\nvmstate:%s\nmemfile:%s\nch_config:%s\negress_ca:%s\n' \
+    printf 'moca-snapshot-manifest/2\nimage:%s\nvmm:%s\ninstance_type:%s\nkernel_release:%s\nguest_ram_mb:%s\nvcpus:%s\ncapabilities:%s\nbuilt_at:%s\nkernel:%s\nrootfs:%s\nagent:%s\nvmstate:%s\nmemfile:%s\nch_config:%s\negress_ca:%s\nsource_image_digest:%s\n' \
       "$IMAGE" "$VMM" "$INSTANCE_TYPE" "$krel" "$GUEST_RAM_MB" "$VCPUS" "$caps_csv" "$built_at" \
-      "$khash" "$rhash" "$ahash" "$vhash" "$mhash" "$chhash" "$cahash" | sha256sum | cut -d' ' -f1
+      "$khash" "$rhash" "$ahash" "$vhash" "$mhash" "$chhash" "$cahash" "$srcdig" | sha256sum | cut -d' ' -f1
   )"
 
   egress_json=""
   [ -n "$cahash" ] && egress_json=",
   \"egress_ca_sha256\": \"$cahash\""
+  local src_json=""
+  [ -n "$srcdig" ] && src_json=",
+  \"source_image_digest\": \"$srcdig\""
   local ch_json=""
   [ -n "$chhash" ] && ch_json=",
   \"ch_config_sha256\": \"$chhash\""
@@ -2030,7 +2041,7 @@ write_manifest() {
   "rootfs_sha256": "$rhash",
   "agent_sha256": "$ahash",
   "vmstate_sha256": "$vhash",
-  "memfile_sha256": "$mhash"$ch_json$egress_json,
+  "memfile_sha256": "$mhash"$ch_json$egress_json$src_json,
   "hash": "$hash"
 }
 MANIFEST

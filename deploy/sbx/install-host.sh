@@ -10,6 +10,9 @@
 #
 # BUNDLE_DIR is deploy/sbx/.generated/workers/<id> from deploy/sbx/setup.sh. IMAGE names a golden
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
+# When template-build.sh's record for it exists ($SBX_SRV/templates/IMAGE.json), the worker env names
+# it (SH_TEMPLATE_RECORD) and the worker checks the record against its snapshot and its own id at
+# every start, refusing a mismatch (template lifecycle spec §8, PV4).
 # Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
 # moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
 # SBX_WORKER_BIN (an absolute path) runs another microvm-worker build, so SBX0 beside deploy/microvm's
@@ -477,6 +480,7 @@ install_worker() {
       printf 'RELAY_ADDR=%s\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\n' "$addr" "$id" "$tok"
       [[ -z "$ca" ]] || printf 'RELAY_CA_FILE=%s\n' "$ca"
       printf 'SH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\nSH_GUEST_RAM_MB=%s\n' "$SBX_SRV/snapshots" "$SNAPSHOT" "$guest_mb"
+      [[ ! -f "$SBX_SRV/templates/$SNAPSHOT.json" ]] || printf 'SH_TEMPLATE_RECORD=%s\n' "$SBX_SRV/templates/$SNAPSHOT.json"
       printf 'SH_WORKSPACE_ROOT=%s\nSH_CHROOT_BASE=%s\n' "$SBX_SRV/workspaces/$id" "$(jail_dir "$id")"
       printf 'SH_PARENT_CGROUP=sbx.slice/sbx-%s.slice\n' "$id"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_WORKSPACE_IDLE=%s\nSH_WORKSPACE_IMAGE_MB=%s\n' "$BUDGET_MB" "$idle" "$image_mb"

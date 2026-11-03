@@ -178,6 +178,7 @@ func TestManifestV2HashCoversEveryField(t *testing.T) {
 		{"memfile_sha256", func(m *Manifest) { m.MemfileSHA256 = "sha256:00" }},
 		{"ch_config_sha256", func(m *Manifest) { m.CHConfigSHA256 = "sha256:00" }},
 		{"egress_ca_sha256", func(m *Manifest) { m.EgressCASHA256 = "sha256:00" }},
+		{"source_image_digest", func(m *Manifest) { m.SourceImageDigest = "sha256:00" }},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
 			img := writeSnapshot(t, t.TempDir(), tc.edit) // edited AFTER Fill: the hash is stale
@@ -247,7 +248,7 @@ func TestManifestV2HashMatchesBuildSnapshot(t *testing.T) {
 	m := Manifest{HashVersion: HashVersionAll, Image: "i", VMM: "firecracker", InstanceType: "t",
 		Kernel: "k", GuestRAMMB: 256, VCPUs: 1, Capabilities: []string{"git", "bash"}, BuiltAt: built,
 		KernelSHA256: "sha256:k", RootfsSHA256: "sha256:r", AgentSHA256: "sha256:a",
-		VMStateSHA256: "sha256:v", MemfileSHA256: "sha256:m"}
+		VMStateSHA256: "sha256:v", MemfileSHA256: "sha256:m", SourceImageDigest: "sha256:s"}
 	got, err := m.ComputeHash()
 	if err != nil {
 		t.Fatal(err)
@@ -259,4 +260,4 @@ func TestManifestV2HashMatchesBuildSnapshot(t *testing.T) {
 }
 
 // manifestV2Golden: sha256 of the version-2 lines for the fields above.
-const manifestV2Golden = "7c18001158fc8c3d49a4595564c1d2a6e1bcde1858be4c84aa7d64176be0a594"
+const manifestV2Golden = "8387ae48e6ec1a40d345607eee9ccf1d2e5bd8ae64ae3bb2ec9d6227f0e59b93"

@@ -1862,9 +1862,11 @@ check "assemble_rootfs calls install_egress_ca only when the flag is set" \
 echo "== PV2-PV3: manifest hash version 2 matches vmpool.Manifest.ComputeHash"
 mv2="$EGT/mv2"; mkdir -p "$mv2/stage"
 for f in kernel rootfs agent vmstate memfile; do printf '%s-bytes' "$f" >"$mv2/stage/$f"; done
+mkdir -p "$mv2/rootfs/etc"
+printf 'image=i@sha256:%s\ndigest=sha256:%s\n' "$(printf 'a%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" >"$mv2/rootfs/etc/moca-rootfs-source"
 {
   echo 'log() { :; }'
-  echo "STAGE='$mv2/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; VCPUS=1; EGRESS_CA=''"
+  echo "STAGE='$mv2/stage'; ROOTFS='$mv2/rootfs'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; VCPUS=1; EGRESS_CA=''"
   printf '%s\n' "MANIFEST_CAPABILITIES='git"$'\n'"bash'"
   sed -n '/^write_manifest() {/,/^MANIFEST$/p' "$SCRIPT"
   echo '}'
@@ -1875,6 +1877,8 @@ check "the version-2 manifest is valid JSON with hash_version 2" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hash_version"])' "$mv2/stage/manifest.json" 2>/dev/null)" "2"
 # Recompute the hash from the manifest's own fields, in the line format the Go side pins
 # (TestManifestV2HashMatchesBuildSnapshot): a drift on either side fails one of the two.
+check "the manifest records the rootfs's source image digest (R)" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_image_digest",""))' "$mv2/stage/manifest.json")" "sha256:$(printf 'a%.0s' {1..64})"
 check "the hash is the version-2 lines' sha256, computed from the manifest's fields" \
   "$(python3 - "$mv2/stage/manifest.json" <<'PY'
 import hashlib, json, sys
@@ -1885,12 +1889,13 @@ lines = ["moca-snapshot-manifest/2"] + [f"{k}:{v}" for k, v in [
     ("capabilities", ",".join(sorted(m["capabilities"]))), ("built_at", m["built_at"]),
     ("kernel", m["kernel_sha256"]), ("rootfs", m["rootfs_sha256"]), ("agent", m["agent_sha256"]),
     ("vmstate", m["vmstate_sha256"]), ("memfile", m["memfile_sha256"]),
-    ("ch_config", m.get("ch_config_sha256", "")), ("egress_ca", m.get("egress_ca_sha256", ""))]]
+    ("ch_config", m.get("ch_config_sha256", "")), ("egress_ca", m.get("egress_ca_sha256", "")),
+    ("source_image_digest", m.get("source_image_digest", ""))]]
 print("ok" if m["hash"] == "sha256:" + hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest() else "mismatch")
 PY
 )" "ok"
 check "the Go golden lines hash to the digest snapshot_test.go pins" \
-  "$(printf 'moca-snapshot-manifest/2\nimage:i\nvmm:firecracker\ninstance_type:t\nkernel_release:k\nguest_ram_mb:256\nvcpus:1\ncapabilities:bash,git\nbuilt_at:2026-11-03T00:00:00Z\nkernel:sha256:k\nrootfs:sha256:r\nagent:sha256:a\nvmstate:sha256:v\nmemfile:sha256:m\nch_config:\negress_ca:\n' | sha256sum | cut -d' ' -f1)" \
+  "$(printf 'moca-snapshot-manifest/2\nimage:i\nvmm:firecracker\ninstance_type:t\nkernel_release:k\nguest_ram_mb:256\nvcpus:1\ncapabilities:bash,git\nbuilt_at:2026-11-03T00:00:00Z\nkernel:sha256:k\nrootfs:sha256:r\nagent:sha256:a\nvmstate:sha256:v\nmemfile:sha256:m\nch_config:\negress_ca:\nsource_image_digest:sha256:s\n' | sha256sum | cut -d' ' -f1)" \
   "$(sed -n 's/^const manifestV2Golden = "\([0-9a-f]*\)"$/\1/p' "$(dirname "$SCRIPT")/../../remote-worker/internal/vmpool/snapshot_test.go")"
 rm -rf "$EGT"
 

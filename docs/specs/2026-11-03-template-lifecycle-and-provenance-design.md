@@ -455,7 +455,7 @@ sha256), and registers the build or rejects it, with a `check` record either way
 | Gate evidence in T (GATING-RULES §3)                                                                              | `template-build.sh`                       | done (26bd6d7f): `gate_record.{schema, passed, kind, network, user, base_digest, recipe, builder, sha256, commit}`                                                                                                 |
 | PV2: the manifest is covered by its digest (done in code: hash version 2)                                         | `build-snapshot.sh`, `vmpool/snapshot.go` | capabilities, image, instance type, guest size, vcpus and the egress CA move into `hash`; the Go manifest gains vcpus and the CA                                                                                   |
 | PV3: every snapshot file has a digest (done in code: hash version 2) (the user, 2026-11-03: a digest, no signing) | `build-snapshot.sh`, `vmpool/snapshot.go` | the manifest records the sha256 of `vmstate` and `memfile` too; the build computes them once; the worker checks them at start only if asked (`SH_VERIFY_MEMFILE=1`, a 4 GiB read), and the offline verifier always |
-| PV4: worker start checks T                                                                                        | `microvm-worker`                          | compares T's `manifest_hash` and R's image digest with its snapshot                                                                                                                                                |
+| PV4: worker start checks T (done in code: `SH_TEMPLATE_RECORD`)                                                   | `microvm-worker`                          | compares T's `manifest_hash` and R's image digest with its snapshot                                                                                                                                                |
 | Registration                                                                                                      | the control plane                         | automatic: registers a build only with a passed `check` against the policy named at create, and a `build` record from the host the build was handed to                                                             |
 
 ### 8.3 Trusted gate-record sources
@@ -518,7 +518,8 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
-   evidence fields are done, 26bd6d7f; PV2 and PV3 in code, manifest hash version 2).
+   evidence fields are done, 26bd6d7f; PV2, PV3 and PV4 in code: manifest hash version 2 and
+   `SH_TEMPLATE_RECORD`; to be proven on a KVM host).
 2. The provenance store and records (§7), with offline verification, for `build`, `check` and
    `policy` first.
 3. Templates in the store, states and the read API (§3, §4), with owners and visibility.

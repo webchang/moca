@@ -66,6 +66,10 @@ type Manifest struct {
 	// The sha256 of the egress CA's DER, when the rootfs trusts one (SBX0.2b). Outside the
 	// hash in version 1; inside it in version 2.
 	EgressCASHA256 string `json:"egress_ca_sha256,omitempty"`
+	// The image digest build-rootfs.sh recorded in the rootfs's /etc/moca-rootfs-source,
+	// copied here so a template record's image can be checked against it without mounting
+	// the rootfs (PV4). Version 2 only; empty for a rootfs built some other way.
+	SourceImageDigest string `json:"source_image_digest,omitempty"`
 	// Hash: see HashVersion. Version 1 does NOT cover vmstate or memfile: they change on
 	// every rebuild even when nothing behavioural did. Version 2 does, because it names
 	// one build, not one toolchain.
@@ -149,6 +153,7 @@ func (m Manifest) ComputeHash() (string, error) {
 			{"memfile", m.MemfileSHA256},
 			{"ch_config", m.CHConfigSHA256},
 			{"egress_ca", m.EgressCASHA256},
+			{"source_image_digest", m.SourceImageDigest},
 		}
 		fmt.Fprintf(h, "moca-snapshot-manifest/%d\n", HashVersionAll)
 		for _, l := range lines {

@@ -629,6 +629,19 @@ func main() {
 	if err := verifyInstanceType(get, man.InstanceType, detectHostInstanceType); err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
+	// SH_TEMPLATE_RECORD: the template record ("T") this worker serves, checked against the
+	// snapshot and the worker's own identity (PV4). Unset: no check, as before.
+	if rec := get("SH_TEMPLATE_RECORD"); rec != "" {
+		if err := verifyTemplateRecord(rec, man, env(get, "SH_SNAPSHOT_IMAGE", "default"),
+			get("SANDBOX_ID"), strings.TrimSpace(get("SANDBOX_TEMPLATE"))); err != nil {
+			log.Fatalf("microvm-worker: %v", err)
+		}
+		if man.SourceImageDigest == "" {
+			log.Printf("microvm-worker: template record %s matches; the snapshot's manifest predates source_image_digest, so its image digest was not compared", rec)
+		} else {
+			log.Printf("microvm-worker: template record %s matches the snapshot (manifest %s, image %s)", rec, man.Hash, man.SourceImageDigest)
+		}
+	}
 	unpin, err := vmpool.PinMemoryFile(filepath.Join(snapDir, "memfile"))
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)

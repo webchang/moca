@@ -119,8 +119,11 @@ field and digest, marked `"hash_version": 2`, so the hash names the build and an
 manifest is refused at worker start. The worker re-hashes the kernel, rootfs, agent and vmstate at
 every start, and the memory file only with `SH_VERIFY_MEMFILE=1` (a full read of the guest's RAM).
 A snapshot built before version 2 (no `hash_version`) still verifies under its old rule, a hash over
-kernel, rootfs and agent only, until it is rebuilt
-([template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md) §8, PV2-PV3).
+kernel, rootfs and agent only, until it is rebuilt. A version-2 manifest also carries
+`source_image_digest`, the image digest `build-rootfs.sh` recorded in `/etc/moca-rootfs-source`, so a
+worker given its template record (`SH_TEMPLATE_RECORD`, set by SBX0's `install-host.sh`) checks the
+record's image against the snapshot without mounting the rootfs
+([template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md) §8, PV2-PV4).
 
 **1. A guest kernel.** Firecracker's CI publishes one. This is its `getting-started.md` recipe,
 kernel only:
