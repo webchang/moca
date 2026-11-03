@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-03T04:37:45Z
+**Last modified:** 2026-11-03T21:43:16Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -220,7 +220,9 @@ holds a token: never print it), then:
 sudo deploy/sbx/install-host.sh <bundle dir> --snapshot default-eed901b838bf --budget-mb 8192
 ```
 
-Expected: `sbx-worker@sbx_default_eed901b838bf attached to the relay`.
+Expected: `sbx-worker@sbx_default_eed901b838bf attached to the relay`. The worker first checks the snapshot against its
+manifest and against the template record `template-build.sh` left in `$SBX_SRV/templates/`
+(`SH_TEMPLATE_RECORD`); a mismatch stops it at start, naming the field.
 
 ### 4.5 Use it
 

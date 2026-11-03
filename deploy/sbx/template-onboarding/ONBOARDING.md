@@ -143,7 +143,9 @@ is already built; `--force` rebuilds it.
 
 **The record** is the spec's fields plus `worker`, `snapshot`, `manifest_hash`, `built_at` and
 `min_budget_mb`: the smallest `--budget-mb` that holds one session, `(guest + 32) × 3 + 1024` MiB.
-It holds no secret. Copy it to the operator's machine.
+It holds no secret. Copy it to the operator's machine. It stays on the KVM host too, at
+`$SBX_SRV/templates/<snapshot>.json`: `install-host.sh` points the worker at it (`SH_TEMPLATE_RECORD`), and
+the worker refuses to start if the record does not match its snapshot.
 
 ## 3. Register (the operator's machine)
 
