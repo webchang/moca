@@ -6,7 +6,12 @@ import { join } from 'node:path';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { uploadUrlProblem } from '../src/api/workloads.js';
 import type { Io } from '../src/headless.js';
-import { cmdWorkloadCreate, cmdWorkloadDelete, cmdWorkloadGet } from '../src/workloads.js';
+import {
+  cmdWorkloadCreate,
+  cmdWorkloadDelete,
+  cmdWorkloadGet,
+  cmdWorkloadList,
+} from '../src/workloads.js';
 import { json, scriptedFetch } from './helpers/fake-fetch.js';
 import { fakeHarness } from './helpers/fakes.js';
 import { testRuntime } from './helpers/runtime.js';
@@ -683,6 +688,135 @@ describe('workloads get', () => {
   });
 });
 
+describe('workloads list', () => {
+  // testRuntime's clock is 1e12 ms, so these are a fixed age in its CREATED column.
+  const NOW = 1e12;
+  const at = (msAgo: number) => new Date(NOW - msAgo).toISOString();
+
+  it('prints the caller’s workloads newest first, with a relative CREATED column', async () => {
+    const { fetch, calls } = scriptedFetch(
+      json({
+        workloads: [
+          workload('ready', {
+            workloadId: 'newer',
+            revision: REV,
+            createdAt: at(120_000),
+            sandboxes: { count: 2, tier: 'container', ready: 1 },
+          }),
+          workload('awaiting_upload', { workloadId: 'older', createdAt: at(7_200_000) }),
+        ],
+      }),
+    );
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: false })).toBe(0);
+    expect(calls[0]!.method + ' ' + calls[0]!.url).toBe('GET http://h/workloads');
+    expect(calls[0]!.headers.authorization).toBe('Bearer a');
+    const lines = o.stdout.trimEnd().split('\n');
+    expect(lines[0]).toMatch(/^WORKLOAD\s+STATUS\s+TYPE\s+SIZE\s+SANDBOXES\s+CREATED\s+REVISION$/);
+    // The order the harness sent, and a 12-character revision so the row stays readable.
+    expect(lines[1]).toMatch(/^newer\s+ready\s+workspace\s+1Gi\s+1\/2\s+2m ago\s+c{12}$/);
+    expect(lines[2]).toMatch(/^older\s+awaiting_upload\s+workspace\s+1Gi\s+-\s+2h ago\s+-$/);
+    expect(lines).toHaveLength(3);
+  });
+
+  it('prints one JSON document with --json, with nulls for what a workload lacks', async () => {
+    const { fetch } = scriptedFetch(
+      json({ workloads: [{ workloadId: 'bare', status: 'awaiting_upload' }] }),
+    );
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: true })).toBe(0);
+    expect(JSON.parse(o.stdout)).toEqual({
+      workloads: [
+        {
+          workloadId: 'bare',
+          status: 'awaiting_upload',
+          contextType: null,
+          workspace: null,
+          createdAt: null,
+          revision: null,
+          sandboxes: null,
+        },
+      ],
+    });
+  });
+
+  it('says so on stderr for an empty listing, and prints no table', async () => {
+    const { fetch } = scriptedFetch(json({ workloads: [] }));
+    const rt = testRuntime({ fetchImpl: fetch });
+    const o = io();
+    expect(await cmdWorkloadList(rt, o, { json: false })).toBe(0);
+    // No header: a piped listing counts workloads, not a header line.
+    expect(o.stdout).toBe('');
+    expect(o.stderr.join('\n')).toContain('no workloads');
+  });
+
+  it('prints an empty array with --json for an empty listing', async () => {
+    const { fetch } = scriptedFetch(json({ workloads: [] }));
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: true })).toBe(0);
+    expect(JSON.parse(o.stdout)).toEqual({ workloads: [] });
+  });
+
+  it('follows the cursor so the listing is every workload, not the first page', async () => {
+    const { fetch, calls } = scriptedFetch(
+      json({
+        workloads: [workload('ready', { workloadId: 'c', createdAt: at(0) })],
+        nextCursor: 300,
+      }),
+      json({
+        workloads: [workload('ready', { workloadId: 'b', createdAt: at(0) })],
+        nextCursor: 200,
+      }),
+      json({ workloads: [workload('ready', { workloadId: 'a', createdAt: at(0) })] }),
+    );
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: true })).toBe(0);
+    expect(calls.map((c) => c.url)).toEqual([
+      'http://h/workloads',
+      'http://h/workloads?cursor=300',
+      'http://h/workloads?cursor=200',
+    ]);
+    expect(
+      (JSON.parse(o.stdout) as { workloads: { workloadId: string }[] }).workloads.map(
+        (w) => w.workloadId,
+      ),
+    ).toEqual(['c', 'b', 'a']);
+  });
+
+  it('shows CREATED as - when the harness recorded no createdAt, or an unparseable one', async () => {
+    const { fetch } = scriptedFetch(
+      json({
+        workloads: [
+          { workloadId: 'legacy', status: 'ready' },
+          { workloadId: 'odd', status: 'ready', createdAt: 'not-a-date' },
+        ],
+      }),
+    );
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: false })).toBe(0);
+    const lines = o.stdout.trimEnd().split('\n');
+    // Unknown, not the epoch: neither row claims to be from 1970.
+    expect(lines[1]).toMatch(/^legacy\s+ready\s+-\s+-\s+-\s+-\s+-$/);
+    expect(lines[2]).toMatch(/^odd\s+ready\s+-\s+-\s+-\s+-\s+-$/);
+  });
+
+  it('exits 1 and prints nothing on a failed listing', async () => {
+    const { fetch } = scriptedFetch(json({ error: 'workloads_unavailable' }, 501));
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: true })).toBe(1);
+    expect(o.stdout).toBe('');
+    expect(o.stderr.join('\n')).toContain('workloads are not enabled on this harness');
+  });
+
+  it('exits 1 on a reply whose workloads are not a list', async () => {
+    const { fetch } = scriptedFetch(json({ workloads: 'nope' }));
+    const o = io();
+    expect(await cmdWorkloadList(testRuntime({ fetchImpl: fetch }), o, { json: true })).toBe(1);
+    expect(o.stdout).toBe('');
+    expect(o.stderr.join('\n')).toContain('invalid workload list');
+  });
+});
+
 describe('workloads delete', () => {
   it('deletes and prints {workloadId, status} with --json', async () => {
     const { fetch, calls } = scriptedFetch(new Response(null, { status: 204 }));
@@ -708,5 +842,75 @@ describe('workloads delete', () => {
     const raced = io();
     expect(await cmdWorkloadDelete(rt, raced, { id: 'demo', json: false })).toBe(1);
     expect(raced.stderr.join('\n')).toContain('409 workload_state_changed');
+  });
+
+  // #602: deleting an already-deleted workload satisfies the operator's intent, so it succeeds
+  // (as `kubectl delete` does) instead of failing indistinguishably from a mistyped id.
+  describe('an already-deleted workload (#602)', () => {
+    const alreadyDeleted = () => json({ error: 'workload_already_deleted' }, 404);
+
+    it('exits 0 and says it was already deleted', async () => {
+      const { fetch } = scriptedFetch(alreadyDeleted());
+      const o = io();
+      expect(
+        await cmdWorkloadDelete(testRuntime({ fetchImpl: fetch }), o, { id: 'demo', json: false }),
+      ).toBe(0);
+      expect(o.stderr.join('\n')).toContain('workload demo was already deleted');
+      // Not the "or it is not yours" sentence: that one is for a name nothing is known about.
+      expect(o.stderr.join('\n')).not.toContain('not yours');
+    });
+
+    // So `workloads delete ID --json | jq` reads the same either way and a cleanup script needs no
+    // special case; `alreadyDeleted` tells the two apart for anyone who does care.
+    it('prints the same --json shape as a delete that did the work, plus alreadyDeleted', async () => {
+      const { fetch } = scriptedFetch(alreadyDeleted());
+      const o = io();
+      expect(
+        await cmdWorkloadDelete(testRuntime({ fetchImpl: fetch }), o, { id: 'demo', json: true }),
+      ).toBe(0);
+      expect(JSON.parse(o.stdout)).toEqual({
+        workloadId: 'demo',
+        status: 'deleted',
+        alreadyDeleted: true,
+      });
+    });
+
+    it('omits alreadyDeleted when the delete did the work', async () => {
+      const { fetch } = scriptedFetch(new Response(null, { status: 204 }));
+      const o = io();
+      expect(
+        await cmdWorkloadDelete(testRuntime({ fetchImpl: fetch }), o, { id: 'demo', json: true }),
+      ).toBe(0);
+      expect(JSON.parse(o.stdout)).not.toHaveProperty('alreadyDeleted');
+    });
+
+    // Only this one code is idempotent. A 404 for a name the harness knows nothing about stays an
+    // error -- that is the mistyped-id case the issue wants kept distinct, and it prints no JSON.
+    it('still exits 1 for workload_not_found, printing no JSON', async () => {
+      const { fetch } = scriptedFetch(json({ error: 'workload_not_found' }, 404));
+      const o = io();
+      expect(
+        await cmdWorkloadDelete(testRuntime({ fetchImpl: fetch }), o, { id: 'demo', json: true }),
+      ).toBe(1);
+      expect(o.stdout).toBe('');
+    });
+
+    // An id that could carry an escape sequence never reaches the new message: `checkId` rejects
+    // anything outside WORKLOAD_ID first, before a request is even made. That is the guarantee
+    // worth pinning -- asserting on the sanitized message instead passes even unsanitized, because
+    // no such id can get that far (it let a no-sanitize mutant survive).
+    it('rejects a crafted id before any request, so the message never sees one', async () => {
+      const { fetch, calls } = scriptedFetch(alreadyDeleted());
+      const o = io();
+      expect(
+        await cmdWorkloadDelete(testRuntime({ fetchImpl: fetch }), o, {
+          id: 'wl-\u001b[31m00',
+          json: true,
+        }),
+      ).toBe(2);
+      expect(calls).toHaveLength(0);
+      expect(o.stdout).toBe('');
+      expect(o.stderr.join('\n')).not.toMatch(/\u001b/);
+    });
   });
 });

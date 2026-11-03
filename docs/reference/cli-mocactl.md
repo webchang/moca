@@ -72,6 +72,7 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 | `mocactl doctor [--json]`                                                                                                         | Seven ordered checks that stop at the first failure (below). Exit 1 if any fails                                                                                                                                                                                                                                                                                                                                         |
 | `mocactl run "prompt" [--session ID \| --new] [--option k=v ...] [--config DIGEST] [--json]`                                      | Runs a turn. Continues `--session`, or starts a new session (`--new`, the default)                                                                                                                                                                                                                                                                                                                                       |
 | `mocactl promote DIR [--dry-run] [--json]`                                                                                        | Builds a config bundle from `DIR/.claude` and uploads it (`POST /v1/config-bundles`). See [Promoting](../guides/promote-claude-workflow.md)                                                                                                                                                                                                                                                                              |
+| `mocactl bundles list [--json]`                                                                                                   | Lists the bundles you own, newest first (`GET /v1/config-bundles`). See below                                                                                                                                                                                                                                                                                                                                            |
 | `mocactl bundles delete DIGEST [--json]`                                                                                          | Deletes a bundle you promoted (`DELETE /v1/config-bundles/{digest}`). `DIGEST` must be `sha256:` plus 64 hex characters                                                                                                                                                                                                                                                                                                  |
 | `mocactl sessions [--json]`                                                                                                       | Lists every session you own (all pages of `GET /v1/sessions`)                                                                                                                                                                                                                                                                                                                                                            |
 | `mocactl sessions delete ID [--json]`                                                                                             | Deletes a session and its local transcript. `status` is `deleted`, or `accepted` when a turn was in flight                                                                                                                                                                                                                                                                                                               |
@@ -82,6 +83,7 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 | `mocactl subagents [--tag T] [--json]`                                                                                            | Lists spawned subagents from the ledger joined with `GET /runs/status`                                                                                                                                                                                                                                                                                                                                                   |
 | `mocactl get SESSIONID [--out DIR] [--json]`                                                                                      | Fetches a terminal result from `GET /runs/status` and writes `<sid>.text` / `<sid>.verdict.json` / `<sid>.patch`                                                                                                                                                                                                                                                                                                         |
 | `mocactl workloads create --context FILE [--name NAME] [--sandboxes N [--mount read-only\|writable]] [--json]`                    | `POST /workloads` (with `sandboxes: {count: N}` and `workspace: {mount}` when given), uploads `FILE` to the returned grant, then `POST /workloads/{id}/activate`, and with `--sandboxes` waits until the workload is `ready`. Prints the workload id                                                                                                                                                                     |
+| `mocactl workloads list [--json]`                                                                                                 | Lists your own live workloads, newest first (`GET /workloads`, following its cursor to the end). See [`workloads list`](#workloads-list)                                                                                                                                                                                                                                                                                 |
 | `mocactl workloads get ID [--json]`                                                                                               | Reads a workload (`GET /workloads/{id}`)                                                                                                                                                                                                                                                                                                                                                                                 |
 | `mocactl workloads delete ID [--json]`                                                                                            | Deletes a workload and its context (`DELETE /workloads/{id}`)                                                                                                                                                                                                                                                                                                                                                            |
 
@@ -97,6 +99,25 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 - Text mode streams the reply to stdout, and reports a `workspace_reset` to stderr.
 - `--json` emits NDJSON: a first line `{"type":"session","sessionId":...}`, then one raw
   [turn frame](http-api.md#streaming-frames) per line.
+
+### `workloads list`
+
+Your own live workloads, newest first; nobody else's, and there is no route that lists another
+user's ([#552](https://github.com/rossoctl/moca/issues/552)). Takes no id: finding one without
+already holding its id is the point, so `workloads list ID` exits 2.
+
+- A table of `WORKLOAD STATUS TYPE SIZE SANDBOXES CREATED REVISION`. `CREATED` is relative
+  (`4m ago`), `REVISION` is the first 12 characters, and `-` means unset — `CREATED` is `-` for a
+  workload created before the harness recorded the field, which is also absent from the listing
+  (see "Upgrading" in [`../context-service.md`](../context-service.md)).
+- `--json` prints one document, `{"workloads": [...]}`, with `null` for what a workload lacks and
+  `createdAt` in ISO 8601.
+- With no workloads it says `no workloads` on stderr and prints no table, so
+  `mocactl workloads list | wc -l` counts workloads; `--json` prints `{"workloads": []}`.
+- A `deleting` workload is listed, because it still holds a quota unit; a `deleted` one is not,
+  though `workloads get` still reads it for a day.
+- `SANDBOXES` can lag: the listing never settles a `provisioning` workload (so listing N makes no
+  provisioner calls). `workloads get ID` settles one.
 
 ### `credentials add`
 
@@ -164,13 +185,45 @@ token. There is no list command: the harness has no list route.
   provisioner lost the bundle) it activates once more. Any other recorded `error`, the same error
   again, or the timeout exits 1 and deletes the workload.
 - `get`/`delete` exit 2 for an invalid id, exit 1 for `404 workload_not_found` or another refusal.
+- `delete` on a workload that is already deleted exits 0: the workload is gone, which is what was
+  asked for, so a cleanup script can delete every id it knows without telling "already done" from a
+  real failure ([#602](https://github.com/rossoctl/moca/issues/602)). Only `404
+workload_already_deleted` is treated this way — `workload_not_found` still exits 1, because there
+  the id may simply be wrong.
 - `--json`:
   - `create` → `{"workloadId","status","contextType","revision","files","bytes"}`, plus
     `"sandboxes":{"count","tier","ready"}` and `"mount"` for a workload with sandboxes of its own.
   - `get` → `{"workloadId","status","contextType","workspace","revision","sandboxes"}` (`null` when
     unset; `workspace.mount` on a mounted workload), plus `"error"` while provisioning has failed.
     The table adds `SANDBOXES` (`ready/count`) and `MOUNT` columns.
-  - `delete` → `{"workloadId","status":"deleted"}`.
+  - `delete` → `{"workloadId","status":"deleted"}`, plus `"alreadyDeleted":true` when the workload
+    was deleted before this call (absent otherwise, so the document reads the same either way).
+
+### `bundles list`
+
+Answers "which config bundles do I own?", so a digest lost between `promote` returning and whatever
+stored it is recoverable instead of holding your byte budget until it expires.
+
+- Only your own bundles. Another subject's is indistinguishable from one that does not exist, and an
+  admin sees their own listing like anyone else — this is not an audit command.
+- Takes no `DIGEST` (exit 2 if given): finding one is the point.
+- Newest first, by when it was promoted. A bundle from before the control plane recorded that time
+  prints `-` and sorts last.
+- Columns `DIGEST BYTES PROMOTED (UTC) EXPIRES (UTC)`. The digest is printed in full because
+  `bundles delete` takes exactly that string.
+- `BYTES` is what the bundle is **charged**, not the size of your directory: the compressed upload,
+  or a 4 KiB minimum if it is smaller.
+- `EXPIRES` moves: each session that uses a bundle extends its 30-day life. `PROMOTED` does not.
+- With no bundles, stdout stays empty — the message goes to stderr — so `| wc -l` answers 0.
+  `--json` prints `{"bundles":[]}`.
+- One unpaged response. No cursor: the index is ordered by expiry, which a concurrent use can move,
+  so a cursor could skip or repeat a bundle. Your 16 MiB subject budget bounds the count.
+- A bundle promoted by the harness's own `promote` tool writes storage directly and keeps no budget
+  entry, so it does not appear here (the same population only an admin can delete).
+- A charge whose stored bytes were already reaped is still listed: that charge is exactly what you
+  need `bundles delete` for.
+- `--json` → `{"bundles":[{"digest","bytes","promotedAt","expiresAt"}]}`, epoch milliseconds,
+  `promotedAt` `null` when unrecorded. Exit 1 if the control plane refuses, 2 if not logged in.
 
 ### `promote` exit codes
 

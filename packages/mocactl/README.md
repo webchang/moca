@@ -80,6 +80,8 @@ mocactl doctor [--json]                     # seven checks, one fix per failure;
 mocactl run "prompt" [--session ID | --new] [--option inferenceCredential=NAME] [--json]
 mocactl promote DIR [--dry-run] [--json]    # upload DIR's .claude/skills and .claude/commands
 mocactl run "prompt" --config DIGEST        # start the new session with that config bundle
+mocactl run "prompt" --show-tools           # print each tool call between the turn's text
+mocactl bundles list [--json]               # your own live bundles, newest first; prints the full digest
 mocactl bundles delete DIGEST [--json]      # delete a bundle you promoted; frees your budget
 ```
 
@@ -109,9 +111,15 @@ mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]  # run it 
 ```bash
 mocactl workloads create --context FILE [--name NAME] [--json]  # upload a context; prints its id
 mocactl workloads create --context FILE --sandboxes N [--mount read-only|writable]  # with sandboxes of its own
+mocactl workloads list [--json]             # your own live workloads, newest first
 mocactl workloads get ID [--json]           # status, context type, size and frozen revision
-mocactl workloads delete ID [--json]        # delete the workload and its context
+mocactl workloads delete ID [--json]        # delete the workload and its context (idempotent)
 ```
+
+`workloads delete` on a workload that is already deleted exits 0 and says so, the way
+`kubectl delete` does, so a cleanup script can delete every id it knows without telling "already
+done" from a real failure. An id the harness knows nothing about still exits 1 — that one may be a
+typo. With `--json`, the already-deleted case adds `"alreadyDeleted": true` to the same document.
 
 `mocactl spawn` creates a session (pinned to the bundle if `--config` is given), writes a record
 to `$XDG_STATE_HOME/mocactl/subagents.jsonl`, then forks a detached worker that holds the sync
@@ -151,6 +159,11 @@ capacity (`503` with `Retry-After`), it waits and retries, printing the harness'
 example `no attached sandbox in sandbox tier 'container'`), for at most 15 minutes in all; then it
 exits `1` with that refusal. A tier or template with no worker never gains one by waiting.
 
+By default it prints the assistant's text only. `--show-tools` adds each tool call the turn makes,
+on its own line between the text, formatted as the TUI formats it (`$ ls /tmp`, `read src/a.ts`),
+and marks a tool call that failed; a successful call's output is not printed. It is refused with
+`--json`, which already streams the `tool_use` and `tool_result` frames themselves.
+
 `mocactl promote` prints what it built and the preflight report (warnings on stderr) BEFORE
 uploading, then the bundle digest to pass to `run --config`. `--dry-run` builds and prints without
 uploading, and needs no login. It exits `2` when refused before upload (a usage error, not logged
@@ -162,6 +175,12 @@ bundle is fixed when it is created, so
 `--config` cannot be combined with `--session`.
 
 Stored bundles count against a per-account and a deployment-wide byte budget (`429` when full).
+`mocactl bundles list` prints the bundles you own — digest, the bytes each is charged, when it was
+promoted and when it expires — newest first, so a digest you lost after `promote` is still
+recoverable instead of holding your budget until it expires. It prints the digest in full because
+that is what `delete` takes. `BYTES` is the charge, not the size of your directory: a small bundle
+is still charged a 4 KiB minimum. A bundle promoted by the harness's own `promote` tool writes
+Redis directly, keeps no budget entry, and so does not appear.
 `mocactl bundles delete DIGEST` deletes a bundle you promoted and frees its share; an admin may
 delete anyone's. Sessions created on it then fail their next turn as for an expired bundle.
 `mocactl promote DIR --dry-run` prints a directory's digest without uploading. Rollout order: upgrade the harness before the
@@ -215,8 +234,29 @@ anything fails after the workload exists, `create` deletes it again, so it does 
 your quota (5 live workloads by default), and exits `1`. `--name` is a lowercase Kubernetes name of
 at most 50 characters; without one `create` generates one (`wl-` and 8 hex) before it sends the
 request, so if the reply is lost (Ctrl-C, a dropped connection) it can still name the workload to
-delete. The harness has no route that lists workloads, so there is no `mocactl workloads` listing:
-keep the id `create` prints.
+delete.
+
+`workloads list` shows what you own, newest first, when you no longer have the id `create` printed
+(`GET /workloads`, [#552](https://github.com/rossoctl/moca/issues/552)). It is the way out of a
+workload holding a quota unit under a name nothing recorded:
+
+```bash
+mocactl workloads list
+# WORKLOAD      STATUS           TYPE       SIZE  SANDBOXES  CREATED  REVISION
+# wl-3f9c1a04   ready            workspace  1Gi   -          4m ago   8c1d0e4a2b77
+# demo          awaiting_upload  workspace  1Gi   -          2h ago   -
+mocactl workloads delete wl-3f9c1a04
+```
+
+Your own workloads only: there is no route that lists another user's, and none that lists everyone's.
+A `deleting` workload is listed, because it still holds its quota unit and a repeated `delete` is
+how to clear it; a `deleted` one is not, though `workloads get` still reads it for a day. The
+listing never settles a `provisioning` workload, so `SANDBOXES` can lag — `workloads get ID` is
+what settles one. `CREATED` is `-` for a workload created before the harness recorded the field;
+those are also absent from the listing (see "Upgrading" in
+[`docs/context-service.md`](../../docs/context-service.md)). With no workloads at all, it says
+`no workloads` on stderr and prints no table, so `mocactl workloads list | wc -l` counts workloads;
+`--json` prints `{"workloads": []}`.
 
 `--sandboxes N` gives the workload N sandboxes of its own instead of the operator's shared pool
 (phase 2, [#476](https://github.com/rossoctl/moca/issues/476); "Own sandboxes" in
@@ -253,19 +293,20 @@ empty list. Without `--json` a listing is an aligned table with a header row, ma
 Times are UTC. With `--json` stdout is one JSON document and one line; `run` and `doctor` keep
 their own shapes. These shapes are stable: fields may be added, but none is renamed or removed.
 
-| Command              | `--json` on stdout                                                                                 |
-| -------------------- | -------------------------------------------------------------------------------------------------- |
-| `sessions`           | `{"sessions":[{"sessionId","title","state","createdAt","lastTurnAt"}]}`                            |
-| `sessions delete`    | `{"sessionId","status"}`, `status` being `deleted`, or `accepted` while the control plane finishes |
-| `credentials`        | `{"credentials":[{"name","kind","consumer","hosts","endpoint"}]}`                                  |
-| `credentials add`    | `{"name","status":"stored"}`                                                                       |
-| `credentials delete` | `{"name","status":"deleted"}`                                                                      |
-| `spawn`              | `{"type":"session","sessionId","pid"}`                                                             |
-| `subagents`          | `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","workload","submittedAt"}]}`    |
-| `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?}`                                 |
-| `workloads create`   | `{"workloadId","status","contextType","revision","files","bytes","sandboxes"?,"mount"?}`           |
-| `workloads get`      | `{"workloadId","status","contextType","workspace","revision","sandboxes","error"?}`, `null` unset  |
-| `workloads delete`   | `{"workloadId","status":"deleted"}`                                                                |
+| Command              | `--json` on stdout                                                                                                                                  |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessions`           | `{"sessions":[{"sessionId","title","state","createdAt","lastTurnAt"}]}`                                                                             |
+| `sessions delete`    | `{"sessionId","status"}`, `status` being `deleted`, or `accepted` while the control plane finishes                                                  |
+| `credentials`        | `{"credentials":[{"name","kind","consumer","hosts","endpoint"}]}`                                                                                   |
+| `credentials add`    | `{"name","status":"stored"}`                                                                                                                        |
+| `credentials delete` | `{"name","status":"deleted"}`                                                                                                                       |
+| `spawn`              | `{"type":"session","sessionId","pid"}`                                                                                                              |
+| `subagents`          | `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","workload","submittedAt"}]}`                                                     |
+| `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?}`                                                                                  |
+| `workloads create`   | `{"workloadId","status","contextType","revision","files","bytes","sandboxes"?,"mount"?}`                                                            |
+| `workloads list`     | `{"workloads":[{"workloadId","status","contextType","workspace","createdAt","revision","sandboxes","error"?}]}`, `null` unset, `createdAt` ISO 8601 |
+| `workloads get`      | `{"workloadId","status","contextType","workspace","revision","sandboxes","error"?}`, `null` unset                                                   |
+| `workloads delete`   | `{"workloadId","status":"deleted","alreadyDeleted"?}`                                                                                               |
 
 `createdAt` and `lastTurnAt` are epoch milliseconds as the control plane sends them (`lastTurnAt`
 is `null` before the first turn); `endpoint` is `null` when the deployment default applies.

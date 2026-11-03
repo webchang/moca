@@ -1,5 +1,10 @@
 import { ApiError } from './api/errors.js';
-import type { CredentialConsumer, DeviceStart, SessionSummary } from './api/types.js';
+import type {
+  ConfigBundleSummary,
+  CredentialConsumer,
+  DeviceStart,
+  SessionSummary,
+} from './api/types.js';
 import {
   LoginCancelledError,
   LoginExpiredError,
@@ -26,6 +31,7 @@ import {
 } from './core/session-options.js';
 import { sameControlPlane, storedLoginUrl } from './config.js';
 import { workspaceResetText } from './render/blocks.js';
+import { toolSummary } from './render/tools.js';
 import { openableUrl, type OsDeps } from './os.js';
 import { ensureRuntimeAuth, sessionManager, setAuth, type Runtime } from './runtime.js';
 
@@ -313,7 +319,16 @@ export interface RunOptions {
   json: boolean;
   signal?: AbortSignal;
   configRef?: string;
+  /** Interleave the turn's tool calls with its text (#419). Redundant under `json`, which has them. */
+  showTools?: boolean;
 }
+
+/**
+ * One tool call is one line, so a newline inside a remote argument (a path, a pattern) cannot break
+ * the layout up. Control characters are already gone -- this runs on sanitizeRemote's output, which
+ * keeps `\n` deliberately for the text path.
+ */
+const oneLine = (s: string): string => s.replace(/\s*\n\s*/g, ' ').trimEnd();
 
 /**
  * False (with the reason on stderr) unless there is a control plane and a valid login for it. The
@@ -380,6 +395,44 @@ export async function cmdPromote(
     io.err(describeError(err));
     return 1;
   }
+}
+
+/**
+ * `mocactl bundles list`: the caller's own stored config bundles (rossoctl/moca#559).
+ *
+ * The digest is printed in full, not abbreviated, because the only thing to do with a listed bundle
+ * is `mocactl bundles delete <digest>` -- an elided digest would have to be retyped from the server.
+ */
+export async function cmdBundleList(rt: Runtime, io: Io, opts: ManageOptions): Promise<number> {
+  if (!ready(rt, io)) return 2;
+  let bundles: ConfigBundleSummary[];
+  try {
+    bundles = (await cancellable(rt.cp.listConfigBundles(), opts.signal)).bundles;
+  } catch (err) {
+    return failed(io, err);
+  }
+  if (opts.json) {
+    io.out(JSON.stringify({ bundles }) + '\n');
+    return 0;
+  }
+  if (bundles.length === 0) {
+    // On stderr with no header, so `mocactl bundles list | wc -l` answers 0 for an empty listing.
+    io.err('no config bundles');
+    return 0;
+  }
+  const head = ['DIGEST', 'BYTES', 'PROMOTED (UTC)', 'EXPIRES (UTC)'];
+  const body = bundles.map((b) =>
+    [
+      b.digest,
+      // Stringified here so it passes through the same sanitizeRemote as every other cell: these are
+      // remote values, and `bytes: number` is only what the type says.
+      String(b.bytes),
+      b.promotedAt === null ? '-' : utc(b.promotedAt),
+      utc(b.expiresAt),
+    ].map(sanitizeRemote),
+  );
+  io.out(table([head, ...body]) + '\n');
+  return 0;
 }
 
 export async function cmdBundleDelete(
@@ -502,6 +555,16 @@ export async function cmdRun(rt: Runtime, io: Io, opts: RunOptions): Promise<num
       // The sandbox id and tier are server-originated, so they are sanitized like the text above.
       else if (e.frame.type === 'workspace_reset')
         io.err(sanitizeRemote(workspaceResetText(e.frame)));
+      // --show-tools (#419). Both go to STDOUT, interleaved with the text rather than beside it on
+      // stderr: the point of the flag is to show, in order, what the agent did before it answered.
+      // Fenced in newlines of their own, because the text they sit between arrives as deltas that
+      // may end mid-line. `toolSummary` is the TUI's own formatter, so the two agree per tool.
+      else if (opts.showTools && e.frame.type === 'tool_use')
+        io.out(`\n${oneLine(sanitizeRemote(toolSummary(e.frame.name, e.frame.args)))}\n`);
+      // Only a FAILED result is reported, and without its preview: a successful command's output is
+      // the agent's business, and a preview is remote multi-line text that would bury the answer.
+      else if (opts.showTools && e.frame.type === 'tool_result' && e.frame.isError)
+        io.out('  (that command failed)\n');
     } else if (e.kind === 'retrying') {
       // The server's reason, when it gives one (a pool, tier or template; server-originated, so
       // sanitized), tells a wait that will end from one that will not.
@@ -617,13 +680,15 @@ export async function cmdSessions(rt: Runtime, io: Io, opts: ManageOptions): Pro
     return failed(io, err);
   }
   // Titles are local (renamed in the TUI, or the first prompt); the control plane keeps none.
-  // No turn count: the control plane reports one, but nothing writes it yet, so it is always 0.
+  // `turns` is the server's own count of completed turns, left out when #406 added this command
+  // because nothing wrote it then and it read 0 on every deployment (#420 gave it a writer).
   const rows = sessions.map((s) => ({
     sessionId: s.sessionId,
     title: rt.transcripts?.load(s.sessionId)?.title ?? null,
     state: s.state,
     createdAt: s.createdAt,
     lastTurnAt: s.lastTurnAt,
+    turns: s.turns,
   }));
   if (opts.json) {
     io.out(JSON.stringify({ sessions: rows }) + '\n');
@@ -633,11 +698,14 @@ export async function cmdSessions(rt: Runtime, io: Io, opts: ManageOptions): Pro
     io.err('no sessions');
     return 0;
   }
-  const head = ['ID', 'STATE', 'CREATED (UTC)', 'LAST TURN (UTC)', 'TITLE'];
+  const head = ['ID', 'STATE', 'TURNS', 'CREATED (UTC)', 'LAST TURN (UTC)', 'TITLE'];
   const body = rows.map((r) =>
     [
       r.sessionId,
       r.state,
+      // Stringified here rather than left to `table`, so it passes through the same sanitizeRemote
+      // as every other cell: this is a remote value, and `turns: number` is only what the type says.
+      String(r.turns),
       utc(r.createdAt),
       r.lastTurnAt === null ? '-' : utc(r.lastTurnAt),
       r.title ?? '',

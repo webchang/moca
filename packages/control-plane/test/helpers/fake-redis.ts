@@ -17,6 +17,15 @@ export function fakeRedis() {
       hashes.set(key, { ...(hashes.get(key) ?? {}), ...values });
       return 1;
     },
+    async hIncrBy(key, field, by) {
+      // The field name is recorded too: `turns` must move by HINCRBY and never by the merging hSet,
+      // and an op log that said only `hIncrBy <key>` could not tell those apart.
+      ops.push(`hIncrBy ${key} ${field}`);
+      const h = hashes.get(key) ?? {};
+      const next = (Number(h[field]) || 0) + by;
+      hashes.set(key, { ...h, [field]: String(next) });
+      return next;
+    },
     async hGetAll(key) {
       return { ...(hashes.get(key) ?? {}) };
     },
@@ -140,6 +149,13 @@ export function fakeBundleRedis(): BundleRedisLike &
         .filter(([, score]) => inRange(score, min, max))
         .sort((a, b) => a[1] - b[1])
         .map(([v]) => v);
+    },
+    async zRangeWithScores(key, min, max, opts) {
+      if (opts?.BY !== 'SCORE') throw new Error('this fake only serves BY SCORE');
+      return [...z(key)]
+        .filter(([, score]) => inRange(score, min, max))
+        .sort((a, b) => a[1] - b[1])
+        .map(([value, score]) => ({ value, score }));
     },
     async zRem(key, member) {
       z(key).delete(member);

@@ -80,6 +80,42 @@ describe('main', () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  // #419. The flag only reaches cmdRun as a boolean, so this is where the wiring is checked;
+  // what it PRINTS is headless.test.ts's.
+  it('passes run --show-tools through, and defaults it to false', async () => {
+    const run = vi.fn(async (..._args: unknown[]) => 0);
+    const headless = await import('../src/headless.js');
+    const spy = vi.spyOn(headless, 'cmdRun').mockImplementation(run);
+    onTestFinished(() => spy.mockRestore());
+    expect(await main(['run', 'hi', '--show-tools'], {}, io(), { buildRuntime: fakeBuild })).toBe(
+      0,
+    );
+    expect(run.mock.calls[0][2]).toMatchObject({ showTools: true });
+    // Absent must be false, not undefined: `opts.showTools && ...` would pass either way, but a
+    // caller that forwards the option object (the TUI, a future wrapper) should see a boolean.
+    expect(await main(['run', 'hi'], {}, io(), { buildRuntime: fakeBuild })).toBe(0);
+    expect(run.mock.calls[1][2]).toMatchObject({ showTools: false });
+  });
+
+  // Refused rather than ignored: --json already carries every tool frame, and a script whose flag
+  // is silently dropped learns nothing.
+  it('rejects --show-tools together with --json, running no turn', async () => {
+    const run = vi.fn(async (..._args: unknown[]) => 0);
+    const headless = await import('../src/headless.js');
+    const spy = vi.spyOn(headless, 'cmdRun').mockImplementation(run);
+    onTestFinished(() => spy.mockRestore());
+    const o = io();
+    expect(
+      await main(['run', 'hi', '--show-tools', '--json'], {}, o, { buildRuntime: fakeBuild }),
+    ).toBe(2);
+    expect(o.errs.join('\n')).toContain('--show-tools is redundant with --json');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('documents --show-tools in the usage, so --help stays the one source of truth', () => {
+    expect(USAGE).toContain('--show-tools');
+  });
+
   it('passes flags to the runtime builder', async () => {
     const build = vi.fn(fakeBuild);
     await main(
@@ -241,15 +277,31 @@ describe('main', () => {
     expect(USAGE).toContain('mocactl promote DIR [--dry-run] [--json]');
   });
 
-  it('bundles delete needs exactly one digest, and bundles has no other subcommand', async () => {
+  it('bundles delete needs exactly one digest, and bundles has no third subcommand', async () => {
     expect(await main(['bundles', 'delete'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
     expect(await main(['bundles', 'delete', 'a', 'b'], {}, io(), { buildRuntime: fakeBuild })).toBe(
       2,
     );
     const o = io();
-    expect(await main(['bundles', 'list'], {}, o, { buildRuntime: fakeBuild })).toBe(2);
-    expect(o.errs.join('')).toContain('unknown bundles command "list"');
+    expect(await main(['bundles', 'promote'], {}, o, { buildRuntime: fakeBuild })).toBe(2);
+    expect(o.errs.join('')).toContain('unknown bundles command "promote"');
     expect(USAGE).toContain('mocactl bundles delete DIGEST [--json]');
+  });
+
+  it('routes bundles list to the listing, and refuses a digest with it (#559)', async () => {
+    const listConfigBundles = vi.fn(async () => ({ bundles: [] }));
+    const build = () => testRuntime({ cp: fakeControlPlane({ listConfigBundles }) });
+    const o = io();
+    expect(await main(['bundles', 'list'], {}, o, { buildRuntime: build })).toBe(0);
+    expect(listConfigBundles).toHaveBeenCalledOnce();
+    expect(o.errs.join('')).toContain('no config bundles');
+    // The listing is how you FIND a digest, so taking one would be nonsense.
+    const d = io();
+    expect(
+      await main(['bundles', 'list', 'sha256:' + 'a'.repeat(64)], {}, d, { buildRuntime: build }),
+    ).toBe(2);
+    expect(listConfigBundles).toHaveBeenCalledOnce();
+    expect(USAGE).toContain('mocactl bundles list [--json]');
   });
 
   it('promote needs exactly one directory', async () => {
@@ -758,15 +810,17 @@ describe('workloads and spawn --workload', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('routes workloads create, get and delete; --context and --name only on create', async () => {
+  it('routes workloads create, list, get and delete; --context and --name only on create', async () => {
     const mod = await import('../src/workloads.js');
     const create = vi.fn(async (..._a: unknown[]) => 0);
     const get = vi.fn(async (..._a: unknown[]) => 0);
     const del = vi.fn(async (..._a: unknown[]) => 0);
+    const list = vi.fn(async (..._a: unknown[]) => 0);
     const spies = [
       vi.spyOn(mod, 'cmdWorkloadCreate').mockImplementation(create),
       vi.spyOn(mod, 'cmdWorkloadGet').mockImplementation(get),
       vi.spyOn(mod, 'cmdWorkloadDelete').mockImplementation(del),
+      vi.spyOn(mod, 'cmdWorkloadList').mockImplementation(list),
     ];
     onTestFinished(() => spies.forEach((s) => s.mockRestore()));
     const run = (argv: string[], o = io()) => main(argv, {}, o, { buildRuntime: fakeBuild });
@@ -783,6 +837,9 @@ describe('workloads and spawn --workload', () => {
     expect(get.mock.calls[0][2]).toMatchObject({ id: 'demo', json: true });
     expect(await run(['workloads', 'delete', 'demo'])).toBe(0);
     expect(del.mock.calls[0][2]).toMatchObject({ id: 'demo', json: false });
+    // `list` takes no id, so it never reaches the id-required branch the others share (#552).
+    expect(await run(['workloads', 'list', '--json'])).toBe(0);
+    expect(list.mock.calls[0][2]).toMatchObject({ json: true });
 
     expect(
       await run([
@@ -812,10 +869,11 @@ describe('workloads and spawn --workload', () => {
     const noContext = io();
     expect(await run(['workloads', 'create'], noContext)).toBe(2);
     expect(noContext.errs.join('\n')).toContain('needs --context FILE');
-    const noList = io();
-    expect(await run(['workloads'], noList)).toBe(2);
-    expect(noList.errs.join('\n')).toContain('there is no list');
-    expect(await run(['workloads', 'list'])).toBe(2);
+    const noSub = io();
+    expect(await run(['workloads'], noSub)).toBe(2);
+    expect(noSub.errs.join('\n')).toContain('needs create, list, get or delete');
+    // An id on the listing is a mistake, not a filter.
+    expect(await run(['workloads', 'list', 'demo'])).toBe(2);
     expect(await run(['workloads', 'get'])).toBe(2);
     expect(await run(['workloads', 'delete', 'a', 'b'])).toBe(2);
     expect(await run(['workloads', 'get', 'demo', '--context', 'x'])).toBe(2);
@@ -823,7 +881,9 @@ describe('workloads and spawn --workload', () => {
     expect(create).toHaveBeenCalledTimes(2);
     expect(get).toHaveBeenCalledTimes(1);
     expect(del).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledTimes(1);
     expect(USAGE).toContain('mocactl workloads create --context FILE');
+    expect(USAGE).toContain('mocactl workloads list');
     expect(USAGE).toContain('--workload ID');
   });
 });
