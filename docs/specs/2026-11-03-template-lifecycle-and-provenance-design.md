@@ -236,9 +236,25 @@ Today `/v1/sessions` is on the `harness` route profile and `/v1/templates` and `
 `sandbox` profile (`packages/control-plane/src/routes.ts`). **The template routes of this design
 mount on both** (`BOTH`), so a Moca Pi brain (sessions, `harness`) and a stock agent (sandboxes,
 `sandbox`) see the same templates, builds and readiness; the host-agent routes (§6.1) mount on the
-profile whose deployment the hosts serve. For the validation (§10) a deployment serves both brains:
-one control plane per profile sharing one store, or the `harness` profile with the sandbox routes
-added; the choice is the validation plan's, recorded there.
+profile whose deployment the hosts serve.
+
+**For the validation (§10): one control plane, the `harness` profile with the sandbox routes added**
+(autobench-moca's choice, 2026-11-03): one store, subject, quota and provenance chain, so both
+brains' reps on an instance are served by the same build under the same lease, and no cross-process
+question about leases and replacement enters what §10 measures. Two control planes sharing a store
+is the alternative, not taken. Mounting the SBX0 routes on `harness` must keep SBX0's token
+separation (to be checked in code and tests when it is built):
+
+- the **sandbox token** keeps its own `typ` (`moca-sandbox+jwt`), audience (`moca-sandbox`) and
+  issuer (`sandbox-token.ts`), whichever profile mints it, so it never passes as a session or API
+  token, nor the reverse;
+- **API tokens** on a `harness` control plane are minted under `sh-control-plane`, not the sandbox
+  profile's `sbx-control-plane-api` (`apiIssuer`, `handlers.ts`); what mints for SBX0 under the
+  sandbox issuer (`deploy/sbx/mint-login.sh` and its test) must follow the deployment's profile, and
+  a sandbox-profile stack sharing the signing key must still accept nothing this one mints;
+- the sandbox routes stay **refused to test users** (SBX0 §4.2 admits only enrolled `github:`
+  subjects; `main.ts` refuses test users on the sandbox profile): on `harness`, the sandbox routes
+  check the subject themselves.
 
 ## 5. Actions: the owner's, and the admin's
 
@@ -340,8 +356,9 @@ Build claims take subjects in turn, so one subject's batch of 50 does not hold e
 - **Aging:** an `active` build idle longer than its host's `idleLimit` (§6.2) is moved to
   `deactivating` by the control plane, whoever activated it.
 - **Leases:** an activation is a **lease** held by its subject, with a length (`leaseSeconds`,
-  default the host's `idleLimit`) the client renews (`POST /v1/templates/{id}/activate` again) while
-  it still needs the build, e.g. for the life of a batch. A build under any unexpired lease is held:
+  default the host's `idleLimit`, at most a day per grant) the client renews
+  (`POST /v1/templates/{id}/activate` again) while it still needs the build, e.g. for the life of a
+  batch; renewals have no cap (O14). A build under any unexpired lease is held:
   aging and replacement never take it, whether or not a session is live between reps.
 - **Replacement:** an activation that would pass the host's `activeLimit` deactivates the `active`
   build on that host with the oldest `lastUsedAt`, no live session and **no unexpired lease**, whoever
@@ -532,11 +549,11 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 
 ### 12.3 Open, for the review
 
-| #   | Question                                                                                                      | Proposed                                                                                          |
-| --- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| O10 | Default visibility of a new template                                                                          | `deployment` (benchmark templates are shared); autobench-moca agrees                              |
-| O11 | May a non-owner's activation replace the owner's oldest, or only idle builds of anyone's (as §6.3)?           | idle builds of anyone's, oldest first, never a leased one (§6.3); autobench-moca agrees           |
-| O12 | Private registries: a client's pull credential, or only registries the build hosts can already pull from?     | the latter for the first version (G16); autobench-moca agrees                                     |
-| O13 | TB needs egress through an allowlist: a `benchmark-egress` profile, or TB out of scope for the first version? | out of scope for the first validation (SWE-bench only); the profile after it                      |
-| O14 | A lease's default length and its maximum                                                                      | the host's `idleLimit`; at most a day                                                             |
-| O15 | Workspace export (W6): a route (a tar stream of `/workspace`), or grading on the host?                        | a route, `GET /v1/sandboxes/{id}/workspace.tar`, after the validation; grading on the host for it |
+| #   | Question                                                                                                      | Proposed                                                                                                                                                                                            |
+| --- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| O10 | Default visibility of a new template                                                                          | `deployment` (benchmark templates are shared); autobench-moca agrees                                                                                                                                |
+| O11 | May a non-owner's activation replace the owner's oldest, or only idle builds of anyone's (as §6.3)?           | idle builds of anyone's, oldest first, never a leased one (§6.3); autobench-moca agrees                                                                                                             |
+| O12 | Private registries: a client's pull credential, or only registries the build hosts can already pull from?     | the latter for the first version (G16); autobench-moca agrees                                                                                                                                       |
+| O13 | TB needs egress through an allowlist: a `benchmark-egress` profile, or TB out of scope for the first version? | out of scope for the first validation (SWE-bench only); the profile after it; autobench-moca agrees                                                                                                 |
+| O14 | A lease's default length and its maximum                                                                      | the host's `idleLimit`, at most a day per grant; **renewal extends it without limit** while the holder renews (batches have run 17.4 h; the runner renews at half the lease); autobench-moca agrees |
+| O15 | Workspace export (W6): a route (a tar stream of `/workspace`), or grading on the host?                        | a route, `GET /v1/sandboxes/{id}/workspace.tar`, after the validation; grading on the host for it (as AM's microVM cells did); autobench-moca agrees                                                |
