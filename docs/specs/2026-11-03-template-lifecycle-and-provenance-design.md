@@ -1,7 +1,7 @@
 # Template lifecycle, readiness and provenance — Design
 
-Version: 0.4 (draft for review; **self-serve**: clients build, register and activate their own
-templates, gated by machine-checked policy) — November 2026
+Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
+templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
@@ -17,6 +17,13 @@ not an admin, decides** whether a build is registered (§8); the client activate
 templates within its quota and the host's limit (§6). Admins set the policy, the quotas and the host
 limits, and can act on any template (§5.2). The request-and-approve flow of 0.3 is gone. Still not
 adopted: build steps in code (clients bring a finished image, D13).
+
+**What changed in 0.5** (autobench-moca's client review of 0.4, 2026-11-03): the template routes mount
+on both route profiles (§4.1); the spec gains `workspace_mb`, and a build's seed and spec are readable
+(§4); reuse keys on the gate record and the profile too (§3.2); activations are **leases** a batch
+renews, so replacement never evicts a held build (§6.3); the `409`s carry readiness and the host's
+slots (§4); the instance-id mapping is part of the benchmark profile (§8.4); the disk floor counts
+retained workspaces (§6.1); open: TB's egress (O13), a lease's length (O14), workspace export (O15).
 
 ## 1. Goal and scope
 
@@ -78,8 +85,8 @@ The user asked (2026-11-03) to leverage the good design decisions of E2B's templ
   manifest hash, `buildId` (`sha256:…`, §8 PV2-PV3 make that hash cover the whole snapshot). A
   **template** is a name over its builds. Today's rule that a new image is a new snapshot and a new
   worker is unchanged: each is a new build of the same template.
-- **A build is reused when its inputs are the same:** a create whose image digest, spec and builder
-  (MOCA commit, kernel) match an existing registered build returns that build, not a second snapshot
+- **A build is reused when its inputs are the same:** a create whose image digest, spec, profile,
+  gate record (its sha256) and builder (MOCA commit, kernel) match an existing registered build returns that build, not a second snapshot
   (E2B caches layers; MOCA's unit is the whole snapshot). Disk is the scarce resource (A3).
 - **Tags are labels on builds, moved without rebuilding.** A template is referenced as `id[:tag]`,
   `default` when the tag is omitted; **the template's owner** moves tags (`stable`, `v2`, …) between
@@ -145,7 +152,7 @@ POST /v1/templates
 {
   "id": "django-django-11133",
   "image": "<repository>@sha256:…",
-  "spec": { "guest_mb": 4096, "vcpus": 2, "egress": false, "tools": ["bash", "git", "python3", "rg"],
+  "spec": { "guest_mb": 4096, "vcpus": 2, "workspace_mb": 2048, "egress": false, "tools": ["bash", "git", "python3", "rg"],
             "seed": "…", "probe": { "command": "…", "expect_rc": 0, "expect": ["…"] },
             "skip_git_identity_check": true, "guest_home": "/tmp/home" },
   "gateRecord": { … },            // optional; required by the benchmark profile (§8)
@@ -156,7 +163,10 @@ POST /v1/templates
 → 202 { "templateId": "django-django-11133", "buildId": null, "build": "/v1/templates/django-django-11133/builds/b-01J…", "status": "queued" }
 ```
 
-The spec is the same document `template-build.sh` reads today (`ONBOARDING.md`); the image's gate
+The spec is the same document `template-build.sh` reads today (`ONBOARDING.md`), plus
+`workspace_mb`, the size of the sandbox's `/workspace` image (default 2048, today's
+`SH_WORKSPACE_IMAGE_MB`; within the profile's envelope; register W11), which the worker serving the
+build applies; the image's gate
 record, when given, is stored with the build and checked (§8). `POST /v1/templates/{id}/builds`
 starts a new build of an existing template (a new image or spec); same body, same answer. A build
 has a provisional handle (`b-…`) until it is built; then its `buildId` is its manifest hash and the
@@ -183,11 +193,16 @@ handle redirects to it. A create that matches an existing registered build (§3.
       "readiness": "active",
       "capacity": { "running": 3, "inUse": 1 },
       "lastUsedAt": "2026-11-03T02:10:00Z",
+      "spec": { "guest_mb": 4096, "vcpus": 2, "workspace_mb": 2048, "seed": "…", "tools": ["…"] },
       "provenance": "/v1/provenance/records/<digest>"
     }
   ]
 }
 ```
+
+Each build carries **its own spec, seed included**: a client that runs the seed itself (SBX0's
+`sandbox` profile does not run it) reads the seed of the build it was served
+(`GET /v1/templates/{id}/builds/{buildId}`), never the newest build's.
 
 **Builds, as a resource (adopted from E2B's build status):**
 
@@ -203,14 +218,27 @@ handle redirects to it. A create that matches an existing registered build (§3.
 plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600, "disk": {"freeGb": 140, "floorGb": 60}}]}`
 (limits are per host, §6.2). Errors keep MOCA's shape, `{error, message}` with a stable code, and
 add `step` where a build step failed and `rule` where policy refused; a refusal that may clear
-carries `Retry-After`. `capacity.running` is what the worker's budget admits at once
-(`(budget − 1024) ÷ (guest + 32)` MiB, the rule measured on 2026-10-31); `inUse` is its running
-sessions now. `GET /v1/templates/{id}` returns one template with its full provenance chain (§7).
+carries `Retry-After`. `capacity.running` is what the worker's budget admits at once, as the worker
+reports it (its stats, through the host agent's inventory), not a formula in the control plane: the
+rule depends on the MOCA commit (#644 changed standby charging: autobench-moca measured a density of 16
+at a280cb41 and 36 at c49e6a8e on the same sweep); `inUse` is its running sessions now. `GET /v1/templates/{id}` returns one template with its full provenance chain (§7).
 
 A session or sandbox names `id`, `id:tag` or `id@sha256:…` (§3.2); the reference is resolved to one
 build at creation, recorded on the session, and kept for its life. On a build that is not `active`
-it is refused at creation with `409 template_not_active`, the build's readiness and `Retry-After`,
-and, unless the client says `activate: false`, an activation is started for it (§6.4).
+it is refused at creation with `409 template_not_active` and `Retry-After`, and, unless the client
+says `activate: false`, an activation is started for it (§6.4). The body says why, so a client can
+tell a wait from a refusal: `{error, message, readiness, hosts: [{id, active: {limit, used}}],
+quota: {active: {limit, used}}}`; `409 no_active_slot` and `409 quota_exceeded` carry the same.
+
+### 4.1 Route profiles
+
+Today `/v1/sessions` is on the `harness` route profile and `/v1/templates` and `/v1/sandboxes` on the
+`sandbox` profile (`packages/control-plane/src/routes.ts`). **The template routes of this design
+mount on both** (`BOTH`), so a Moca Pi brain (sessions, `harness`) and a stock agent (sandboxes,
+`sandbox`) see the same templates, builds and readiness; the host-agent routes (§6.1) mount on the
+profile whose deployment the hosts serve. For the validation (§10) a deployment serves both brains:
+one control plane per profile sharing one store, or the `harness` profile with the sandbox routes
+added; the choice is the validation plan's, recorded there.
 
 ## 5. Actions: the owner's, and the admin's
 
@@ -258,7 +286,9 @@ SBX0 §8.3). It has two jobs:
 - **Build** (self-serve, new in 0.4): it claims `queued` builds and runs `template-build.sh` on them,
   as an operator does today, then installs the worker (`install-host.sh`) without starting it. A build
   is claimed only when the host's free disk stays above its floor after one more snapshot (the
-  `template-build.sh` refusal at 60 G, measured 2026-11-01), and at most `buildConcurrency` at a time
+  `template-build.sh` refusal at 60 G, measured 2026-11-01), counting the disk retained workspaces
+  may still grow to (each session's sparse workspace, up to `workspace_mb`, kept until
+  `SH_WORKSPACE_IDLE`: what filled bm1 in TB, register W8), and at most `buildConcurrency` at a time
   (default 1). The build log is streamed in `logEntries` (§4); the build record follows (§7).
 - **Activate**: start and stop a template's installed worker unit, as `install-host.sh` /
   `setup-microvm.sh --template` do today.
@@ -309,9 +339,16 @@ Build claims take subjects in turn, so one subject's batch of 50 does not hold e
   sees every creation).
 - **Aging:** an `active` build idle longer than its host's `idleLimit` (§6.2) is moved to
   `deactivating` by the control plane, whoever activated it.
+- **Leases:** an activation is a **lease** held by its subject, with a length (`leaseSeconds`,
+  default the host's `idleLimit`) the client renews (`POST /v1/templates/{id}/activate` again) while
+  it still needs the build, e.g. for the life of a batch. A build under any unexpired lease is held:
+  aging and replacement never take it, whether or not a session is live between reps.
 - **Replacement:** an activation that would pass the host's `activeLimit` deactivates the `active`
-  build on that host with the oldest `lastUsedAt` and no live session, whoever's it is; one that
-  would pass the subject's quota deactivates that subject's own oldest.
+  build on that host with the oldest `lastUsedAt`, no live session and **no unexpired lease**, whoever
+  activated it (O11: idle builds only); one that would pass the subject's quota deactivates that
+  subject's own oldest. If no build is free, the activation is refused (`409 no_active_slot`), never
+  served by evicting a held one: a batch's waits then measure the host's capacity, not its
+  neighbours.
 - **Live sessions:** a build is never stopped under a live session; `deactivating` drains (no new
   sessions, existing ones finish or expire). If every active build on every holding host has live
   sessions, the activation waits (`activating`, `Retry-After`) or is refused with `409 no_active_slot`.
@@ -375,6 +412,11 @@ offers named **profiles**; an admin writes them (§5.2), and each create names o
 | `base`      | any client's own image (a toolchain, a project's env) | MOCA's rules M1-M4, M7-M17; the image from an allowed registry; the size envelope; a probe (the default probe `true` if none) passing in a restored VM (M12)                                                      |
 | `benchmark` | SWE-bench, TB and the like                            | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
 
+TB-like benchmarks that need packages from the network (23-30 of 90 TB2 reps reached PyPI or
+GitHub) do not fit X11; a `benchmark-egress` profile (egress through `moca-egress` with an allowlist
+whose digest is in the spec and the build record) is open (O13). Until it is decided, TB templates are
+created under `base`.
+
 ### 8.1 At create (in the control plane, before any build)
 
 M7 (the spec well formed, the id rule), M8, M9 for `benchmark`, X10-X12 and X15 from the spec and the
@@ -409,6 +451,16 @@ sha256 with the one the client sent. A record that cannot be fetched there is re
 (it may still be stored, as `source: client`, on a `base` build). For the first version the fetch may
 be replaced by an admin-loaded copy of the source's records (A23); fetching is G13.
 
+### 8.4 The instance-id mapping
+
+So two clients onboarding the same benchmark instance name it alike (and §3.2's reuse or
+`409 template_exists` applies), the `benchmark` profile names its **id rule**, and the control plane
+applies it at create: for SWE-bench, the instance id lower-cased, `__` and `_` to `-`, `-v` appended
+for a Verified instance (also when it is in Lite), refused, never truncated, past 31 characters (all
+55 instances run so far fit; the longest, `scikit-learn-scikit-learn-13439`, is exactly 31). TB's
+rule is open (register G12: one TB id is 32 characters). The create names the instance
+(`instance: "django__django-11133"`) and the id is derived from it, or checked against it.
+
 ## 9. Tracing a run (PV7)
 
 A session's and a sandbox's responses carry `sandbox.templateManifestHash`, and the control plane's
@@ -432,7 +484,14 @@ scripted mock model first (A13):
 5. autobench-moca's runner opens sessions naming each instance's template, several instances at once;
 6. aging and replacement: more templates than `activeLimit`, the window moves by itself;
 7. export the provenance and verify it offline, from a machine with no access to the cluster;
-8. then a real model and grading, with the user's OK; then the PRs, from what this proved.
+8. then a real model and grading, with the user's OK; then the PRs, from what this proved. Grading a
+   microVM workspace off the host needs a way out of the 8 MiB Exec output cap (register W6, O15).
+
+autobench-moca's runner plan (its private `Plan-20261103-template-arm.md`): templates are created
+(or reused) and followed to `registered`, and a window of K is activated, before any timed span;
+creations send `activate: false`, so first-use activation never falls inside a rep; each rep records
+its template, `buildId` and `sandbox.templateManifestHash`, and a hash other than the frozen `buildId`
+voids the rep; the model-free stage replays recorded trajectories before the scripted mock model.
 
 The process doc (`PROCESS.md`) is updated at each step, and the validation follows it as written.
 
@@ -473,8 +532,11 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 
 ### 12.3 Open, for the review
 
-| #   | Question                                                                                                  | Proposed                                      |
-| --- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| O10 | Default visibility of a new template                                                                      | `deployment` (benchmark templates are shared) |
-| O11 | May a non-owner's activation replace the owner's oldest, or only idle builds of anyone's (as §6.3)?       | idle builds of anyone's, oldest first         |
-| O12 | Private registries: a client's pull credential, or only registries the build hosts can already pull from? | the latter for the first version (G16)        |
+| #   | Question                                                                                                      | Proposed                                                                                          |
+| --- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| O10 | Default visibility of a new template                                                                          | `deployment` (benchmark templates are shared); autobench-moca agrees                              |
+| O11 | May a non-owner's activation replace the owner's oldest, or only idle builds of anyone's (as §6.3)?           | idle builds of anyone's, oldest first, never a leased one (§6.3); autobench-moca agrees           |
+| O12 | Private registries: a client's pull credential, or only registries the build hosts can already pull from?     | the latter for the first version (G16); autobench-moca agrees                                     |
+| O13 | TB needs egress through an allowlist: a `benchmark-egress` profile, or TB out of scope for the first version? | out of scope for the first validation (SWE-bench only); the profile after it                      |
+| O14 | A lease's default length and its maximum                                                                      | the host's `idleLimit`; at most a day                                                             |
+| O15 | Workspace export (W6): a route (a tar stream of `/workspace`), or grading on the host?                        | a route, `GET /v1/sandboxes/{id}/workspace.tar`, after the validation; grading on the host for it |
