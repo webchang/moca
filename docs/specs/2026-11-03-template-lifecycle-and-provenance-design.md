@@ -472,9 +472,12 @@ be replaced by an admin-loaded copy of the source's records (A23); fetching is G
 
 So two clients onboarding the same benchmark instance name it alike (and §3.2's reuse or
 `409 template_exists` applies), the `benchmark` profile names its **id rule**, and the control plane
-applies it at create: for SWE-bench, the instance id lower-cased, `__` and `_` to `-`, `-v` appended
-for a Verified instance (also when it is in Lite), refused, never truncated, past 31 characters (all
-55 instances run so far fit; the longest, `scikit-learn-scikit-learn-13439`, is exactly 31). TB's
+applies it at create: for SWE-bench, the instance id lower-cased, `__` and `_` to `-`, and `-v`
+appended **only** to a Verified image whose instance is also in Lite (the user's rule (a),
+2026-10-30, `ONBOARDING.md`), refused, never truncated, past 31 characters. Under it every instance
+in autobench-sandboxes' four SWE-bench task sets fits (30 Lite and 30 Verified ids, 5 in both;
+checked 2026-11-03): the longest are 31, e.g. `scikit-learn-scikit-learn-11310`. Appending `-v` to
+every Verified id would not fit: `scikit-learn-scikit-learn-11310-v` and `…-12585-v` are 33. TB's
 rule is open (register G12: one TB id is 32 characters). The create names the instance
 (`instance: "django__django-11133"`) and the id is derived from it, or checked against it.
 
