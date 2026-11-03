@@ -401,18 +401,27 @@ follows) so the chain from the image to a session can be walked and checked. Eve
 ### 7.2 Hosting, persistence and offline verification
 
 - **Hosted in the control plane** (D8), in a store that is **not Redis** (A8): an append-only
-  directory on the control plane's persistent volume, one file per record named by its digest, and an
-  index per template. The control plane's existing file store and its PVC (`file-store.ts`, the
-  egress credentials' `moca-sbx-credentials`) are the precedent.
+  directory on the control plane's persistent volume (`SH_PROVENANCE_DIR`), one file per record named
+  by its digest (`records/`), a head per stream (`heads/`), and the documents records cite, such as
+  gate records, byte for byte (`blobs/`). A **stream** is `policy` or `template/<id>`; a record is
+  written before its stream's head moves, so a crash leaves an orphan, never a head naming a missing
+  record. The control plane's file credential store is the precedent (`file-store.ts`). Built:
+  `packages/control-plane/src/provenance.ts`.
 - **Digests, not signatures** (the user, 2026-11-03): every record is named by the sha256 of its
-  canonical JSON, and names its predecessor's digest in `prev`, so any edit breaks the chain. Each
-  template's chain head (the latest record's digest) is listed in the export's index, to be compared
-  against a copy kept elsewhere. Nothing is signed.
+  canonical JSON (keys sorted, no whitespace, integers only, so a second implementation writes the
+  same bytes), and names its predecessor's digest in `prev`, with a `seq`, so any edit, drop or
+  reorder breaks the chain. Each stream's head (the latest record's digest and the count) is listed in
+  the export, to be compared against a copy kept elsewhere. Nothing is signed.
 - **Exported**: `GET /v1/provenance/export?template=<id>` (the owner, readers of a `deployment`
-  template, admins) returns the records, the cited gate records, the policy records and the index as a
-  tarball; `mocactl` (or a small script) **verifies offline**: every record's digest, every `prev`,
-  each `check` re-run against its policy record and the records it cites, and that the `build`
-  record's manifest hash matches a snapshot if one is at hand.
+  template, admins; _planned_) returns one JSON document (`moca-provenance-export/1`): the template's
+  stream, the policy stream, every stream head, and the gate records its `gate` records cite. It is
+  **verified offline** by `verify-provenance.py` (stdlib Python, built) or `verifyExport` (the same
+  rules in TypeScript; a test runs both on the same exports): every record's digest, `seq` and
+  `prev`, each stream's head and count, every blob's sha256, that each `check` cites a policy record
+  and each `gate` a blob of the export, and, with `--head`, a head kept elsewhere (an export can only
+  prove itself consistent; the kept head catches one that dropped its latest records). **Not built
+  yet:** re-running each `check` against its policy, and matching a `build` record's manifest hash
+  to a snapshot at hand.
 - **The workload plane only reports**: the host agent posts build logs, `build`, and
   `activate`/`deactivate` events. The control plane checks and records; it never trusts a report it
   cannot tie to its chain (a `build` report must answer a build it handed to that host).
@@ -521,7 +530,8 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    evidence fields are done, 26bd6d7f; PV2, PV3 and PV4 in code: manifest hash version 2 and
    `SH_TEMPLATE_RECORD`; to be proven on a KVM host).
 2. The provenance store and records (§7), with offline verification, for `build`, `check` and
-   `policy` first.
+   `policy` first (store and verifiers done: `provenance.ts`, `verify-provenance.py`; records are
+   written once the routes exist).
 3. Templates in the store, states and the read API (§3, §4), with owners and visibility.
 4. Create and policy at create (§4, §8.1), quotas (§6.2).
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
