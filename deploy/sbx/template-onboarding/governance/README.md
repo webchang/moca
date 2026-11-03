@@ -21,7 +21,8 @@ image and template stays traceable. The tools are one level up, in
   scripts ([`docs/CONTRIBUTING-DOCS.md`](../../../../docs/CONTRIBUTING-DOCS.md), "Where things go").
 - **The register is kept beside the rules on purpose**, not in `docs/notes/`: it is the list of what
   the rules and tools do not cover yet, and changes with them.
-- **The design** (its reasoning and alternatives) is a spec in `docs/specs/`, as that rule says.
+- **The design** (its reasoning and alternatives) is a spec in `docs/specs/`, as that rule says:
+  [template lifecycle, readiness and provenance](../../../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md).
 
 **This folder is movable.** Other documents link only to this README (the documentation map and the
 design spec); the documents here link to each other by relative path. If MOCA's admin team wants it
