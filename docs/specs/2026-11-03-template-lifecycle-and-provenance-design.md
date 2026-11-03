@@ -1,6 +1,7 @@
 # Template lifecycle, readiness and provenance — Design
 
-Version: 0.3 (draft for review; §12 answers applied; E2B's template design adopted where it fits, §3.3) — November 2026
+Version: 0.4 (draft for review; **self-serve**: clients build, register and activate their own
+templates, gated by machine-checked policy) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
@@ -10,93 +11,118 @@ host janitor), and the template governance folder
 the gating rules (M, X), the register of decisions (D), gaps (G, PV, S) and assumptions (A) this
 design cites by id, and the process.
 
+**What changed in 0.4** (the user, 2026-11-03: "support a self-serve model in principle, as much as
+can"; D12): an enrolled client creates a template from its own image and follows its build; **policy,
+not an admin, decides** whether a build is registered (§8); the client activates and deactivates its
+templates within its quota and the host's limit (§6). Admins set the policy, the quotas and the host
+limits, and can act on any template (§5.2). The request-and-approve flow of 0.3 is gone. Still not
+adopted: build steps in code (clients bring a finished image, D13).
+
 ## 1. Goal and scope
 
 **Goal:** SWE-bench, and benchmarks like it, at scale on MOCA templates: many per-instance templates
-onboarded and gated, a bounded set of them **active** on a host at a time, chosen by the workload
-through the **MOCA API** (D1, D3), with every deployed image and template traceable through
-persistent provenance that can be verified offline (D5, D7), hosted in the control plane (D8).
+**onboarded by their clients themselves**, gated automatically, a bounded set of them **active** on a
+host at a time, chosen by the workload through the **MOCA API** (D1, D3, D12), with every deployed
+image and template traceable through persistent provenance that can be verified offline (D5, D7),
+hosted in the control plane (D8).
 
 **In scope (feasibility first, D10):**
 
+- **self-serve onboarding**: a client creates a template from an image by digest; a build host builds
+  and probes it; the build is registered when it passes policy (§4, §7, §8);
 - template **states** a client can read: onboarding and readiness (D4; gaps S1, S2);
-- client **requests** for onboarding and activation, and **admin** actions that act on them (D9; S3);
-- **activation**: attaching and detaching a template's worker on a KVM host, driven by the control
-  plane, with an active limit per host, **aging** and **least-recently-used replacement** (A16);
-- **provenance**: a chain of records from the gated image to every run, persistent in the control
-  plane and verifiable offline (D7, D8; PV1-PV9);
-- **gating at build and registration**: MOCA's side of the gating rules, including X10 and X12;
+- **activation by the client**, within a per-subject quota and a per-host active limit, with
+  **aging** and **least-recently-used replacement** (A16), and activation on first use (§6.4);
+- **policy**: MOCA's side of the gating rules as machine checks, in profiles an admin chooses (§8);
+- **provenance**: a chain of records from the image to every run, persistent in the control plane and
+  verifiable offline (D7, D8; PV1-PV9);
 - **tracing a run** to its exact snapshot (PV7).
 
-**Out of scope here:** the authorization design (D10: clients are admin clients for now, A1); a
-worker serving several snapshots (A2); multi-host scheduling and HA (A15); signing images or an
-SBOM (GATING-RULES §4, "later"); the workload and its scheduler (autobench-moca's, D2).
+**Out of scope here:** the authorization design (D10: every enrolled subject is a client, admins are
+`SH_ADMIN_SUBJECTS`, A1); build steps in code (D13); a worker serving several snapshots (A2);
+multi-host scheduling and HA (A15); signing images or an SBOM (GATING-RULES §4, "later"); the
+workload and its scheduler (autobench-moca's, D2).
 
 ## 2. What exists, and what is missing
 
 | Today                                                                                                           | Where                                                                      | Missing for the goal                                                           |
 | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | Templates are declared to the control plane as `SH_SANDBOX_TEMPLATES` (a JSON env list), changed by redeploying | `packages/control-plane/src/sandbox-config.ts`; `deploy/sbx/setup.sh`      | no states; a change is a deploy (S1): **declared in the store instead** (§3.1) |
-| `GET /v1/templates` lists them                                                                                  | `packages/control-plane/src/routes.ts:297`                                 | no readiness, capacity or provenance (S1)                                      |
+| `GET /v1/templates` lists them                                                                                  | `packages/control-plane/src/routes.ts:297`                                 | no readiness, capacity, owner or provenance (S1)                               |
 | A session or sandbox names one; the harness routes it to a worker labelled `moca.dev/template`                  | `handlers.ts:706-725`; `harness/src/select-sandbox.ts`                     | a template with no worker fails only at session time, 503 (S2)                 |
 | One `microvm-worker` per template; it mlocks its snapshot's memory at start                                     | `remote-worker/cmd/microvm-worker/main.go:605,630`                         | ~4 GiB per attached worker, idle or not (A3)                                   |
+| An operator builds a template on the KVM host                                                                   | `deploy/sbx/template-onboarding/template-build.sh`                         | no way for a client to build one (S3)                                          |
 | Workers are attached and detached by an operator on the host                                                    | `deploy/sbx/install-host.sh`; `deploy/microvm/setup-microvm.sh --template` | nothing for the control plane to drive (S3)                                    |
 | The build writes a template record and a snapshot manifest on the host                                          | `template-build.sh`; `build-snapshot.sh`                                   | not in the control plane, not chained by digest (PV1-PV6)                      |
 | The host janitor already reads the control plane with its own bearer                                            | `sandbox-handlers.ts:266-271` (`janitorSandboxes`)                         | the pattern this design reuses for a host agent                                |
 
-## 3. Template states
+## 3. Templates, builds and states
 
 ### 3.1 Templates are declared in the store
 
 Templates are **declared in the control plane's store**, not in `SH_SANDBOX_TEMPLATES` (the user,
-2026-11-03): registering, retiring or changing one is an API call that writes a record (§7), never a
+2026-11-03): creating, retiring or changing one is an API call that writes a record (§7), never a
 redeploy. The env list is read once, at the first start against an empty store, to import what a
-deployment declares today, and is ignored after that (a warning names it if it is still set and
-differs). The harness's session templates (the seed, the tools) come from the same store, through the
-exchange as today.
+deployment declares today (owned by the first admin subject), and is ignored after that (a warning
+names it if it is still set and differs). The harness's session templates (the seed, the tools) come
+from the same store, through the exchange as today.
 
-### 3.3 Templates, builds and tags (adopted from E2B)
+### 3.2 Templates, builds and tags (adopted from E2B)
 
 The user asked (2026-11-03) to leverage the good design decisions of E2B's templates
 (docs.e2b.dev, "Template tags & versioning", "Template names", the templates API). Adopted:
 
+- **Self-serve:** any enrolled client creates a template and its builds through the API, as any E2B
+  key holder does (D12). MOCA adds what E2B does not have: policy gating before registration (§8).
 - **A build is an immutable artifact with an id.** A build is one snapshot; its id is the snapshot's
   manifest hash, `buildId` (`sha256:…`, §8 PV2-PV3 make that hash cover the whole snapshot). A
   **template** is a name over its builds. Today's rule that a new image is a new snapshot and a new
   worker is unchanged: each is a new build of the same template.
+- **A build is reused when its inputs are the same:** a create whose image digest, spec and builder
+  (MOCA commit, kernel) match an existing registered build returns that build, not a second snapshot
+  (E2B caches layers; MOCA's unit is the whole snapshot). Disk is the scarce resource (A3).
 - **Tags are labels on builds, moved without rebuilding.** A template is referenced as `id[:tag]`,
-  `default` when the tag is omitted; admins move tags (`stable`, `v2`, …) between builds
-  (§5). This replaces "the template id moves to the new worker" (versioned updates, RUNBOOK §5) with
-  an explicit, recorded label (§7), and old builds stay addressable while their sandboxes drain.
+  `default` when the tag is omitted; **the template's owner** moves tags (`stable`, `v2`, …) between
+  its registered builds (§5). Old builds stay addressable while their sandboxes drain.
 - **Pin by build id:** a session or sandbox may name `id@sha256:…` instead of a tag, and is then
   served by exactly that build or refused.
 - **The build is an API resource** with a status and paged logs (§4), as E2B's build status is.
 - **Names:** MOCA keeps its id rule, `^[a-z0-9][a-z0-9-]{0,30}$` (31 characters, the worker-id limit),
   lowercased on input and refused, never truncated, when longer; `GET /v1/templates/{id}` answering
-  404 is the existence check. A tag follows the same rule.
+  404 is the existence check. A tag follows the same rule. **Ids are unique per deployment**: the
+  first subject to create an id owns it; another's create of the same id is `409 template_exists`
+  (E2B scopes names to a project; a MOCA deployment is one project, A21).
+- **Visibility:** `private` (the owner and admins) or `deployment` (every enrolled client may use and
+  activate it; only the owner changes it). Default `deployment`, so per-instance benchmark templates
+  are built once and shared (A21).
 
-Not adopted, by design: self-service builds by any client (gating, D5, D9); a builder chain of layers
-in code (images are built and gated by their builder, A6); capturing running processes (a clean guest
-per command); unlimited templates (a per-host active limit, A3); public templates across deployments.
+Not adopted, by design: a builder chain of layers in code (D13: clients bring a finished image, built
+anywhere); capturing running processes (a clean guest per command); unlimited templates (a per-host
+active limit, A3); public templates across deployments.
 
-Readiness (§3.2) is per build: `active` means a worker serving that build is attached.
+### 3.3 The two states
 
-### 3.2 The two states
+A template's builds each have two independent states, both kept by the control plane.
 
-A template has two independent states, both kept by the control plane.
+**Onboarding** (how far the build is from usable), set by the build host's reports and by policy,
+never by a person's approval:
 
-**Onboarding** (how far the template is from usable):
+| State        | Means                                                                                          | Entered by                       |
+| ------------ | ---------------------------------------------------------------------------------------------- | -------------------------------- |
+| `queued`     | created; admitted by the create-time checks (§8.1); waiting for a host                         | the client's create (§4)         |
+| `building`   | a build host took it: pull, rootfs, boot, in-guest checks, snapshot                            | the host agent's claim (§6.1)    |
+| `probing`    | restored from the new snapshot; the seed and the probe running                                 | the host agent's report          |
+| `built`      | snapshot and probe passed on a host; its build record is in                                    | the host agent's report (§7)     |
+| `registered` | the control plane checked the build record against policy (§8.2) and the gate evidence; usable | the control plane, automatically |
+| `rejected`   | refused by policy at create or registration, with the rule id and reason                       | the control plane, automatically |
+| `failed`     | the build or the probe failed, with `reason {message, step}`                                   | the host agent's report          |
+| `retired`    | no new sessions; kept for provenance                                                           | the owner, or an admin           |
 
-| State        | Means                                                                       | Entered by                   |
-| ------------ | --------------------------------------------------------------------------- | ---------------------------- |
-| `requested`  | a client asked for it; nothing built                                        | a client's request (§5)      |
-| `approved`   | an admin accepted the request                                               | an admin                     |
-| `built`      | its snapshot is built and its in-VM probe passed, on a host                 | the build's report (§7.2)    |
-| `registered` | its template record is accepted by the control plane, gate evidence checked | an admin's registration (§8) |
-| `rejected`   | refused at any step, with the reason                                        | an admin, or a failed check  |
-| `retired`    | no new sessions; kept for provenance                                        | an admin                     |
+A template's own state is its newest build's (`registered` once any build is), so a client polling
+`GET /v1/templates/{id}` sees `queued → building → probing → built → registered` without knowing the
+build id.
 
-**Readiness** (whether sessions can run on it now), for a `registered` template:
+**Readiness** (whether sessions can run on it now), for a `registered` build:
 
 | State          | Means                                                                                              |
 | -------------- | -------------------------------------------------------------------------------------------------- |
@@ -110,13 +136,41 @@ Readiness follows from facts, not from intent: `active` means the relay holds an
 for its worker (the same record the harness routes on), and the control plane derives it from that,
 so the state cannot claim a worker that is not there.
 
-## 4. The API (reads: any client)
+## 4. The API: create, read, follow
 
-`GET /v1/templates` keeps today's fields and adds, per template, its tags and their builds:
+**Create (any enrolled client):**
+
+```http
+POST /v1/templates
+{
+  "id": "django-django-11133",
+  "image": "<repository>@sha256:…",
+  "spec": { "guest_mb": 4096, "vcpus": 2, "egress": false, "tools": ["bash", "git", "python3", "rg"],
+            "seed": "…", "probe": { "command": "…", "expect_rc": 0, "expect": ["…"] },
+            "skip_git_identity_check": true, "guest_home": "/tmp/home" },
+  "gateRecord": { … },            // optional; required by the benchmark profile (§8)
+  "profile": "benchmark",         // a policy profile the deployment offers (§8); default its default
+  "visibility": "deployment",
+  "tags": ["default"]
+}
+→ 202 { "templateId": "django-django-11133", "buildId": null, "build": "/v1/templates/django-django-11133/builds/b-01J…", "status": "queued" }
+```
+
+The spec is the same document `template-build.sh` reads today (`ONBOARDING.md`); the image's gate
+record, when given, is stored with the build and checked (§8). `POST /v1/templates/{id}/builds`
+starts a new build of an existing template (a new image or spec); same body, same answer. A build
+has a provisional handle (`b-…`) until it is built; then its `buildId` is its manifest hash and the
+handle redirects to it. A create that matches an existing registered build (§3.2) answers
+`200 {buildId, status: "registered", reused: true}`.
+
+**Reads (any enrolled client; `private` templates only to their owner and admins).**
+`GET /v1/templates` keeps today's fields and adds, per template, its owner, tags and builds:
 
 ```json
 {
   "id": "django-django-11133",
+  "owner": "github:3454373",
+  "visibility": "deployment",
   "description": "SWE-bench django__django-11133 (lite) at its baseline bc348023edb4",
   "tools": ["bash", "git", "python3", "rg"],
   "onboarding": "registered",
@@ -125,6 +179,7 @@ so the state cannot claim a worker that is not there.
     {
       "buildId": "sha256:3c1f…",
       "status": "registered",
+      "profile": "benchmark",
       "readiness": "active",
       "capacity": { "running": 3, "inUse": 1 },
       "lastUsedAt": "2026-11-03T02:10:00Z",
@@ -136,104 +191,158 @@ so the state cannot claim a worker that is not there.
 
 **Builds, as a resource (adopted from E2B's build status):**
 
-| Route                                                                            | Returns                                                                                                                                                             |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /v1/templates/{id}/builds`                                                  | the template's builds, newest first                                                                                                                                 |
-| `GET /v1/templates/{id}/builds/{buildId}`                                        | one build: `status` (`queued`, `building`, `probing`, `built`, `failed`, `registered`), `readiness`, its record chain (§7), and on failure `reason {message, step}` |
-| `GET /v1/templates/{id}/builds/{buildId}/logs?logsOffset=0&limit=100&level=warn` | `logEntries [{timestamp, level, step, message}]`, paged by offset, at most 100 a page; reported by the build host, stored with its record                           |
-| `GET /v1/templates/{id}/tags`                                                    | each tag and the build it points to, with when it was assigned                                                                                                      |
+| Route                                                                          | Returns                                                                                                                                                                              |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /v1/templates/{id}/builds`                                                | the template's builds, newest first                                                                                                                                                  |
+| `GET /v1/templates/{id}/builds/{build}`                                        | one build: `status` (§3.3), `readiness`, the policy result (each rule checked, passed or failed), its record chain (§7), and on failure or rejection `reason {message, step, rule?}` |
+| `GET /v1/templates/{id}/builds/{build}/logs?logsOffset=0&limit=100&level=warn` | `logEntries [{timestamp, level, step, message}]`, paged by offset, at most 100 a page; reported by the build host, stored with its record                                            |
+| `GET /v1/templates/{id}/tags`                                                  | each tag and the build it points to, with when it was assigned and by whom                                                                                                           |
+| `GET /v1/quota`                                                                | the caller's quotas and use: templates, builds queued, active templates (§6.2)                                                                                                       |
+| `GET /v1/policy`                                                               | the deployment's policy profiles: each one's rules, size envelope, allowed registries, trusted gate-record sources, and the policy's digest (§8)                                     |
 
-plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600}]}`
+plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600, "disk": {"freeGb": 140, "floorGb": 60}}]}`
 (limits are per host, §6.2). Errors keep MOCA's shape, `{error, message}` with a stable code, and
-add `step` where a build step failed; a refusal that may clear carries `Retry-After`.
-`capacity.running` is what the
-worker's budget admits at once (`(budget − 1024) ÷ (guest + 32)` MiB, the rule measured on
-2026-10-31); `inUse` is its running sessions now. `GET /v1/templates/{id}` returns one template with
-its full provenance chain (§7). A session or sandbox names `id`, `id:tag` or
-`id@sha256:…` (§3.3); the reference is resolved to one build at creation, recorded on the session,
-and kept for its life. On a build that is not `active` it is refused at creation with
-`409 template_not_active` and the build's readiness, not left to a 503 retry later.
+add `step` where a build step failed and `rule` where policy refused; a refusal that may clear
+carries `Retry-After`. `capacity.running` is what the worker's budget admits at once
+(`(budget − 1024) ÷ (guest + 32)` MiB, the rule measured on 2026-10-31); `inUse` is its running
+sessions now. `GET /v1/templates/{id}` returns one template with its full provenance chain (§7).
 
-## 5. Requests and admin actions
+A session or sandbox names `id`, `id:tag` or `id@sha256:…` (§3.2); the reference is resolved to one
+build at creation, recorded on the session, and kept for its life. On a build that is not `active`
+it is refused at creation with `409 template_not_active`, the build's readiness and `Retry-After`,
+and, unless the client says `activate: false`, an activation is started for it (§6.4).
 
-| Route                                                                                 | Who                           | Does                                                                                                                                                      |
-| ------------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /v1/template-requests {kind: "onboard", image, spec?, reason}`                  | any client                    | records a request to onboard an image (by digest) as a template; `202 {requestId, templateId}`, and once an admin approves it, a `buildId` to follow (§4) |
-| `POST /v1/template-requests {kind: "activate", template, reason}`                     | any client                    | records a request to activate a registered template                                                                                                       |
-| `GET /v1/template-requests[/{id}]`                                                    | the requester; admins see all | the request and its state (`open`, `approved`, `done`, `rejected`)                                                                                        |
-| `POST /v1/template-requests/{id}/approve` · `/reject`                                 | **admin**                     | acts on a request; an approved onboarding goes to the operator's build (§7.2)                                                                             |
-| `POST /v1/templates/{id}/activate` · `/deactivate`                                    | **admin**                     | sets the wanted readiness; the host agent acts on it (§6)                                                                                                 |
-| `POST /v1/templates/{id}/retire`                                                      | **admin**                     | onboarding → `retired`; deactivates it                                                                                                                    |
-| `POST /v1/templates/{id}/tags {tags, build}` · `DELETE /v1/templates/{id}/tags/{tag}` | **admin**                     | moves tags onto a registered build, or removes a tag; removing one never deletes the build (adopted from E2B)                                             |
+## 5. Actions: the owner's, and the admin's
+
+### 5.1 The owner's (self-serve)
+
+| Route                                                                                 | Who                                      | Does                                                                                                            |
+| ------------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/templates` · `POST /v1/templates/{id}/builds`                               | any client; a new build: the owner       | creates a template or a build (§4)                                                                              |
+| `POST /v1/templates/{id}/activate` · `/deactivate`                                    | the owner; `deployment` ones: any client | sets the wanted readiness, within the caller's quota (§6.2); the host agent acts on it (§6)                     |
+| `POST /v1/templates/{id}/tags {tags, build}` · `DELETE /v1/templates/{id}/tags/{tag}` | the owner                                | moves tags onto a registered build, or removes a tag; removing one never deletes the build (adopted from E2B)   |
+| `PATCH /v1/templates/{id} {visibility, description}`                                  | the owner                                | changes them; a record (§7)                                                                                     |
+| `POST /v1/templates/{id}/builds/{build}/cancel`                                       | the owner                                | a `queued` or `building` build → `failed` (`cancelled`)                                                         |
+| `POST /v1/templates/{id}/retire` · `DELETE /v1/templates/{id}/builds/{build}`         | the owner                                | retires the template (deactivates it), or retires one build; snapshots go when no host needs them; records stay |
+
+A deactivation by a non-owner applies to its own activation only: a `deployment` template stays
+active while any subject's activation of it stands (each activation counts against that subject's
+quota, §6.2).
+
+### 5.2 The admin's
 
 "Admin" is the existing `admin` role (`SH_ADMIN_SUBJECTS`, `packages/control-plane/src/identity.ts`);
-the finer roles are the authorization design's (D10). Every request and action writes a provenance
-record (§7).
+the finer roles are the authorization design's (D10). Admins do not approve builds; they set what
+policy allows and act where self-serve cannot:
 
-## 6. Activation on a host
+| Route                                               | Does                                                                                                    |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `PUT /v1/policy`                                    | the policy profiles (§8): rules, envelope, registries, trusted gate-record sources; a new policy record |
+| `PUT /v1/quota/{subject}` · `PUT /v1/quota/default` | a subject's quotas (§6.2)                                                                               |
+| every owner action, on any template                 | e.g. deactivate or retire another's template, move its tags                                             |
+| `POST /v1/templates/{id}/builds/{build}/reject`     | rejects a registered build after the fact (a rule found broken), with the reason; deactivates it        |
+| `PUT /v1/templates/{id}/owner`                      | transfers ownership                                                                                     |
+
+Host limits stay in each host's settings file (§6.2), set by its operator. Every action, the owner's
+or the admin's, writes a provenance record naming its subject (§7).
+
+## 6. Builds and activation on a host
 
 ### 6.1 The host agent
 
 A **new, small service** on each KVM host, `sbx-host-agent` (the user, 2026-11-03; not an extension of
-the host janitor, which keeps its one job), beside the workers. It does what an operator does today
-with `install-host.sh` / `setup-microvm.sh --template`: start and stop a template's installed worker
-unit. It **polls** the control plane and **reports** to it; it never listens, as the janitor does not
-(a per-host bearer, no inbound port, SBX0 §8.3).
+the host janitor, which keeps its one job), beside the workers. It **polls** the control plane and
+**reports** to it; it never listens, as the janitor does not (a per-host bearer, no inbound port,
+SBX0 §8.3). It has two jobs:
+
+- **Build** (self-serve, new in 0.4): it claims `queued` builds and runs `template-build.sh` on them,
+  as an operator does today, then installs the worker (`install-host.sh`) without starting it. A build
+  is claimed only when the host's free disk stays above its floor after one more snapshot (the
+  `template-build.sh` refusal at 60 G, measured 2026-11-01), and at most `buildConcurrency` at a time
+  (default 1). The build log is streamed in `logEntries` (§4); the build record follows (§7).
+- **Activate**: start and stop a template's installed worker unit, as `install-host.sh` /
+  `setup-microvm.sh --template` do today.
 
 **Each host declares the snapshots it holds** (the user, 2026-11-03): the control plane does not
-assign templates to hosts. On every poll the agent sends its inventory, and the control plane matches
-it to registered templates by manifest hash:
+assign templates to hosts. A build lands on the host that claimed it, and then is in that host's
+inventory. On every poll the agent sends its inventory, and the control plane matches it to
+registered builds by manifest hash:
 
-| Step | Agent                                                                                                                      | Control plane                                                           |
-| ---- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| 1    | `POST /v1/hosts/{host}/inventory`: each installed worker's template id and its snapshot's manifest hash; the host's limits | records the inventory; a template is placeable only on hosts holding it |
-| 2    | `GET /v1/hosts/{host}/wanted`: the wanted readiness of the templates it holds                                              | answers from its store                                                  |
-| 3    | for each wanted `active`: check the snapshot's manifest hash is the registered one, then start the worker unit             | —                                                                       |
-| 4    | `POST /v1/hosts/{host}/reports`: `{template, event, reason}`, the event `attached`, `refused` or `detached`                | records it (§7); readiness follows the relay's attached record          |
-| 5    | for each wanted `inactive` with no live sessions: stop the unit                                                            | —                                                                       |
+| Step | Agent                                                                                                                                      | Control plane                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| 1    | `POST /v1/hosts/{host}/inventory`: each installed worker's template id and its snapshot's manifest hash; the host's limits, free disk      | records the inventory; a build is placeable only on hosts holding it            |
+| 2    | `POST /v1/hosts/{host}/builds/claim`: up to its free build slots                                                                           | hands out `queued` builds, oldest first, one subject's at a time in turn (§6.2) |
+| 3    | builds; `POST /v1/hosts/{host}/builds/{build}/logs` and `/report` (`building`, `probing`, `built` with T and S, or `failed` with the step) | records them; on `built`, checks policy and registers or rejects (§8.2)         |
+| 4    | `GET /v1/hosts/{host}/wanted`: the wanted readiness of the builds it holds                                                                 | answers from its store                                                          |
+| 5    | for each wanted `active`: check the snapshot's manifest hash is the registered one, then start the worker unit                             | —                                                                               |
+| 6    | `POST /v1/hosts/{host}/reports`: `{build, event, reason}`, the event `attached`, `refused` or `detached`                                   | records it (§7); readiness follows the relay's attached record                  |
+| 7    | for each wanted `inactive` with no live sessions: stop the unit; for each retired build no longer wanted: remove the snapshot and the unit | —                                                                               |
 
-Workers are installed once per template (`install-host.sh`), so activation is a start and
-deactivation a stop: no file changes, no relay or control-plane restart. A stopped worker costs no
-memory. A template no host declares is `unavailable`.
+Activation is a start and deactivation a stop: no file changes, no relay or control-plane restart.
+A stopped worker costs no memory. A build no host declares is `unavailable`.
 
-### 6.2 The active limit
+**The build host handles untrusted images** in a self-serve model. The image is pulled only from a
+registry the policy allows (§8.1), its export runs as today (`build-rootfs.sh`, as root, owners kept,
+M4) into a size-capped scratch directory, and everything the image runs, runs inside the Firecracker
+guest. Hardening the export of a hostile image (G14) is recorded, not solved, for the first version
+(A15).
+
+### 6.2 Quotas and the active limit
 
 **Per host** (the user, 2026-11-03): each host's agent reports its `activeLimit` (the workers it may
-run at once) and `idleLimit` (§6.3) with its inventory, from the host's own settings file. They are
-set by its operator from the host's memory and disk and the templates' budgets (measured on bm1: ~26
-SWE-bench templates by disk, ~36 workers by memory at 4 GiB guests, A3). The agent also refuses a
-start that would pass the host's memory, as a second guard. Activation beyond a host's limit is
-refused, or triggers replacement on that host (§6.3).
+run at once), `idleLimit` (§6.3), `buildConcurrency` and disk floor with its inventory, from the
+host's own settings file. They are set by its operator from the host's memory and disk and the
+templates' budgets (measured on bm1: ~26 SWE-bench templates by disk, ~36 workers by memory at
+4 GiB guests, A3). The agent also refuses a start that would pass the host's memory, as a second
+guard.
+
+**Per subject** (new in 0.4, A22): quotas an admin sets, with a deployment default:
+`templates` (owned, not retired), `buildsQueued` (queued or building at once), `active` (templates
+the subject holds active at once). An activation over the subject's `active` quota replaces that
+subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded`. A
+create over `templates` or `buildsQueued` is `429 quota_exceeded` with `Retry-After` for the latter.
+Build claims take subjects in turn, so one subject's batch of 50 does not hold every slot.
 
 ### 6.3 Aging and replacement (A16)
 
-- **Use:** a template's `lastUsedAt` is the start of its latest session or sandbox (the control
-  plane sees every creation).
-- **Aging:** an `active` template idle longer than its host's `idleLimit` (§6.2) is moved to
-  `deactivating` by the control plane.
-- **Replacement:** an activation that would pass `activeLimit` deactivates the `active` template
-  with the oldest `lastUsedAt` that has no live session.
-- **Live sessions:** a template is never stopped under a live session; `deactivating` drains (no new
-  sessions, existing ones finish or expire). If every active template has live sessions, the
-  activation waits or is refused with `409 no_active_slot`.
+- **Use:** a build's `lastUsedAt` is the start of its latest session or sandbox (the control plane
+  sees every creation).
+- **Aging:** an `active` build idle longer than its host's `idleLimit` (§6.2) is moved to
+  `deactivating` by the control plane, whoever activated it.
+- **Replacement:** an activation that would pass the host's `activeLimit` deactivates the `active`
+  build on that host with the oldest `lastUsedAt` and no live session, whoever's it is; one that
+  would pass the subject's quota deactivates that subject's own oldest.
+- **Live sessions:** a build is never stopped under a live session; `deactivating` drains (no new
+  sessions, existing ones finish or expire). If every active build on every holding host has live
+  sessions, the activation waits (`activating`, `Retry-After`) or is refused with `409 no_active_slot`.
+
+### 6.4 Activation on first use
+
+So a client can name a template and go, as on E2B: a session or sandbox creation on a `registered`
+build that is `inactive` starts its activation (counted against the caller's quota) and answers
+`409 template_not_active {readiness: "activating"}` with `Retry-After`; the client retries (`mocactl`
+does, within its capacity wait, bcebfaf3). An explicit `activate` before a batch avoids the first
+wait; autobench-moca's runner can do either.
 
 ## 7. Provenance
 
 ### 7.1 Records and the chain
 
 Every step writes one record. A record is JSON, append-only, with `prev` (the digest of the record it
-follows) so the chain from the gated image to a session can be walked and checked:
+follows) so the chain from the image to a session can be walked and checked. Every record names its
+**subject** (who, or `policy`, or a host) and when:
 
-| Record                    | Written when                             | Holds                                                                                                                                                                                | Source (workload plane) |
-| ------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
-| `gate`                    | the image's gate record is cited         | image-factory's record digest and its gate fields (GATING-RULES §3)                                                                                                                  | image-factory           |
-| `build`                   | a snapshot is built and its probe passed | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent digests, probe and its result, the MOCA commit, the builder, when | `template-build.sh`     |
-| `register`                | an admin registers it                    | T as accepted, the checks it passed (§8)                                                                                                                                             | the control plane       |
-| `activate` · `deactivate` | readiness changes                        | host, worker, manifest hash, reason (request, aging, replacement)                                                                                                                    | the host agent's report |
-| `retire`                  | an admin retires it                      | reason                                                                                                                                                                               | the control plane       |
-| `tag`                     | an admin moves or removes a tag          | the tag, the build it now points to (or none), the one before                                                                                                                        | the control plane       |
-| `request` · `decision`    | a client requests, an admin decides      | who, what, reason                                                                                                                                                                    | the control plane       |
-| `use` (summary)           | sessions start                           | per template and day: count, first and last                                                                                                                                          | the control plane       |
+| Record                         | Written when                                               | Holds                                                                                                                                                                                             | Source (workload plane) |
+| ------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `policy`                       | an admin sets the policy                                   | the profiles, in full; its digest is what every `check` cites                                                                                                                                     | the control plane       |
+| `create`                       | a client creates a template or a build                     | the subject, id, image digest, spec, profile, visibility, the gate record's sha256 if given (the record itself stored beside it)                                                                  | the control plane       |
+| `gate`                         | a gate record is cited                                     | the gate record's digest, its sha256, its source (a trusted source and commit, or `client`) and its gate fields (GATING-RULES §3)                                                                 | the image builder       |
+| `build`                        | a snapshot is built and its probe passed                   | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent/vmstate/memfile digests, probe and its result, the MOCA commit, the host, when | the host agent          |
+| `check`                        | policy is applied, at create and at registration           | the policy's digest, the profile, each rule and its result, the outcome (`admitted`, `registered`, `rejected`)                                                                                    | the control plane       |
+| `activate` · `deactivate`      | readiness changes                                          | host, worker, manifest hash, subject, reason (owner, first use, aging, replacement, admin)                                                                                                        | the host agent's report |
+| `tag` · `visibility` · `owner` | the owner or an admin changes one                          | the new value, the one before                                                                                                                                                                     | the control plane       |
+| `retire` · `reject`            | a template or build is retired, or rejected after the fact | subject, reason                                                                                                                                                                                   | the control plane       |
+| `use` (summary)                | sessions start                                             | per build and day: count, first and last, by subject                                                                                                                                              | the control plane       |
 
 ### 7.2 Hosting, persistence and offline verification
 
@@ -245,60 +354,105 @@ follows) so the chain from the gated image to a session can be walked and checke
   canonical JSON, and names its predecessor's digest in `prev`, so any edit breaks the chain. Each
   template's chain head (the latest record's digest) is listed in the export's index, to be compared
   against a copy kept elsewhere. Nothing is signed.
-- **Exported**: `GET /v1/provenance/export?template=<id>` returns the records and the index as a
+- **Exported**: `GET /v1/provenance/export?template=<id>` (the owner, readers of a `deployment`
+  template, admins) returns the records, the cited gate records, the policy records and the index as a
   tarball; `mocactl` (or a small script) **verifies offline**: every record's digest, every `prev`,
-  and that the `build` record's manifest hash matches a snapshot if one is at hand.
-- **The workload plane only reports**: the build host posts `build` (or the operator registers T,
-  which carries it); the host agent posts `activate`/`deactivate` events. The control plane checks
-  and records; it never trusts a report it cannot tie to its chain.
+  each `check` re-run against its policy record and the records it cites, and that the `build`
+  record's manifest hash matches a snapshot if one is at hand.
+- **The workload plane only reports**: the host agent posts build logs, `build`, and
+  `activate`/`deactivate` events. The control plane checks and records; it never trusts a report it
+  cannot tie to its chain (a `build` report must answer a build it handed to that host).
 
-## 8. Gating at build and registration
+## 8. Policy: gating without an approver
 
-MOCA's side of the gating rules ([GATING-RULES](../../deploy/sbx/template-onboarding/governance/GATING-RULES.md)):
+Self-serve replaces the admin's approval with **policy**: the gating rules
+([GATING-RULES](../../deploy/sbx/template-onboarding/governance/GATING-RULES.md)) as machine checks,
+applied by the control plane and the build host, each result recorded (`check`, §7). A deployment
+offers named **profiles**; an admin writes them (§5.2), and each create names one.
+
+| Profile     | For                                                   | Requires, beyond the `base` rules                                                                                                                                                                                 |
+| ----------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`      | any client's own image (a toolchain, a project's env) | MOCA's rules M1-M4, M7-M17; the image from an allowed registry; the size envelope; a probe (the default probe `true` if none) passing in a restored VM (M12)                                                      |
+| `benchmark` | SWE-bench, TB and the like                            | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
+
+### 8.1 At create (in the control plane, before any build)
+
+M7 (the spec well formed, the id rule), M8, M9 for `benchmark`, X10-X12 and X15 from the spec and the
+gate record, the image pinned by digest (M1) **from an allowed registry** (new; closes G2's
+allowlist part), and the caller's quota (§6.2). A refusal is `422 policy_refused {rule, message}` and
+a `check` record; nothing is queued.
+
+### 8.2 At build and registration
+
+On the build host, `template-build.sh` applies what it does today (M1-M4, M10-M13, M15, and X10, X12
+with `--gate-record`). On the `built` report, the control plane re-checks the build record against
+the create's spec and the policy (the manifest hash covers the fields, PV2; T names the gate record's
+sha256), and registers the build or rejects it, with a `check` record either way.
 
 | Rule                                                                               | Where                                     | Change                                                                                                                                                                                                             |
 | ---------------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| X10: `source_record_digest` equals the image digest                                | `template-build.sh`                       | refuse a spec where it does not; carry it in T                                                                                                                                                                     |
-| X12: commits stay refused where the spec says                                      | `template-build.sh`, T                    | T records `skip_git_identity_check` with its reason and the gate's X5 evidence                                                                                                                                     |
-| Gate evidence in T (GATING-RULES §3)                                               | `template-build.sh` from the spec         | T carries `gate_record.{schema, passed, kind, network, user, base_digest, recipe, builder, sha256, commit}`                                                                                                        |
+| X10: `source_record_digest` equals the image digest                                | `template-build.sh`; the control plane    | done in `template-build.sh` (26bd6d7f); the control plane checks it again at create and registration                                                                                                               |
+| X12: commits stay refused where the spec says                                      | `template-build.sh`, T                    | done (26bd6d7f): T records `skip_git_identity_check` and the gate's X5 evidence                                                                                                                                    |
+| Gate evidence in T (GATING-RULES §3)                                               | `template-build.sh`                       | done (26bd6d7f): `gate_record.{schema, passed, kind, network, user, base_digest, recipe, builder, sha256, commit}`                                                                                                 |
 | PV2: the manifest is covered by its digest                                         | `build-snapshot.sh`, `vmpool/snapshot.go` | capabilities, image, instance type, guest size, vcpus and the egress CA move into `hash`; the Go manifest gains vcpus and the CA                                                                                   |
 | PV3: every snapshot file has a digest (the user, 2026-11-03: a digest, no signing) | `build-snapshot.sh`, `vmpool/snapshot.go` | the manifest records the sha256 of `vmstate` and `memfile` too; the build computes them once; the worker checks them at start only if asked (`SH_VERIFY_MEMFILE=1`, a 4 GiB read), and the offline verifier always |
 | PV4: worker start checks T                                                         | `microvm-worker`                          | compares T's `manifest_hash` and R's image digest with its snapshot                                                                                                                                                |
-| Registration                                                                       | the control plane                         | accepts T only with a passed gate (X1), a matching `source_record_digest` (X10), and a `build` record it can verify                                                                                                |
+| Registration                                                                       | the control plane                         | automatic: registers a build only with a passed `check` against the policy named at create, and a `build` record from the host the build was handed to                                                             |
+
+### 8.3 Trusted gate-record sources
+
+Without signatures, a gate record proves nothing by itself: a client could write one. The `benchmark`
+profile therefore trusts a gate record only from a **source the policy names**: a repository and path
+pattern (for image-factory, its repository's `testbeds/` and `platforms/moca/` records), from which
+the control plane (or the offline verifier) fetches the record at the cited commit and compares its
+sha256 with the one the client sent. A record that cannot be fetched there is refused for `benchmark`
+(it may still be stored, as `source: client`, on a `base` build). For the first version the fetch may
+be replaced by an admin-loaded copy of the source's records (A23); fetching is G13.
 
 ## 9. Tracing a run (PV7)
 
 A session's and a sandbox's responses carry `sandbox.templateManifestHash`, and the control plane's
 `use` records count them. Any run's result can then be traced: run → template → manifest hash →
-`build` record → `gate` record → image-factory's record.
+`build` record → `check` (policy) → `gate` record → the image builder's record.
 
 ## 10. Validation, before any PR (D1, D11)
 
-On bm1 with ykt3's control plane, autobench-moca driving the workload (D2), a scripted mock model
-first (A13):
+On bm1 with ykt3's control plane, autobench-moca driving the workload (D2) as a self-serve client, a
+scripted mock model first (A13):
 
-1. image-factory's gated images for K instances (K = 4, then more);
-2. clients request onboarding; an admin approves; `template-build.sh` builds and records; the admin
-   registers (gating checks, §8);
-3. clients request activation; the admin activates; the host agent attaches; readiness `active`;
-4. autobench-moca's runner opens sessions naming each instance's template, several instances at once;
-5. aging and replacement: more templates than `activeLimit`, the window moves by itself;
-6. export the provenance and verify it offline, from a machine with no access to the cluster;
-7. then a real model and grading, with the user's OK; then the PRs, from what this proved.
+1. image-factory's gated images for K instances (K = 4, then more); its records loaded as the
+   `benchmark` profile's trusted source (A23);
+2. the client creates each template through the API (`profile: benchmark`); the host agent builds and
+   probes; policy registers them; one deliberately broken create (a mismatched `source_record_digest`)
+   is refused with its rule id, and one broken probe fails at `probing`;
+3. a second client creates the same instance: the build is reused (§3.2) or the id is refused
+   (`409 template_exists`), as designed;
+4. the client activates (and, for one template, relies on activation on first use, §6.4); readiness
+   `active`; its quota is reached and replacement takes its own oldest;
+5. autobench-moca's runner opens sessions naming each instance's template, several instances at once;
+6. aging and replacement: more templates than `activeLimit`, the window moves by itself;
+7. export the provenance and verify it offline, from a machine with no access to the cluster;
+8. then a real model and grading, with the user's OK; then the PRs, from what this proved.
 
 The process doc (`PROCESS.md`) is updated at each step, and the validation follows it as written.
 
 ## 11. Order of work
 
-1. §8's gating changes (X10, X12, the evidence fields, PV2, PV4): no API change, testable alone.
-2. The provenance store and records (§7), with offline verification, for build and register first.
-3. Template states and the read API (§3, §4).
-4. Requests and admin actions (§5).
-5. The host agent and activation, the limit, aging and replacement (§6).
-6. Tracing (§9).
-7. The validation (§10).
+1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
+   evidence fields are done, 26bd6d7f).
+2. The provenance store and records (§7), with offline verification, for `build`, `check` and
+   `policy` first.
+3. Templates in the store, states and the read API (§3, §4), with owners and visibility.
+4. Create and policy at create (§4, §8.1), quotas (§6.2).
+5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
+   (§6.1, §8.2).
+6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6).
+7. Tracing (§9).
+8. The validation (§10).
 
-## 12. Decisions on the open questions (the user, 2026-11-03)
+## 12. Decisions
+
+### 12.1 On the open questions of 0.2 (the user, 2026-11-03)
 
 | #   | Question                                                           | Decision                                                                                  | Where          |
 | --- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | -------------- |
@@ -307,3 +461,20 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 | O3  | The control plane assigns templates to hosts, or hosts declare?    | **each host declares the snapshots it holds**                                             | §6.1           |
 | O4  | The host agent: a new service, or the janitor extended?            | **a new service**, `sbx-host-agent`                                                       | §6.1           |
 | O5  | Templates declared in the store, not `SH_SANDBOX_TEMPLATES`?       | **declared in the store**; the env list imported once into an empty store                 | §3.1           |
+
+### 12.2 Self-serve (the user, 2026-11-03; D12, D13)
+
+| #   | Question                                   | Decision                                                                                                                        | Where      |
+| --- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| O6  | Who may build a template?                  | **any enrolled client**; policy gates it automatically; admins set policy and quotas, and can retire                            | §4, §5, §8 |
+| O7  | Where does a client's image get its gate?  | **MOCA gates it** (the `base` profile); a trusted builder's gate record is extra evidence, **required for benchmark templates** | §8         |
+| O8  | Who activates and deactivates?             | **clients, within quotas**; aging and LRU free slots; admins set quotas and can deactivate any                                  | §5.1, §6   |
+| O9  | Build steps in code (E2B's builder chain)? | **not now**: clients bring a finished image by digest                                                                           | §3.2       |
+
+### 12.3 Open, for the review
+
+| #   | Question                                                                                                  | Proposed                                      |
+| --- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| O10 | Default visibility of a new template                                                                      | `deployment` (benchmark templates are shared) |
+| O11 | May a non-owner's activation replace the owner's oldest, or only idle builds of anyone's (as §6.3)?       | idle builds of anyone's, oldest first         |
+| O12 | Private registries: a client's pull credential, or only registries the build hosts can already pull from? | the latter for the first version (G16)        |
