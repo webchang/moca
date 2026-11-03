@@ -1,6 +1,6 @@
 # Template lifecycle, readiness and provenance — Design
 
-Version: 0.2 (draft for review; the user's answers to §12 applied, 2026-11-03) — November 2026
+Version: 0.3 (draft for review; §12 answers applied; E2B's template design adopted where it fits, §3.3) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
@@ -55,6 +55,32 @@ deployment declares today, and is ignored after that (a warning names it if it i
 differs). The harness's session templates (the seed, the tools) come from the same store, through the
 exchange as today.
 
+### 3.3 Templates, builds and tags (adopted from E2B)
+
+The user asked (2026-11-03) to leverage the good design decisions of E2B's templates
+(docs.e2b.dev, "Template tags & versioning", "Template names", the templates API). Adopted:
+
+- **A build is an immutable artifact with an id.** A build is one snapshot; its id is the snapshot's
+  manifest hash, `buildId` (`sha256:…`, §8 PV2-PV3 make that hash cover the whole snapshot). A
+  **template** is a name over its builds. Today's rule that a new image is a new snapshot and a new
+  worker is unchanged: each is a new build of the same template.
+- **Tags are labels on builds, moved without rebuilding.** A template is referenced as `id[:tag]`,
+  `default` when the tag is omitted; admins move tags (`stable`, `v2`, …) between builds
+  (§5). This replaces "the template id moves to the new worker" (versioned updates, RUNBOOK §5) with
+  an explicit, recorded label (§7), and old builds stay addressable while their sandboxes drain.
+- **Pin by build id:** a session or sandbox may name `id@sha256:…` instead of a tag, and is then
+  served by exactly that build or refused.
+- **The build is an API resource** with a status and paged logs (§4), as E2B's build status is.
+- **Names:** MOCA keeps its id rule, `^[a-z0-9][a-z0-9-]{0,30}$` (31 characters, the worker-id limit),
+  lowercased on input and refused, never truncated, when longer; `GET /v1/templates/{id}` answering
+  404 is the existence check. A tag follows the same rule.
+
+Not adopted, by design: self-service builds by any client (gating, D5, D9); a builder chain of layers
+in code (images are built and gated by their builder, A6); capturing running processes (a clean guest
+per command); unlimited templates (a per-host active limit, A3); public templates across deployments.
+
+Readiness (§3.2) is per build: `active` means a worker serving that build is attached.
+
 ### 3.2 The two states
 
 A template has two independent states, both kept by the control plane.
@@ -86,7 +112,7 @@ so the state cannot claim a worker that is not there.
 
 ## 4. The API (reads: any client)
 
-`GET /v1/templates` keeps today's fields and adds, per template:
+`GET /v1/templates` keeps today's fields and adds, per template, its tags and their builds:
 
 ```json
 {
@@ -94,30 +120,51 @@ so the state cannot claim a worker that is not there.
   "description": "SWE-bench django__django-11133 (lite) at its baseline bc348023edb4",
   "tools": ["bash", "git", "python3", "rg"],
   "onboarding": "registered",
-  "readiness": "active",
-  "capacity": { "running": 3, "inUse": 1 },
-  "lastUsedAt": "2026-11-03T02:10:00Z",
-  "provenance": { "manifestHash": "sha256:…", "record": "/v1/provenance/records/<digest>" }
+  "tags": { "default": "sha256:3c1f…", "stable": "sha256:3c1f…" },
+  "builds": [
+    {
+      "buildId": "sha256:3c1f…",
+      "status": "registered",
+      "readiness": "active",
+      "capacity": { "running": 3, "inUse": 1 },
+      "lastUsedAt": "2026-11-03T02:10:00Z",
+      "provenance": "/v1/provenance/records/<digest>"
+    }
+  ]
 }
 ```
 
+**Builds, as a resource (adopted from E2B's build status):**
+
+| Route                                                                            | Returns                                                                                                                                                             |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/templates/{id}/builds`                                                  | the template's builds, newest first                                                                                                                                 |
+| `GET /v1/templates/{id}/builds/{buildId}`                                        | one build: `status` (`queued`, `building`, `probing`, `built`, `failed`, `registered`), `readiness`, its record chain (§7), and on failure `reason {message, step}` |
+| `GET /v1/templates/{id}/builds/{buildId}/logs?logsOffset=0&limit=100&level=warn` | `logEntries [{timestamp, level, step, message}]`, paged by offset, at most 100 a page; reported by the build host, stored with its record                           |
+| `GET /v1/templates/{id}/tags`                                                    | each tag and the build it points to, with when it was assigned                                                                                                      |
+
 plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600}]}`
-(limits are per host, §6.2). `capacity.running` is what the
+(limits are per host, §6.2). Errors keep MOCA's shape, `{error, message}` with a stable code, and
+add `step` where a build step failed; a refusal that may clear carries `Retry-After`.
+`capacity.running` is what the
 worker's budget admits at once (`(budget − 1024) ÷ (guest + 32)` MiB, the rule measured on
 2026-10-31); `inUse` is its running sessions now. `GET /v1/templates/{id}` returns one template with
-its full provenance chain (§7). A session or sandbox on a template that is not `active` is refused at
-creation with `409 template_not_active` and its readiness, not left to a 503 retry later.
+its full provenance chain (§7). A session or sandbox names `id`, `id:tag` or
+`id@sha256:…` (§3.3); the reference is resolved to one build at creation, recorded on the session,
+and kept for its life. On a build that is not `active` it is refused at creation with
+`409 template_not_active` and the build's readiness, not left to a 503 retry later.
 
 ## 5. Requests and admin actions
 
-| Route                                                                | Who                           | Does                                                                          |
-| -------------------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
-| `POST /v1/template-requests {kind: "onboard", image, spec?, reason}` | any client                    | records a request to onboard an image (by digest) as a template               |
-| `POST /v1/template-requests {kind: "activate", template, reason}`    | any client                    | records a request to activate a registered template                           |
-| `GET /v1/template-requests[/{id}]`                                   | the requester; admins see all | the request and its state (`open`, `approved`, `done`, `rejected`)            |
-| `POST /v1/template-requests/{id}/approve` · `/reject`                | **admin**                     | acts on a request; an approved onboarding goes to the operator's build (§7.2) |
-| `POST /v1/templates/{id}/activate` · `/deactivate`                   | **admin**                     | sets the wanted readiness; the host agent acts on it (§6)                     |
-| `POST /v1/templates/{id}/retire`                                     | **admin**                     | onboarding → `retired`; deactivates it                                        |
+| Route                                                                                 | Who                           | Does                                                                                                                                                      |
+| ------------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/template-requests {kind: "onboard", image, spec?, reason}`                  | any client                    | records a request to onboard an image (by digest) as a template; `202 {requestId, templateId}`, and once an admin approves it, a `buildId` to follow (§4) |
+| `POST /v1/template-requests {kind: "activate", template, reason}`                     | any client                    | records a request to activate a registered template                                                                                                       |
+| `GET /v1/template-requests[/{id}]`                                                    | the requester; admins see all | the request and its state (`open`, `approved`, `done`, `rejected`)                                                                                        |
+| `POST /v1/template-requests/{id}/approve` · `/reject`                                 | **admin**                     | acts on a request; an approved onboarding goes to the operator's build (§7.2)                                                                             |
+| `POST /v1/templates/{id}/activate` · `/deactivate`                                    | **admin**                     | sets the wanted readiness; the host agent acts on it (§6)                                                                                                 |
+| `POST /v1/templates/{id}/retire`                                                      | **admin**                     | onboarding → `retired`; deactivates it                                                                                                                    |
+| `POST /v1/templates/{id}/tags {tags, build}` · `DELETE /v1/templates/{id}/tags/{tag}` | **admin**                     | moves tags onto a registered build, or removes a tag; removing one never deletes the build (adopted from E2B)                                             |
 
 "Admin" is the existing `admin` role (`SH_ADMIN_SUBJECTS`, `packages/control-plane/src/identity.ts`);
 the finer roles are the authorization design's (D10). Every request and action writes a provenance
@@ -184,6 +231,7 @@ follows) so the chain from the gated image to a session can be walked and checke
 | `register`                | an admin registers it                    | T as accepted, the checks it passed (§8)                                                                                                                                             | the control plane       |
 | `activate` · `deactivate` | readiness changes                        | host, worker, manifest hash, reason (request, aging, replacement)                                                                                                                    | the host agent's report |
 | `retire`                  | an admin retires it                      | reason                                                                                                                                                                               | the control plane       |
+| `tag`                     | an admin moves or removes a tag          | the tag, the build it now points to (or none), the one before                                                                                                                        | the control plane       |
 | `request` · `decision`    | a client requests, an admin decides      | who, what, reason                                                                                                                                                                    | the control plane       |
 | `use` (summary)           | sessions start                           | per template and day: count, first and last                                                                                                                                          | the control plane       |
 
