@@ -1,6 +1,6 @@
 # Template lifecycle, readiness and provenance — Design
 
-Version: 0.1 (draft for review) — November 2026
+Version: 0.2 (draft for review; the user's answers to §12 applied, 2026-11-03) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
@@ -34,17 +34,28 @@ SBOM (GATING-RULES §4, "later"); the workload and its scheduler (autobench-moca
 
 ## 2. What exists, and what is missing
 
-| Today                                                                                                           | Where                                                                      | Missing for the goal                                           |
-| --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Templates are declared to the control plane as `SH_SANDBOX_TEMPLATES` (a JSON env list), changed by redeploying | `packages/control-plane/src/sandbox-config.ts`; `deploy/sbx/setup.sh`      | no states; a change is a deploy (S1)                           |
-| `GET /v1/templates` lists them                                                                                  | `packages/control-plane/src/routes.ts:297`                                 | no readiness, capacity or provenance (S1)                      |
-| A session or sandbox names one; the harness routes it to a worker labelled `moca.dev/template`                  | `handlers.ts:706-725`; `harness/src/select-sandbox.ts`                     | a template with no worker fails only at session time, 503 (S2) |
-| One `microvm-worker` per template; it mlocks its snapshot's memory at start                                     | `remote-worker/cmd/microvm-worker/main.go:605,630`                         | ~4 GiB per attached worker, idle or not (A3)                   |
-| Workers are attached and detached by an operator on the host                                                    | `deploy/sbx/install-host.sh`; `deploy/microvm/setup-microvm.sh --template` | nothing for the control plane to drive (S3)                    |
-| The build writes a template record and a snapshot manifest on the host                                          | `template-build.sh`; `build-snapshot.sh`                                   | not in the control plane, not signed, not chained (PV1-PV6)    |
-| The host janitor already reads the control plane with its own bearer                                            | `sandbox-handlers.ts:266-271` (`janitorSandboxes`)                         | the pattern this design reuses for a host agent                |
+| Today                                                                                                           | Where                                                                      | Missing for the goal                                                           |
+| --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Templates are declared to the control plane as `SH_SANDBOX_TEMPLATES` (a JSON env list), changed by redeploying | `packages/control-plane/src/sandbox-config.ts`; `deploy/sbx/setup.sh`      | no states; a change is a deploy (S1): **declared in the store instead** (§3.1) |
+| `GET /v1/templates` lists them                                                                                  | `packages/control-plane/src/routes.ts:297`                                 | no readiness, capacity or provenance (S1)                                      |
+| A session or sandbox names one; the harness routes it to a worker labelled `moca.dev/template`                  | `handlers.ts:706-725`; `harness/src/select-sandbox.ts`                     | a template with no worker fails only at session time, 503 (S2)                 |
+| One `microvm-worker` per template; it mlocks its snapshot's memory at start                                     | `remote-worker/cmd/microvm-worker/main.go:605,630`                         | ~4 GiB per attached worker, idle or not (A3)                                   |
+| Workers are attached and detached by an operator on the host                                                    | `deploy/sbx/install-host.sh`; `deploy/microvm/setup-microvm.sh --template` | nothing for the control plane to drive (S3)                                    |
+| The build writes a template record and a snapshot manifest on the host                                          | `template-build.sh`; `build-snapshot.sh`                                   | not in the control plane, not chained by digest (PV1-PV6)                      |
+| The host janitor already reads the control plane with its own bearer                                            | `sandbox-handlers.ts:266-271` (`janitorSandboxes`)                         | the pattern this design reuses for a host agent                                |
 
 ## 3. Template states
+
+### 3.1 Templates are declared in the store
+
+Templates are **declared in the control plane's store**, not in `SH_SANDBOX_TEMPLATES` (the user,
+2026-11-03): registering, retiring or changing one is an API call that writes a record (§7), never a
+redeploy. The env list is read once, at the first start against an empty store, to import what a
+deployment declares today, and is ignored after that (a warning names it if it is still set and
+differs). The harness's session templates (the seed, the tools) come from the same store, through the
+exchange as today.
+
+### 3.2 The two states
 
 A template has two independent states, both kept by the control plane.
 
@@ -61,13 +72,13 @@ A template has two independent states, both kept by the control plane.
 
 **Readiness** (whether sessions can run on it now), for a `registered` template:
 
-| State          | Means                                                                                  |
-| -------------- | -------------------------------------------------------------------------------------- |
-| `inactive`     | registered, no worker attached                                                         |
-| `activating`   | the control plane asked a host to attach its worker; not yet attached                  |
-| `active`       | its worker is attached; sessions can run                                               |
-| `deactivating` | the control plane asked the host to detach it; live sessions drain (§6.3)              |
-| `unavailable`  | it cannot be activated: no host has its snapshot, or the host refused, with the reason |
+| State          | Means                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| `inactive`     | registered, no worker attached                                                                     |
+| `activating`   | the control plane asked a host to attach its worker; not yet attached                              |
+| `active`       | its worker is attached; sessions can run                                                           |
+| `deactivating` | the control plane asked the host to detach it; live sessions drain (§6.3)                          |
+| `unavailable`  | it cannot be activated: no host declares its snapshot (§6.1), or the host refused, with the reason |
 
 Readiness follows from facts, not from intent: `active` means the relay holds an attached record
 for its worker (the same record the harness routes on), and the control plane derives it from that,
@@ -90,7 +101,8 @@ so the state cannot claim a worker that is not there.
 }
 ```
 
-plus a host-wide block: `{"active": {"limit": 24, "used": 18}}`. `capacity.running` is what the
+plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600}]}`
+(limits are per host, §6.2). `capacity.running` is what the
 worker's budget admits at once (`(budget − 1024) ÷ (guest + 32)` MiB, the rule measured on
 2026-10-31); `inUse` is its running sessions now. `GET /v1/templates/{id}` returns one template with
 its full provenance chain (§7). A session or sandbox on a template that is not `active` is refused at
@@ -115,35 +127,42 @@ record (§7).
 
 ### 6.1 The host agent
 
-A small agent on each KVM host, beside the workers, does what an operator does today with
-`install-host.sh` / `setup-microvm.sh --template`: start and stop a template's worker unit. It
-**polls** the control plane for the wanted readiness of the templates assigned to its host, and
-reports back. The pattern is the host janitor's: a per-host bearer, a read route, no inbound port on
-the host (SBX0 §8.3).
+A **new, small service** on each KVM host, `sbx-host-agent` (the user, 2026-11-03; not an extension of
+the host janitor, which keeps its one job), beside the workers. It does what an operator does today
+with `install-host.sh` / `setup-microvm.sh --template`: start and stop a template's installed worker
+unit. It **polls** the control plane and **reports** to it; it never listens, as the janitor does not
+(a per-host bearer, no inbound port, SBX0 §8.3).
 
-| Step | Agent                                                                                                                   | Control plane          |
-| ---- | ----------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| 1    | `GET /v1/host/{host}/templates` (wanted state, per template)                                                            | answers from its store |
-| 2    | for each `activating`: check the snapshot is on disk and its manifest hash is the registered one; start the worker unit | —                      |
-| 3    | `POST /v1/host/{host}/reports {template, event: "attached"                                                              | "refused", reason}`    | records it (§7); readiness follows the relay record |
-| 4    | for each `deactivating` with no live sessions: stop the unit                                                            | —                      |
+**Each host declares the snapshots it holds** (the user, 2026-11-03): the control plane does not
+assign templates to hosts. On every poll the agent sends its inventory, and the control plane matches
+it to registered templates by manifest hash:
+
+| Step | Agent                                                                                                                      | Control plane                                                           |
+| ---- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 1    | `POST /v1/hosts/{host}/inventory`: each installed worker's template id and its snapshot's manifest hash; the host's limits | records the inventory; a template is placeable only on hosts holding it |
+| 2    | `GET /v1/hosts/{host}/wanted`: the wanted readiness of the templates it holds                                              | answers from its store                                                  |
+| 3    | for each wanted `active`: check the snapshot's manifest hash is the registered one, then start the worker unit             | —                                                                       |
+| 4    | `POST /v1/hosts/{host}/reports`: `{template, event, reason}`, the event `attached`, `refused` or `detached`                | records it (§7); readiness follows the relay's attached record          |
+| 5    | for each wanted `inactive` with no live sessions: stop the unit                                                            | —                                                                       |
 
 Workers are installed once per template (`install-host.sh`), so activation is a start and
 deactivation a stop: no file changes, no relay or control-plane restart. A stopped worker costs no
-memory.
+memory. A template no host declares is `unavailable`.
 
 ### 6.2 The active limit
 
-Each host has `activeLimit`: the number of workers it may run at once, from its memory and the
-templates' budgets (the host-wide budget sum, register gap; measured: ~26 templates by disk, ~36
-workers by memory at 4 GiB guests, A3). Activation beyond the limit is refused, or triggers
-replacement (§6.3).
+**Per host** (the user, 2026-11-03): each host's agent reports its `activeLimit` (the workers it may
+run at once) and `idleLimit` (§6.3) with its inventory, from the host's own settings file. They are
+set by its operator from the host's memory and disk and the templates' budgets (measured on bm1: ~26
+SWE-bench templates by disk, ~36 workers by memory at 4 GiB guests, A3). The agent also refuses a
+start that would pass the host's memory, as a second guard. Activation beyond a host's limit is
+refused, or triggers replacement on that host (§6.3).
 
 ### 6.3 Aging and replacement (A16)
 
 - **Use:** a template's `lastUsedAt` is the start of its latest session or sandbox (the control
   plane sees every creation).
-- **Aging:** an `active` template idle longer than `idleLimit` (a deployment setting) is moved to
+- **Aging:** an `active` template idle longer than its host's `idleLimit` (§6.2) is moved to
   `deactivating` by the control plane.
 - **Replacement:** an activation that would pass `activeLimit` deactivates the `active` template
   with the oldest `lastUsedAt` that has no live session.
@@ -174,11 +193,13 @@ follows) so the chain from the gated image to a session can be walked and checke
   directory on the control plane's persistent volume, one file per record named by its digest, and an
   index per template. The control plane's existing file store and its PVC (`file-store.ts`, the
   egress credentials' `moca-sbx-credentials`) are the precedent.
-- **Signed** by the control plane with an Ed25519 key (the same kind as its session-token key), so a
-  copy is verifiable without trusting where it came from.
-- **Exported**: `GET /v1/provenance/export?template=<id>` returns the records and the public key as
-  a tarball; `mocactl` (or a small script) **verifies offline**: every signature, every `prev`, and
-  that the `build` record's manifest hash matches a snapshot if one is at hand.
+- **Digests, not signatures** (the user, 2026-11-03): every record is named by the sha256 of its
+  canonical JSON, and names its predecessor's digest in `prev`, so any edit breaks the chain. Each
+  template's chain head (the latest record's digest) is listed in the export's index, to be compared
+  against a copy kept elsewhere. Nothing is signed.
+- **Exported**: `GET /v1/provenance/export?template=<id>` returns the records and the index as a
+  tarball; `mocactl` (or a small script) **verifies offline**: every record's digest, every `prev`,
+  and that the `build` record's manifest hash matches a snapshot if one is at hand.
 - **The workload plane only reports**: the build host posts `build` (or the operator registers T,
   which carries it); the host agent posts `activate`/`deactivate` events. The control plane checks
   and records; it never trusts a report it cannot tie to its chain.
@@ -187,14 +208,15 @@ follows) so the chain from the gated image to a session can be walked and checke
 
 MOCA's side of the gating rules ([GATING-RULES](../../deploy/sbx/template-onboarding/governance/GATING-RULES.md)):
 
-| Rule                                                | Where                                     | Change                                                                                                                           |
-| --------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| X10: `source_record_digest` equals the image digest | `template-build.sh`                       | refuse a spec where it does not; carry it in T                                                                                   |
-| X12: commits stay refused where the spec says       | `template-build.sh`, T                    | T records `skip_git_identity_check` with its reason and the gate's X5 evidence                                                   |
-| Gate evidence in T (GATING-RULES §3)                | `template-build.sh` from the spec         | T carries `gate_record.{schema, passed, kind, network, user, base_digest, recipe, builder, sha256, commit}`                      |
-| PV2: the manifest is authenticated                  | `build-snapshot.sh`, `vmpool/snapshot.go` | capabilities, image, instance type, guest size, vcpus and the egress CA move into `hash`; the Go manifest gains vcpus and the CA |
-| PV4: worker start checks T                          | `microvm-worker`                          | compares T's `manifest_hash` and R's image digest with its snapshot                                                              |
-| Registration                                        | the control plane                         | accepts T only with a passed gate (X1), a matching `source_record_digest` (X10), and a `build` record it can verify              |
+| Rule                                                                               | Where                                     | Change                                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| X10: `source_record_digest` equals the image digest                                | `template-build.sh`                       | refuse a spec where it does not; carry it in T                                                                                                                                                                     |
+| X12: commits stay refused where the spec says                                      | `template-build.sh`, T                    | T records `skip_git_identity_check` with its reason and the gate's X5 evidence                                                                                                                                     |
+| Gate evidence in T (GATING-RULES §3)                                               | `template-build.sh` from the spec         | T carries `gate_record.{schema, passed, kind, network, user, base_digest, recipe, builder, sha256, commit}`                                                                                                        |
+| PV2: the manifest is covered by its digest                                         | `build-snapshot.sh`, `vmpool/snapshot.go` | capabilities, image, instance type, guest size, vcpus and the egress CA move into `hash`; the Go manifest gains vcpus and the CA                                                                                   |
+| PV3: every snapshot file has a digest (the user, 2026-11-03: a digest, no signing) | `build-snapshot.sh`, `vmpool/snapshot.go` | the manifest records the sha256 of `vmstate` and `memfile` too; the build computes them once; the worker checks them at start only if asked (`SH_VERIFY_MEMFILE=1`, a 4 GiB read), and the offline verifier always |
+| PV4: worker start checks T                                                         | `microvm-worker`                          | compares T's `manifest_hash` and R's image digest with its snapshot                                                                                                                                                |
+| Registration                                                                       | the control plane                         | accepts T only with a passed gate (X1), a matching `source_record_digest` (X10), and a `build` record it can verify                                                                                                |
 
 ## 9. Tracing a run (PV7)
 
@@ -228,12 +250,12 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 6. Tracing (§9).
 7. The validation (§10).
 
-## 12. Open questions
+## 12. Decisions on the open questions (the user, 2026-11-03)
 
-| #   | Question                                                                                                                                                       | For                           |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| O1  | Hash and sign vmstate and memfile too (PV3, register Q2), at a build-time cost?                                                                                | the user                      |
-| O2  | `idleLimit` and `activeLimit` as settings per deployment, per host, or computed from memory?                                                                   | the user, after a measurement |
-| O3  | Should the control plane assign templates to hosts, or each host declare the snapshots it holds? (One host for the validation.)                                | the user                      |
-| O4  | The host agent: a new small service, or an extension of the host janitor?                                                                                      | review                        |
-| O5  | Templates declared in the store instead of `SH_SANDBOX_TEMPLATES`, so registering is not a redeploy? (Proposed: yes, with the env list kept as the bootstrap.) | review                        |
+| #   | Question                                                           | Decision                                                                                  | Where          |
+| --- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | -------------- |
+| O1  | Hash and sign vmstate and memfile too?                             | **a digest, no signing**: every snapshot file has a digest; records are chained by digest | §7.2, §8 (PV3) |
+| O2  | `idleLimit` and `activeLimit`: per deployment, per host, computed? | **per host**                                                                              | §6.2           |
+| O3  | The control plane assigns templates to hosts, or hosts declare?    | **each host declares the snapshots it holds**                                             | §6.1           |
+| O4  | The host agent: a new service, or the janitor extended?            | **a new service**, `sbx-host-agent`                                                       | §6.1           |
+| O5  | Templates declared in the store, not `SH_SANDBOX_TEMPLATES`?       | **declared in the store**; the env list imported once into an empty store                 | §3.1           |
