@@ -112,18 +112,18 @@ active limit, A3); public templates across deployments.
 A template's builds each have two independent states, both kept by the control plane.
 
 **Onboarding** (how far the build is from usable), set by the build host's reports and by policy,
-never by a person's approval:
+never by a person's approval (people still cancel, retire, and reject after the fact, §5):
 
-| State        | Means                                                                                          | Entered by                       |
-| ------------ | ---------------------------------------------------------------------------------------------- | -------------------------------- |
-| `queued`     | created; admitted by the create-time checks (§8.1); waiting for a host                         | the client's create (§4)         |
-| `building`   | a build host took it: pull, rootfs, boot, in-guest checks, snapshot                            | the host agent's claim (§6.1)    |
-| `probing`    | restored from the new snapshot; the seed and the probe running                                 | the host agent's report          |
-| `built`      | snapshot and probe passed on a host; its build record is in                                    | the host agent's report (§7)     |
-| `registered` | the control plane checked the build record against policy (§8.2) and the gate evidence; usable | the control plane, automatically |
-| `rejected`   | refused by policy at create or registration, with the rule id and reason                       | the control plane, automatically |
-| `failed`     | the build or the probe failed, with `reason {message, step}`                                   | the host agent's report          |
-| `retired`    | no new sessions; kept for provenance                                                           | the owner, or an admin           |
+| State        | Means                                                                                                                                                                               | Entered by                                 |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `queued`     | created; admitted by the create-time checks (§8.1); waiting for a host                                                                                                              | the client's create (§4)                   |
+| `building`   | a build host took it: pull, rootfs, boot, in-guest checks, snapshot                                                                                                                 | the host agent's claim (§6.1)              |
+| `probing`    | restored from the new snapshot; the seed and the probe running                                                                                                                      | the host agent's report                    |
+| `built`      | snapshot and probe passed on a host; its build record is in                                                                                                                         | the host agent's report (§7)               |
+| `registered` | the control plane checked the build record against policy (§8.2) and the gate evidence; usable                                                                                      | the control plane, automatically           |
+| `rejected`   | refused by policy at registration (§8.2), with the rule id and reason, or rejected after the fact by an admin (§5.2); a create policy refuses is a `422` and leaves no build (§8.1) | the control plane, automatically; an admin |
+| `failed`     | the build or the probe failed, with `reason {message, step}`, or the owner cancelled a `queued` or `building` build (§5.1)                                                          | the host agent's report; the owner         |
+| `retired`    | no new sessions; kept for provenance                                                                                                                                                | the owner, or an admin                     |
 
 A template's own state is its newest build's (`registered` once any build is), so a client polling
 `GET /v1/templates/{id}` sees `queued → building → probing → built → registered` without knowing the
