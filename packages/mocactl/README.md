@@ -80,6 +80,7 @@ mocactl doctor [--json]                     # seven checks, one fix per failure;
 mocactl run "prompt" [--session ID | --new] [--option inferenceCredential=NAME] [--json]
 mocactl promote DIR [--dry-run] [--json]    # upload DIR's .claude/skills and .claude/commands
 mocactl run "prompt" --config DIGEST        # start the new session with that config bundle
+mocactl run "prompt" --show-tools           # print each tool call between the turn's text
 mocactl bundles delete DIGEST [--json]      # delete a bundle you promoted; frees your budget
 ```
 
@@ -110,8 +111,13 @@ mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]  # run it 
 mocactl workloads create --context FILE [--name NAME] [--json]  # upload a context; prints its id
 mocactl workloads create --context FILE --sandboxes N [--mount read-only|writable]  # with sandboxes of its own
 mocactl workloads get ID [--json]           # status, context type, size and frozen revision
-mocactl workloads delete ID [--json]        # delete the workload and its context
+mocactl workloads delete ID [--json]        # delete the workload and its context (idempotent)
 ```
+
+`workloads delete` on a workload that is already deleted exits 0 and says so, the way
+`kubectl delete` does, so a cleanup script can delete every id it knows without telling "already
+done" from a real failure. An id the harness knows nothing about still exits 1 — that one may be a
+typo. With `--json`, the already-deleted case adds `"alreadyDeleted": true` to the same document.
 
 `mocactl spawn` creates a session (pinned to the bundle if `--config` is given), writes a record
 to `$XDG_STATE_HOME/mocactl/subagents.jsonl`, then forks a detached worker that holds the sync
@@ -146,6 +152,11 @@ verdict. A session that has not finished yet exits `1` with a hint; a `failed` b
 with the status, reason, and detail on stderr.
 
 `mocactl run` continues the session `--session` names, or starts a new one (`--new`, the default).
+
+By default it prints the assistant's text only. `--show-tools` adds each tool call the turn makes,
+on its own line between the text, formatted as the TUI formats it (`$ ls /tmp`, `read src/a.ts`),
+and marks a tool call that failed; a successful call's output is not printed. It is refused with
+`--json`, which already streams the `tool_use` and `tool_result` frames themselves.
 
 `mocactl promote` prints what it built and the preflight report (warnings on stderr) BEFORE
 uploading, then the bundle digest to pass to `run --config`. `--dry-run` builds and prints without
@@ -261,7 +272,7 @@ their own shapes. These shapes are stable: fields may be added, but none is rena
 | `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?}`                                 |
 | `workloads create`   | `{"workloadId","status","contextType","revision","files","bytes","sandboxes"?,"mount"?}`           |
 | `workloads get`      | `{"workloadId","status","contextType","workspace","revision","sandboxes","error"?}`, `null` unset  |
-| `workloads delete`   | `{"workloadId","status":"deleted"}`                                                                |
+| `workloads delete`   | `{"workloadId","status":"deleted","alreadyDeleted"?}`                                              |
 
 `createdAt` and `lastTurnAt` are epoch milliseconds as the control plane sends them (`lastTurnAt`
 is `null` before the first turn); `endpoint` is `null` when the deployment default applies.
