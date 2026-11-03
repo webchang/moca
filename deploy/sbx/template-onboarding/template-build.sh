@@ -3,7 +3,16 @@
 # golden snapshot, checked in a microVM before it is published (deploy/sbx/template-onboarding/ONBOARDING.md, steps 1-2).
 #
 #   sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
-#                                     [--registry HOST] [--egress-ca PATH] [--keep-image] [--force]
+#                                     [--registry HOST] [--egress-ca PATH] [--gate-record FILE [--gate-commit SHA]]
+#                                     [--keep-image] [--force]
+#
+# --gate-record FILE is the image's gate record from its builder (image-factory's
+# `image-factory/<family>/1`; governance/GATING-RULES.md §3). The build refuses unless the record's
+# gate passed (X1), its image digest is the spec's, and the spec's `source_record_digest` is that
+# digest (X10); for a spec that skips the git identity check, the record must show commits refused
+# (X5, X12). The template record then carries `gate_record`: the evidence, the record's sha256 and,
+# with --gate-commit, the builder's commit that holds it, so the chain can be checked offline.
+# A spec that names a `source_record_digest` must be built with its gate record.
 #
 # --egress-ca PATH bakes the KVM host's TLS-interception CA (the public certificate, from
 # `install-host.sh --egress-ca-out`) into the snapshot, for a template whose sandboxes use egress
@@ -83,6 +92,7 @@ usage() {
 spec_error() { echo "deploy/sbx/template-onboarding/template-build.sh: $SPEC: $*" >&2; exit 2; }
 
 SPEC='' KERNEL='' AGENT="$REPO_ROOT/remote-worker" VMM=firecracker REGISTRY='' EGRESS_CA='' KEEP_IMAGE='' FORCE=''
+GATE_RECORD='' GATE_COMMIT=''
 while (($#)); do
   case "$1" in
   --kernel) [[ $# -ge 2 ]] || usage; KERNEL="$2"; shift 2 ;;
@@ -90,6 +100,8 @@ while (($#)); do
   --vmm) [[ $# -ge 2 ]] || usage; VMM="$2"; shift 2 ;;
   --registry) [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || usage; REGISTRY="$2"; shift 2 ;;
   --egress-ca) [[ $# -ge 2 ]] || usage; EGRESS_CA="$2"; shift 2 ;;
+  --gate-record) [[ $# -ge 2 ]] || usage; GATE_RECORD="$2"; shift 2 ;;
+  --gate-commit) [[ $# -ge 2 && "$2" =~ ^[0-9a-f]{7,40}$ ]] || usage; GATE_COMMIT="$2"; shift 2 ;;
   --keep-image) KEEP_IMAGE=1; shift ;;
   --force) FORCE=1; shift ;;
   -h | --help) usage ;;
@@ -153,6 +165,39 @@ esac
 HOSTS_SHA="$(field etc_hosts_sha256)"
 [[ -z "$HOSTS_SHA" || "$HOSTS_SHA" =~ ^[0-9a-f]{64}$ ]] || spec_error "etc_hosts_sha256 must be 64 hex digits, got '$HOSTS_SHA'"
 
+# The gate evidence (governance/GATING-RULES.md X1, X5, X10, X12). Checked here, with the spec, so a
+# refusal costs no pull.
+SRC_DIGEST="$(field source_record_digest)"
+[[ -z "$GATE_COMMIT" || -n "$GATE_RECORD" ]] || spec_error '--gate-commit needs --gate-record'
+if [[ -n "$SRC_DIGEST" ]]; then
+  [[ "$SRC_DIGEST" == "$DIGEST" ]] ||
+    spec_error "source_record_digest $SRC_DIGEST is not the image's digest $DIGEST (X10): the spec does not name its image's gate record"
+  [[ -n "$GATE_RECORD" ]] || spec_error 'the spec names a gate record (source_record_digest): build it with --gate-record FILE (X10)'
+fi
+GATE_JSON='null'
+if [[ -n "$GATE_RECORD" ]]; then
+  [[ -f "$GATE_RECORD" ]] || spec_error "no gate record $GATE_RECORD"
+  jq -e 'type == "object"' "$GATE_RECORD" >/dev/null 2>&1 || spec_error "$GATE_RECORD is not a JSON object"
+  [[ "$(jq -r '.gate.passed // false' "$GATE_RECORD")" == true ]] || spec_error "the gate record's gate did not pass (X1)"
+  [[ "$(jq -r '.image.digest // empty' "$GATE_RECORD")" == "$DIGEST" ]] ||
+    spec_error "the gate record is for image $(jq -r '.image.digest // "none"' "$GATE_RECORD"), not $DIGEST"
+  if [[ "$(jq -r '.skip_git_identity_check // false' "$SPEC")" == true ]]; then
+    # A spec that skips the identity check says the image refuses agent commits on purpose; the gate
+    # must have seen that (X5), or skipping the check would hide an image that commits.
+    jq -e '.observed.testbed.agent_can_commit == "no" and (.observed.guest.git_identity // "none") == "none"' \
+      "$GATE_RECORD" >/dev/null ||
+      spec_error 'skip_git_identity_check, but the gate record does not show commits refused (X5: agent_can_commit no, git_identity none) (X12)'
+  fi
+  GATE_SHA="$({ sha256sum "$GATE_RECORD" 2>/dev/null || shasum -a 256 "$GATE_RECORD"; } | cut -d' ' -f1)"
+  GATE_JSON="$(jq -c --arg sha "sha256:$GATE_SHA" --arg commit "$GATE_COMMIT" '{
+    schema, passed: .gate.passed, kind: .gate.kind, network: .gate.network, user: .gate.user,
+    base_digest: (.testbed_image.digest // .environment_image.digest // .base_image.digest // null),
+    recipe, builder, built_at, sha256: $sha}
+    + (if $commit == "" then {} else {commit: $commit} end)
+    + (if .observed.testbed.agent_can_commit then {commits_refused: (.observed.testbed.agent_can_commit == "no")} else {} end)' \
+    "$GATE_RECORD")"
+fi
+
 TAG12="${DIGEST#sha256:}"; TAG12="${TAG12:0:12}"
 NAME="$ID-$TAG12"
 WORKER="sbx_${ID//-/_}_$TAG12"
@@ -194,17 +239,26 @@ write_record() {
   mkdir -p "$SBX_SRV/templates"
   jq -S --arg snapshot "$NAME" --arg worker "$WORKER" --arg hash "$hash" --arg built "$built" \
     --argjson budget "$BUDGET_MIN" --arg ca "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" \
+    --argjson gate "$GATE_JSON" \
     '{schema: "moca-sbx-template/1", id, worker: $worker, snapshot: $snapshot, image, guest_ram_mb,
       vcpus, egress, seed, probe, description, tools, guest_home_gitconfig: (.guest_home_gitconfig // false),
       manifest_hash: $hash, built_at: $built,
       min_budget_mb: $budget}
-    + (if $ca == "" then {} else {egress_ca_sha256: $ca} end)' "$SPEC" >"$RECORD.tmp"
+    + (if $ca == "" then {} else {egress_ca_sha256: $ca} end)
+    + (if .skip_git_identity_check then {skip_git_identity_check: true} else {} end)
+    + (if .source_record_digest then {source_record_digest} else {} end)
+    + (if .probe_status then {probe_status} else {} end)
+    + (if .proved_in_vm != null then {proved_in_vm} else {} end)
+    + (if $gate == null then {} else {gate_record: $gate} end)' "$SPEC" >"$RECORD.tmp"
   mv "$RECORD.tmp" "$RECORD"
 }
 
 # The spec's part of a record, for "already built": the same spec on the same snapshot.
 spec_key() { jq -S '{id, image, guest_ram_mb, vcpus, egress, seed, probe, description, tools,
   guest_home_gitconfig: (.guest_home_gitconfig // false)}' "$1"; }
+# The gate evidence the existing record carries, for "already built": a build against another gate
+# record (or none) rewrites the record.
+gate_key() { jq -c '.gate_record.sha256 // null' "$1"; }
 
 [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root (build-rootfs.sh and build-snapshot.sh do)'
 [[ -f "$KERNEL" ]] || die "no kernel at $KERNEL"
@@ -223,6 +277,13 @@ if [[ -z "$FORCE" && -f "$OUT/manifest.json" && -f "$RECORD" ]] &&
   [[ "$(spec_key "$SPEC")" == "$(spec_key "$RECORD")" ]] &&
   [[ "$(jq -r .manifest_hash "$RECORD")" == "$(jq -r .hash "$OUT/manifest.json")" ]] &&
   [[ "$(jq -r '.egress_ca_sha256 // empty' "$OUT/manifest.json")" == "$CA_SHA" ]]; then
+  if [[ "$(gate_key "$RECORD")" != "$(jq -c '.sha256 // null' <<<"$GATE_JSON")" ]]; then
+    # The same snapshot, cited against another gate record (or newly against one): the snapshot
+    # stands, only the record's evidence changes.
+    write_record
+    log "already built: snapshot $NAME; its record now cites the given gate record ($RECORD)"
+    exit 0
+  fi
   log "already built: snapshot $NAME, record $RECORD (--force rebuilds)"
   exit 0
 fi

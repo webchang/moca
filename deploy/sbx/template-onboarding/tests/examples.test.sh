@@ -28,9 +28,12 @@ export PATH="$TMP/bin:$PATH" SBX_SRV="$TMP/srv" SBX_SKIP_ROOT_CHECK=1
 # check SPEC SNAPSHOT: the spec passes every field check (the run reaches the pull, never exit 2),
 # and the pull is of the spec's pinned image.
 check() {
-  local spec="$1" want="$2" rc=0
+  local spec="$1" want="$2" rc=0 gate=()
+  # A sample that names its gate record (source_record_digest) ships it beside it, as
+  # <spec>.gate-record.json, and is built with it (governance/GATING-RULES.md X10).
+  [[ ! -f "${spec%.json}.gate-record.json" ]] || gate=(--gate-record "${spec%.json}.gate-record.json")
   bash "$TPL/template-build.sh" "$spec" --kernel "$TMP/vmlinux" --agent "$TMP/agent" \
-    --registry registry.example.com >"$TMP/out" 2>&1 || rc=$?
+    --registry registry.example.com ${gate[@]+"${gate[@]}"} >"$TMP/out" 2>&1 || rc=$?
   [[ "$rc" != 2 ]] || fail "$(basename "$spec") was refused as a spec"
   grep -q '^podman-pull ' "$TMP/out" || fail "$(basename "$spec") did not reach the pull"
   grep -q "^podman-pull .*@$(jq -r '.image | split("@")[1]' "$spec")\$" "$TMP/out" ||
@@ -41,6 +44,7 @@ check() {
 
 n=0
 for spec in "$TPL"/examples/*.json; do
+  [[ "$spec" != *.gate-record.json ]] || continue
   jq -e '.schema == "moca-sbx-template-spec/1"' "$spec" >/dev/null || fail "$(basename "$spec") is not a spec"
   n=$((n + 1))
 done
@@ -58,3 +62,12 @@ pass 'django__django-11133.json passes the spec check; its image is host-free an
 ! grep -l -E 'amazonaws|dkr\.ecr|ghp_|github_pat_|[0-9]{12}\.' "$TPL"/examples/*.json >/dev/null ||
   fail 'a sample names a registry host, an account id or a token'
 pass 'no sample names a private registry, an account id or a token'
+
+# A gate record shipped beside a sample is that sample's: same image digest as its source_record_digest.
+for g in "$TPL"/examples/*.gate-record.json; do
+  spec="${g%.gate-record.json}.json"
+  [[ -f "$spec" ]] || fail "$(basename "$g") has no sample spec beside it"
+  [[ "$(jq -r .image.digest "$g")" == "$(jq -r .source_record_digest "$spec")" ]] ||
+    fail "$(basename "$g") is not the gate record $(basename "$spec") names"
+done
+pass 'every gate record beside a sample is the one its spec names'

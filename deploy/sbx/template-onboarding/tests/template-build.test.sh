@@ -271,3 +271,55 @@ spec '.skip_git_identity_check = false'
 run || fail 'switching it off failed'
 grep -q build-snapshot "$MOCK_LOG" || fail 'switching guest_home_gitconfig off was taken as already built'
 pass 'guest_home_gitconfig: off by default, passed through, recorded; refused without guest_home or with skip_git_identity_check'
+
+# 11. --gate-record (governance/GATING-RULES.md X1, X5, X10, X12): the gate record is checked against
+# the spec before anything is pulled, and its evidence is carried in the template record.
+gate() { # gate [jq filter]: a gate record as image-factory writes one, for this test's image
+  jq -n --arg d "$DIGEST" '{schema: "image-factory/moca-microvm/1",
+    image: {repository: "image-factory/moca-microvm", digest: $d},
+    testbed_image: {digest: "sha256:'"$(printf 'e%.0s' {1..64})"'"},
+    recipe: {dockerfile_sha256: "d1", platform_layer_sha256: "p1", emitter: "oci-moca-microvm/1"},
+    builder: {arch: "x86_64", engine: "podman", network: "host"}, built_at: "2026-10-15T00:00:00Z",
+    gate: {passed: true, kind: "guest emulation", network: "none", rootfs: "read-only", user: "root"},
+    observed: {testbed: {agent_can_commit: "no", commit_count: "1"}, guest: {git_identity: "none"}}}' |
+    jq "${1:-.}" >"$TMP/gate.json"
+}
+spec ".source_record_digest = \"$DIGEST\" | .probe_status = \"vm\" | .proved_in_vm = true"
+gate
+run --force --gate-record "$TMP/gate.json" --gate-commit c3ea3a4 || fail "a passing gate record failed: $(cat "$TMP/out")"
+R="$SBX_SRV/templates/$NAME.json"
+jq -e --arg d "$DIGEST" '.source_record_digest == $d and .probe_status == "vm" and .proved_in_vm == true
+  and .skip_git_identity_check == true and .gate_record.passed == true and .gate_record.network == "none"
+  and .gate_record.schema == "image-factory/moca-microvm/1" and .gate_record.commit == "c3ea3a4"
+  and .gate_record.commits_refused == true and (.gate_record.sha256 | startswith("sha256:"))
+  and .gate_record.recipe.dockerfile_sha256 == "d1" and (.gate_record.base_digest | startswith("sha256:eee"))' "$R" >/dev/null ||
+  fail "the record lacks the gate evidence: $(jq -c '{source_record_digest, gate_record}' "$R")"
+G1="$(jq -r .gate_record.sha256 "$R")"
+# The same snapshot cited against a changed gate record: the record is rewritten, the snapshot is not.
+gate '.built_at = "2026-10-16T00:00:00Z"'
+run --gate-record "$TMP/gate.json" || fail 'a changed gate record failed'
+! grep -q build-snapshot "$MOCK_LOG" || fail 'a changed gate record rebuilt the snapshot'
+[[ "$(jq -r .gate_record.sha256 "$R")" != "$G1" ]] || fail 'a changed gate record was not written into the record'
+pass '--gate-record: the evidence (passed, how, base, recipe, builder, sha256, commit, commits refused) lands in the record; a new gate record rewrites it without a rebuild'
+
+refused() { # refused WHY SPEC_FILTER GATE_FILTER [ARGS]: exit 2, saying WHY, before any pull
+  spec "$2"; gate "$3"; local rc=0
+  run --force "${@:4}" || rc=$?
+  [[ "$rc" == 2 ]] && grep -q -- "$1" "$TMP/out" || fail "not refused ($1): rc $rc, $(cat "$TMP/out")"
+  ! grep -q podman "$MOCK_LOG" || fail "pulled before refusing ($1)"
+}
+OK=".source_record_digest = \"$DIGEST\""
+refused 'is not the image' ".source_record_digest = \"sha256:$(printf 'f%.0s' {1..64})\"" . --gate-record "$TMP/gate.json"
+refused 'build it with --gate-record' "$OK" .
+refused 'did not pass (X1)' "$OK" '.gate.passed = false' --gate-record "$TMP/gate.json"
+refused "is for image sha256:000" "$OK" '.image.digest = "sha256:'"$(printf '0%.0s' {1..64})"'"' --gate-record "$TMP/gate.json"
+refused 'does not show commits refused' "$OK" '.observed.testbed.agent_can_commit = "yes"' --gate-record "$TMP/gate.json"
+refused 'does not show commits refused' "$OK" '.observed.guest.git_identity = "SWE-bench <s@x>"' --gate-record "$TMP/gate.json"
+refused 'needs --gate-record' . . --gate-commit c3ea3a4
+pass '--gate-record refuses, before any pull: a source_record_digest that is not the image (X10), a gated spec built without its record, a failed gate (X1), another image, commits not refused under skip_git_identity_check (X5, X12), --gate-commit alone'
+
+# A spec with no source_record_digest and no --gate-record builds as before, with no gate_record.
+spec
+run --force || fail 'a spec without gate evidence no longer builds'
+jq -e 'has("gate_record") | not' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'a record without a gate record names one'
+pass 'a spec without gate evidence builds as before, and its record names no gate record'

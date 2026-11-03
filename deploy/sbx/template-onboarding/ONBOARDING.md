@@ -100,8 +100,15 @@ jq '.template' platforms/moca/microvm/django__django-11133.json > django__django
 
 ```bash
 sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel /path/to/vmlinux [--agent <checkout>/remote-worker] \
-  [--registry HOST] [--egress-ca /etc/sbx/egress/ca.crt]
+  [--registry HOST] [--egress-ca /etc/sbx/egress/ca.crt] [--gate-record FILE [--gate-commit SHA]]
 ```
+
+`--gate-record` is the image's gate record from its builder (image-factory's record for its images).
+The build checks it before pulling: its gate passed, it is for this image, the spec's
+`source_record_digest` is this image's digest, and, for a spec that skips the git identity check, it
+shows commits refused. A spec that names a `source_record_digest` must be built with it. The template
+record then carries `gate_record`, the evidence and the record's sha256 (with `--gate-commit`, the
+builder's commit that holds it), for checking offline ([gating rules X10, X12](governance/GATING-RULES.md)).
 
 `--egress-ca` is for a template whose sandboxes use egress credentials (`egress: true` only): it bakes
 the host's interception CA, from `install-host.sh --egress-ca-out`, into the snapshot, and the record

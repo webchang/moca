@@ -12,15 +12,16 @@ what each step records): [`governance/`](governance/README.md).
 
 ## In this folder
 
-| File                                                                       | What it is                                                                                                                           |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| [`GUIDE.md`](GUIDE.md), [`GUIDE.pdf`](GUIDE.pdf)                           | the guide: mental model, the flow, two worked examples, update and retire, capacity, troubleshooting                                 |
-| [`ONBOARDING.md`](ONBOARDING.md)                                           | the short reference: the steps, the spec's fields, the tools' options                                                                |
-| [`template-build.sh`](template-build.sh)                                   | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record               |
-| [`template-register.sh`](template-register.sh)                             | **operator machine:** record → `SBX_WORKERS` and the templates file (add, versioned update, `--retire`, `--remove`), then `setup.sh` |
-| [`examples/default.json`](examples/default.json)                           | sample spec 1: MOCA's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                       |
-| [`examples/django__django-11133.json`](examples/django__django-11133.json) | sample spec 2: a SWE-bench instance (image-factory's spec block, host-free image), template `django-django-11133`                    |
-| [`tests/`](tests/)                                                         | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                   |
+| File                                                                                               | What it is                                                                                                                           |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [`GUIDE.md`](GUIDE.md), [`GUIDE.pdf`](GUIDE.pdf)                                                   | the guide: mental model, the flow, two worked examples, update and retire, capacity, troubleshooting                                 |
+| [`ONBOARDING.md`](ONBOARDING.md)                                                                   | the short reference: the steps, the spec's fields, the tools' options                                                                |
+| [`template-build.sh`](template-build.sh)                                                           | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record               |
+| [`template-register.sh`](template-register.sh)                                                     | **operator machine:** record → `SBX_WORKERS` and the templates file (add, versioned update, `--retire`, `--remove`), then `setup.sh` |
+| [`examples/default.json`](examples/default.json)                                                   | sample spec 1: MOCA's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                       |
+| [`examples/django__django-11133.json`](examples/django__django-11133.json)                         | sample spec 2: a SWE-bench instance (image-factory's spec block, host-free image), template `django-django-11133`                    |
+| [`examples/django__django-11133.gate-record.json`](examples/django__django-11133.gate-record.json) | sample 2's gate record, image-factory's (commit c3ea3a4), passed with `--gate-record`                                                |
+| [`tests/`](tests/)                                                                                 | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                   |
 
 ## Related files elsewhere in the repository
 
