@@ -5,6 +5,7 @@ import type { CredentialConsumer } from './api/types.js';
 import {
   cmdAuthToken,
   cmdBundleDelete,
+  cmdBundleList,
   cmdCredentialAdd,
   cmdCredentialDelete,
   cmdCredentials,
@@ -23,7 +24,12 @@ import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
 import { sbxMain } from './sbx/cli.js';
 import { cmdGet, cmdSpawn, cmdSubagents, MAX_PROMPT_BYTES, runSpawnWorker } from './subagent.js';
 import { WORKLOAD_MOUNTS, type WorkloadMount } from './api/workloads.js';
-import { cmdWorkloadCreate, cmdWorkloadDelete, cmdWorkloadGet } from './workloads.js';
+import {
+  cmdWorkloadCreate,
+  cmdWorkloadDelete,
+  cmdWorkloadGet,
+  cmdWorkloadList,
+} from './workloads.js';
 import { VERSION } from './version.js';
 
 export const USAGE = `usage:
@@ -43,6 +49,7 @@ export const USAGE = `usage:
                                                  text (not with --json, which streams the frames)
   mocactl promote DIR [--dry-run] [--json]       upload DIR's .claude/skills and .claude/commands
                                                  (--dry-run: build and report, upload nothing)
+  mocactl bundles list [--json]                  your own stored bundles, newest first
   mocactl bundles delete DIGEST [--json]         delete a bundle you promoted and free its budget
   mocactl sbx …                                  the sandbox service: login, create, ls, rm, token, env (mocactl sbx --help)
   mocactl sessions [--json]                      list your sessions
@@ -69,6 +76,7 @@ export const USAGE = `usage:
                                                  new workload; prints its id (--sandboxes: N
                                                  sandboxes of its own; --mount: its context on
                                                  their own volume, no per-run copy)
+  mocactl workloads list [--json]                your own live workloads, newest first
   mocactl workloads get ID [--json]
   mocactl workloads delete ID [--json]           delete a workload and its context
 flags for every command: --control-plane-url URL
@@ -344,6 +352,11 @@ export async function main(
     }
     case 'bundles': {
       const [sub, digest, ...extra] = rest;
+      if (sub === 'list') {
+        // Takes no digest: the point of the listing is to find one (rossoctl/moca#559).
+        if (digest !== undefined) return usage(io);
+        return cmdBundleList(rt, io, { json, signal });
+      }
       if (sub !== 'delete') return sub === undefined ? usage(io) : unknown(io, 'bundles', sub);
       if (digest === undefined || extra.length > 0) return usage(io);
       return cmdBundleDelete(rt, io, { digest, json, signal });
@@ -466,9 +479,13 @@ export async function main(
     case 'workloads': {
       const [sub, id, ...extra] = rest;
       if (sub === undefined) {
-        // The harness has no route that lists workloads.
-        io.err(`mocactl workloads needs create, get or delete (there is no list)\n${USAGE}`);
+        io.err(`mocactl workloads needs create, list, get or delete\n${USAGE}`);
         return 2;
+      }
+      if (sub === 'list') {
+        // Takes no id: the point of the listing is to find one (#552).
+        if (id !== undefined) return usage(io);
+        return cmdWorkloadList(rt, io, { json, signal });
       }
       if (sub === 'create') {
         if (id !== undefined) return usage(io);
