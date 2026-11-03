@@ -7,12 +7,12 @@ How a container image becomes a MOCA sandbox template that may be deployed, and 
 image and template stays traceable. The tools are one level up, in
 [`deploy/sbx/template-onboarding/`](../README.md); this folder holds what governs their use.
 
-| Document                                             | What                                                                                                                                                      | Owner         |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| [`GATING-RULES.md`](GATING-RULES.md)                 | the gating rules for images and templates: MOCA's own (M) plus image-factory's extensions (X), each with its tier, evidence, record and enforcement       | image-factory |
-| [`GAPS-AND-ASSUMPTIONS.md`](GAPS-AND-ASSUMPTIONS.md) | the register: the decisions this work rests on (D), gaps in gating (G), provenance (PV) and client status (S), the assumptions (A) and open questions (Q) | sbx-template  |
-| [`PROCESS.md`](PROCESS.md)                           | the process, written while it is built: onboarding, gating, provenance, activation                                                                        | sbx-template  |
-| [`INVENTORY-2026-11-02.md`](INVENTORY-2026-11-02.md) | MOCA's rules as found on 2026-11-02, with file and line (a snapshot, not kept current)                                                                    | sbx-template  |
+| Document                                             | What                                                                                                                                                                                 | Owner         |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------- |
+| [`GATING-RULES.md`](GATING-RULES.md)                 | the gating rules for images and templates: MOCA's own (M) plus image-factory's extensions (X), each with its tier, evidence, record and enforcement                                  | image-factory |
+| [`GAPS-AND-ASSUMPTIONS.md`](GAPS-AND-ASSUMPTIONS.md) | the register: the decisions this work rests on (D), gaps in gating (G), provenance (PV), client status (S) and the guest and runtime (W), the assumptions (A) and open questions (Q) | sbx-template  |
+| [`PROCESS.md`](PROCESS.md)                           | the process, written while it is built: onboarding, gating, provenance, activation                                                                                                   | sbx-template  |
+| [`INVENTORY-2026-11-02.md`](INVENTORY-2026-11-02.md) | MOCA's rules as found on 2026-11-02, with file and line (a snapshot, not kept current)                                                                                               | sbx-template  |
 
 ## Why here
 
