@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-02T06:07:15Z
+**Last modified:** 2026-11-03T04:37:45Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -246,7 +246,11 @@ names no registry host:
 
 ```bash
 jq '.template' platforms/moca/microvm/django__django-11133.json > django__django-11133.json
+cp platforms/moca/microvm/django__django-11133.json django__django-11133.gate-record.json
 ```
+
+The second file is the image's **gate record**, unchanged: the build checks the image against it
+(§5.2). Both are in [`examples/`](examples/).
 
 The fields that matter: `id: django-django-11133` (the instance id lower-cased, `__` → `-`; a
 Verified image also in Lite gets `-v`), 4096 MiB and 2 vCPUs, `egress: false`, `seed:
@@ -256,8 +260,13 @@ Verified image also in Lite gets `-v`), 4096 MiB and 2 vCPUs, `egress: false`, `
 ### 5.2 Build, register, install
 
 ```bash
-sudo deploy/sbx/template-onboarding/template-build.sh deploy/sbx/template-onboarding/examples/django__django-11133.json --kernel /path/to/vmlinux --registry registry.example.com
+sudo deploy/sbx/template-onboarding/template-build.sh deploy/sbx/template-onboarding/examples/django__django-11133.json --kernel /path/to/vmlinux --registry registry.example.com --gate-record deploy/sbx/template-onboarding/examples/django__django-11133.gate-record.json
 ```
+
+The spec names its gate record (`source_record_digest`), so the build needs it: before pulling, it
+checks the gate passed, the record is for this image, and commits are refused, and the template
+record keeps that evidence ([gating rules X10, X12](governance/GATING-RULES.md)). The run below was
+on 2026-10-30, before this check existed _(the `--gate-record` form is unverified on a host)_.
 
 As it ran on 2026-10-30 (about 3 minutes, plus the pull):
 
