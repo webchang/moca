@@ -1,5 +1,7 @@
 import type { PresenceReader, TemplateCatalog } from './template-catalog.js';
 import type { PolicyStore } from './template-policy.js';
+import type { TemplateHost } from './host-config.js';
+import { HOST_HANDLERS, type HostRegistry } from './host-handlers.js';
 import type { ProvenanceStore } from './provenance.js';
 import {
   assertValidDigest,
@@ -95,6 +97,8 @@ export function apiIssuer(config: Pick<CpConfig, 'routeProfile'>): string {
 export interface CpConfig {
   /** Which routes this control plane mounts (SBX0 §4.1). Absent means `harness`. */
   routeProfile?: RouteProfile;
+  /** The template hosts (SH_TEMPLATE_HOSTS, template lifecycle spec §6.1); absent or empty: none. */
+  templateHosts?: TemplateHost[];
   apiTokenTtlSeconds: number;
   sessionTokenTtlSeconds: number;
   /** A refresh family dies this long after its last use (`SH_REFRESH_IDLE_TTL_SECONDS`, B14). */
@@ -206,6 +210,8 @@ export interface CpDeps {
   policy?: PolicyStore;
   /** The provenance store (§7), when SH_PROVENANCE_DIR is set. */
   provenance?: ProvenanceStore;
+  /** The template hosts' inventories and limits (§6.1), as their agents last reported them. */
+  hosts?: HostRegistry;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
 }
@@ -225,6 +231,8 @@ export interface RequestCtx {
   janitorAuthorized?: boolean;
   /** Set by the router for `auth: 'egress'` routes: the host whose token was presented. */
   egressHost?: EgressHost;
+  /** Set by the router for `auth: 'host'` routes: the template host whose token was presented. */
+  host?: string;
 }
 
 export type Handler = (ctx: RequestCtx, deps: CpDeps) => Promise<{ status: number; body: unknown }>;
@@ -1158,5 +1166,6 @@ export const HANDLERS: Record<string, Handler> = {
 
   // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
   ...SANDBOX_HANDLERS,
+  ...HOST_HANDLERS,
   ...EGRESS_HANDLERS,
 };

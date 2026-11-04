@@ -1,0 +1,24 @@
+# deploy/sbx/sbx-host-agent.service -- one poll of the template host agent (deploy/sbx/host-agent.sh,
+# template lifecycle spec §6.1), started by sbx-host-agent.timer. host-agent.env holds SBX_API_URL,
+# SBX_HOST_ID, SBX_KERNEL and, optionally, SBX_API_CA_FILE, SBX_REGISTRY and the limits; the token is
+# only in host-agent.token, which the script reads itself. Not yet installed by install-host.sh: copy
+# it, the timer and host-agent.sh by hand for the validation (the RUNBOOK's host-agent section).
+[Unit]
+Description=SBX0 template host agent: build queued templates, report them
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sbx/host-agent.env
+Environment=SBX_ENV_DIR=/etc/sbx
+Environment=SBX_SRV=/srv/sbx
+Environment=SBX_HOST_TOKEN_FILE=/etc/sbx/host-agent.token
+# template-build.sh runs as root (rootfs export, the VMM); it pulls, builds and probes one template.
+ExecStart=/usr/local/libexec/sbx-host-agent.sh --once
+# A SWE-bench build with its probe takes minutes; one poll must not outlive a few of them.
+TimeoutStartSec=2h
+Nice=5
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=yes

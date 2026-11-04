@@ -659,3 +659,26 @@ The two `HOME`s are two enrolled users' logins (§13, or `mint-login.sh`, §4). 
 (the id upper-cased, dashes as underscores) runs in every template's sandboxes: it must print `yes`
 in its own template's and anything else in the others'. `SBX_CHECK_EXEC=0` checks the control plane
 alone, before any worker is installed. `--help` lists every input and check.
+
+## 15. The template host agent (preview)
+
+> **Preview, not yet installed by `install-host.sh`.** The self-serve template build of the
+> [template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+> §6.1; not proven on a KVM host yet.
+
+`deploy/sbx/host-agent.sh --once` is one poll of a KVM host's agent. It reports what the host holds,
+claims queued template builds (clients create them with `POST /v1/templates`), runs
+`template-build.sh` on each with its gate record, and reports the result. The control plane
+registers or rejects each built build by policy; nobody approves it. It needs:
+
+- on the control plane, `SH_PROVENANCE_DIR` (the template store), `SH_TEMPLATE_HOSTS` naming this
+  host, and `SH_HOST_TOKEN_<ID>` (64 hex, its own: not the janitor's or an egress token);
+- on the host, `/etc/sbx/host-agent.env` (`SBX_API_URL`, `SBX_HOST_ID`, `SBX_KERNEL`, optionally
+  `SBX_DISK_FLOOR_GB`, `SBX_BUILD_CONCURRENCY`, `SBX_ACTIVE_LIMIT`, `SBX_IDLE_LIMIT_S`,
+  `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at
+  `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer.
+
+It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), and it checks a gate
+record's bytes against their sha256 before building with it. The token stays in a 0600 header file,
+never in argv or the log. The agent does not install or start workers yet: activation is the next
+increment.

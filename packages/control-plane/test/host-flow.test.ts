@@ -1,0 +1,290 @@
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { HANDLERS } from '../src/handlers.js';
+import { HostRegistry } from '../src/host-handlers.js';
+import { templateHostsFromEnv } from '../src/host-config.js';
+import { matchRoute, ROUTES } from '../src/routes.js';
+import { ProvenanceStore, sha256Hex, verifyExport } from '../src/provenance.js';
+import { FileTemplateCatalog } from '../src/template-catalog.js';
+import { FilePolicyStore } from '../src/template-policy-store.js';
+import { DEFAULT_POLICY } from '../src/template-policy.js';
+import { alice, bob, codeOf, ctx, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
+
+const EX = resolve(__dirname, '../../../deploy/sbx/template-onboarding/examples');
+const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf8')) as Record<
+  string,
+  any
+>; // eslint-disable-line @typescript-eslint/no-explicit-any
+const GATE = readFileSync(join(EX, 'django__django-11133.gate-record.json'), 'utf8');
+const GATE_SHA = `sha256:${sha256Hex(Buffer.from(GATE, 'utf8'))}`;
+const { id: ID, image: IMAGE, schema: _s, notes: _n, ...REST } = SPEC;
+const DIGEST = IMAGE.slice(IMAGE.indexOf('@') + 1);
+const HASH = `sha256:${'a'.repeat(64)}`;
+type Body = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+let seq = 0;
+async function setup(): Promise<TestDeps> {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-host-'));
+  const provenance = new ProvenanceStore({ dir, now: () => NOW_MS });
+  const d = makeDeps({
+    // Distinct in the first 26 hex characters, which is what a build handle keeps.
+    newId: () => `${(++seq).toString(16).padStart(26, '0')}000000`,
+    templates: new FileTemplateCatalog({ dir, declared: [], provenance }),
+    provenance,
+    policy: new FilePolicyStore({ dir, provenance }),
+    hosts: new HostRegistry(),
+    config: { routeProfile: 'sandbox' },
+  });
+  await d.policy!.set({ ...DEFAULT_POLICY, trustedGateRecords: [GATE_SHA] }, 'github:admin');
+  await HANDLERS.createTemplate!(
+    ctx({
+      principal: alice,
+      body: { id: ID, image: IMAGE, spec: REST, profile: 'benchmark', gateRecord: GATE },
+    }),
+    d,
+  );
+  return d;
+}
+const asHost = (host: string, params: Record<string, string> = {}, body: unknown = {}) =>
+  ({ ...ctx({ params: { host, ...params }, body }), host }) as ReturnType<typeof ctx> & {
+    host: string;
+  };
+
+/** What template-build.sh and build-snapshot.sh write for this spec (T and S), as files. */
+const records = (over: { t?: Record<string, unknown>; s?: Record<string, unknown> } = {}) => ({
+  templateRecord: JSON.stringify({
+    schema: 'moca-sbx-template/1',
+    id: ID,
+    worker: 'sbx_django_django_11133_3d3e705ff379',
+    snapshot: 'django-django-11133-3d3e705ff379',
+    image: IMAGE,
+    guest_ram_mb: 4096,
+    vcpus: 2,
+    manifest_hash: HASH,
+    probe_status: 'vm',
+    skip_git_identity_check: true,
+    gate_record: { sha256: GATE_SHA, passed: true },
+    ...over.t,
+  }),
+  manifest: JSON.stringify({
+    hash_version: 2,
+    hash: HASH,
+    guest_ram_mb: 4096,
+    vcpus: 2,
+    source_image_digest: DIGEST,
+    ...over.s,
+  }),
+});
+
+async function claimAndBuild(d: TestDeps): Promise<string> {
+  const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+  return c.builds[0].build as string;
+}
+
+describe('the host agent flow (§6.1, §8.2)', () => {
+  it('claims the queued build with what to build, then registers it on a matching built report', async () => {
+    const d = await setup();
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 2 }), d)).body as Body;
+    expect(c.builds).toHaveLength(1);
+    const job = c.builds[0];
+    expect(job).toMatchObject({ template: ID, image: IMAGE });
+    expect(job.spec).toMatchObject({
+      id: ID,
+      image: IMAGE,
+      guest_ram_mb: 4096,
+      skip_git_identity_check: true,
+    });
+    expect(job.gateRecord).toBe(`/v1/hosts/bm1/blobs/${GATE_SHA}`);
+    const blob = (await HANDLERS.hostBlob!(asHost('bm1', { digest: GATE_SHA }), d)).body as Body;
+    expect(Buffer.from(blob.base64, 'base64').toString('utf8')).toBe(GATE);
+
+    // Claimed builds are not handed out twice.
+    expect(
+      ((await HANDLERS.hostClaimBuilds!(asHost('bm2', {}, { max: 1 }), d)).body as Body).builds,
+    ).toEqual([]);
+
+    for (const event of ['building', 'probing']) {
+      await HANDLERS.hostBuildReport!(asHost('bm1', { build: job.build }, { event }), d);
+    }
+    await HANDLERS.hostBuildLog!(
+      asHost(
+        'bm1',
+        { build: job.build },
+        { entries: [{ step: 'probe', level: 'info', message: 'OK' }] },
+      ),
+      d,
+    );
+    const r = (
+      await HANDLERS.hostBuildReport!(
+        asHost('bm1', { build: job.build }, { event: 'built', ...records() }),
+        d,
+      )
+    ).body as Body;
+    expect(r).toEqual({ status: 'registered', buildId: HASH });
+
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: bob, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.onboarding).toBe('registered');
+    expect(t.tags).toEqual({ default: HASH });
+    expect(t.builds[0]).toMatchObject({
+      buildId: HASH,
+      status: 'registered',
+      readiness: 'unknown',
+    });
+
+    const chain = await d.provenance!.chain(`template/${ID}`);
+    expect(chain.map((x) => x.kind)).toEqual(['create', 'gate', 'check', 'build', 'check']);
+    expect(chain[4].body).toMatchObject({ at: 'registration', outcome: 'registered' });
+    const exp = JSON.parse(JSON.stringify(await d.provenance!.export([`template/${ID}`])));
+    expect(verifyExport(exp)).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    [
+      "a manifest hash that is not the record's",
+      { s: { hash: `sha256:${'b'.repeat(64)}` } },
+      'S.hash',
+    ],
+    ['a version-1 manifest', { s: { hash_version: undefined } }, 'S.hash_version'],
+    [
+      'a rootfs from another image',
+      { s: { source_image_digest: `sha256:${'c'.repeat(64)}` } },
+      'S.source_image_digest',
+    ],
+    [
+      'another gate record',
+      { t: { gate_record: { sha256: `sha256:${'d'.repeat(64)}` } } },
+      'T.gate_record',
+    ],
+    ['another image', { t: { image: 'x@sha256:' + 'e'.repeat(64) } }, 'T.image'],
+    ['a dropped identity skip', { t: { skip_git_identity_check: undefined } }, 'T.X12'],
+    ['another guest size', { s: { guest_ram_mb: 2048 } }, 'S.guest_ram_mb'],
+  ])('rejects, automatically and recorded, a built report with %s', async (_n, over, rule) => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    const r = (
+      await HANDLERS.hostBuildReport!(
+        asHost('bm1', { build }, { event: 'built', ...records(over) }),
+        d,
+      )
+    ).body as Body;
+    expect(r).toEqual({ status: 'rejected', rule });
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds[0].status).toBe('rejected');
+    expect(t.tags).toEqual({});
+    const chain = await d.provenance!.chain(`template/${ID}`);
+    expect(chain.at(-1)!.body).toMatchObject({ outcome: 'rejected' });
+  });
+
+  it('records a failed build with its step and message', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    await HANDLERS.hostBuildReport!(
+      asHost(
+        'bm1',
+        { build },
+        { event: 'failed', step: 'probe', message: 'verify command exited 91' },
+      ),
+      d,
+    );
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds[0].status).toBe('failed');
+    expect(
+      await codeOf(() =>
+        HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d),
+      ),
+    ).toBe('invalid_request');
+  });
+
+  it('refuses a report for a build another host claimed (a host reports only for itself)', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    expect(
+      await codeOf(() =>
+        HANDLERS.hostBuildReport!(asHost('bm2', { build }, { event: 'building' }), d),
+      ),
+    ).toBe('not_found');
+    expect(
+      await codeOf(() => HANDLERS.hostBuildLog!(asHost('bm2', { build }, { entries: [] }), d)),
+    ).toBe('not_found');
+  });
+
+  it('takes subjects in turn when claiming, oldest first within each', async () => {
+    const d = await setup();
+    let t = NOW_MS;
+    d.now = () => (t += 1);
+    for (const [p, id] of [
+      [alice, 'a-two'],
+      [alice, 'a-three'],
+      [bob, 'b-one'],
+    ] as const) {
+      await HANDLERS.createTemplate!(
+        ctx({
+          principal: p,
+          body: {
+            id,
+            image: IMAGE,
+            spec: { ...REST, source_record_digest: undefined, skip_git_identity_check: false },
+            profile: 'base',
+          },
+        }),
+        d,
+      );
+    }
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 4 }), d)).body as Body;
+    expect(c.builds.map((b: Body) => b.template)).toEqual([ID, 'b-one', 'a-two', 'a-three']);
+  });
+
+  it('keeps the inventory a host reports', async () => {
+    const d = await setup();
+    await HANDLERS.hostInventory!(
+      asHost(
+        'bm1',
+        {},
+        {
+          holds: [{ template: ID, manifestHash: HASH }],
+          limits: { activeLimit: 24, idleLimitSeconds: 3600, diskFreeGb: 140, diskFloorGb: 60 },
+        },
+      ),
+      d,
+    );
+    expect(d.hosts!.get('bm1')).toMatchObject({
+      holds: { [HASH]: ID },
+      limits: { activeLimit: 24 },
+    });
+  });
+});
+
+describe('host authentication', () => {
+  const env = { SH_TEMPLATE_HOSTS: '[{"id":"bm1"}]', SH_HOST_TOKEN_BM1: 'f'.repeat(64) };
+  it('reads hosts and their tokens, refusing a bad id, a short token and a reused one', () => {
+    expect(templateHostsFromEnv(env)).toEqual([{ id: 'bm1', token: 'f'.repeat(64) }]);
+    expect(templateHostsFromEnv({})).toEqual([]);
+    expect(() => templateHostsFromEnv({ ...env, SH_HOST_TOKEN_BM1: 'short' })).toThrow(
+      /SH_HOST_TOKEN_BM1/,
+    );
+    expect(() => templateHostsFromEnv({ SH_TEMPLATE_HOSTS: '[{"id":"BM1"}]' })).toThrow(
+      /id must match/,
+    );
+    expect(() => templateHostsFromEnv(env, ['f'.repeat(64)])).toThrow(/must differ/);
+  });
+
+  it('mounts the host routes with auth host, every one naming its host in the path', () => {
+    const host = ROUTES.filter((r) => r.auth === 'host');
+    expect(host.map((r) => r.operationId).sort()).toEqual([
+      'hostBlob',
+      'hostBuildLog',
+      'hostBuildReport',
+      'hostClaimBuilds',
+      'hostInventory',
+    ]);
+    for (const r of host) expect(r.path.startsWith('/v1/hosts/{host}/'), r.path).toBe(true);
+    expect(matchRoute('POST', '/v1/hosts/bm1/builds/claim', 'harness')?.route.operationId).toBe(
+      'hostClaimBuilds',
+    );
+  });
+});

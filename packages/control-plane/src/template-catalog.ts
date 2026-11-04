@@ -56,7 +56,20 @@ export interface TemplateBuild {
   createdAt: number;
   /** The digest of the provenance record that created it, when the catalog records provenance. */
   provenance?: string;
+  /** What a host agent needs to build it (§6.1): the image and the spec as the client sent them. */
+  request?: { image: string; spec: Record<string, unknown>; gateRecordSha256?: string };
+  /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */
+  queuedAtMs?: number;
+  /** The host that claimed it, and when (epoch seconds). */
+  claim?: { host: string; at: number };
+  /** On `failed` or `rejected`: why, and at which step or rule. */
+  reason?: { message: string; step?: string; rule?: string };
+  /** The host agent's build log, newest last, at most LOG_MAX entries (§4 logs). */
+  log?: { at: number; level: 'info' | 'warn' | 'error'; step: string; message: string }[];
 }
+
+/** A build log keeps at most this many entries; older ones are dropped, oldest first. */
+export const LOG_MAX = 1000;
 
 export interface TemplateDoc {
   schema: typeof TEMPLATE_DOC_SCHEMA;

@@ -551,7 +551,17 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    The repository's SWE-bench example passes the benchmark profile in full. Not yet: retire,
    cancel, visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
-   (§6.1, §8.2).
+   (§6.1, §8.2). **Built, first increment:** the host routes (`auth: host`, `SH_TEMPLATE_HOSTS` and
+   `SH_HOST_TOKEN_<ID>`; a host reports only for itself) for inventory, claim (oldest first,
+   subjects in turn), the gate record's bytes, log and report; on `built`, T and S stored byte for
+   byte, a `build` record, and automatic registration or rejection naming the rule (T against the
+   create's request, S hash version 2, R's digest, size, gate record, X12), with a `check` record;
+   the first registered build takes `default`. `deploy/sbx/host-agent.sh` (one poll; the 0600
+   header-file token; the disk floor; the gate record checked against its digest) with its unit and
+   timer. Not yet: installing the worker after a build, activation (wanted state, attach/detach
+   reports, readiness `activating`/`deactivating`/`unavailable`), the hosts block's contents,
+   `GET .../builds/{build}/logs` for clients, `install-host.sh --host-agent`, and a run on a KVM
+   host.
 6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6).
 7. Tracing (§9).
 8. The validation (§10).

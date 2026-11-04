@@ -277,12 +277,8 @@ function writable(deps: CpDeps): {
   };
 }
 
-const HANDLE_HEX = 26;
-function buildHandle(raw: string): string {
-  const hex = raw.toLowerCase().replace(/[^0-9a-f]/g, '');
-  if (hex.length < HANDLE_HEX) throw new CpError('internal_error', 'id source is too short');
-  return `b-${hex.slice(0, HANDLE_HEX)}`;
-}
+/** `b-` and the same 26 random hex characters a sandbox id takes (sandboxId: a UUID's fixed nibbles dropped). */
+const buildHandle = (raw: string): string => `b-${sandboxId(raw).slice('sbx-'.length)}`;
 
 /** The quota counters for one subject (§6.2): templates owned, builds queued or building. */
 async function usage(
@@ -412,7 +408,13 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
       worker: '',
       spec: buildSpec(spec),
       createdAt: now,
+      queuedAtMs: deps.now(),
       provenance: created.digest,
+      request: {
+        image: b.image as string,
+        spec: JSON.parse(JSON.stringify(spec)) as Record<string, unknown>,
+        ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
+      },
     };
     const base: TemplateDoc = cur ?? {
       schema: TEMPLATE_DOC_SCHEMA,

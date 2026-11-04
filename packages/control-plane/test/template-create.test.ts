@@ -26,7 +26,8 @@ function stored(policy: Policy = benchmarkPolicy): TestDeps {
   const dir = mkdtempSync(join(tmpdir(), 'cp-create-'));
   const provenance = new ProvenanceStore({ dir, now: () => NOW_MS });
   const d = makeDeps({
-    newId: () => (++seq).toString(16).padStart(32, '0'),
+    // Distinct in the first 26 hex characters, which is what a build handle keeps.
+    newId: () => `${(++seq).toString(16).padStart(26, '0')}000000`,
     templates: new FileTemplateCatalog({ dir, declared: [], provenance }),
     provenance,
     policy: new FilePolicyStore({ dir, provenance }),
@@ -285,4 +286,14 @@ describe('the rules alone', () => {
       ]),
     );
   });
+});
+
+it("gives each build a distinct handle from a production id's random hex", async () => {
+  const { randomUUID } = await import('node:crypto');
+  const d = stored();
+  d.newId = () => randomUUID();
+  const a = ((await create(d)).body as Body).build as string;
+  const b = ((await create(d)).body as Body).build as string;
+  expect(a).not.toBe(b);
+  expect(a).toMatch(/\/b-[0-9a-f]{26}$/);
 });
