@@ -3,6 +3,8 @@ import { asRecord, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
+import { liveLeases, place } from './activation.js';
+import { isLive } from './sandbox-store.js';
 
 /**
  * The template host agent's routes (template lifecycle spec §6.1): a KVM host's `sbx-host-agent`
@@ -18,7 +20,12 @@ import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalo
  * this host claimed. On `built` it checks the build record against the create's request and the
  * policy (§8.2) and registers or rejects the build, automatically, with a `check` record.
  *
- * Activation (wanted state, attach/detach reports) is the next increment.
+ *   GET  /v1/hosts/{host}/wanted             the builds this host should run (placed on it), and
+ *                                            those it holds that it should stop (no lease left)
+ *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
+ *
+ * Readiness itself is never taken from a report: `active` is the relay's attached record (§3.3).
+ * The reports are provenance: who ran what, where, when.
  */
 
 const MANIFEST_HASH_RE = /^sha256:[0-9a-f]{64}$/;
@@ -159,6 +166,61 @@ function registrationResults(
 }
 
 export const HOST_HANDLERS: Record<string, Handler> = {
+  hostWanted: async (ctx, deps) => {
+    const host = hostOf(ctx);
+    const { cat } = catalogOf(deps);
+    const nowS = seconds(deps);
+    const docs = await cat.list();
+    const views = (deps.hosts?.all() ?? []).map(([id, h]) => ({
+      id,
+      holds: h.holds,
+      activeLimit: h.limits.activeLimit,
+    }));
+    const p = place(docs, views, nowS);
+    const mine = deps.hosts?.get(host);
+    // A worker is never stopped under a live sandbox (§6.3): it drains first.
+    const busy = new Set<string>();
+    if (deps.sandboxes) {
+      for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+    }
+    const run: Record<string, unknown>[] = [];
+    const stop: Record<string, unknown>[] = [];
+    for (const d of docs) {
+      for (const b of d.builds) {
+        if (b.status !== 'registered' || !mine || mine.holds[b.buildId] === undefined) continue;
+        const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
+        if (p.placed.get(b.buildId) === host) run.push(entry);
+        else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) stop.push(entry);
+      }
+    }
+    return { status: 200, body: { run, stop } };
+  },
+
+  hostWorkerReport: async (ctx, deps) => {
+    const host = hostOf(ctx);
+    const { cat, prov } = catalogOf(deps);
+    const b = asRecord(ctx.body);
+    const event = b.event;
+    if (event !== 'attached' && event !== 'refused' && event !== 'detached') {
+      throw new CpError('invalid_request', 'event must be attached, refused or detached');
+    }
+    const buildId = typeof b.buildId === 'string' ? b.buildId : '';
+    const doc = (await cat.list()).find((d) =>
+      d.builds.some((x) => x.buildId === buildId && x.status === 'registered'),
+    );
+    if (!doc || deps.hosts?.get(host)?.holds[buildId] === undefined) {
+      throw new CpError('not_found', 'no registered build this host holds');
+    }
+    const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;
+    await prov.append({
+      stream: `template/${doc.id}`,
+      kind: event === 'detached' ? 'deactivate' : 'activate',
+      subject: `host:${host}`,
+      body: { buildId, event, ...(reason ? { reason } : {}) },
+    });
+    return { status: 200, body: { recorded: event } };
+  },
+
   hostInventory: async (ctx, deps) => {
     const host = hostOf(ctx);
     const b = asRecord(ctx.body);

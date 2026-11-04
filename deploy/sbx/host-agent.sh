@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # deploy/sbx/host-agent.sh -- sbx-host-agent, a KVM host's template agent
 # (docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md §6.1). One run is one poll:
-# report the inventory, claim queued builds, build each with template-build.sh, report the outcome.
-# The control plane registers or rejects a built build by policy (§8.2); nothing here decides that.
-# Activation (start and stop workers on the control plane's wanted state) is the next increment.
+# report the inventory, claim queued builds, build each with template-build.sh, report the outcome;
+# then start and stop installed workers as the control plane wants (§6.3). The control plane
+# registers or rejects a built build by policy (§8.2) and decides what runs; nothing here does.
+#
+# A worker must already be installed (install-host.sh, with its relay token from setup.sh): a wanted
+# build whose worker is not is reported `refused`, never installed here (register gap G18).
 #
 #   sudo deploy/sbx/host-agent.sh --once     one poll (the unit's timer runs it)
 #
@@ -25,7 +28,7 @@
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged. Output: one JSON line per action, then one summary line
-# {"agent":"summary","claimed","built","failed","errors"}. A refusal of its own settings is exit 2.
+# {"agent":"summary","claimed","built","failed","started","stopped","errors"}. A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
 
@@ -33,17 +36,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${SBX_TEMPLATE_BUILD:=$REPO_ROOT/deploy/sbx/template-onboarding/template-build.sh}"
 HOST_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 HANDLE_RE='^b-[0-9a-f]{26}$'
+WORKER_RE='^[A-Za-z_][A-Za-z0-9_]*$'
 TEMPLATE_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 DIGEST_RE='^sha256:[0-9a-f]{64}$'
 
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
-CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0
+CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
 check_settings() {
   local t
-  for t in jq curl df mktemp base64 sha256sum; do command -v "$t" >/dev/null || refuse "needs $t on PATH"; done
+  for t in jq curl df mktemp base64 sha256sum systemctl; do command -v "$t" >/dev/null || refuse "needs $t on PATH"; done
   SBX_SRV="${SBX_SRV-/srv/sbx}" SBX_ENV_DIR="${SBX_ENV_DIR-/etc/sbx}"
   [[ "$SBX_SRV" =~ ^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$ ]] || refuse "SBX_SRV='$SBX_SRV' must be an absolute path other than /"
   [[ "${SBX_API_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || refuse 'SBX_API_URL must be https://<api host>'
@@ -148,6 +152,45 @@ build_one() { # build_one JOB_JSON
   say "{\"agent\":\"reported\",\"build\":\"$handle\",\"outcome\":$(jq -c . <<<"$out")}"
 }
 
+worker_report() { # worker_report BUILD_ID EVENT [REASON]
+  jq -cn --arg b "$1" --arg e "$2" --arg r "${3:-}" '{buildId: $b, event: $e} + (if $r == "" then {} else {reason: $r} end)' \
+    >"$WORK/worker.json"
+  api POST "/v1/hosts/$SBX_HOST_ID/workers/report" "$WORK/worker.json" >/dev/null || error "worker report for $1 failed"
+}
+
+# Start what is wanted and installed; stop what is not wanted (the control plane leaves out a worker
+# with live sandboxes). Readiness is the relay's attached record, never this report.
+activation() {
+  local wanted w unit
+  wanted="$(api GET "/v1/hosts/$SBX_HOST_ID/wanted")" || { error 'wanted state unreadable'; return; }
+  jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted" || { error 'wanted state malformed'; return; }
+  while IFS=$'\t' read -r w b; do
+    [[ "$w" =~ $WORKER_RE ]] || { error 'a wanted worker id is malformed'; continue; }
+    unit="sbx-worker@$w.service"
+    if [[ ! -f "$SBX_ENV_DIR/workers/$w.env" ]]; then
+      worker_report "$b" refused 'worker not installed on this host (install-host.sh with its setup.sh bundle)'
+      say "{\"agent\":\"refused\",\"worker\":\"$w\",\"why\":\"not installed\"}"
+      continue
+    fi
+    systemctl is-active --quiet "$unit" && continue
+    if systemctl start "$unit"; then
+      STARTED=$((STARTED + 1)); worker_report "$b" attached; say "{\"agent\":\"started\",\"worker\":\"$w\"}"
+    else
+      worker_report "$b" refused "systemctl start $unit failed"; error "start $unit failed"
+    fi
+  done < <(jq -r '.run[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+  while IFS=$'\t' read -r w b; do
+    [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to stop is malformed'; continue; }
+    unit="sbx-worker@$w.service"
+    systemctl is-active --quiet "$unit" || continue
+    if systemctl stop "$unit"; then
+      STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"}"
+    else
+      error "stop $unit failed"
+    fi
+  done < <(jq -r '.stop[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+}
+
 main() {
   [[ "${1:-}" == --once && $# -eq 1 ]] || { echo 'usage: host-agent.sh --once' >&2; exit 2; }
   command -v jq >/dev/null || refuse 'needs jq on PATH'
@@ -174,7 +217,8 @@ main() {
       error 'claim failed'
     fi
   fi
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"errors\":$ERRORS}"
+  activation
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
 }
 
 main "$@"

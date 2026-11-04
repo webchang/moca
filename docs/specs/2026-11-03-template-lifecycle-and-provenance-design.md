@@ -558,11 +558,18 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    create's request, S hash version 2, R's digest, size, gate record, X12), with a `check` record;
    the first registered build takes `default`. `deploy/sbx/host-agent.sh` (one poll; the 0600
    header-file token; the disk floor; the gate record checked against its digest) with its unit and
-   timer. Not yet: installing the worker after a build, activation (wanted state, attach/detach
-   reports, readiness `activating`/`deactivating`/`unavailable`), the hosts block's contents,
-   `GET .../builds/{build}/logs` for clients, `install-host.sh --host-agent`, and a run on a KVM
-   host.
-6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6).
+   timer. **Then the activation half:** leases (`POST /v1/templates/{id}/activate` · `/deactivate`;
+   60 s-1 day a grant, renewals unlimited), placement on the holding host with the fewest builds,
+   within its `activeLimit`, first-leased first, never evicting (`409 no_active_slot` with
+   Retry-After), the `active` quota, `GET /v1/hosts/{host}/wanted` (run, and stop only with no
+   lease and no live sandbox), the agent's start/stop of **installed** workers with attach,
+   refused and detach reports, readiness `activating`/`deactivating`/`unavailable`, and the hosts
+   block filled. A build is followed by its handle after registration, and carries `reason`. Not
+   yet: installing a worker (G18: its relay token is minted only by `setup.sh`), activation on
+   first use (§6.4) and the session's `409 template_not_active`, the client logs route,
+   `install-host.sh --host-agent`, and a run on a KVM host.
+6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6). Built with
+   item 5 (leases, limits, aging as leases ending; no eviction), except first use (§6.4).
 7. Tracing (§9).
 8. The validation (§10).
 

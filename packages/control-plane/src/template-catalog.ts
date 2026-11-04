@@ -64,6 +64,11 @@ export interface TemplateBuild {
   claim?: { host: string; at: number };
   /** On `failed` or `rejected`: why, and at which step or rule. */
   reason?: { message: string; step?: string; rule?: string };
+  /**
+   * Activation leases (§6.3): each subject's hold on this build, until (epoch seconds). The build
+   * is wanted active while any lease is unexpired; aging is a lease running out.
+   */
+  leases?: { subject: string; until: number; since?: number }[];
   /** The host agent's build log, newest last, at most LOG_MAX entries (§4 logs). */
   log?: { at: number; level: 'info' | 'warn' | 'error'; step: string; message: string }[];
 }

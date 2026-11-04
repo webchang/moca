@@ -39,6 +39,8 @@ case "$method $path" in
 "GET /v1/hosts/bm1/blobs/"*) printf '{"sha256":"x","base64":"%s"}' "$(printf '%s' "$MOCK_GATE" | base64)" ;;
 "POST /v1/hosts/bm1/builds/"*/log) echo '{"appended":1}' ;;
 "POST /v1/hosts/bm1/builds/"*/report) echo '{"status":"registered","buildId":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}' ;;
+"GET /v1/hosts/bm1/wanted") cat "$MOCK_STATE/wanted-answer" ;;
+"POST /v1/hosts/bm1/workers/report") echo '{"recorded":"x"}' ;;
 *) echo "curl: (22) 404 $method $path" >&2; exit 22 ;;
 esac
 MOCK
@@ -54,7 +56,19 @@ jq -n --arg n "$name" --arg id "$id" '{schema: "moca-sbx-template/1", id: $id, s
   >"$SBX_SRV/templates/$name.json"
 echo "==> built template $id"
 MOCK
-chmod +x "$TMP/bin/curl" "$TMP/bin/template-build"
+# systemctl: logs its argv; `is-active` answers from $MOCK_STATE/active-<unit>.
+cat >"$TMP/bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >>"$MOCK_LOG"
+case "$1" in
+is-active) [[ -f "$MOCK_STATE/active-${!#}" ]] ;;
+start) touch "$MOCK_STATE/active-$2" ;;
+stop) rm -f "$MOCK_STATE/active-$2" ;;
+esac
+MOCK
+chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl"
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
 (umask 077 && printf '%s' "$TOKEN" >"$TMP/token")
 export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/log" MOCK_STATE="$TMP/state" MOCK_TOKEN_FILE="$TMP/token" MOCK_GATE="$GATE"
@@ -72,7 +86,7 @@ run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --once >"$TMP/out" 
 # 1. A good build: claimed, built, reported with both files; the token only in a header file.
 job "$GATE_SHA"
 run || fail 'a good poll failed'
-grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"errors":0' "$TMP/out" || fail 'summary'
+grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'summary'
 R="$TMP/state/POST_v1_hosts_bm1_builds_b-0123456789abcdef0123456789_report"
 jq -e '.event == "built" and (.templateRecord | fromjson | .manifest_hash == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   and (.manifest | fromjson | .hash_version == 2)' "$R" >/dev/null || fail 'the built report does not carry T and S as files'
@@ -125,5 +139,26 @@ chmod 0600 "$TMP/token"
 rc=0; bash "$A" >"$TMP/out" 2>&1 || rc=$?
 [[ "$rc" == 2 ]] || fail 'ran without --once'
 pass 'refuses a bad host id, a non-https URL, a bad concurrency or floor, a shared token file, and no --once, before calling anything'
+
+# 7. Activation: start a wanted, installed worker and report attached; refuse one not installed;
+#    stop one no longer wanted and report detached.
+job ''
+printf '{"builds":[]}' >"$TMP/state/claim-answer"
+: >"$TMP/workers/sbx_t1.env"
+printf '{"run":[{"worker":"sbx_t1","buildId":"sha256:1"},{"worker":"sbx_t2","buildId":"sha256:2"}],"stop":[]}' >"$TMP/state/wanted-answer"
+run || fail 'activation poll'
+grep -q 'systemctl start sbx-worker@sbx_t1.service' "$MOCK_LOG" || fail 'did not start the wanted, installed worker'
+grep -q 'systemctl start sbx-worker@sbx_t2.service' "$MOCK_LOG" && fail 'started a worker that is not installed'
+grep -q '"started":1' "$TMP/out" && grep -q '"agent":"refused","worker":"sbx_t2"' "$TMP/out" || fail 'start and refusal not reported'
+W="$TMP/state/POST_v1_hosts_bm1_workers_report"
+jq -e '.event == "refused" and .buildId == "sha256:2"' "$W" >/dev/null || fail 'the refusal was not reported to the control plane'
+printf '{"run":[],"stop":[{"worker":"sbx_t1","buildId":"sha256:1"}]}' >"$TMP/state/wanted-answer"
+run || fail 'stop poll'
+grep -q 'systemctl stop sbx-worker@sbx_t1.service' "$MOCK_LOG" || fail 'did not stop the unwanted worker'
+jq -e '.event == "detached"' "$W" >/dev/null || fail 'detach not reported'
+printf '{"run":[{"worker":"../x","buildId":"sha256:1"}],"stop":[]}' >"$TMP/state/wanted-answer"
+run || fail 'malformed wanted poll'
+grep -q 'systemctl start' "$MOCK_LOG" && fail 'started a malformed worker id'
+pass 'starts wanted installed workers (attached), refuses uninstalled ones, stops unwanted ones (detached), refuses a malformed id'
 
 echo 'all host-agent.sh tests passed'

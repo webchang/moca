@@ -281,10 +281,48 @@ describe('host authentication', () => {
       'hostBuildReport',
       'hostClaimBuilds',
       'hostInventory',
+      'hostWanted',
+      'hostWorkerReport',
     ]);
     for (const r of host) expect(r.path.startsWith('/v1/hosts/{host}/'), r.path).toBe(true);
     expect(matchRoute('POST', '/v1/hosts/bm1/builds/claim', 'harness')?.route.operationId).toBe(
       'hostClaimBuilds',
     );
+  });
+});
+
+describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
+  it('resolves the 202 handle after registration, the body naming the manifest hash', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    await HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d);
+    const b = (
+      await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build } }), d)
+    ).body as Body;
+    expect(b).toMatchObject({ buildId: HASH, handle: build, status: 'registered', reason: null });
+  });
+
+  it('says why a build was rejected (the rule) or failed (the step)', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    await HANDLERS.hostBuildReport!(
+      asHost('bm1', { build }, { event: 'built', ...records({ s: { hash_version: undefined } }) }),
+      d,
+    );
+    const b = (
+      await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build } }), d)
+    ).body as Body;
+    expect(b.status).toBe('rejected');
+    expect(b.reason).toMatchObject({ rule: 'S.hash_version' });
+    const d2 = await setup();
+    const b2 = await claimAndBuild(d2);
+    await HANDLERS.hostBuildReport!(
+      asHost('bm1', { build: b2 }, { event: 'failed', step: 'probe', message: 'exit 91' }),
+      d2,
+    );
+    const f = (
+      await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build: b2 } }), d2)
+    ).body as Body;
+    expect(f.reason).toEqual({ message: 'exit 91', step: 'probe' });
   });
 });

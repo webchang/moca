@@ -9,6 +9,7 @@ import {
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import type { SandboxConfig } from './sandbox-config.js';
 import type { ProvenanceStore } from './provenance.js';
+import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
 import {
   checkCreate,
   policyDigest,
@@ -180,9 +181,25 @@ interface ReadinessFacts {
   inUse: Map<string, number> | null;
   /** worker -> epoch seconds of the newest sandbox created on it, retained records included. */
   lastUsed: Map<string, number> | null;
+  /** Where wanted builds are placed (§6.2), when any host agent has reported; else null. */
+  placement: Placement | null;
+  nowS: number;
 }
 
-async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
+/** The hosts as their agents last reported (§6.1), for placement and the hosts block. */
+function hostViews(deps: CpDeps): HostView[] {
+  return (deps.hosts?.all() ?? []).map(([id, h]) => ({
+    id,
+    holds: h.holds,
+    activeLimit: h.limits.activeLimit,
+  }));
+}
+
+async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<ReadinessFacts> {
+  const nowS = seconds(deps);
+  const hosts = hostViews(deps);
+  const placement =
+    hosts.length > 0 ? place(docs ?? (await catalog(deps).list()), hosts, nowS) : null;
   let attached: Map<string, number> | null = null;
   if (deps.presence) {
     try {
@@ -193,7 +210,7 @@ async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
     }
   }
   if (deps.config.routeProfile !== 'sandbox' || !deps.sandboxes) {
-    return { attached, inUse: null, lastUsed: null };
+    return { attached, inUse: null, lastUsed: null, placement, nowS };
   }
   const inUse = new Map<string, number>();
   const lastUsed = new Map<string, number>();
@@ -202,18 +219,12 @@ async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
     if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
     lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
   }
-  return { attached, inUse, lastUsed };
+  return { attached, inUse, lastUsed, placement, nowS };
 }
 
 function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: boolean) {
   const readiness =
-    b.status !== 'registered'
-      ? null
-      : f.attached === null
-        ? 'unknown'
-        : f.attached.has(b.worker)
-          ? 'active'
-          : 'inactive';
+    b.status !== 'registered' ? null : readinessOf(b, f.nowS, f.placement, f.attached);
   return {
     buildId: b.buildId,
     status: b.status,
@@ -222,7 +233,7 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     capacity:
       readiness === 'active'
         ? {
-            running: f.attached!.get(b.worker) ?? 0,
+            running: f.attached?.get(b.worker) ?? 0,
             inUse: f.inUse === null ? null : (f.inUse.get(b.worker) ?? 0),
           }
         : null,
@@ -233,6 +244,10 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
       .sort(),
     createdAt: b.createdAt,
     provenance: b.provenance ?? null,
+    // The handle a create answered; equal to buildId until the build is registered.
+    handle: b.handle ?? b.buildId,
+    // On failed or rejected: why, and the step or the rule (§4).
+    reason: b.reason ?? null,
     ...(full ? { spec: b.spec } : {}),
   };
 }
@@ -456,7 +471,164 @@ function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
   };
 }
 
+/** Per host: its limits, its use (builds placed on it now) and its disk (§4, §6.2). */
+function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
+  const used = new Map<string, number>();
+  for (const h of f.placement?.placed.values() ?? []) used.set(h, (used.get(h) ?? 0) + 1);
+  return (deps.hosts?.all() ?? []).map(([id, h]) => ({
+    id,
+    active: { limit: h.limits.activeLimit, used: used.get(id) ?? 0 },
+    idleLimitSeconds: h.limits.idleLimitSeconds,
+    disk: { freeGb: h.limits.diskFreeGb, floorGb: h.limits.diskFloorGb },
+  }));
+}
+
+/**
+ * Activate (§5.1, §6.3): take or renew this subject's lease on a registered build, `leaseSeconds`
+ * long (default the host's idleLimit, at most a day per grant, renewals unlimited). Refused with
+ * template_unavailable when no host holds it, no_active_slot (Retry-After) when every holder is
+ * full, quota_exceeded over the subject's active quota; on a refusal the lease is not kept.
+ */
+async function activate(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  const { cat, policy, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const b = asRecord(ctx.body);
+  const ref =
+    typeof b.build === 'string'
+      ? { build: b.build }
+      : { tag: typeof b.tag === 'string' ? b.tag : 'default' };
+  const target = resolveBuild(d0, ref);
+  if (!target || target.status !== 'registered') {
+    throw new CpError(
+      'template_unavailable',
+      'no registered build of this template under that reference',
+      undefined,
+      {
+        readiness: 'unavailable',
+      },
+    );
+  }
+  const nowS = seconds(deps);
+  const DAY = 86_400;
+  const hosts = hostViews(deps);
+  const defaultLease =
+    Math.max(...hosts.map((h) => deps.hosts!.get(h.id)!.limits.idleLimitSeconds), 0) || 3600;
+  const want =
+    typeof b.leaseSeconds === 'number' && Number.isSafeInteger(b.leaseSeconds)
+      ? b.leaseSeconds
+      : defaultLease;
+  if (want < 60 || want > DAY)
+    throw new CpError('invalid_request', 'leaseSeconds must be 60-86400 (renew to hold longer)');
+  const { policy: pol } = await policy.current();
+  const docs = await cat.list();
+  const held = docs
+    .flatMap((d) => d.builds)
+    .filter(
+      (x) => x.buildId !== target.buildId && liveLeases(x, nowS).some((l) => l.subject === p.sub),
+    );
+  if (held.length >= pol.quota.active) {
+    throw new CpError(
+      'quota_exceeded',
+      `at most ${pol.quota.active} active templates per subject`,
+      undefined,
+      { quota: 'active' },
+    );
+  }
+  const withLease = (x: TemplateBuild): TemplateBuild => {
+    const others = (x.leases ?? []).filter((l) => l.subject !== p.sub && l.until > nowS);
+    const mine = (x.leases ?? []).find((l) => l.subject === p.sub && l.until > nowS);
+    return {
+      ...x,
+      leases: [...others, { subject: p.sub, until: nowS + want, since: mine?.since ?? nowS }],
+    };
+  };
+  // Would it be placed? Judge with this lease added, before keeping it.
+  const trial = docs.map((d) =>
+    d.id !== d0.id
+      ? d
+      : { ...d, builds: d.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)) },
+  );
+  const pl = place(trial, hosts, nowS);
+  if (hosts.length > 0 && pl.unplaced.get(target.buildId) === 'not_held') {
+    throw new CpError('template_unavailable', "no host holds this build's snapshot", undefined, {
+      readiness: 'unavailable',
+    });
+  }
+  if (pl.unplaced.get(target.buildId) === 'no_slot') {
+    const free = Math.min(
+      ...trial
+        .flatMap((d) => d.builds)
+        .flatMap((x) => liveLeases(x, nowS).map((l) => l.until - nowS)),
+    );
+    throw new CpError(
+      'no_active_slot',
+      'every host holding this build is at its active limit with leased builds',
+      undefined,
+      {
+        readiness: 'unavailable',
+      },
+      Number.isFinite(free) ? Math.max(1, free) : 60,
+    );
+  }
+  await cat.update(d0.id, async (cur) => ({
+    ...cur!,
+    builds: cur!.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)),
+  }));
+  await prov.append({
+    stream: `template/${d0.id}`,
+    kind: 'activate',
+    subject: p.sub,
+    body: {
+      buildId: target.buildId,
+      leaseSeconds: want,
+      until: nowS + want,
+      ...(pl.placed.get(target.buildId) ? { host: pl.placed.get(target.buildId)! } : {}),
+    },
+  });
+  return {
+    status: 200,
+    body: {
+      templateId: d0.id,
+      buildId: target.buildId,
+      leaseUntil: nowS + want,
+      host: pl.placed.get(target.buildId) ?? null,
+    },
+  };
+}
+
+/** Deactivate (§5.1): drop this subject's lease; the build stays wanted while others hold it. */
+async function deactivate(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  const { cat, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const b = asRecord(ctx.body);
+  const nowS = seconds(deps);
+  const all = isAdmin(p) && b.all === true;
+  let dropped = 0;
+  await cat.update(d0.id, async (cur) => ({
+    ...cur!,
+    builds: cur!.builds.map((x) => {
+      const keep = (x.leases ?? []).filter((l) => l.until > nowS && !(all || l.subject === p.sub));
+      dropped += (x.leases ?? []).filter((l) => l.until > nowS).length - keep.length;
+      return { ...x, leases: keep };
+    }),
+  }));
+  if (dropped > 0) {
+    await prov.append({
+      stream: `template/${d0.id}`,
+      kind: 'deactivate',
+      subject: p.sub,
+      body: { leases: dropped, all },
+    });
+  }
+  return { status: 200, body: { templateId: d0.id, released: dropped } };
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
+  activateTemplate: activate,
+  deactivateTemplate: deactivate,
+
   createTemplate: (ctx, deps) => createBuild(ctx, deps, false),
 
   createTemplateBuild: (ctx, deps) => createBuild(ctx, deps, true),
@@ -512,7 +684,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const templates = docs.map((d) => templateBody(d, live, false));
     // Per-host limits and use (§4, §6.2) are reported by the host agent (§6.1), not built yet:
     // an empty list means "no host reports", never "no limit".
-    return { status: 200, body: { templates, hosts: [] } };
+    return { status: 200, body: { templates, hosts: hostsBlock(deps, live) } };
   },
 
   listTemplateTags: async (ctx, deps) => {
@@ -543,7 +715,10 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   getTemplateBuild: async (ctx, deps) => {
     const p = requireEnrolled(ctx, deps);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
-    const b = d.builds.find((x) => x.buildId === (ctx.params.build ?? ''));
+    // By build id, or by the handle the create answered (§4: it keeps resolving once the build is
+    // registered and its id becomes the manifest hash); the body's buildId is the real id.
+    const ref = ctx.params.build ?? '';
+    const b = d.builds.find((x) => x.buildId === ref || x.handle === ref);
     if (!b) throw new CpError('template_not_found', 'no such build of this template');
     return { status: 200, body: buildBody(d, b, await readinessFacts(deps), true) };
   },

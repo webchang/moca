@@ -680,5 +680,11 @@ registers or rejects each built build by policy; nobody approves it. It needs:
 
 It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), and it checks a gate
 record's bytes against their sha256 before building with it. The token stays in a 0600 header file,
-never in argv or the log. The agent does not install or start workers yet: activation is the next
-increment.
+never in argv or the log.
+
+Each poll also asks the control plane which workers to run and stop (`GET /v1/hosts/{host}/wanted`:
+builds leased by clients and placed on this host, within `SBX_ACTIVE_LIMIT`), starts and stops
+their `sbx-worker@<id>` units, and reports each start (`attached`), refusal and stop (`detached`). It
+never stops a worker with live sandboxes. It starts only **installed** workers: install a new
+template's worker as in §5 (its relay token comes from `setup.sh`); until then the agent reports
+it `refused` (register gap G18).

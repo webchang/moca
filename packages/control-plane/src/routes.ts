@@ -343,6 +343,24 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     operationId: 'listTemplateTags',
   },
+  {
+    method: 'POST',
+    path: '/v1/templates/{id}/activate',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    bodyRequired: false,
+    operationId: 'activateTemplate',
+  },
+  {
+    method: 'POST',
+    path: '/v1/templates/{id}/deactivate',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    bodyRequired: false,
+    operationId: 'deactivateTemplate',
+  },
   // Template lifecycle spec §4, §5.1, §8.1: self-serve create, policy, quota. Both profiles.
   {
     method: 'POST',
@@ -427,6 +445,22 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     maxBodyBytes: 1024 * 1024,
     operationId: 'hostBuildReport',
+  },
+  {
+    method: 'GET',
+    path: '/v1/hosts/{host}/wanted',
+    auth: 'host',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'hostWanted',
+  },
+  {
+    method: 'POST',
+    path: '/v1/hosts/{host}/workers/report',
+    auth: 'host',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'hostWorkerReport',
   },
   {
     method: 'POST',
