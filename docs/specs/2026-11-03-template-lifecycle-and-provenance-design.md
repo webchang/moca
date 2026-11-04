@@ -3,7 +3,7 @@
 Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
 templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
-implemented on the branch (see §11), the validation (item 8) pending
+implemented on the branch (see §11); the validation (item 8): window 1 run 2026-11-04 (§10.1)
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -531,6 +531,29 @@ voids the rep; the model-free stage replays recorded trajectories before the scr
 
 The process doc (`PROCESS.md`) is updated at each step, and the validation follows it as written.
 
+### 10.1 Status (window 1, 2026-11-04)
+
+Window 1: stock agents only, the sandbox profile, the control-plane image
+`sbx-template-0fb59160`, bm1's host agent, autobench-moca's runner as a non-admin client, K = 4
+(django-11133, astropy-14995, sympy-12481, sympy-18189).
+
+| Step | Result                                                                                                                                                                                                   |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | done: image-factory's four records the policy's trusted gate records (A23)                                                                                                                               |
+| 2    | **4 of 4 built by the host agent and registered by policy**, no approver; the mismatched create refused at create (`422`, X10); the broken probe not reached (host-agent fixes made during the window)   |
+| 3    | not run as designed: a duplicate create queued a second build (G21, reuse not built)                                                                                                                     |
+| 4    | all four `active` by lease within 143 s, no eviction; first use (§6.4) not built                                                                                                                         |
+| 5    | sandboxes on `id@buildId`: served `buildId` and `templateManifestHash` = the pinned ones, 4 of 4; the replays' patches **not compared**: commands of about 40 KB or more stall over the exec Route (G26) |
+| 6    | not exercised                                                                                                                                                                                            |
+| 7    | **8 chains, 83 records verified offline** (`verify-provenance.py`, rc 0); 12 of 12 snapshot digests match the chain                                                                                      |
+| 8    | not started                                                                                                                                                                                              |
+
+Also found: Valkey 9 cannot read Redis 7.4's RDB 12 (G20, `SBX_REDIS_IMAGE`); a registry host
+reached one build's reason and record and four build logs, now redacted by the agent and removed
+from the store with `redact-provenance.py` (G25); the quota hides the sandbox cap (G27); T and S
+are kept unredacted (G28). **Window 2:** the replays with file bytes as Exec stdin, G26 bisected,
+the broken probe rerun, then the Moca Pi arm with the combined control plane.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
@@ -586,7 +609,8 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    profile with `setup.sh SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS=bm1` (a7eca0a7) and a control-plane
    image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers
    pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
-   combined control plane.
+   combined control plane. **Run 2026-11-04** (§10.1): steps 1, 2, 4 and 7 passed; 3, 5 (patches)
+   and 6 open for window 2.
 
 ## 12. Decisions
 
