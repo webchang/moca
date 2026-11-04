@@ -1,3 +1,10 @@
+import { ProvenanceStore } from './provenance.js';
+import {
+  FileTemplateCatalog,
+  redisPresenceReader,
+  type PresenceRedisLike,
+  type TemplateCatalog,
+} from './template-catalog.js';
 import { createClient } from 'redis';
 import type { BundleRedisLike } from '@moca/config-bundle';
 import { fileURLToPath } from 'node:url';
@@ -406,6 +413,25 @@ export function redisClientOptions(url: string) {
   return { url, socket: { reconnectStrategy: redisReconnectStrategy } };
 }
 
+/**
+ * `SH_PROVENANCE_DIR` (template lifecycle spec §7.2): a directory on the control plane's
+ * persistent volume holding the provenance store and the template catalog. Set, the catalog is
+ * the store (SH_SANDBOX_TEMPLATES imported into it once); unset, templates come from
+ * SH_SANDBOX_TEMPLATES at every start, as before, and nothing is recorded.
+ */
+export function templateCatalogFromEnv(
+  env: NodeJS.ProcessEnv,
+  config: CpConfig,
+): { templates?: TemplateCatalog } {
+  const dir = env.SH_PROVENANCE_DIR;
+  if (!dir || !config.sandbox) return {};
+  if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
+  const provenance = new ProvenanceStore({ dir });
+  return {
+    templates: new FileTemplateCatalog({ dir, declared: config.sandbox.templates, provenance }),
+  };
+}
+
 export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
   const config = configFromEnv(env);
   const signer = makeSigner(env.SH_SESSION_TOKEN_PRIVATE_KEY!);
@@ -460,7 +486,13 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
         ? new UnavailableCredentialStore()
         : credentialStoreFromEnv(env),
     ...(sandboxProfile
-      ? { sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike) }
+      ? {
+          sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike),
+          // Readiness (template lifecycle spec §3.3) from the relay's presence records, which the
+          // sandbox profile's relay writes into this same Redis.
+          presence: redisPresenceReader(client as unknown as PresenceRedisLike),
+          ...templateCatalogFromEnv(env, config),
+        }
       : {}),
     identity: new GithubOAuthProvider({
       clientId: env.SH_GITHUB_CLIENT_ID!,

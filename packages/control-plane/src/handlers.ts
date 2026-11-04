@@ -1,3 +1,4 @@
+import type { PresenceReader, TemplateCatalog } from './template-catalog.js';
 import {
   assertValidDigest,
   BundleDigestMismatchError,
@@ -192,6 +193,13 @@ export interface CpDeps {
   close?: () => Promise<void>;
   /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
   sandboxes?: SandboxStore;
+  /**
+   * The template catalog (template lifecycle spec §3.1). Absent: built from the sandbox profile's
+   * SH_SANDBOX_TEMPLATES, as before the catalog existed.
+   */
+  templates?: TemplateCatalog;
+  /** The relay's presence records, which template readiness is derived from (§3.3). */
+  presence?: PresenceReader;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
 }

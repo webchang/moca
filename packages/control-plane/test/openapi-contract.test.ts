@@ -180,7 +180,7 @@ describe('§9.3 test 3 — contract drift', () => {
         r.operationId === 'refreshAuth' ||
         (r.profiles.includes('sandbox') && r.profiles.length === 1 && r.auth === 'api'),
     ).map((r) => `${r.method} ${r.path}`);
-    expect(enrollable.length).toBe(8);
+    expect(enrollable.length).toBe(11);
     const missing = operations()
       .filter(({ path, method }) => enrollable.includes(`${method} ${path}`))
       .filter(({ op }) => !(op as { responses?: Record<string, unknown> }).responses?.['403'])

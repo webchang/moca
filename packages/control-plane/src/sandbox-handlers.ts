@@ -9,6 +9,14 @@ import {
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import type { SandboxConfig } from './sandbox-config.js';
 import {
+  MemoryTemplateCatalog,
+  resolveBuild,
+  type TemplateBuild,
+  type TemplateCatalog,
+  type TemplateDoc,
+} from './template-catalog.js';
+import {
+  isLive,
   viewOf,
   type SandboxRecord,
   type SandboxStore,
@@ -124,17 +132,126 @@ function parseLabels(raw: unknown): Record<string, string> {
 const audit = (deps: CpDeps, subject: string, sandboxId: string, decision: string) =>
   auditBestEffort(deps, decision, sandboxId, { subject, sandboxId, decision });
 
+/** The catalog (template lifecycle spec §3.1); built from the env list when none is wired. */
+function catalog(deps: CpDeps): TemplateCatalog {
+  return deps.templates ?? new MemoryTemplateCatalog(service(deps).cfg.templates);
+}
+
+const canSee = (d: TemplateDoc, p: TokenClaims): boolean =>
+  d.visibility === 'deployment' || d.owner === p.sub || isAdmin(p);
+
+async function visibleTemplates(deps: CpDeps, p: TokenClaims): Promise<TemplateDoc[]> {
+  return (await catalog(deps).list()).filter((d) => canSee(d, p));
+}
+
+/** 404 for a template the caller cannot see, as for one that does not exist (no existence oracle). */
+async function visibleTemplate(deps: CpDeps, p: TokenClaims, id: string): Promise<TemplateDoc> {
+  const d = await catalog(deps).get(id);
+  if (!d || !canSee(d, p)) throw new CpError('template_not_found', 'no such template');
+  return d;
+}
+
+/** What readiness is derived from (§3.3): attached workers, and the live sandboxes per worker. */
+interface ReadinessFacts {
+  /** worker sandbox id -> its advertised capacity; present = attached to the relay. */
+  attached: Map<string, number> | null;
+  inUse: Map<string, number>;
+}
+
+async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
+  let attached: Map<string, number> | null = null;
+  if (deps.presence) {
+    try {
+      attached = new Map((await deps.presence.list()).map((r) => [r.sandboxId, r.capacityMax]));
+    } catch {
+      // Presence unreadable: readiness is unknown, not inactive (a client must not act on a guess).
+      attached = null;
+    }
+  }
+  const inUse = new Map<string, number>();
+  if (deps.sandboxes) {
+    const now = seconds(deps);
+    for (const r of await deps.sandboxes.listAll(now)) {
+      if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
+    }
+  }
+  return { attached, inUse };
+}
+
+function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: boolean) {
+  const readiness =
+    b.status !== 'registered'
+      ? null
+      : f.attached === null
+        ? 'unknown'
+        : f.attached.has(b.worker)
+          ? 'active'
+          : 'inactive';
+  return {
+    buildId: b.buildId,
+    status: b.status,
+    profile: b.profile,
+    readiness,
+    capacity:
+      readiness === 'active'
+        ? { running: f.attached!.get(b.worker) ?? 0, inUse: f.inUse.get(b.worker) ?? 0 }
+        : null,
+    tags: Object.entries(d.tags)
+      .filter(([, id]) => id === b.buildId)
+      .map(([t]) => t)
+      .sort(),
+    createdAt: b.createdAt,
+    provenance: b.provenance ?? null,
+    ...(full ? { spec: b.spec } : {}),
+  };
+}
+
+function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
+  const def = resolveBuild(d, {});
+  return {
+    id: d.id,
+    description: d.description,
+    tools: def?.spec.tools ?? [],
+    owner: d.owner,
+    visibility: d.visibility,
+    onboarding: d.builds.some((b) => b.status === 'registered')
+      ? 'registered'
+      : (d.builds[0]?.status ?? null),
+    readiness: def ? buildBody(d, def, f, false).readiness : null,
+    tags: { ...d.tags },
+    builds: d.builds.map((b) => buildBody(d, b, f, full)),
+  };
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
   listTemplates: async (ctx, deps) => {
-    requireEnrolled(ctx, deps);
-    const { cfg } = service(deps);
+    const p = requireEnrolled(ctx, deps);
+    const docs = await visibleTemplates(deps, p);
+    const live = await readinessFacts(deps);
     // The worker id is deployment plumbing; a client names a template, never a worker.
-    const templates = cfg.templates.map(({ id, description, tools }) => ({
-      id,
-      description,
-      tools,
-    }));
+    const templates = docs.map((d) => templateBody(d, live, false));
     return { status: 200, body: { templates } };
+  },
+
+  getTemplate: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
+    return { status: 200, body: templateBody(d, await readinessFacts(deps), true) };
+  },
+
+  listTemplateBuilds: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
+    const live = await readinessFacts(deps);
+    return { status: 200, body: { builds: d.builds.map((b) => buildBody(d, b, live, true)) } };
+  },
+
+  getTemplateBuild: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
+    const b = d.builds.find((x) => x.buildId === (ctx.params.build ?? ''));
+    if (!b) throw new CpError('template_not_found', 'no such build of this template');
+    return { status: 200, body: buildBody(d, b, await readinessFacts(deps), true) };
   },
 
   createSandbox: async (ctx, deps) => {

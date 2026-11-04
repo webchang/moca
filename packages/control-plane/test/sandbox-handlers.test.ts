@@ -138,12 +138,14 @@ describe('sandbox handlers (SBX0 §5)', () => {
     }
   });
 
-  it('lists templates without their worker ids', async () => {
+  it('lists templates without their worker ids, keeping the original three fields', async () => {
     const r = await HANDLERS.listTemplates!(ctx({ principal: alice }), sbxDeps());
-    expect((r.body as { templates: object[] }).templates).toEqual([
+    const ts = (r.body as { templates: Record<string, unknown>[] }).templates;
+    expect(ts.map(({ id, description, tools }) => ({ id, description, tools }))).toEqual([
       { id: 'default', description: 'bash, git, Python 3', tools: ['bash', 'git', 'python3'] },
       { id: 'node22', description: 'Node 22', tools: ['node'] },
     ]);
+    expect(JSON.stringify(ts)).not.toContain('sbx_default');
   });
 
   it("hides another user's sandbox behind 404, on get, delete and token", async () => {

@@ -308,6 +308,32 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: SANDBOX,
     operationId: 'listTemplates',
   },
+  // Template lifecycle spec §4: one template, its builds, one build. Sandbox profile for now; BOTH
+  // profiles (§4.1) once the harness profile has a catalog.
+  {
+    method: 'GET',
+    path: '/v1/templates/{id}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: SANDBOX,
+    operationId: 'getTemplate',
+  },
+  {
+    method: 'GET',
+    path: '/v1/templates/{id}/builds',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: SANDBOX,
+    operationId: 'listTemplateBuilds',
+  },
+  {
+    method: 'GET',
+    path: '/v1/templates/{id}/builds/{build}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: SANDBOX,
+    operationId: 'getTemplateBuild',
+  },
   {
     method: 'POST',
     path: '/v1/sandboxes',

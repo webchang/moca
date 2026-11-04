@@ -532,7 +532,13 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 2. The provenance store and records (§7), with offline verification, for `build`, `check` and
    `policy` first (store and verifiers done: `provenance.ts`, `verify-provenance.py`; records are
    written once the routes exist).
-3. Templates in the store, states and the read API (§3, §4), with owners and visibility.
+3. Templates in the store, states and the read API (§3, §4), with owners and visibility. **First
+   increment built** (sandbox profile): the catalog (`template-catalog.ts`; `SH_PROVENANCE_DIR`
+   imports the env list once, with a `create` record each), `GET /v1/templates` extended,
+   `GET /v1/templates/{id}`, `/builds`, `/builds/{build}`, `404 template_not_found`, readiness
+   `active`/`inactive` from the relay's presence (`unknown` when unreadable). Not yet: the hosts
+   block, `lastUsedAt`, `activating`/`deactivating`/`unavailable` (they need the host agent), the
+   logs and tags routes, the harness profile (§4.1), and builds from template records.
 4. Create and policy at create (§4, §8.1), quotas (§6.2).
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2).
