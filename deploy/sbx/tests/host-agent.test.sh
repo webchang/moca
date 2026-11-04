@@ -106,7 +106,7 @@ pass 'the inventory names the snapshots held, by manifest hash'
 # 3. A failed build is reported failed, with template-build.sh's exit and last line.
 job ''
 MOCK_BUILD_FAIL=1 run || fail 'a failing build failed the poll'
-jq -e '.event == "failed" and (.message | test("exit 1: build-snapshot.sh: the --verify-command exited 91"))' "$R" >/dev/null ||
+jq -e '.event == "failed" and (.message | test("^probe_failed: template-build.sh exit 1: build-snapshot.sh: the --verify-command exited 91"))' "$R" >/dev/null ||
   fail 'the failure report'
 grep -q '"failed":1' "$TMP/out" || fail 'summary of a failure'
 pass 'a failed build is reported failed with its exit and last line'
@@ -160,5 +160,41 @@ printf '{"run":[{"worker":"../x","buildId":"sha256:1"}],"stop":[]}' >"$TMP/state
 run || fail 'malformed wanted poll'
 grep -q 'systemctl start' "$MOCK_LOG" && fail 'started a malformed worker id'
 pass 'starts wanted installed workers (attached), refuses uninstalled ones, stops unwanted ones (detached), refuses a malformed id'
+
+# 8. Nothing that names where an image lives leaves the host (ykt3, 2026-11-04: a build's reason
+#    carried a private registry's host and account). A failure whose last line names one is reported
+#    redacted, the log upload too; the full log stays on the host.
+job ''
+LEAK="build-rootfs.sh: could not pull 123456789012.dkr.ecr.us-east-1.amazonaws.com/image-factory/moca-microvm@sha256:$DIGEST. Re-run"
+cat >"$TMP/bin/template-build" <<MOCK
+#!/usr/bin/env bash
+printf 'build %s\\n' "\$*" >>"\$MOCK_LOG"
+echo 'pulling from https://123456789012.dkr.ecr.us-east-1.amazonaws.com/v2/ at 10.1.2.3'
+echo "$LEAK"
+exit 1
+MOCK
+chmod +x "$TMP/bin/template-build"
+run || fail 'the leaking poll failed'
+for f in "$R" "$TMP/state/POST_v1_hosts_bm1_builds_b-0123456789abcdef0123456789_log"; do
+  ! grep -qE 'amazonaws|123456789012|10\.1\.2\.3|https://' "$f" || fail "a registry host, account, IP or URL left the host in $(basename "$f")"
+done
+jq -e '.message | test("<registry>/image-factory/moca-microvm@sha256:")' "$R" >/dev/null || fail 'the redacted reason lost the image path'
+jq -e '.message | startswith("pull_failed: ")' "$R" >/dev/null || fail 'the reason does not lead with the pull_failed code'
+grep -q 'amazonaws' "$TMP/srv/agent-logs/b-0123456789abcdef0123456789.log" || fail 'the full log was not kept on the host'
+[[ "$(stat -c %a "$TMP/srv/agent-logs" 2>/dev/null || stat -f %Lp "$TMP/srv/agent-logs")" == 700 ]] || fail 'agent-logs is not 0700'
+pass 'a failed build reports redacted text only (no registry host, account, IP or URL); the full log stays on the host, root-only'
+
+# 9. With SBX_REGISTRY set, no build is claimed until the registry login exists (bm1, 2026-11-04).
+job ''
+: >"$MOCK_LOG"
+SBX_REGISTRY=reg.example.invalid REGISTRY_AUTH_FILE="$TMP/auth.json" bash "$A" --once >"$TMP/out" 2>&1 || fail 'no-login poll failed'
+grep -q 'builds/claim' "$MOCK_LOG" && fail 'claimed a build with no registry login'
+grep -q 'no registry login' "$TMP/out" || fail 'the skip does not say why'
+printf '{"auths":{"reg.example.invalid":{"auth":"x"}}}' >"$TMP/auth.json"
+: >"$MOCK_LOG"
+SBX_REGISTRY=reg.example.invalid REGISTRY_AUTH_FILE="$TMP/auth.json" bash "$A" --once >"$TMP/out" 2>&1 || fail 'logged-in poll failed'
+grep -q 'builds/claim' "$MOCK_LOG" || fail 'did not claim with a registry login'
+! grep -q 'reg.example.invalid' "$TMP/out" || fail 'the registry host reached the output'
+pass 'with SBX_REGISTRY, claims wait for a login in REGISTRY_AUTH_FILE, and the host is never printed'
 
 echo 'all host-agent.sh tests passed'

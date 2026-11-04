@@ -79,6 +79,12 @@ api() { # api METHOD PATH [BODY_FILE] -> the body on stdout; fails on any non-2x
   curl -fsS --max-time 60 --proto =https "${ca[@]}" -H "@$HDR" -X "$1" "${data[@]}" "$SBX_API_URL$2"
 }
 
+# registry_logged_in: REGISTRY_AUTH_FILE holds an entry for SBX_REGISTRY (podman's auth.json shape).
+registry_logged_in() {
+  local f="${REGISTRY_AUTH_FILE:-/run/containers/0/auth.json}"
+  [[ -r "$f" ]] && jq -e --arg h "$SBX_REGISTRY" '.auths // {} | has($h)' "$f" >/dev/null 2>&1
+}
+
 free_gb() { df -Pk "$SBX_SRV" 2>/dev/null | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
 
 # The snapshots this host holds, by manifest hash, as template-build.sh's records name them.
@@ -104,8 +110,23 @@ report() { # report HANDLE BODY_JSON
   api POST "/v1/hosts/$SBX_HOST_ID/builds/$1/report" "$WORK/report.json"
 }
 
-log_tail() { # log_tail HANDLE FILE: the build log's last 200 lines, as entries
-  tail -n 200 "$2" | jq -Rs '{entries: (split("\n") | map(select(length > 0)) | map({level: "info", step: "build", message: .[0:4096]}))}' \
+# redact: stdin to stdout with registry hosts, account-shaped numbers, URLs and IP addresses masked.
+# Build output names the image it pulls in full (build-rootfs.sh), and a private registry's host
+# carries its account (ykt3, 2026-11-04: one leaked into a build's reason and log). The control plane
+# keeps what it is sent, readable by clients and append-only in provenance, so nothing that names
+# where an image lives leaves the host. The full log stays on the host (SBX_SRV/agent-logs).
+redact() {
+  # Portable ERE (GNU and BSD sed): a host is a dotted name, or localhost, with an optional port.
+  sed -E \
+    -e 's#https?://[^[:space:]"]+#<url>#g' \
+    -e 's#([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:[0-9]+)?/#<registry>/#g' \
+    -e 's#([A-Za-z0-9-]+\.)+(com|io|net|org|dev|cloud)([^A-Za-z0-9.-]|$)#<host>\3#g' \
+    -e 's#(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)#\1<ip>\3#g' \
+    -e 's#(^|[^0-9])[0-9]{12}([^0-9]|$)#\1<account>\2#g'
+}
+
+log_tail() { # log_tail HANDLE FILE: the build log's last 200 lines, redacted, as entries
+  tail -n 200 "$2" | redact | jq -Rs '{entries: (split("\n") | map(select(length > 0)) | map({level: "info", step: "build", message: .[0:4096]}))}' \
     >"$WORK/log.json"
   api POST "/v1/hosts/$SBX_HOST_ID/builds/$1/log" "$WORK/log.json" >/dev/null || error "log upload for $1 failed"
 }
@@ -130,12 +151,24 @@ build_one() { # build_one JOB_JSON
   [[ -z "${SBX_REGISTRY:-}" ]] || args+=(--registry "$SBX_REGISTRY")
   report "$handle" '{"event":"building"}' >/dev/null || { error "report building for $handle failed"; return; }
   "$SBX_TEMPLATE_BUILD" "$spec" --kernel "$SBX_KERNEL" "${args[@]}" >"$WORK/$handle.log" 2>&1 || rc=$?
+  # The full, unredacted log stays on the host (root-only), for whoever runs it; only redacted text
+  # leaves (log_tail, the failure report).
+  install -d -m 0700 "$SBX_SRV/agent-logs" && install -m 0600 "$WORK/$handle.log" "$SBX_SRV/agent-logs/$handle.log" ||
+    error "could not keep the build log of $handle"
   log_tail "$handle" "$WORK/$handle.log"
   if ((rc != 0)); then
     FAILED=$((FAILED + 1))
     local last
-    last="$(grep -v '^[[:space:]]*$' "$WORK/$handle.log" | tail -n 1 | cut -c1-500)"
-    report "$handle" "$(jq -cn --arg m "template-build.sh exit $rc: $last" '{event: "failed", step: "build", message: $m}')" >/dev/null ||
+    last="$(grep -v '^[[:space:]]*$' "$WORK/$handle.log" | tail -n 1 | redact | cut -c1-500)"
+    # A fixed code a client can branch on, from template-build.sh's own wording; then the redacted line.
+    local code=build_failed
+    case "$last" in
+    *"could not pull"* | *"pull"*"denied"* | *"unauthorized"*) code=pull_failed ;;
+    *"probe exited"* | *"no match for"* | *"verify command exited"* | *"verify-command exited"*) code=probe_failed ;;
+    *"GiB free"* | *"free disk"*) code=disk_floor ;;
+    *"spec"*"must"* | *"is not a JSON"*) code=spec_refused ;;
+    esac
+    report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" '{event: "failed", step: "build", message: $m}')" >/dev/null ||
       error "report failed for $handle failed"
     say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc}"
     return
@@ -210,6 +243,14 @@ main() {
   fi
   local free
   free="$(free_gb)"
+  # A build pulls its image: claiming one with no registry login fails it at the pull and loses it
+  # (bm1, 2026-11-04 16:33Z). With SBX_REGISTRY set, require a login for it in REGISTRY_AUTH_FILE first.
+  if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
+    say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
+    activation
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
+    return 0
+  fi
   if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
     say "{\"agent\":\"skipped\",\"why\":\"free disk ${free:-?} GB is below the floor $SBX_DISK_FLOOR_GB GB\"}"
   else
