@@ -116,8 +116,12 @@ report() { # report HANDLE BODY_JSON
 # keeps what it is sent, readable by clients and append-only in provenance, so nothing that names
 # where an image lives leaves the host. The full log stays on the host (SBX_SRV/agent-logs).
 redact() {
-  # Portable ERE (GNU and BSD sed): a host is a dotted name, or localhost, with an optional port.
-  sed -E \
+  # SBX_REGISTRY itself first, exactly, whatever its shape (register G28: the patterns below miss a
+  # bare dotted name with an uncommon suffix). Then portable ERE (GNU and BSD sed): a host is a
+  # dotted name, or localhost, with an optional port.
+  local own=()
+  [[ -z "${SBX_REGISTRY:-}" ]] || own=(-e "s#$(printf '%s' "$SBX_REGISTRY" | sed 's/[][\.*^$#+?(){}|]/\\&/g')#<registry>#g")
+  sed -E ${own[@]+"${own[@]}"} \
     -e 's#https?://[^[:space:]"]+#<url>#g' \
     -e 's#([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:[0-9]+)?/#<registry>/#g' \
     -e 's#([A-Za-z0-9-]+\.)+(com|io|net|org|dev|cloud)([^A-Za-z0-9.-]|$)#<host>\3#g' \
@@ -182,6 +186,15 @@ build_one() { # build_one JOB_JSON
   [[ -f "$rec" ]] || { error "no template record for $handle at $rec"; return; }
   snap="$SBX_SRV/snapshots/$(jq -r .snapshot "$rec")"
   [[ -f "$snap/manifest.json" ]] || { error "no manifest for $handle"; return; }
+  # T and S go byte for byte (the control plane checks T against the create and hashes S), so they
+  # cannot be redacted: one that names this host's registry is not sent at all (register G28).
+  if [[ -n "${SBX_REGISTRY:-}" ]] && grep -qF -- "$SBX_REGISTRY" "$rec" "$snap/manifest.json"; then
+    FAILED=$((FAILED + 1))
+    report "$handle" '{"event":"failed","step":"report","message":"leak_refused: the template record or manifest names this host'"'"'s registry; not sent (name the image without its registry)"}' >/dev/null ||
+      error "report failed for $handle failed"
+    say "{\"agent\":\"failed\",\"build\":\"$handle\",\"why\":\"leak_refused\"}"
+    return
+  fi
   local out
   out="$(report "$handle" "$(jq -cn --rawfile t "$rec" --rawfile s "$snap/manifest.json" '{event: "built", templateRecord: $t, manifest: $s}')")" ||
     { error "report built for $handle failed"; return; }

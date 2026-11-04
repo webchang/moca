@@ -706,6 +706,14 @@ It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), and
 record's bytes against their sha256 before building with it. The token stays in a 0600 header file,
 never in argv or the log.
 
+**Nothing that names where an image lives leaves the host** (register G25, G28). A failed build's
+reason and its uploaded log are redacted (`SBX_REGISTRY` exactly, then URLs, registry hosts, IPs
+and 12-digit account ids); the full log stays on the host in `/srv/sbx/agent-logs/` (0700). The
+reason leads with a code a client can branch on: `pull_failed`, `probe_failed`, `disk_floor`,
+`spec_refused`, `build_failed`, or `leak_refused` (step `report`): the template record or manifest,
+which go byte for byte, names `SBX_REGISTRY`, so the build is reported failed and neither is sent.
+Name the image in the spec without its registry; `SBX_REGISTRY` supplies it at the pull.
+
 Each poll also asks the control plane which workers to run and stop (`GET /v1/hosts/{host}/wanted`:
 builds leased by clients and placed on this host, within `SBX_ACTIVE_LIMIT`), starts and stops
 their `sbx-worker@<id>` units, and reports each start (`attached`), refusal and stop (`detached`). It

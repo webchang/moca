@@ -197,4 +197,41 @@ grep -q 'builds/claim' "$MOCK_LOG" || fail 'did not claim with a registry login'
 ! grep -q 'reg.example.invalid' "$TMP/out" || fail 'the registry host reached the output'
 pass 'with SBX_REGISTRY, claims wait for a login in REGISTRY_AUTH_FILE, and the host is never printed'
 
+# 10. Register G28: SBX_REGISTRY is redacted exactly, whatever its shape (a bare name with an
+#     uncommon suffix passed the patterns), and a built report whose template record or manifest
+#     names it is not sent (T and S go byte for byte, so they cannot be masked).
+reg_run() {
+  : >"$MOCK_LOG"
+  rm -f "$TMP/state/POST_"*
+  SBX_REGISTRY=reg.internal REGISTRY_AUTH_FILE="$TMP/auth.json" bash "$A" --once >"$TMP/out" 2>&1
+}
+printf '{"auths":{"reg.internal":{"auth":"x"}}}' >"$TMP/auth.json"
+job ''
+cat >"$TMP/bin/template-build" <<'MOCK'
+#!/usr/bin/env bash
+printf 'build %s\n' "$*" >>"$MOCK_LOG"
+echo 'build-rootfs.sh: could not pull reg.internal image-factory/moca-microvm'
+exit 1
+MOCK
+chmod +x "$TMP/bin/template-build"
+reg_run || fail 'bare-host poll failed'
+! grep -q 'reg\.internal' "$R" || fail 'a bare registry host with an uncommon suffix left the host in the reason'
+jq -e '.message | test("<registry>")' "$R" >/dev/null || fail 'the registry was not marked redacted'
+job ''
+cat >"$TMP/bin/template-build" <<'MOCK'
+#!/usr/bin/env bash
+printf 'build %s\n' "$*" >>"$MOCK_LOG"
+id="$(jq -r .id "$1")" d="$(jq -r .image "$1")"; d="${d##*@sha256:}"; name="$id-${d:0:12}"
+mkdir -p "$SBX_SRV/snapshots/$name"
+printf '{"hash_version":2,"hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}' >"$SBX_SRV/snapshots/$name/manifest.json"
+jq -n --arg n "$name" --arg id "$id" '{schema: "moca-sbx-template/1", id: $id, snapshot: $n, image: "reg.internal/image-factory/x@sha256:00"}' \
+  >"$SBX_SRV/templates/$name.json"
+MOCK
+chmod +x "$TMP/bin/template-build"
+reg_run || fail 'leaking-record poll failed'
+jq -e '.event == "failed" and (.message | startswith("leak_refused: "))' "$R" >/dev/null || fail 'a record naming the registry was not refused'
+! grep -q 'reg\.internal' "$R" || fail 'the refusal names the registry'
+grep -q '"templateRecord"' "$R" && fail 'the template record was sent'
+pass 'SBX_REGISTRY is redacted exactly, and a template record naming it is never reported (G28)'
+
 echo 'all host-agent.sh tests passed'
