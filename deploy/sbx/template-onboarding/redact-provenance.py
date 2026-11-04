@@ -2,6 +2,10 @@
 """Redact one template's provenance stream and catalog entry in place (offline, control plane stopped).
 
     python3 redact-provenance.py STORE_DIR TEMPLATE_ID --pattern REGEX [--pattern REGEX ...] [--apply]
+    python3 redact-provenance.py STORE_DIR --catalog-only --pattern REGEX [...] [--apply]
+
+--catalog-only redacts every catalog entry (catalog/*.json) and touches no provenance record: for
+text that reached only the catalog (a build's stored `log`, which no provenance record copies).
 
 STORE_DIR is the control plane's SH_PROVENANCE_DIR (records/, heads/, blobs/, catalog/). For the
 template's stream (`template/<id>`), every record whose canonical JSON matches a pattern is rewritten
@@ -73,6 +77,8 @@ def main(argv):
     if len(argv) < 2 or argv[0] in ("-h", "--help"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    if len(argv) > 1 and argv[1] == "--catalog-only":
+        return catalog_only(argv[0], argv[2:])
     store, tid, rest = argv[0], argv[1], argv[2:]
     pats, apply = [], False
     while rest:
@@ -142,6 +148,42 @@ def main(argv):
                             "old_head": old_head, "new_head": new_head, "records_rewritten": rewritten,
                             "catalog_redacted": bool(cat_hits)}) + "\n")
     print(f"rewrote {rewritten} records; head {old_head[:19]}... -> {new_head[:19]}...; catalog {'redacted' if cat_hits else 'unchanged'}")
+    return 0
+
+
+def catalog_only(store, rest):
+    pats, apply = [], False
+    while rest:
+        if rest[0] == "--apply":
+            apply, rest = True, rest[1:]
+        elif rest[0] == "--pattern" and len(rest) > 1:
+            pats.append(re.compile(rest[1]))
+            rest = rest[2:]
+        else:
+            print("usage: redact-provenance.py STORE_DIR --catalog-only --pattern REGEX ... [--apply]", file=sys.stderr)
+            return 2
+    if not pats:
+        print("need at least one --pattern", file=sys.stderr)
+        return 2
+    cdir = os.path.join(store, "catalog")
+    changed = 0
+    for name in sorted(os.listdir(cdir)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(cdir, name)
+        raw = open(path).read()
+        n = sum(len(p.findall(raw)) for p in pats)
+        if not n:
+            continue
+        print(f"catalog/{name}: {n} match(es)")
+        changed += 1
+        if apply:
+            write_atomic(path, json.dumps(scrub(json.loads(raw), pats)).encode())
+    if apply and changed:
+        with open(os.path.join(store, "redactions.log"), "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "catalog_only": True,
+                                "entries_redacted": changed}) + "\n")
+    print(f"{'redacted' if apply else 'would redact'} {changed} catalog entr{'y' if changed == 1 else 'ies'}")
     return 0
 
 
