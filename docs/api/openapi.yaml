@@ -109,10 +109,22 @@ components:
       required: [templateId, buildId, build, status]
       properties:
         templateId: { type: string }
-        buildId: { type: 'null', description: set once built (the manifest hash) }
+        buildId:
+          type: [string, 'null']
+          description: null until registered; then the manifest hash (a reused registered build)
         build:
-          { type: string, description: the build to follow (its provisional handle b-<26 hex>) }
-        status: { type: string, enum: [queued] }
+          type: string
+          description: the build to follow (its provisional handle b-<26 hex>, or its buildId once registered)
+        status:
+          type: string
+          enum: [queued, building, probing, built, registered]
+          description: "`queued` for a new build; a reused build's own status"
+        reused:
+          type: boolean
+          description: |
+            true when the create matched a build of the same inputs (image, spec, profile, gate record's
+            sha256) that is registered or on its way there (§3.2): that build is answered, and no second
+            one is queued. Absent for a new build.
     LimitUse:
       type: object
       required: [limit, used]
@@ -1458,7 +1470,9 @@ paths:
         `409 template_exists` (`404 template_not_found` when it is private). Over a quota:
         `429 quota_exceeded` with `quota` (`templates` or `buildsQueued`). The build is queued for
         a host agent (deploy/sbx/host-agent.sh), which builds it and reports it; policy then registers
-        or rejects it: follow it at `build`.
+        or rejects it: follow it at `build`. A create whose inputs match a build of the caller's
+        template that is registered or on its way (§3.2) queues nothing and answers that build with
+        `reused: true`: `200` when it is registered, `202` while it is not.
       security: [{ sessionToken: [] }]
       requestBody:
         required: true
@@ -1466,8 +1480,13 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/TemplateCreate' }
       responses:
+        '200':
+          description: a registered build of the same inputs, reused
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateQueued' }
         '202':
-          description: queued
+          description: queued (or a reused build not yet registered)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TemplateQueued' }
@@ -1553,7 +1572,8 @@ paths:
       summary: A new build of your own template (a new image or spec); as POST /v1/templates
       description: |
         The template must exist (`404 template_not_found`) and be the caller's
-        (`409 template_exists`); otherwise exactly POST /v1/templates, the body's `id` ignored.
+        (`409 template_exists`); otherwise exactly POST /v1/templates, the body's `id` ignored,
+        build reuse included.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -1563,8 +1583,13 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/TemplateCreate' }
       responses:
+        '200':
+          description: a registered build of the same inputs, reused
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateQueued' }
         '202':
-          description: queued
+          description: queued (or a reused build not yet registered)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TemplateQueued' }

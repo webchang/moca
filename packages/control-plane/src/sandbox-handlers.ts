@@ -8,7 +8,7 @@ import {
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import type { SandboxConfig } from './sandbox-config.js';
-import type { ProvenanceStore } from './provenance.js';
+import { canonicalJson, type ProvenanceStore } from './provenance.js';
 import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
 import {
   checkCreate,
@@ -368,6 +368,8 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
   const now = seconds(deps);
   const handle = buildHandle(deps.newId());
   const quota = pol.quota;
+  const want = reuseKey(b.image as string, spec, result.profile, result.gateRecordSha256);
+  let reused: TemplateBuild | undefined;
   const doc = await cat.update(id, async (cur) => {
     if (existing && !cur) throw new CpError('template_not_found', 'no such template');
     if (cur && cur.owner !== p.sub && !(existing && isAdmin(p))) {
@@ -376,6 +378,11 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         ? new CpError('template_not_found', 'no such template')
         : new CpError('template_exists', `template '${id}' belongs to another subject`);
     }
+    // §3.2: the same inputs are the same build. One registered, or still on its way there, is
+    // answered instead of a second build (register G21: a duplicate create queued one, and both
+    // registered under one manifest hash).
+    reused = cur?.builds.find((x) => REUSABLE.has(x.status) && buildReuseKey(x) === want);
+    if (reused) return cur!;
     const u = await usage(cat, p.sub);
     if (!cur && u.templates >= quota.templates) {
       throw new CpError(
@@ -447,6 +454,23 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     };
     return { ...base, builds: [build, ...base.builds] };
   });
+  if (reused) {
+    await auditBestEffort(deps, 'template_build_reused', id, {
+      subject: p.sub,
+      decision: 'template_build_reused',
+    });
+    const done = reused.status === 'registered';
+    return {
+      status: done ? 200 : 202,
+      body: {
+        templateId: doc.id,
+        buildId: done ? reused.buildId : null,
+        build: `/v1/templates/${doc.id}/builds/${done ? reused.buildId : (reused.handle ?? reused.buildId)}`,
+        status: reused.status,
+        reused: true,
+      },
+    };
+  }
   await auditBestEffort(deps, 'template_build_queued', id, {
     subject: p.sub,
     decision: 'template_build_queued',
@@ -460,6 +484,40 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
       status: 'queued',
     },
   };
+}
+
+/** The statuses a build is reused from: registered, or on its way there (§3.2). */
+const REUSABLE = new Set<TemplateBuild['status']>([
+  'queued',
+  'building',
+  'probing',
+  'built',
+  'registered',
+]);
+
+/**
+ * What makes two creates the same build (§3.2): the image, the spec as sent, the profile and the
+ * gate record's sha256. The builder (MOCA commit, kernel) is the host's, unknown at create, so it
+ * is not part of it: one deployment's hosts build with one builder.
+ */
+function reuseKey(
+  image: string,
+  spec: Record<string, unknown>,
+  profile: string,
+  gateRecordSha256: string | undefined,
+): string {
+  return canonicalJson({
+    image,
+    spec: JSON.parse(JSON.stringify(spec)),
+    profile,
+    gate: gateRecordSha256 ?? null,
+  });
+}
+
+/** A stored build's reuse key; none for an imported build (it has no request). */
+function buildReuseKey(x: TemplateBuild): string | undefined {
+  if (!x.request) return undefined;
+  return reuseKey(x.request.image, x.request.spec, x.profile, x.request.gateRecordSha256);
 }
 
 /** What a build keeps of its spec: the fields a client reads back (§4). */

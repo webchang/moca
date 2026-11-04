@@ -165,6 +165,55 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     const d = stored();
     await create(d);
     expect(await codeOf(() => create(d, body(), bob))).toBe('template_exists');
+    expect(
+      (await create(d, body({ spec: { ...spec, description: 'another build' } }))).status,
+    ).toBe(202);
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds).toHaveLength(2);
+  });
+
+  it('reuses a build with the same inputs (§3.2, G21): no second build, and a new one when they differ', async () => {
+    const d = stored();
+    const first = await create(d);
+    const again = await create(d);
+    // Still queued: the same build is answered, followed by its handle.
+    expect(again.status).toBe(202);
+    expect(again.body).toMatchObject({ status: 'queued', buildId: null, reused: true });
+    expect((again.body as Body).build).toBe((first.body as Body).build);
+    const builds = async () =>
+      ((await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d)).body as Body)
+        .builds as Body[];
+    expect(await builds()).toHaveLength(1);
+    // A different spec is a different build.
+    expect(
+      (await create(d, body({ spec: { ...spec, description: 'another build' } }))).body,
+    ).not.toHaveProperty('reused');
+    expect(await builds()).toHaveLength(2);
+  });
+
+  it('answers a registered build 200 with its buildId, and builds again after a failure', async () => {
+    const d = stored();
+    await create(d);
+    const setStatus = (status: string, buildId?: string) =>
+      d.templates!.update!(ID, async (cur) => ({
+        ...cur!,
+        builds: cur!.builds.map((x) => ({
+          ...x,
+          status: status as never,
+          ...(buildId ? { buildId } : {}),
+        })),
+      }));
+    await setStatus('registered', 'sha256:' + 'a'.repeat(64));
+    const r = await create(d);
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({
+      status: 'registered',
+      buildId: 'sha256:' + 'a'.repeat(64),
+      build: `/v1/templates/${ID}/builds/sha256:${'a'.repeat(64)}`,
+      reused: true,
+    });
+    await setStatus('failed');
     expect((await create(d)).status).toBe(202);
     const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
       .body as Body;
@@ -203,8 +252,8 @@ describe('POST /v1/templates (§4, §8.1)', () => {
   it('enforces the per-subject quotas (§6.2): 429 quota_exceeded, naming which', async () => {
     const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 2, active: 1 } });
     await create(d);
-    await create(d);
-    const e = await create(d).catch((x) => x);
+    await create(d, body({ spec: { ...spec, description: 'a second build' } }));
+    const e = await create(d, body({ spec: { ...spec, description: 'a third' } })).catch((x) => x);
     expect(e.code).toBe('quota_exceeded');
     expect(e.extra).toEqual({ quota: 'buildsQueued' });
     const other = await create(d, body({ id: 'other-template' })).catch((x) => x);
@@ -293,7 +342,8 @@ it("gives each build a distinct handle from a production id's random hex", async
   const d = stored();
   d.newId = () => randomUUID();
   const a = ((await create(d)).body as Body).build as string;
-  const b = ((await create(d)).body as Body).build as string;
+  const b = ((await create(d, body({ spec: { ...spec, description: 'b' } }))).body as Body)
+    .build as string;
   expect(a).not.toBe(b);
   expect(a).toMatch(/\/b-[0-9a-f]{26}$/);
 });

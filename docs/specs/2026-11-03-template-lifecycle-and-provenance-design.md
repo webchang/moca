@@ -172,7 +172,11 @@ record, when given, is stored with the build and checked (§8). `POST /v1/templa
 starts a new build of an existing template (a new image or spec); same body, same answer. A build
 has a provisional handle (`b-…`) until it is built; then its `buildId` is its manifest hash and the
 handle redirects to it. A create that matches an existing registered build (§3.2) answers
-`200 {buildId, status: "registered", reused: true}`.
+`200 {buildId, status: "registered", reused: true}`; one that matches a build still on its way
+(queued to built) answers `202` with that build and `reused: true`, and queues nothing. As built
+(G21): the match is the image, the spec as sent, the profile and the gate record's sha256 on the
+caller's own template; the builder is not compared (one deployment's hosts build with one builder),
+and a failed or rejected build is never reused.
 
 **Reads (any enrolled client; `private` templates only to their owner and admins).**
 `GET /v1/templates` keeps today's fields and adds, per template, its owner, tags and builds:
