@@ -838,3 +838,58 @@ grep -q "worker 'sbx_nt' serves no template" "$TMP/out" || fail "non-template eg
 ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something before refusing a non-template egress worker'
 pass 'egress hosts take only template workers: the default host skips others, an explicit one is refused'
 pass 'refuses a bad switch, a worker listed twice or owned by no host, bad ids, bad separators and an out-of-range TTL'
+
+# 15. The template store (template lifecycle spec §3.1, §6.1, §7.2) behind SBX_TEMPLATE_STORE=1.
+reset_state
+run_setup true || fail 'store off failed'
+cp "$K" "$TMP/store-off.yaml"
+run_setup export SBX_TEMPLATE_STORE=0 || fail 'SBX_TEMPLATE_STORE=0 failed'
+cmp -s "$TMP/store-off.yaml" "$K" || fail 'SBX_TEMPLATE_STORE=0 differs from unset'
+! grep -q 'template-store\|sbx-template-hosts' "$K" "$MOCK_LOG" || fail 'store off touched the store'
+pass 'store off (unset or 0) changes nothing'
+
+ST=(export SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS='kvm-a bm1')
+run_setup "${ST[@]}" || fail "store on failed: $(cat "$TMP/out")"
+grep -q -- '- ../../k8s/overlays/ocp-sbx/template-store' "$K" || fail 'the overlay does not include the template-store component'
+[[ "$(cm sbx-settings SH_TEMPLATE_HOSTS)" == '[{"id":"kvm-a"},{"id":"bm1"}]' ]] || fail "SH_TEMPLATE_HOSTS: $(cm sbx-settings SH_TEMPLATE_HOSTS)"
+ta="$(secret_val sbx-template-hosts SH_HOST_TOKEN_KVM_A)" tb="$(secret_val sbx-template-hosts SH_HOST_TOKEN_BM1)"
+[[ "$ta" =~ ^[0-9a-f]{64}$ && "$tb" =~ ^[0-9a-f]{64}$ && "$ta" != "$tb" ]] || fail 'host tokens are not distinct 64-hex values'
+jq -e '.metadata.labels["sbx.moca.dev/setup"] == "true"' "$MOCK_STATE/secret-sbx-template-hosts.json" >/dev/null || fail 'sbx-template-hosts is not labelled'
+HB="$GEN/host-agent/kvm-a"
+[[ "$(cat "$HB/host-agent.env")" == $'SBX_API_URL=https://sbx-api.apps.example.invalid\nSBX_HOST_ID=kvm-a' ]] || fail "host-agent.env: $(cat "$HB/host-agent.env")"
+[[ "$(cat "$HB/host-agent.token")" == "$ta" && "$(mode "$HB")" == 700 && "$(mode "$HB/host-agent.token")" == 600 ]] || fail 'the host-agent bundle'
+for v in "$ta" "$tb"; do ! grep -qF "$v" "$MOCK_LOG" "$TMP/out" "$HB/host-agent.env" || fail 'a host token reached argv, the log or the env file'; done
+render
+grep -q 'claimName: moca-sbx-templates' "$TMP/render.yaml" && grep -q 'value: /var/lib/moca/templates' "$TMP/render.yaml" || fail 'the store volume does not render'
+grep -q 'name: sbx-template-hosts' "$TMP/render.yaml" || fail 'the host tokens are not mounted'
+h1="$(pod_hash moca-control-plane)"
+run_setup "${ST[@]}" || fail 'store re-run'
+[[ "$(secret_val sbx-template-hosts SH_HOST_TOKEN_KVM_A)" == "$ta" ]] || fail 'a re-run rotated a host token'
+render
+[[ "$(pod_hash moca-control-plane)" == "$h1" ]] || fail 'a re-run moved the settings hash'
+pass 'store on: the component, SH_TEMPLATE_HOSTS, a kept token per host (hyphen to underscore), 0700/0600 bundles, nothing secret in argv or the log'
+
+run_setup export SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS='kvm-a' || fail 'dropping a host failed'
+! has_key sbx-template-hosts SH_HOST_TOKEN_BM1 || fail "the dropped host's token is still there"
+[[ ! -e "$GEN/host-agent/bm1" ]] || fail "the dropped host's bundle is still there"
+grep -q 'kubectl patch secret sbx-template-hosts' "$MOCK_LOG" || fail 'the dropped token was not revoked by a null patch'
+pass 'a dropped host loses its token and bundle'
+
+# With egress too: both components, the credentials volume keeps every source.
+run_setup export SBX_TEMPLATE_STORE=1 SBX_EGRESS_CREDENTIALS=1 || fail 'store with egress failed'
+render
+grep -q 'name: sbx-egress' "$TMP/render.yaml" && grep -q 'name: sbx-template-hosts' "$TMP/render.yaml" && grep -q 'name: moca-mu1' "$TMP/render.yaml" ||
+  fail 'with egress and the store, the credentials volume lost a source'
+pass 'with egress on as well, the credentials volume mounts moca-mu1, sbx-egress and sbx-template-hosts'
+
+for r in 'export SBX_TEMPLATE_STORE=2 => SBX_TEMPLATE_STORE must be unset, 0 or 1' \
+  'export SBX_TEMPLATE_HOSTS=a => SBX_TEMPLATE_HOSTS needs SBX_TEMPLATE_STORE=1' \
+  "export SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS='A' => template host id .A. must match" \
+  "export SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS='a a' => listed twice"; do
+  bad="${r%% => *}" want="${r#* => }"
+  reset_state
+  ! run_setup eval "$bad" || fail "accepted: $bad"
+  grep -Eq -- "$want" "$TMP/out" || fail "refused '$bad', but not with /$want/"
+  ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail "changed something before refusing: $bad"
+done
+pass 'refuses a bad store switch, hosts without the store, a bad or repeated host id'

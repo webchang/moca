@@ -671,8 +671,13 @@ claims queued template builds (clients create them with `POST /v1/templates`), r
 `template-build.sh` on each with its gate record, and reports the result. The control plane
 registers or rejects each built build by policy; nobody approves it. It needs:
 
-- on the control plane, `SH_PROVENANCE_DIR` (the template store), `SH_TEMPLATE_HOSTS` naming this
-  host, and `SH_HOST_TOKEN_<ID>` (64 hex, its own: not the janitor's or an egress token);
+- on the control plane, the template store and this host's bearer: run `setup.sh` with
+  `SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS='<host id> ...'`. It adds the store's PVC
+  (`moca-sbx-templates`, mounted as `SH_PROVENANCE_DIR`; `SBX_TEMPLATES_FILE` is imported into it
+  once), a token per host in the Secret `sbx-template-hosts`, and a bundle per host in
+  `.generated/host-agent/<id>/` (`host-agent.env`, `host-agent.token`): copy it to the host as
+  `/etc/sbx/host-agent.env` and `/etc/sbx/host-agent.token`, add `SBX_KERNEL` to the env file, and
+  delete the copy;
 - on the host, `/etc/sbx/host-agent.env` (`SBX_API_URL`, `SBX_HOST_ID`, `SBX_KERNEL`, optionally
   `SBX_DISK_FLOOR_GB`, `SBX_BUILD_CONCURRENCY`, `SBX_ACTIVE_LIMIT`, `SBX_IDLE_LIMIT_S`,
   `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at

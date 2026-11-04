@@ -34,6 +34,15 @@
 #                           SBX_TEMPLATES_FILE, owned by exactly one host). Unset: one host, kvm,
 #                           owning every template worker
 #   SBX_EGRESS_CREDENTIAL_TTL_SECONDS   optional; 5-300 (the control plane's default is 60)
+#   SBX_TEMPLATE_STORE      optional; unset, 0 or 1 (template lifecycle spec §3.1, §7.2). 1 gives the
+#                           control plane its template store: a PVC for SH_PROVENANCE_DIR (the
+#                           catalog, the policy, the provenance records; SBX_TEMPLATES_FILE is
+#                           imported into it once), and with SBX_TEMPLATE_HOSTS the host agents'
+#                           bearers. Unset or 0 changes nothing; turning it off leaves the PVC in place
+#   SBX_TEMPLATE_HOSTS      optional, with SBX_TEMPLATE_STORE=1: space-separated host ids
+#                           (^[a-z0-9][a-z0-9-]{0,30}$) whose sbx-host-agent may build and run
+#                           templates; one bearer each in the Secret sbx-template-hosts, and a
+#                           host-agent bundle each
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
 #                           router's default certificate (API)
@@ -55,7 +64,9 @@
 # for deploy/sbx/install-host.sh on the KVM host), janitor/ (janitor.env, janitor.token
 # [+ api-ca.crt], for install-host.sh --janitor) and, with SBX_EGRESS_CREDENTIALS=1, egress/<host id>/
 # (egress.env, egress.token [+ api-ca.crt], for install-host.sh --egress). Copy each bundle straight to its host and delete
-# the copy. Users log in with `mocactl sbx login`; nothing here is handed to them.
+# the copy. With SBX_TEMPLATE_STORE=1 and SBX_TEMPLATE_HOSTS, also host-agent/<host id>/
+# (host-agent.env, host-agent.token [+ api-ca.crt]) for deploy/sbx/host-agent.sh (RUNBOOK §15).
+# Users log in with `mocactl sbx login`; nothing here is handed to them.
 set -euo pipefail
 
 SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,6 +164,7 @@ validate() {
 
   validate_templates
   validate_egress
+  validate_store
 
   local pair
   for pair in ATTACH EXEC API; do
@@ -171,6 +183,31 @@ EGRESS_IDS=''
 EGRESS_SPEC=''
 EGRESS_HOSTS_JSON=''
 EGRESS_HOST_RE='^[a-z0-9][a-z0-9-]{0,30}$'
+
+# SBX_TEMPLATE_STORE and SBX_TEMPLATE_HOSTS (template lifecycle spec §6.1, §7.2). Sets STORE_ON and
+# STORE_HOSTS (host ids, in order) and STORE_HOSTS_JSON.
+STORE_ON=''
+STORE_HOSTS=''
+STORE_HOSTS_JSON='[]'
+validate_store() {
+  case "${SBX_TEMPLATE_STORE:-}" in
+    '' | 0)
+      [[ -z "${SBX_TEMPLATE_HOSTS:-}" ]] || die 'SBX_TEMPLATE_HOSTS needs SBX_TEMPLATE_STORE=1'
+      return 0
+      ;;
+    1) STORE_ON=1 ;;
+    *) die 'SBX_TEMPLATE_STORE must be unset, 0 or 1' ;;
+  esac
+  local id seen=' '
+  for id in ${SBX_TEMPLATE_HOSTS:-}; do
+    [[ "$id" =~ $EGRESS_HOST_RE ]] || die "template host id '$id' must match $EGRESS_HOST_RE"
+    [[ "$seen" != *" $id "* ]] || die "template host id '$id' is listed twice in SBX_TEMPLATE_HOSTS"
+    seen+="$id "
+    STORE_HOSTS+="${STORE_HOSTS:+ }$id"
+  done
+  # shellcheck disable=SC2086 # one argument per host; ids hold no whitespace
+  STORE_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | {id: .}]' --args $STORE_HOSTS)"
+}
 validate_egress() {
   case "${SBX_EGRESS_CREDENTIALS:-}" in
     '' | 0) return 0 ;;
@@ -220,6 +257,10 @@ validate_egress() {
 # The Secret key that carries a host's bearer: packages/control-plane/src/egress-config.ts
 # egressTokenEnvName (kvm-a -> SH_EGRESS_TOKEN_KVM_A), which the control plane reads from
 # $CREDENTIALS_DIRECTORY/<NAME>. tests/setup.test.sh pins one hyphenated id.
+# The Secret key of a template host's bearer: packages/control-plane/src/host-config.ts
+# hostTokenEnvName (kvm-a -> SH_HOST_TOKEN_KVM_A), read from $CREDENTIALS_DIRECTORY/<NAME>.
+host_key() { printf 'SH_HOST_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+
 egress_key() { printf 'SH_EGRESS_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
 # The control plane rolls with a new lifetime at once, but a running worker keeps the
@@ -491,6 +532,39 @@ ensure_egress_secrets() {
   fi
 }
 
+# The template hosts' Secret, sbx-template-hosts (SBX_TEMPLATE_STORE=1 only): one bearer per host
+# (rand_hex), each generated once and kept, distinct from every egress and janitor token by
+# construction (random). A host no longer listed has its token removed by an explicit null patch.
+# Applied (empty when no host is listed) whenever the store is on: the control plane's projected
+# credentials volume names it, and a missing Secret would keep the pod from starting.
+ensure_store_secrets() {
+  [[ -n "$STORE_ON" ]] || return 0
+  local json id key tok stale patch k want=' ' names='' i=0
+  json="$(secret_json sbx-template-hosts)"
+  (
+    for id in $STORE_HOSTS; do
+      key="$(host_key "$id")"
+      tok="$(json_value "$json" "$key")"
+      [[ -n "$tok" ]] || { log "generating the template host token of host $id"; tok="$(rand_hex)"; }
+      export "S_$i=$tok"
+      names+=" $key"
+      i=$((i + 1))
+    done
+    # shellcheck disable=SC2086 # one argument per key; the names are validated identifiers
+    apply_secret sbx-template-hosts $names
+  )
+  for id in $STORE_HOSTS; do want+="$(host_key "$id") "; done
+  stale="$(printf '%s' "$json" | jq -r '.data // {} | keys[]' | while read -r k; do
+    [[ "$k" == SH_HOST_TOKEN_* && "$want" != *" $k "* ]] && printf '%s\n' "$k"
+    true
+  done)"
+  if [[ -n "$stale" ]]; then
+    log "revoking the template host token of host(s) no longer listed: $(printf '%s' "$stale" | tr '\n' ' ')"
+    patch="$(printf '%s\n' "$stale" | jq -Rnc '{data: ([inputs | {key: ., value: null}] | from_entries)}')"
+    kc patch secret sbx-template-hosts -n "$NS" --type=merge -p "$patch" >/dev/null
+  fi
+}
+
 # apply_configmap NAME KEY=VALUE...: non-secret settings, so the values may appear in jq's argv
 # (never kubectl's). Server-side apply with the one field manager: a key dropped from the list is
 # removed, as SH_SANDBOX_EXEC_CA is once the exec certificate is issued.
@@ -511,7 +585,7 @@ apply_configmap() {
 # change rolls the control plane alone and leaves running Execs be (RUNBOOK §5). Runs after
 # route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx relay keys attach_crt exec_crt egress
+  local ca='' moca sbx relay keys attach_crt exec_crt egress hosts
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   moca=("SH_GITHUB_CLIENT_ID=$SBX_GITHUB_CLIENT_ID" "SH_ADMIN_SUBJECTS=${SBX_ADMIN_SUBJECTS:-}"
@@ -522,6 +596,7 @@ ensure_settings() {
     "SH_SANDBOX_RETENTION_SECONDS=$RETENTION_S" "SH_SANDBOX_MAX_PER_SUBJECT=$SBX_MAX_PER_SUBJECT"
     "SH_SANDBOX_MAX_TOTAL=$SBX_MAX_TOTAL" "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT")
   [[ -z "$ca" ]] || sbx+=("SH_SANDBOX_EXEC_CA=$ca")
+  [[ -z "$STORE_ON" ]] || sbx+=("SH_TEMPLATE_HOSTS=$STORE_HOSTS_JSON")
   if [[ -n "$EGRESS_ON" ]]; then
     sbx+=("SH_EGRESS_HOSTS=$EGRESS_HOSTS_JSON")
     [[ -z "${SBX_EGRESS_CREDENTIAL_TTL_SECONDS:-}" ]] || sbx+=("SH_EGRESS_CREDENTIAL_TTL_SECONDS=$SBX_EGRESS_CREDENTIAL_TTL_SECONDS")
@@ -536,14 +611,16 @@ ensure_settings() {
   exec_crt="$(secret_json sbx-exec-tls)"
   # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
   # token or KEK changes the pod template, so the control plane rolls and rereads its files.
-  egress=''
+  egress='' hosts=''
   [[ -z "$EGRESS_ON" ]] || egress="$(secret_json sbx-egress | jq -cS '.data // {}')"
+  [[ -z "$STORE_ON" ]] || hosts="$(secret_json sbx-template-hosts | jq -cS '.data // {}')"
   SETTINGS_HASH="$({
     printf '%s\n' "${moca[@]}" "${sbx[@]}"
     json_value "$keys" PUBLIC_KEYS
     json_value "$attach_crt" tls.crt
     json_value "$exec_crt" tls.crt
     [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
+    [[ -z "$STORE_ON" ]] || printf '%s\n' "$hosts"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
   [[ "$SETTINGS_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the settings (openssl dgst)'
   # The relay's env from sbx-settings, by key, as patch-relay.yaml names them.
@@ -619,7 +696,12 @@ write_overlay() {
     printf '# GENERATED by deploy/sbx/setup.sh on every run. Do not edit; gitignored.\n'
     printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n'
     printf 'namespace: %s\nresources:\n  - %s\n' "$NS" "$OVERLAY_REL"
-    [[ -z "$EGRESS_ON" ]] || printf 'components:\n  - %s/egress-credentials\n' "$OVERLAY_REL"
+    if [[ -n "$EGRESS_ON" || -n "$STORE_ON" ]]; then
+      printf 'components:\n'
+      [[ -z "$EGRESS_ON" ]] || printf '  - %s/egress-credentials\n' "$OVERLAY_REL"
+      # After egress-credentials: its credentials volume restates every source (sbx-egress optional).
+      [[ -z "$STORE_ON" ]] || printf '  - %s/template-store\n' "$OVERLAY_REL"
+    fi
     printf 'patches:\n'
     printf '  - target: { kind: Route, name: moca-relay }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_ATTACH_HOST"
     printf '  - target: { kind: Route, name: sbx-exec }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_EXEC_HOST"
@@ -691,6 +773,7 @@ write_bundles() {
   )
   write_janitor_bundle
   write_egress_bundles
+  write_store_bundles
   log "worker bundles: $GEN/workers/<id>  (copy to the KVM host, run deploy/sbx/install-host.sh, delete the copy)"
   log "janitor bundle: $GEN/janitor  (copy to every KVM host, run deploy/sbx/install-host.sh --janitor, delete the copy)"
   [[ -z "${HOSTS_TO_REINSTALL:-}" ]] ||
@@ -756,6 +839,41 @@ write_egress_bundles() {
   done
 }
 
+# The host-agent bundle of each template host (RUNBOOK §15): host-agent.env (the API URL and the
+# host id; no secret), host-agent.token (the host's bearer alone, no newline) and, with
+# SBX_API_CA_FILE, api-ca.crt. A host no longer listed loses its directory.
+write_store_bundles() {
+  [[ -n "$STORE_ON" ]] || return 0
+  local json d id tok
+  json="$(secret_json sbx-template-hosts)"
+  for d in "$GEN"/host-agent/*/; do
+    [[ -d "$d" ]] || continue
+    id="$(basename "$d")"
+    [[ " $STORE_HOSTS " == *" $id "* ]] || { log "deleting the host-agent bundle of host $id"; rm -rf "$d"; }
+  done
+  (
+    umask 077
+    for id in $STORE_HOSTS; do
+      d="$GEN/host-agent/$id"
+      tok="$(json_value "$json" "$(host_key "$id")")"
+      [[ "$tok" =~ ^[0-9a-f]{64}$ ]] || die "sbx-template-hosts has no valid token for host $id: re-run setup.sh"
+      mkdir -p "$d"
+      chmod 700 "$GEN/host-agent" "$d"
+      printf 'SBX_API_URL=https://%s\nSBX_HOST_ID=%s\n' "$SBX_API_HOST" "$id" >"$d/host-agent.env"
+      printf '%s' "$tok" >"$d/host-agent.token"
+      chmod 600 "$d/host-agent.env" "$d/host-agent.token"
+      if [[ -n "${SBX_API_CA_FILE:-}" ]]; then
+        cp "$SBX_API_CA_FILE" "$d/api-ca.crt.new" && chmod 600 "$d/api-ca.crt.new" && mv "$d/api-ca.crt.new" "$d/api-ca.crt"
+      else
+        rm -f "$d/api-ca.crt"
+      fi
+    done
+  )
+  for id in $STORE_HOSTS; do
+    log "host-agent bundle: $GEN/host-agent/$id  (copy to host $id, install host-agent.sh as RUNBOOK §15 says, delete the copy)"
+  done
+}
+
 main() {
   parse_args "$@"
   validate
@@ -766,6 +884,7 @@ main() {
   remove_client_tokens
   ensure_signing_key
   ensure_egress_secrets
+  ensure_store_secrets
   route_cert moca-relay-tls "$SBX_ATTACH_HOST" "${SBX_ATTACH_TLS_CERT:-}" "${SBX_ATTACH_TLS_KEY:-}" "$GEN/attach-ca.crt"
   route_cert sbx-exec-tls "$SBX_EXEC_HOST" "${SBX_EXEC_TLS_CERT:-}" "${SBX_EXEC_TLS_KEY:-}" "$GEN/exec-ca.crt"
   ensure_settings
