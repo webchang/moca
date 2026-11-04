@@ -254,13 +254,13 @@ validate_egress() {
   EGRESS_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | split("=") | {id: .[0], workers: (.[1] | split(","))}]' --args $EGRESS_SPEC)"
 }
 
-# The Secret key that carries a host's bearer: packages/control-plane/src/egress-config.ts
-# egressTokenEnvName (kvm-a -> SH_EGRESS_TOKEN_KVM_A), which the control plane reads from
-# $CREDENTIALS_DIRECTORY/<NAME>. tests/setup.test.sh pins one hyphenated id.
 # The Secret key of a template host's bearer: packages/control-plane/src/host-config.ts
 # hostTokenEnvName (kvm-a -> SH_HOST_TOKEN_KVM_A), read from $CREDENTIALS_DIRECTORY/<NAME>.
 host_key() { printf 'SH_HOST_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
+# The Secret key that carries a host's bearer: packages/control-plane/src/egress-config.ts
+# egressTokenEnvName (kvm-a -> SH_EGRESS_TOKEN_KVM_A), which the control plane reads from
+# $CREDENTIALS_DIRECTORY/<NAME>. tests/setup.test.sh pins one hyphenated id.
 egress_key() { printf 'SH_EGRESS_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
 # The control plane rolls with a new lifetime at once, but a running worker keeps the
