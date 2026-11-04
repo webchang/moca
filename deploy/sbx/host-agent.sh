@@ -10,6 +10,10 @@
 #
 #   sudo deploy/sbx/host-agent.sh --once     one poll (the unit's timer runs it)
 #
+# Run it through the unit (systemctl start sbx-host-agent.service): the unit loads host-agent.env; a
+# bare run sees none of it and refuses (SBX_API_URL). Installed outside the tree, it needs
+# SBX_TEMPLATE_BUILD (the unit sets it to /srv/sbx/src/...).
+#
 # Environment (the unit sets it from /etc/sbx/host-agent.env):
 #   SBX_API_URL              https://<api host>, the control plane
 #   SBX_HOST_ID              this host's id, as in the control plane's SH_TEMPLATE_HOSTS

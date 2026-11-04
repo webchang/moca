@@ -692,7 +692,11 @@ registers or rejects each built build by policy; nobody approves it. It needs:
 - on the host, `/etc/sbx/host-agent.env` (`SBX_API_URL`, `SBX_HOST_ID`, `SBX_KERNEL`, optionally
   `SBX_DISK_FLOOR_GB`, `SBX_BUILD_CONCURRENCY`, `SBX_ACTIVE_LIMIT`, `SBX_IDLE_LIMIT_S`,
   `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at
-  `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer.
+  `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer. The unit sets
+  `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
+  `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's home):
+  log root's podman in with `--authfile /run/containers/0/auth.json`. Run a poll through the unit
+  (`systemctl start sbx-host-agent.service`), not by hand: only the unit loads the env file.
 
 It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), and it checks a gate
 record's bytes against their sha256 before building with it. The token stays in a 0600 header file,
