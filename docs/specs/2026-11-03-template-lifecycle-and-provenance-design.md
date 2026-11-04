@@ -3,7 +3,7 @@
 Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
 templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
-implemented on the branch (see §11); the validation (item 8): window 1 run 2026-11-04 (§10.1)
+implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04 (§10.1)
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -545,7 +545,7 @@ voids the rep; the model-free stage replays recorded trajectories before the scr
 
 The process doc (`PROCESS.md`) is updated at each step, and the validation follows it as written.
 
-### 10.1 Status (window 1, 2026-11-04)
+### 10.1 Status (windows 1 and 2, 2026-11-04)
 
 Window 1: stock agents only, the sandbox profile, the control-plane image
 `sbx-template-0fb59160`, bm1's host agent, autobench-moca's runner as a non-admin client, K = 4
@@ -568,11 +568,25 @@ from the store with `redact-provenance.py` (G25); the quota hides the sandbox ca
 are kept unredacted (G28). **Window 2:** the replays with file bytes as Exec stdin, G26 bisected,
 the broken probe rerun, then the Moca Pi arm with the combined control plane.
 
+**Window 2** (2026-11-04, the same four instances, code 521efe5c, `SBX_ACTIVE_LIMIT=2`):
+
+| Step | Result                                                                                                                                                                                                 |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2    | **4 of 4 built fresh and registered** (G29: no reuse of window 1's removed snapshots); the mismatched create refused (X10); the broken probe failed `probe_failed`, its reason without a registry host |
+| 3    | not covered (one subject)                                                                                                                                                                              |
+| 4    | first use passed: `409 template_not_active`, `Retry-After: 30`, the caller's lease taken                                                                                                               |
+| 5    | build check 4 of 4; writes as Exec stdin, no stall (G26 fixed); **patches 4 of 4 match** the recordings                                                                                                |
+| 6    | aging passed: two windows of 2, the second placed as the first's leases ended                                                                                                                          |
+| 7    | **8 chains, 140 records verified offline**; 12 of 12 snapshot digests match                                                                                                                            |
+| 8    | not started                                                                                                                                                                                            |
+
+Open from window 2: client-side stalls of about 20 s on some Execs (register G30).
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
    evidence fields are done, 26bd6d7f; PV2, PV3 and PV4 in code: manifest hash version 2 and
-   `SH_TEMPLATE_RECORD`; to be proven on a KVM host).
+   `SH_TEMPLATE_RECORD`; proven on bm1 in windows 1 and 2).
 2. The provenance store and records (§7), with offline verification, for `build`, `check` and
    `policy` first (store and verifiers done: `provenance.ts`, `verify-provenance.py`; records are
    written once the routes exist).
@@ -609,9 +623,9 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
    lease and no live sandbox), the agent's start/stop of **installed** workers with attach,
    refused and detach reports, readiness `activating`/`deactivating`/`unavailable`, and the hosts
    block filled. A build is followed by its handle after registration, and carries `reason`. Not
-   yet: installing a worker (G18: its relay token is minted only by `setup.sh`), activation on
-   the session's `409 template_not_active` (first use is built for sandboxes, §6.4), the client logs route,
-   `install-host.sh --host-agent`, and a run on a KVM host.
+   yet: installing a worker (G18: its relay token is minted only by `setup.sh`), the session's
+   `409 template_not_active` (first use is built for sandboxes, §6.4), the client logs route and
+   `install-host.sh --host-agent`. Run on bm1 in windows 1 and 2 (§10.1).
 6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6). Built with
    item 5 (leases, limits, aging as leases ending; no eviction); first use for sandboxes (§6.4).
 7. Tracing (§9). **Built:** a sandbox's template reference (`id`, `id:tag`, `id@sha256:…`) resolves
@@ -623,8 +637,8 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
    profile with `setup.sh SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS=bm1` (a7eca0a7) and a control-plane
    image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers
    pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
-   combined control plane. **Run 2026-11-04** (§10.1): steps 1, 2, 4 and 7 passed; 3, 5 (patches)
-   and 6 open for window 2.
+   combined control plane. **Run 2026-11-04** (§10.1): window 1 passed steps 1, 2, 4 and 7;
+   window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 not covered, step 8 not started.
 
 ## 12. Decisions
 
