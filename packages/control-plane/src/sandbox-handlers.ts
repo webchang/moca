@@ -553,7 +553,7 @@ function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
  */
 async function activate(ctx: RequestCtx, deps: CpDeps) {
   const p = requireEnrolled(ctx, deps);
-  const { cat, policy, prov } = writable(deps);
+  writable(deps);
   const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
   const b = asRecord(ctx.body);
   const ref =
@@ -571,14 +571,35 @@ async function activate(ctx: RequestCtx, deps: CpDeps) {
       },
     );
   }
+  const r = await takeLease(deps, p, d0, target, b.leaseSeconds, 'owner');
+  return {
+    status: 200,
+    body: { templateId: d0.id, buildId: target.buildId, leaseUntil: r.until, host: r.host },
+  };
+}
+
+/**
+ * Takes or renews `p`'s lease on `target` (§6.3) and records it, or refuses with no lease kept:
+ * template_unavailable, no_active_slot (Retry-After), quota_exceeded. Shared by activate and by
+ * activation on first use (§6.4); `reason` is the record's (§7.1).
+ */
+async function takeLease(
+  deps: CpDeps,
+  p: TokenClaims,
+  d0: TemplateDoc,
+  target: TemplateBuild,
+  leaseSeconds: unknown,
+  reason: 'owner' | 'first_use',
+): Promise<{ until: number; host: string | null }> {
+  const { cat, policy, prov } = writable(deps);
   const nowS = seconds(deps);
   const DAY = 86_400;
   const hosts = hostViews(deps);
   const defaultLease =
     Math.max(...hosts.map((h) => deps.hosts!.get(h.id)!.limits.idleLimitSeconds), 0) || 3600;
   const want =
-    typeof b.leaseSeconds === 'number' && Number.isSafeInteger(b.leaseSeconds)
-      ? b.leaseSeconds
+    typeof leaseSeconds === 'number' && Number.isSafeInteger(leaseSeconds)
+      ? leaseSeconds
       : defaultLease;
   if (want < 60 || want > DAY)
     throw new CpError('invalid_request', 'leaseSeconds must be 60-86400 (renew to hold longer)');
@@ -646,17 +667,10 @@ async function activate(ctx: RequestCtx, deps: CpDeps) {
       leaseSeconds: want,
       until: nowS + want,
       ...(pl.placed.get(target.buildId) ? { host: pl.placed.get(target.buildId)! } : {}),
+      ...(reason === 'first_use' ? { reason } : {}),
     },
   });
-  return {
-    status: 200,
-    body: {
-      templateId: d0.id,
-      buildId: target.buildId,
-      leaseUntil: nowS + want,
-      host: pl.placed.get(target.buildId) ?? null,
-    },
-  };
+  return { until: nowS + want, host: pl.placed.get(target.buildId) ?? null };
 }
 
 /** Deactivate (§5.1): drop this subject's lease; the build stays wanted while others hold it. */
@@ -744,7 +758,13 @@ async function resolveForUse(
   deps: CpDeps,
   p: TokenClaims,
   ref: string,
-): Promise<{ id: string; worker: string; buildId: string }> {
+): Promise<{
+  id: string;
+  worker: string;
+  buildId: string;
+  doc: TemplateDoc;
+  build: TemplateBuild;
+}> {
   const at = ref.indexOf('@');
   const colon = at < 0 ? ref.indexOf(':') : -1;
   const id = at >= 0 ? ref.slice(0, at) : colon >= 0 ? ref.slice(0, colon) : ref;
@@ -755,7 +775,48 @@ async function resolveForUse(
   if (!d || !b || b.status !== 'registered' || !b.worker) {
     throw new CpError('unknown_template', 'no such template (GET /v1/templates lists them)');
   }
-  return { id: d.id, worker: b.worker, buildId: b.buildId };
+  return { id: d.id, worker: b.worker, buildId: b.buildId, doc: d, build: b };
+}
+
+/** How long a client waits before retrying a create on a template still activating (§6.4). */
+export const FIRST_USE_RETRY_S = 30;
+
+/**
+ * Activation on first use (§6.4): on a deployment with host agents, a sandbox is created only on
+ * an `active` build. One not active is refused with `409 template_not_active` and Retry-After, and,
+ * unless the client sent `activate: false`, the caller's lease on it is taken first, so the host
+ * agent starts its worker; the retry succeeds once it is attached. No sandbox record is kept while
+ * waiting, so a wait never uses the caller's live-sandbox cap. Without host agents (workers run
+ * by the deployment, SH_TEMPLATE_HOSTS unset) nothing changes: the create succeeds as before.
+ */
+async function requireActive(
+  deps: CpDeps,
+  p: TokenClaims,
+  t: { doc: TemplateDoc; build: TemplateBuild },
+  activate: boolean,
+): Promise<void> {
+  if (hostViews(deps).length === 0) return;
+  const facts = await readinessFacts(deps);
+  const readiness = readinessOf(t.build, facts.nowS, facts.placement, facts.attached);
+  if (readiness === 'active') return;
+  let now = readiness;
+  if (
+    activate &&
+    (readiness === 'inactive' || readiness === 'deactivating' || readiness === 'activating')
+  ) {
+    // Refusals (no_active_slot, quota_exceeded, template_unavailable) answer as they would to activate.
+    await takeLease(deps, p, t.doc, t.build, undefined, 'first_use');
+    now = 'activating';
+  }
+  throw new CpError(
+    'template_not_active',
+    activate
+      ? `template '${t.doc.id}' is ${now}; its activation has started: retry after the wait`
+      : `template '${t.doc.id}' is ${now}; activate it (POST /v1/templates/${t.doc.id}/activate) or retry without activate: false`,
+    undefined,
+    { readiness: now },
+    FIRST_USE_RETRY_S,
+  );
 }
 
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
@@ -875,11 +936,14 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const b = asRecord(ctx.body);
     if (typeof b.template !== 'string')
       throw new CpError('invalid_request', 'template is required');
+    if (b.activate !== undefined && typeof b.activate !== 'boolean')
+      throw new CpError('invalid_request', 'activate must be true or false');
     const template = await resolveForUse(deps, p, b.template);
     if (b.name !== undefined && (typeof b.name !== 'string' || !NAME_RE.test(b.name))) {
       throw new CpError('invalid_request', `name must match ${NAME_RE}`);
     }
     const labels = parseLabels(b.labels);
+    await requireActive(deps, p, template, b.activate !== false);
     const now = seconds(deps);
     const id = sandboxId(deps.newId());
     // Create does no I/O to the worker: the first Exec creates the workspace, and wsk being the

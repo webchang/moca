@@ -180,12 +180,42 @@ export async function cmdTemplates(c: SbxCtx): Promise<number> {
   }
 }
 
+/** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
+export const ACTIVATION_WAIT_MS = 10 * 60_000;
+
+/**
+ * Creates a sandbox, waiting while its template activates (template lifecycle spec §6.4): a
+ * `409 template_not_active` means the control plane has started the activation, so the create is
+ * retried after its Retry-After, saying why, until ACTIVATION_WAIT_MS. Any other refusal is thrown.
+ */
+export async function createWaitingForActivation(
+  c: SbxCtx,
+  body: { template: string; name?: string; labels?: Record<string, string> },
+): Promise<SbxSandbox> {
+  const start = c.rt.now();
+  for (;;) {
+    try {
+      return await c.api.createSandbox(body);
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 409 && err.code === 'template_not_active'))
+        throw err;
+      const left = ACTIVATION_WAIT_MS - (c.rt.now() - start);
+      if (left <= 0) throw err;
+      const waitMs = Math.min(Math.max(1, err.retryAfterS ?? 30) * 1000, left);
+      c.io.err(
+        `template ${sanitizeRemote(body.template)} is activating; retrying in ${Math.ceil(waitMs / 1000)} s`,
+      );
+      await c.rt.sleep(waitMs, c.signal);
+    }
+  }
+}
+
 export async function cmdCreate(
   c: SbxCtx,
   body: { template: string; name?: string; labels?: Record<string, string> },
 ): Promise<number> {
   try {
-    const s = await c.api.createSandbox(body);
+    const s = await createWaitingForActivation(c, body);
     if (c.json) c.io.out(JSON.stringify(s) + '\n');
     else c.io.out(`${sanitizeRemote(s.id)}\n`);
     c.io.err(

@@ -324,6 +324,7 @@ components:
             - policy_refused
             - no_active_slot
             - template_unavailable
+            - template_not_active
             - digest_mismatch
             - bundle_quota_exceeded
             - config_bundle_not_found
@@ -353,7 +354,7 @@ components:
           description: 'sandbox_terminated only: deleted | expired'
         readiness:
           type: string
-          description: "template_unavailable and no_active_slot: the build's readiness"
+          description: "template_unavailable, no_active_slot and template_not_active: the build's readiness"
         rule:
           type: string
           description: |
@@ -2138,6 +2139,14 @@ paths:
       description: |
         Enrolled subjects and admins only. Does no I/O to the worker: the first Exec creates the
         workspace, so a new sandbox always starts empty (SBX0 §5.1).
+
+        Activation on first use (template lifecycle spec §6.4), on a deployment with host agents
+        (SH_TEMPLATE_HOSTS): a sandbox is created only on an `active` build. On one that is not,
+        the create takes the caller's activation lease (as POST /v1/templates/{id}/activate, with
+        its refusals: `409 no_active_slot`, `409 template_unavailable`, `429 quota_exceeded`) and
+        answers `409 template_not_active` with `readiness` and `Retry-After`; retry after the wait.
+        With `activate: false` nothing is started. No sandbox is kept while waiting, so a wait
+        never uses the live-sandbox cap. Without host agents the create succeeds as before.
       security: [{ sessionToken: [] }]
       requestBody:
         required: true
@@ -2147,7 +2156,13 @@ paths:
               type: object
               required: [template]
               properties:
-                template: { type: string, description: a template id from GET /v1/templates }
+                template:
+                  type: string
+                  description: a template from GET /v1/templates, as `id`, `id:tag` or `id@sha256:…`
+                activate:
+                  type: boolean
+                  default: true
+                  description: false to be refused on a build not active without starting its activation (§6.4)
                 name: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
                 labels:
                   type: object
@@ -2169,12 +2184,15 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotEnrolled' }
         '409':
-          description: '`name_conflict`: the caller already has a live sandbox with that name'
+          description: |
+            `name_conflict`: the caller already has a live sandbox with that name;
+            `template_not_active` (Retry-After): the build is not active yet, its activation started
+            unless `activate: false`; `no_active_slot` (Retry-After), `template_unavailable`: as activate
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
-          description: '`quota_exceeded`: per-user or deployment-wide live sandboxes (SBX0 §5.3)'
+          description: '`quota_exceeded`: per-user or deployment-wide live sandboxes (SBX0 §5.3), or the active-template quota on first use'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

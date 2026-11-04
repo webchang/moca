@@ -389,6 +389,15 @@ build that is `inactive` starts its activation (counted against the caller's quo
 does, within its capacity wait, bcebfaf3). An explicit `activate` before a batch avoids the first
 wait; autobench-moca's runner can do either.
 
+**As built (2026-11-04), sandboxes only:** on a deployment with host agents (`SH_TEMPLATE_HOSTS`),
+`POST /v1/sandboxes` on a registered build that is not `active` takes the caller's lease (as
+`activate`, recorded with `reason: first_use`; its refusals `no_active_slot`, `template_unavailable`
+and `quota_exceeded` answer as they would) and answers `409 template_not_active` with `readiness`
+and `Retry-After: 30`; `activate: false` starts nothing. No sandbox record is kept while waiting,
+so a wait never uses the live-sandbox cap. Without host agents nothing changes. `mocactl sbx create`
+and `sbx up` retry it for up to 10 minutes, saying why. Sessions (Moca Pi) are not gated yet: they
+wait for the combined control plane (§4.1).
+
 ## 7. Provenance
 
 ### 7.1 Records and the chain
@@ -600,10 +609,10 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
    refused and detach reports, readiness `activating`/`deactivating`/`unavailable`, and the hosts
    block filled. A build is followed by its handle after registration, and carries `reason`. Not
    yet: installing a worker (G18: its relay token is minted only by `setup.sh`), activation on
-   first use (§6.4) and the session's `409 template_not_active`, the client logs route,
+   the session's `409 template_not_active` (first use is built for sandboxes, §6.4), the client logs route,
    `install-host.sh --host-agent`, and a run on a KVM host.
 6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6). Built with
-   item 5 (leases, limits, aging as leases ending; no eviction), except first use (§6.4).
+   item 5 (leases, limits, aging as leases ending; no eviction); first use for sandboxes (§6.4).
 7. Tracing (§9). **Built:** a sandbox's template reference (`id`, `id:tag`, `id@sha256:…`) resolves
    through the catalog to one registered build at creation, kept for its life, and the Sandbox
    carries `buildId` and `templateManifestHash`; a session records `sandboxBuildId` (its

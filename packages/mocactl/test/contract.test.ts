@@ -263,7 +263,9 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     expect(resolveSchema(list.properties.sandboxes.items)).toEqual(sandbox);
     const templates = responseSchema(openapi.paths['/v1/templates'].get);
     for (const f of SBX_TEMPLATE_READS) {
-      expect(Object.keys(templates.properties.templates.items.properties)).toContain(f);
+      expect(Object.keys(resolveSchema(templates.properties.templates.items).properties)).toContain(
+        f,
+      );
     }
   });
 

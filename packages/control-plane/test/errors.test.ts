@@ -38,6 +38,7 @@ const EXPECTED: Record<CpErrorCode, number> = {
   policy_refused: 422,
   no_active_slot: 409,
   template_unavailable: 409,
+  template_not_active: 409,
   digest_mismatch: 400,
   bundle_quota_exceeded: 429,
   config_bundle_not_found: 404,

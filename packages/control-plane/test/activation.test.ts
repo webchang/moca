@@ -287,6 +287,88 @@ describe('activation (§6.2-§6.4)', () => {
   });
 });
 
+describe('activation on first use (§6.4)', () => {
+  const createSandbox = (d: TestDeps, body: Record<string, unknown>, principal = alice) =>
+    HANDLERS.createSandbox!(ctx({ principal, body }), d);
+  const refusal = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      const x = e as { code: string; extra?: Record<string, string>; retryAfterS?: number };
+      return { code: x.code, readiness: x.extra?.readiness, retryAfterS: x.retryAfterS };
+    }
+    return { code: 'none' };
+  };
+  const leases = async (d: TestDeps, id: string) =>
+    ((await d.templates!.get(id))!.builds[0]!.leases ?? []).filter(
+      (l) => l.until > Math.floor(now / 1000),
+    );
+
+  it('starts the activation and answers 409 template_not_active; the retry creates once active', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    expect(await refusal(() => createSandbox(d, { template: 't1' }))).toEqual({
+      code: 'template_not_active',
+      readiness: 'activating',
+      retryAfterS: 30,
+    });
+    // The lease is the caller's, recorded as first use, and the host is asked to run it.
+    expect((await leases(d, 't1')).map((l) => l.subject)).toEqual([alice.sub]);
+    const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(rec).toMatchObject({ kind: 'activate', body: { reason: 'first_use' } });
+    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+    // No sandbox was kept while waiting.
+    expect(await d.sandboxes!.listByOwner(alice.sub, Math.floor(now / 1000))).toHaveLength(0);
+    // Still activating: the retry waits again, without a second lease.
+    expect((await refusal(() => createSandbox(d, { template: 't1' }))).code).toBe(
+      'template_not_active',
+    );
+    expect(await leases(d, 't1')).toHaveLength(1);
+    attachedNow = ['sbx_t1'];
+    const r = await createSandbox(d, { template: 't1' });
+    expect(r.status).toBe(201);
+    expect((r.body as Body).buildId).toBe(hash('1'));
+  });
+
+  it('with activate: false, answers 409 and starts nothing', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    expect(await refusal(() => createSandbox(d, { template: 't1', activate: false }))).toEqual({
+      code: 'template_not_active',
+      readiness: 'inactive',
+      retryAfterS: 30,
+    });
+    expect(await leases(d, 't1')).toHaveLength(0);
+    expect(await refusal(() => createSandbox(d, { template: 't1', activate: 'no' }))).toMatchObject(
+      { code: 'invalid_request' },
+    );
+  });
+
+  it('answers what activate would: no_active_slot when the host is full', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await activate(d, 't1', bob);
+    expect((await refusal(() => createSandbox(d, { template: 't2' }))).code).toBe('no_active_slot');
+    expect(await leases(d, 't2')).toHaveLength(0);
+  });
+
+  it('changes nothing without host agents: the create succeeds as before', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    d.hosts = undefined;
+    expect((await createSandbox(d, { template: 't1' })).status).toBe(201);
+  });
+});
+
 describe('place, alone', () => {
   const doc = (id: string, h: string, sinceS: number, until = 10_000): TemplateDoc => ({
     schema: 'moca-template/1',
