@@ -105,6 +105,17 @@ Then re-run `install-host.sh` with the new bundle for every worker (step 5 of §
 bundle. The run deletes the static client tokens and removes the relay's harness exec token. **1a
 workspaces are not migrated:** tell 1a users to pull their work out first.
 
+**Redis's image and its data (Valkey, #670).** Since upstream #670 the base runs Valkey 9. Valkey
+9 **cannot read RDB format 12**, which Redis 7.4 writes, so on a namespace that Redis 7.4 ran,
+Valkey's AOF load aborts (`Can't handle RDB format version 12`) and `redis-0` crash-loops, taking
+the control plane down with it (ykt3, 2026-11-04, about 24 min). Until a real migration exists,
+keep such a namespace on Redis 7: set `SBX_REDIS_IMAGE` to the digest it ran, e.g.
+`docker.io/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499`.
+Before any Redis image change, take a copy of `/data` (`BGSAVE`, then `dump.rdb` and
+`appendonlydir`). **The StatefulSet is OrderedReady:** a `redis-0` that crash-loops on the old
+revision is never replaced, so `setup.sh`'s rollout wait times out. Then delete the pod
+(`kubectl -n <ns> delete pod redis-0`; its PVC stays) and re-run `setup.sh`.
+
 **A host bundle change.** Re-run `install-host.sh` with the new worker bundle whenever `setup.sh`
 says so, and `install-host.sh --janitor` with the new janitor bundle after a change to
 `SBX_JANITOR_WAIT_MINUTES`, `SBX_TOKEN_TTL_MINUTES` (its default wait follows the lifetime),
