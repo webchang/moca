@@ -1681,6 +1681,48 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/templates/{id}/builds/{build}/cancel:
+    post:
+      operationId: cancelTemplateBuild
+      summary: Withdraw a build not yet built (the owner)
+      description: |
+        Template lifecycle spec §5.1 (register G22). The template's owner, or an admin, cancels a
+        `queued`, `building` or `probing` build: it becomes `failed` with `reason.step` `cancelled`,
+        and a `build` record (outcome `cancelled`) names who did it. A host agent still building it
+        has its later reports refused, so it never registers. Another subject: `403 forbidden`; an
+        unknown build: `404 template_not_found`; any other status: `400 invalid_request`.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: build, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templateId, build, status]
+                properties:
+                  templateId: { type: string }
+                  build: { type: string, description: the build's handle }
+                  status: { type: string, enum: [failed] }
+        '400':
+          description: '`invalid_request`: the build is not queued, building or probing'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`not_enrolled`, or `forbidden`: not the template's owner"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/policy:
     get:
       operationId: getPolicy

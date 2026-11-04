@@ -687,6 +687,53 @@ async function deactivate(ctx: RequestCtx, deps: CpDeps) {
   return { status: 200, body: { templateId: d0.id, released: dropped } };
 }
 
+/** The statuses an owner may cancel (§5.1): not yet built. */
+const CANCELLABLE = new Set<TemplateBuild['status']>(['queued', 'building', 'probing']);
+
+/**
+ * Cancel (§5.1, register G22): the owner (or an admin) withdraws a build not yet built; it becomes
+ * `failed` with step `cancelled`, and a `build` record says who cancelled it. A host agent still
+ * building it has its later reports refused (a failed build takes none), so it never registers.
+ */
+async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  const { cat, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  if (d0.owner !== p.sub && !isAdmin(p))
+    throw new CpError('forbidden', "only the template's owner cancels its builds");
+  const ref = ctx.params.build ?? '';
+  let cancelled: TemplateBuild | undefined;
+  await cat.update(d0.id, async (cur) => {
+    const x = cur!.builds.find((y) => y.handle === ref || y.buildId === ref);
+    if (!x) throw new CpError('template_not_found', 'no such build of this template');
+    if (!CANCELLABLE.has(x.status))
+      throw new CpError(
+        'invalid_request',
+        `the build is ${x.status}; only a queued, building or probing build is cancelled`,
+      );
+    cancelled = {
+      ...x,
+      status: 'failed',
+      reason: { message: `cancelled by ${p.sub}`, step: 'cancelled' },
+    };
+    return { ...cur!, builds: cur!.builds.map((y) => (y === x ? cancelled! : y)) };
+  });
+  await prov.append({
+    stream: `template/${d0.id}`,
+    kind: 'build',
+    subject: p.sub,
+    body: { handle: cancelled!.handle ?? cancelled!.buildId, outcome: 'cancelled' },
+  });
+  await auditBestEffort(deps, 'template_build_cancelled', d0.id, {
+    subject: p.sub,
+    decision: 'template_build_cancelled',
+  });
+  return {
+    status: 200,
+    body: { templateId: d0.id, build: cancelled!.handle ?? cancelled!.buildId, status: 'failed' },
+  };
+}
+
 /**
  * A sandbox's template reference (§3.2, §4): `id`, `id:tag` or `id@sha256:...`, resolved to one
  * registered build and its worker at creation, and kept for the sandbox's life. A build not
@@ -718,6 +765,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   createTemplate: (ctx, deps) => createBuild(ctx, deps, false),
 
   createTemplateBuild: (ctx, deps) => createBuild(ctx, deps, true),
+  cancelTemplateBuild: cancelBuild,
 
   getPolicy: async (ctx, deps) => {
     requireEnrolled(ctx, deps);

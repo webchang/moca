@@ -123,7 +123,7 @@ never by a person's approval (people still cancel, retire, and reject after the 
 | `built`      | snapshot and probe passed on a host; its build record is in                                                                                                                         | the host agent's report (§7)               |
 | `registered` | the control plane checked the build record against policy (§8.2) and the gate evidence; usable                                                                                      | the control plane, automatically           |
 | `rejected`   | refused by policy at registration (§8.2), with the rule id and reason, or rejected after the fact by an admin (§5.2); a create policy refuses is a `422` and leaves no build (§8.1) | the control plane, automatically; an admin |
-| `failed`     | the build or the probe failed, with `reason {message, step}`, or the owner cancelled a `queued` or `building` build (§5.1)                                                          | the host agent's report; the owner         |
+| `failed`     | the build or the probe failed, with `reason {message, step}`, or the owner cancelled a `queued`, `building` or `probing` build (§5.1)                                               | the host agent's report; the owner         |
 | `retired`    | no new sessions; kept for provenance                                                                                                                                                | the owner, or an admin                     |
 
 A template's own state is its newest build's (`registered` once any build is), so a client polling
@@ -271,7 +271,7 @@ separation (to be checked in code and tests when it is built):
 | `POST /v1/templates/{id}/activate` · `/deactivate`                                    | the owner; `deployment` ones: any client | sets the wanted readiness, within the caller's quota (§6.2); the host agent acts on it (§6)                     |
 | `POST /v1/templates/{id}/tags {tags, build}` · `DELETE /v1/templates/{id}/tags/{tag}` | the owner                                | moves tags onto a registered build, or removes a tag; removing one never deletes the build (adopted from E2B)   |
 | `PATCH /v1/templates/{id} {visibility, description}`                                  | the owner                                | changes them; a record (§7)                                                                                     |
-| `POST /v1/templates/{id}/builds/{build}/cancel`                                       | the owner                                | a `queued` or `building` build → `failed` (`cancelled`)                                                         |
+| `POST /v1/templates/{id}/builds/{build}/cancel`                                       | the owner                                | a `queued`, `building` or `probing` build → `failed` (`cancelled`)                                              |
 | `POST /v1/templates/{id}/retire` · `DELETE /v1/templates/{id}/builds/{build}`         | the owner                                | retires the template (deactivates it), or retires one build; snapshots go when no host needs them; records stay |
 
 A deactivation by a non-owner applies to its own activation only: a `deployment` template stays
@@ -582,8 +582,8 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
    (`template-policy.ts`: M1, M7, M8, M9, the registry allowlist, the envelope, X1 + trusted gate
    records (A23), X10, X11, X12 (fail closed), X14, X15), `422 policy_refused` with `rule`,
    `409 template_exists`, `429 quota_exceeded` with `quota`; `create`, `gate` and `check` records.
-   The repository's SWE-bench example passes the benchmark profile in full. Not yet: retire,
-   cancel, visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
+   The repository's SWE-bench example passes the benchmark profile in full. Cancel built (G22). Not yet: retire,
+   visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2). **Built, first increment:** the host routes (`auth: host`, `SH_TEMPLATE_HOSTS` and
    `SH_HOST_TOKEN_<ID>`; a host reports only for itself) for inventory, claim (oldest first,

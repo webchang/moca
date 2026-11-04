@@ -381,6 +381,15 @@ export const ROUTES: readonly RouteSpec[] = [
     operationId: 'createTemplateBuild',
   },
   {
+    method: 'POST',
+    path: '/v1/templates/{id}/builds/{build}/cancel',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    bodyRequired: false,
+    operationId: 'cancelTemplateBuild',
+  },
+  {
     method: 'GET',
     path: '/v1/policy',
     auth: 'api',

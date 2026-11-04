@@ -200,6 +200,41 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     ).toBe('invalid_request');
   });
 
+  it('lets the owner cancel a build the host is building, and refuses the host its later reports (G22)', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    await HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'building' }), d);
+    const cancel = (principal = alice, ref = build) =>
+      HANDLERS.cancelTemplateBuild!(ctx({ principal, params: { id: ID, build: ref } }), d);
+    expect(await codeOf(() => cancel(bob))).toBe('forbidden');
+    expect(await codeOf(() => cancel(alice, 'b-' + 'f'.repeat(26)))).toBe('template_not_found');
+    expect((await cancel()).body).toMatchObject({ templateId: ID, build, status: 'failed' });
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds[0]).toMatchObject({ status: 'failed', reason: { step: 'cancelled' } });
+    // The host finishes anyway: its report is refused, so the build never registers.
+    expect(
+      await codeOf(() =>
+        HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d),
+      ),
+    ).toBe('invalid_request');
+    // Once failed, it is not cancelled again; and a new create is not a reuse of it.
+    expect(await codeOf(() => cancel())).toBe('invalid_request');
+    const again = await HANDLERS.createTemplate!(
+      ctx({
+        principal: alice,
+        body: { id: ID, image: IMAGE, spec: REST, profile: 'benchmark', gateRecord: GATE },
+      }),
+      d,
+    );
+    expect(again.status).toBe(202);
+    expect(again.body).not.toHaveProperty('reused');
+    // The cancel is on the template's stream, and the chain verifies.
+    const ex = await d.provenance!.export([`template/${ID}`]);
+    expect(verifyExport(ex).ok).toBe(true);
+    expect(ex.records.some((r) => r.kind === 'build' && r.body.outcome === 'cancelled')).toBe(true);
+  });
+
   it('refuses a report for a build another host claimed (a host reports only for itself)', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
