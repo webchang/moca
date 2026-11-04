@@ -215,3 +215,18 @@ export {
   type TemplateCatalog,
   type TemplateDoc,
 } from './template-catalog.js';
+export {
+  DEFAULT_POLICY,
+  POLICY_SCHEMA,
+  checkCreate,
+  policyDigest,
+  policyProblems,
+  registryOf,
+  type CheckResult,
+  type Policy,
+  type PolicyStore,
+  type Profile,
+  type Quota,
+  type RuleResult,
+} from './template-policy.js';
+export { FilePolicyStore } from './template-policy-store.js';

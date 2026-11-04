@@ -542,7 +542,14 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    and the hosts' contents (the host agent, item 5), the logs route (with builds, item 5), builds from
    template records (item 5), and the SBX0 token rules of §4.1 (sandbox routes on harness, with the
    validation deployment).
-4. Create and policy at create (§4, §8.1), quotas (§6.2).
+4. Create and policy at create (§4, §8.1), quotas (§6.2). **Built:** `POST /v1/templates` and
+   `POST /v1/templates/{id}/builds` (202, a `b-<26 hex>` handle, status `queued`), `GET`/`PUT
+/v1/policy` (admin PUT; every change a `policy` record), `GET /v1/quota`; the create-time rules
+   (`template-policy.ts`: M1, M7, M8, M9, the registry allowlist, the envelope, X1 + trusted gate
+   records (A23), X10, X11, X12 (fail closed), X14, X15), `422 policy_refused` with `rule`,
+   `409 template_exists`, `429 quota_exceeded` with `quota`; `create`, `gate` and `check` records.
+   The repository's SWE-bench example passes the benchmark profile in full. Not yet: retire,
+   cancel, visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2).
 6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6).

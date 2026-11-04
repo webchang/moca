@@ -8,7 +8,17 @@ import {
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import type { SandboxConfig } from './sandbox-config.js';
+import type { ProvenanceStore } from './provenance.js';
 import {
+  checkCreate,
+  policyDigest,
+  policyProblems,
+  TEMPLATE_ID_RE,
+  type Policy,
+  type PolicyStore,
+} from './template-policy.js';
+import {
+  TEMPLATE_DOC_SCHEMA,
   MemoryTemplateCatalog,
   resolveBuild,
   type TemplateBuild,
@@ -244,7 +254,254 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
   };
 }
 
+/**
+ * Create (template lifecycle spec §4, §8.1): self-serve, any enrolled client. Needs the stored
+ * catalog and policy (SH_PROVENANCE_DIR); without them the route says so rather than pretending.
+ */
+function writable(deps: CpDeps): {
+  cat: TemplateCatalog & Required<Pick<TemplateCatalog, 'update'>>;
+  policy: PolicyStore;
+  prov: ProvenanceStore;
+} {
+  const cat = deps.templates;
+  if (!cat?.update || !deps.policy || !deps.provenance) {
+    throw new CpError(
+      'invalid_request',
+      'this deployment does not store templates (SH_PROVENANCE_DIR is unset)',
+    );
+  }
+  return {
+    cat: cat as TemplateCatalog & Required<Pick<TemplateCatalog, 'update'>>,
+    policy: deps.policy,
+    prov: deps.provenance,
+  };
+}
+
+const HANDLE_HEX = 26;
+function buildHandle(raw: string): string {
+  const hex = raw.toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (hex.length < HANDLE_HEX) throw new CpError('internal_error', 'id source is too short');
+  return `b-${hex.slice(0, HANDLE_HEX)}`;
+}
+
+/** The quota counters for one subject (§6.2): templates owned, builds queued or building. */
+async function usage(
+  cat: TemplateCatalog,
+  subject: string,
+): Promise<{ templates: number; buildsQueued: number }> {
+  let templates = 0;
+  let buildsQueued = 0;
+  for (const d of await cat.list()) {
+    if (d.owner !== subject) continue;
+    if (d.builds.some((b) => b.status !== 'retired')) templates++;
+    buildsQueued += d.builds.filter((b) => b.status === 'queued' || b.status === 'building').length;
+  }
+  return { templates, buildsQueued };
+}
+
+/**
+ * The shared body of both create routes. `existing`: true for POST /v1/templates/{id}/builds (the
+ * template must exist and be the caller's), false for POST /v1/templates (a new id, or the
+ * caller's own existing one).
+ */
+async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
+  const p = requireEnrolled(ctx, deps);
+  const { cat, policy, prov } = writable(deps);
+  const b = asRecord(ctx.body);
+  const id = existing ? (ctx.params.id ?? '') : typeof b.id === 'string' ? b.id.toLowerCase() : '';
+  const spec = asRecord(b.spec);
+  let gateRecordBytes: Buffer | undefined;
+  if (b.gateRecord !== undefined) {
+    if (typeof b.gateRecord !== 'string') {
+      throw new CpError(
+        'invalid_request',
+        'gateRecord must be the gate record file as a string, byte for byte (its sha256 is what is trusted)',
+      );
+    }
+    gateRecordBytes = Buffer.from(b.gateRecord, 'utf8');
+  }
+  if (b.visibility !== undefined && b.visibility !== 'private' && b.visibility !== 'deployment') {
+    throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
+  }
+  const { policy: pol, record: policyRecord } = await policy.current();
+  const result = checkCreate(
+    {
+      id,
+      image: typeof b.image === 'string' ? b.image : '',
+      spec,
+      ...(typeof b.profile === 'string' ? { profile: b.profile } : {}),
+      ...(gateRecordBytes ? { gateRecordBytes } : {}),
+    },
+    pol,
+  );
+  const stream = `template/${id}`;
+  const checkBody = {
+    policy: policyRecord,
+    profile: result.profile,
+    at: 'create',
+    outcome: result.passed ? 'admitted' : 'refused',
+    results: result.results as unknown as Record<string, unknown>[],
+  };
+  if (!result.passed) {
+    // A refusal of a well-formed id is recorded on its template's stream; an id the rule refuses
+    // has no stream to record on, and is only answered.
+    if (TEMPLATE_ID_RE.test(id))
+      await prov.append({ stream, kind: 'check', subject: 'policy', body: checkBody });
+    const f = result.failed!;
+    throw new CpError('policy_refused', f.message ?? f.rule, undefined, { rule: f.rule });
+  }
+  const now = seconds(deps);
+  const handle = buildHandle(deps.newId());
+  const quota = pol.quota;
+  const doc = await cat.update(id, async (cur) => {
+    if (existing && !cur) throw new CpError('template_not_found', 'no such template');
+    if (cur && cur.owner !== p.sub && !(existing && isAdmin(p))) {
+      // 404 for a private template, 409 for a visible one: never an existence oracle for private.
+      throw cur.visibility === 'private' && !isAdmin(p)
+        ? new CpError('template_not_found', 'no such template')
+        : new CpError('template_exists', `template '${id}' belongs to another subject`);
+    }
+    const u = await usage(cat, p.sub);
+    if (!cur && u.templates >= quota.templates) {
+      throw new CpError(
+        'quota_exceeded',
+        `at most ${quota.templates} templates per subject`,
+        undefined,
+        { quota: 'templates' },
+      );
+    }
+    if (u.buildsQueued >= quota.buildsQueued) {
+      throw new CpError(
+        'quota_exceeded',
+        `at most ${quota.buildsQueued} builds queued per subject`,
+        undefined,
+        { quota: 'buildsQueued' },
+      );
+    }
+    if (gateRecordBytes) await prov.putBlob(gateRecordBytes);
+    const created = await prov.append({
+      stream,
+      kind: 'create',
+      subject: p.sub,
+      body: {
+        image: b.image as string,
+        // A round trip through JSON: what the client sent, as the wire carries it (no undefined).
+        spec: JSON.parse(JSON.stringify(spec)) as Record<string, unknown>,
+        profile: result.profile,
+        handle,
+        ...(result.gateRecordSha256 ? { gate_record_sha256: result.gateRecordSha256 } : {}),
+      },
+    });
+    if (result.gateRecordSha256) {
+      await prov.append({
+        stream,
+        kind: 'gate',
+        subject: p.sub,
+        body: {
+          record_sha256: result.gateRecordSha256,
+          source: pol.trustedGateRecords.includes(result.gateRecordSha256) ? 'trusted' : 'client',
+        },
+      });
+    }
+    await prov.append({ stream, kind: 'check', subject: 'policy', body: checkBody });
+    const build: TemplateBuild = {
+      buildId: handle,
+      handle,
+      status: 'queued',
+      profile: result.profile,
+      worker: '',
+      spec: buildSpec(spec),
+      createdAt: now,
+      provenance: created.digest,
+    };
+    const base: TemplateDoc = cur ?? {
+      schema: TEMPLATE_DOC_SCHEMA,
+      id,
+      owner: p.sub,
+      visibility: (b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment',
+      description: String(spec.description ?? ''),
+      tags: {},
+      builds: [],
+      createdAt: now,
+    };
+    return { ...base, builds: [build, ...base.builds] };
+  });
+  await auditBestEffort(deps, 'template_build_queued', id, {
+    subject: p.sub,
+    decision: 'template_build_queued',
+  });
+  return {
+    status: 202,
+    body: {
+      templateId: doc.id,
+      buildId: null,
+      build: `/v1/templates/${doc.id}/builds/${handle}`,
+      status: 'queued',
+    },
+  };
+}
+
+/** What a build keeps of its spec: the fields a client reads back (§4). */
+function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
+  const n = (v: unknown) => (typeof v === 'number' ? v : undefined);
+  const guest = n(spec.guest_mb ?? spec.guest_ram_mb);
+  return {
+    ...(guest !== undefined ? { guest_mb: guest } : {}),
+    ...(n(spec.vcpus) !== undefined ? { vcpus: n(spec.vcpus) } : {}),
+    ...(n(spec.workspace_mb) !== undefined ? { workspace_mb: n(spec.workspace_mb) } : {}),
+    ...(typeof spec.seed === 'string' ? { seed: spec.seed } : {}),
+    tools: Array.isArray(spec.tools) ? (spec.tools as string[]) : [],
+  };
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
+  createTemplate: (ctx, deps) => createBuild(ctx, deps, false),
+
+  createTemplateBuild: (ctx, deps) => createBuild(ctx, deps, true),
+
+  getPolicy: async (ctx, deps) => {
+    requireEnrolled(ctx, deps);
+    if (!deps.policy)
+      throw new CpError(
+        'invalid_request',
+        'this deployment does not store templates (SH_PROVENANCE_DIR is unset)',
+      );
+    const { policy, record } = await deps.policy.current();
+    return { status: 200, body: { policy, digest: policyDigest(policy), record } };
+  },
+
+  putPolicy: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    if (!isAdmin(p)) throw new CpError('forbidden', 'setting the policy requires the admin role');
+    if (!deps.policy)
+      throw new CpError(
+        'invalid_request',
+        'this deployment does not store templates (SH_PROVENANCE_DIR is unset)',
+      );
+    const bad = policyProblems(ctx.body);
+    if (bad.length) throw new CpError('invalid_request', bad.join('; '));
+    const { policy, record } = await deps.policy.set(ctx.body as Policy, p.sub);
+    await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
+    return { status: 200, body: { policy, digest: policyDigest(policy), record } };
+  },
+
+  getQuota: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    const { cat, policy } = writable(deps);
+    const { policy: pol } = await policy.current();
+    const u = await usage(cat, p.sub);
+    return {
+      status: 200,
+      body: {
+        subject: p.sub,
+        templates: { limit: pol.quota.templates, used: u.templates },
+        buildsQueued: { limit: pol.quota.buildsQueued, used: u.buildsQueued },
+        // Activations (§6) are not built yet: nothing is held, so nothing is used.
+        active: { limit: pol.quota.active, used: 0 },
+      },
+    };
+  },
+
   listTemplates: async (ctx, deps) => {
     const p = requireEnrolled(ctx, deps);
     const docs = await visibleTemplates(deps, p);

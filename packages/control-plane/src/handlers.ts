@@ -1,4 +1,6 @@
 import type { PresenceReader, TemplateCatalog } from './template-catalog.js';
+import type { PolicyStore } from './template-policy.js';
+import type { ProvenanceStore } from './provenance.js';
 import {
   assertValidDigest,
   BundleDigestMismatchError,
@@ -200,6 +202,10 @@ export interface CpDeps {
   templates?: TemplateCatalog;
   /** The relay's presence records, which template readiness is derived from (§3.3). */
   presence?: PresenceReader;
+  /** The deployment's template policy (§8), stored with the catalog; absent without SH_PROVENANCE_DIR. */
+  policy?: PolicyStore;
+  /** The provenance store (§7), when SH_PROVENANCE_DIR is set. */
+  provenance?: ProvenanceStore;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
 }

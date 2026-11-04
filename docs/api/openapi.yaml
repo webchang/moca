@@ -72,6 +72,87 @@ components:
         type: string
         pattern: '^sbx-[0-9a-f]{26}$'
   schemas:
+    TemplateCreate:
+      type: object
+      required: [image, spec]
+      properties:
+        id: { type: string, description: 'the template id (lowercased); ignored on /{id}/builds' }
+        image: { type: string, description: 'repository@sha256:<64 hex>, from an allowed registry' }
+        spec:
+          type: object
+          description: |
+            the template spec template-build.sh reads (deploy/sbx/template-onboarding/ONBOARDING.md):
+            guest_mb (or guest_ram_mb), vcpus, workspace_mb?, egress, seed, probe, tools,
+            description, and optionally guest_home, skip_git_identity_check, guest_home_gitconfig,
+            probe_status, source_record_digest
+        profile: { type: string, description: a policy profile; the policy's default when absent }
+        gateRecord:
+          type: string
+          description: the image's gate record file, byte for byte (its sha256 is what the policy trusts)
+        visibility: { type: string, enum: [private, deployment] }
+    TemplateQueued:
+      type: object
+      required: [templateId, buildId, build, status]
+      properties:
+        templateId: { type: string }
+        buildId: { type: 'null', description: set once built (the manifest hash) }
+        build:
+          { type: string, description: the build to follow (its provisional handle b-<26 hex>) }
+        status: { type: string, enum: [queued] }
+    LimitUse:
+      type: object
+      required: [limit, used]
+      properties:
+        limit: { type: integer }
+        used: { type: integer }
+    Policy:
+      type: object
+      description: The template policy (template lifecycle spec §8); schema moca-template-policy/1
+      required: [schema, profiles, defaultProfile, allowedRegistries, trustedGateRecords, quota]
+      properties:
+        schema: { type: string, enum: [moca-template-policy/1] }
+        profiles:
+          type: object
+          additionalProperties:
+            type: object
+            required: [requires, envelope]
+            properties:
+              requires: { type: array, items: { type: string }, description: gating rule ids }
+              envelope:
+                type: object
+                required: [maxGuestMb, maxVcpus, maxWorkspaceMb]
+                properties:
+                  maxGuestMb: { type: integer }
+                  maxVcpus: { type: integer }
+                  maxWorkspaceMb: { type: integer }
+                  exact:
+                    type: object
+                    properties:
+                      guestMb: { type: integer }
+                      vcpus: { type: integer }
+        defaultProfile: { type: string }
+        allowedRegistries:
+          type: array
+          items: { type: string }
+          description: registry hosts; `<default>` for a reference with no host
+        trustedGateRecords:
+          type: array
+          items: { type: string }
+          description: sha256 digests of the gate records the benchmark profile trusts
+        quota:
+          type: object
+          required: [templates, buildsQueued, active]
+          properties:
+            templates: { type: integer }
+            buildsQueued: { type: integer }
+            active: { type: integer }
+    PolicyView:
+      type: object
+      required: [policy, digest, record]
+      properties:
+        policy: { $ref: '#/components/schemas/Policy' }
+        digest: { type: string }
+        record: { type: string, description: the provenance policy record's digest }
     Template:
       type: object
       description: A template (template lifecycle spec §3.2, §4)
@@ -181,6 +262,8 @@ components:
             - quota_exceeded
             - unknown_template
             - template_not_found
+            - template_exists
+            - policy_refused
             - digest_mismatch
             - bundle_quota_exceeded
             - config_bundle_not_found
@@ -1267,6 +1350,57 @@ paths:
                             floorGb: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotEnrolled' }
+    post:
+      operationId: createTemplate
+      summary: Create a template (or a new build of your own), self-serve; policy decides
+      description: |
+        Template lifecycle spec §4, §8.1. Any enrolled client (sandbox profile) or logged-in
+        subject (harness profile). Needs SH_PROVENANCE_DIR (else `400 invalid_request`). The create
+        is checked against the deployment's policy (GET /v1/policy) before anything is queued: a
+        refusal is `422 policy_refused` with `rule`, the gating rule's id (governance
+        GATING-RULES.md), and is recorded. Ids are unique per deployment: another subject's id is
+        `409 template_exists` (`404 template_not_found` when it is private). Over a quota:
+        `429 quota_exceeded` with `quota` (`templates` or `buildsQueued`). The build is queued for
+        a host agent (not built yet): follow it at `build`.
+      security: [{ sessionToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateCreate' }
+      responses:
+        '202':
+          description: queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateQueued' }
+        '400':
+          description: '`invalid_request` (also: this deployment stores no templates)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotEnrolled' }
+        '404':
+          description: "`template_not_found`: another subject's private template"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`template_exists`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`policy_refused`, with `rule`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: '`quota_exceeded`, with `quota`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/templates/{id}:
     get:
       operationId: getTemplate
@@ -1314,6 +1448,53 @@ paths:
         '403': { $ref: '#/components/responses/NotEnrolled' }
         '404':
           description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    post:
+      operationId: createTemplateBuild
+      summary: A new build of your own template (a new image or spec); as POST /v1/templates
+      description: |
+        The template must exist (`404 template_not_found`) and be the caller's
+        (`409 template_exists`); otherwise exactly POST /v1/templates, the body's `id` ignored.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateCreate' }
+      responses:
+        '202':
+          description: queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateQueued' }
+        '400':
+          description: '`invalid_request`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotEnrolled' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`template_exists`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`policy_refused`, with `rule`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: '`quota_exceeded`, with `quota`'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1378,6 +1559,79 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/policy:
+    get:
+      operationId: getPolicy
+      summary: The deployment's template policy (profiles, envelope, registries, trusted gate records, quotas)
+      description: |
+        Template lifecycle spec §8. Its `record` is the provenance `policy` record every `check`
+        cites; `digest` is the sha256 of the policy itself. Needs SH_PROVENANCE_DIR.
+      security: [{ sessionToken: [] }]
+      responses:
+        '200':
+          description: the policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyView' }
+        '400':
+          description: '`invalid_request`: this deployment stores no templates'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotEnrolled' }
+    put:
+      operationId: putPolicy
+      summary: Set the template policy (admin); recorded
+      security: [{ sessionToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Policy' }
+      responses:
+        '200':
+          description: the policy as set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyView' }
+        '400':
+          description: '`invalid_request`: the policy is malformed (each problem named)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`forbidden` (not an admin) or `not_enrolled`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/quota:
+    get:
+      operationId: getQuota
+      summary: The caller's template quotas and use (§6.2)
+      description: '`active.used` is 0 until activation (§6) exists. Needs SH_PROVENANCE_DIR.'
+      security: [{ sessionToken: [] }]
+      responses:
+        '200':
+          description: limits and use
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subject, templates, buildsQueued, active]
+                properties:
+                  subject: { type: string }
+                  templates: { $ref: '#/components/schemas/LimitUse' }
+                  buildsQueued: { $ref: '#/components/schemas/LimitUse' }
+                  active: { $ref: '#/components/schemas/LimitUse' }
+        '400':
+          description: '`invalid_request`: this deployment stores no templates'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotEnrolled' }
   /v1/sandboxes:
     description: |
       Sandbox service control planes only (`SH_ROUTE_PROFILE=sandbox`); a MOCA control plane answers

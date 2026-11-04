@@ -1,4 +1,6 @@
 import { ProvenanceStore } from './provenance.js';
+import { FilePolicyStore } from './template-policy-store.js';
+import type { PolicyStore } from './template-policy.js';
 import {
   FileTemplateCatalog,
   redisPresenceReader,
@@ -422,13 +424,17 @@ export function redisClientOptions(url: string) {
 export function templateCatalogFromEnv(
   env: NodeJS.ProcessEnv,
   config: CpConfig,
-): { templates?: TemplateCatalog } {
+): { templates?: TemplateCatalog; policy?: PolicyStore; provenance?: ProvenanceStore } {
   const dir = env.SH_PROVENANCE_DIR;
   if (!dir) return {};
   if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
   const declared = config.sandbox?.templates ?? config.sessionTemplates ?? [];
   const provenance = new ProvenanceStore({ dir });
-  return { templates: new FileTemplateCatalog({ dir, declared, provenance }) };
+  return {
+    templates: new FileTemplateCatalog({ dir, declared, provenance }),
+    policy: new FilePolicyStore({ dir, provenance }),
+    provenance,
+  };
 }
 
 export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {

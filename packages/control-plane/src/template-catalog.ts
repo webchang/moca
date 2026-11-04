@@ -3,6 +3,7 @@ import { accessSync, constants, mkdirSync } from 'node:fs';
 import { open as openFile, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ProvenanceStore } from './provenance.js';
+import { SubjectQueue } from './subject-document.js';
 import type { SandboxTemplate } from './sandbox-config.js';
 
 /**
@@ -38,6 +39,11 @@ export interface BuildSpec {
 }
 
 export interface TemplateBuild {
+  /**
+   * The provisional handle `b-<26 hex>` a queued build is followed by (§4), until it is built and
+   * its buildId becomes its manifest hash; equal to buildId for an imported build.
+   */
+  handle?: string;
   /** `sha256:<manifest hash>`, or `imported:<12 hex>` for a build imported from the env list. */
   buildId: string;
   status: OnboardingStatus;
@@ -74,6 +80,15 @@ export interface TemplateDoc {
 export interface TemplateCatalog {
   list(): Promise<TemplateDoc[]>;
   get(id: string): Promise<TemplateDoc | null>;
+  /**
+   * Writes a template (a new one, or one with a new build), serialized per id. `mutate` receives
+   * the current document (null when there is none) and returns the one to write, or throws to
+   * refuse; the write happens only when it returns. Absent on a catalog that cannot store.
+   */
+  update?(
+    id: string,
+    mutate: (cur: TemplateDoc | null) => Promise<TemplateDoc>,
+  ): Promise<TemplateDoc>;
 }
 
 /** The build a reference names: `id` (tag default), `id:tag`, or `id@sha256:...` (§3.2). */
@@ -135,6 +150,7 @@ export class MemoryTemplateCatalog implements TemplateCatalog {
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
 export class FileTemplateCatalog implements TemplateCatalog {
+  private readonly queue = new SubjectQueue();
   private readonly dir: string;
   private readonly declared: SandboxTemplate[];
   private readonly provenance: ProvenanceStore;
@@ -256,6 +272,21 @@ export class FileTemplateCatalog implements TemplateCatalog {
   async get(id: string): Promise<TemplateDoc | null> {
     await this.ensure();
     return this.readFile(id);
+  }
+
+  async update(
+    id: string,
+    mutate: (cur: TemplateDoc | null) => Promise<TemplateDoc>,
+  ): Promise<TemplateDoc> {
+    if (!ID_RE.test(id)) throw new Error(`template id ${id} is not valid`);
+    await this.ensure();
+    return this.queue.run(id, async () => {
+      const next = await mutate(await this.readFile(id));
+      if (next.id !== id || next.schema !== TEMPLATE_DOC_SCHEMA)
+        throw new Error('catalog update changed the id');
+      await this.write(next);
+      return next;
+    });
   }
 }
 
