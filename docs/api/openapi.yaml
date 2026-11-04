@@ -1773,8 +1773,11 @@ paths:
   /v1/quota:
     get:
       operationId: getQuota
-      summary: The caller's template quotas and use (§6.2)
-      description: '`active.used` is 0 until activation (§6) exists. Needs SH_PROVENANCE_DIR.'
+      summary: The caller's template quotas and use (§6.2), and the live-sandbox cap
+      description: |
+        `active.used` counts the builds the caller holds a live lease on (§6.3). On the sandbox
+        profile, `sandboxes` is SBX0's per-subject cap on live sandboxes (`SH_SANDBOX_MAX_PER_SUBJECT`)
+        and the caller's live ones (register G27); absent elsewhere. Needs SH_PROVENANCE_DIR.
       security: [{ sessionToken: [] }]
       responses:
         '200':
@@ -1789,6 +1792,7 @@ paths:
                   templates: { $ref: '#/components/schemas/LimitUse' }
                   buildsQueued: { $ref: '#/components/schemas/LimitUse' }
                   active: { $ref: '#/components/schemas/LimitUse' }
+                  sandboxes: { $ref: '#/components/schemas/LimitUse' }
         '400':
           description: '`invalid_request`: this deployment stores no templates'
           content:

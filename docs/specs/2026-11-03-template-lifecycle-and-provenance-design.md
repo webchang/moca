@@ -217,7 +217,7 @@ Each build carries **its own spec, seed included**: a client that runs the seed 
 | `GET /v1/templates/{id}/builds/{build}`                                        | one build: `status` (§3.3), `readiness`, the policy result (each rule checked, passed or failed), its record chain (§7), and on failure or rejection `reason {message, step, rule?}` |
 | `GET /v1/templates/{id}/builds/{build}/logs?logsOffset=0&limit=100&level=warn` | `logEntries [{timestamp, level, step, message}]`, paged by offset, at most 100 a page; reported by the build host, stored with its record                                            |
 | `GET /v1/templates/{id}/tags`                                                  | each tag and the build it points to, with when it was assigned and by whom                                                                                                           |
-| `GET /v1/quota`                                                                | the caller's quotas and use: templates, builds queued, active templates (§6.2)                                                                                                       |
+| `GET /v1/quota`                                                                | the caller's quotas and use: templates, builds queued, active templates (§6.2); on the sandbox profile, live sandboxes (G27)                                                         |
 | `GET /v1/policy`                                                               | the deployment's policy profiles: each one's rules, size envelope, allowed registries, trusted gate-record sources, and the policy's digest (§8)                                     |
 
 plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600, "disk": {"freeGb": 140, "floorGb": 60}}]}`
@@ -582,7 +582,7 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
    (`template-policy.ts`: M1, M7, M8, M9, the registry allowlist, the envelope, X1 + trusted gate
    records (A23), X10, X11, X12 (fail closed), X14, X15), `422 policy_refused` with `rule`,
    `409 template_exists`, `429 quota_exceeded` with `quota`; `create`, `gate` and `check` records.
-   The repository's SWE-bench example passes the benchmark profile in full. Cancel built (G22). Not yet: retire,
+   The repository's SWE-bench example passes the benchmark profile in full. Cancel built (G22); the quota shows active leases and the live-sandbox cap (G27). Not yet: retire,
    visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2). **Built, first increment:** the host routes (`auth: host`, `SH_TEMPLATE_HOSTS` and

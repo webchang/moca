@@ -798,14 +798,26 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const { cat, policy } = writable(deps);
     const { policy: pol } = await policy.current();
     const u = await usage(cat, p.sub);
+    const nowS = seconds(deps);
+    // Builds this subject holds a live lease on (§6.3), as activate counts them.
+    const active = (await cat.list())
+      .flatMap((d) => d.builds)
+      .filter((x) => liveLeases(x, nowS).some((l) => l.subject === p.sub)).length;
+    // SBX0's live-sandbox cap (register G27): shown where it applies, so a client sees it before
+    // a create is refused by it.
+    let sandboxes: { limit: number; used: number } | undefined;
+    if (deps.config.sandbox && deps.sandboxes) {
+      const live = (await deps.sandboxes.listByOwner(p.sub, nowS)).filter((r) => isLive(r, nowS));
+      sandboxes = { limit: deps.config.sandbox.maxPerSubject, used: live.length };
+    }
     return {
       status: 200,
       body: {
         subject: p.sub,
         templates: { limit: pol.quota.templates, used: u.templates },
         buildsQueued: { limit: pol.quota.buildsQueued, used: u.buildsQueued },
-        // Activations (§6) are not built yet: nothing is held, so nothing is used.
-        active: { limit: pol.quota.active, used: 0 },
+        active: { limit: pol.quota.active, used: active },
+        ...(sandboxes ? { sandboxes } : {}),
       },
     };
   },

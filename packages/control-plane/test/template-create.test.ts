@@ -303,6 +303,47 @@ describe('policy and quota routes', () => {
     });
     const qb = (await HANDLERS.getQuota!(ctx({ principal: bob }), d)).body as Body;
     expect(qb.templates.used).toBe(0);
+    // The sandbox profile: its live-sandbox cap is shown, nothing used yet.
+    expect(q.sandboxes).toEqual({ limit: 3, used: 0 });
+  });
+
+  it('counts live leases in active.used, and shows the live-sandbox cap where it applies (G27)', async () => {
+    const d = stored();
+    await create(d);
+    await d.templates!.update!(ID, async (cur) => ({
+      ...cur!,
+      builds: cur!.builds.map((x) => ({
+        ...x,
+        status: 'registered' as const,
+        leases: [
+          { subject: alice.sub, until: NOW_MS / 1000 + 600 },
+          { subject: bob.sub, until: NOW_MS / 1000 - 1 },
+        ],
+      })),
+    }));
+    const nowS = NOW_MS / 1000;
+    const rec = (id: string, expiresAt: number) => ({
+      id,
+      owner: alice.sub,
+      tenant: alice.sub,
+      name: '',
+      template: 'default',
+      worker: 'sbx_default',
+      wsk: id,
+      labels: {},
+      createdAt: nowS - 120,
+      expiresAt,
+    });
+    const limits = { perSubject: 3, total: 40, retentionS: 3600 };
+    await d.sandboxes!.create(rec('sbx-live', nowS + 60), limits, nowS - 120);
+    await d.sandboxes!.create(rec('sbx-ended', nowS - 60), limits, nowS - 120);
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.active.used).toBe(1);
+    expect(q.sandboxes).toEqual({ limit: 3, used: 1 });
+    // bob's lease has run out.
+    expect(((await HANDLERS.getQuota!(ctx({ principal: bob }), d)).body as Body).active.used).toBe(
+      0,
+    );
   });
 });
 
