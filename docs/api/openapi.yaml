@@ -1457,7 +1457,8 @@ paths:
         GATING-RULES.md), and is recorded. Ids are unique per deployment: another subject's id is
         `409 template_exists` (`404 template_not_found` when it is private). Over a quota:
         `429 quota_exceeded` with `quota` (`templates` or `buildsQueued`). The build is queued for
-        a host agent (not built yet): follow it at `build`.
+        a host agent (deploy/sbx/host-agent.sh), which builds it and reports it; policy then registers
+        or rejects it: follow it at `build`.
       security: [{ sessionToken: [] }]
       requestBody:
         required: true

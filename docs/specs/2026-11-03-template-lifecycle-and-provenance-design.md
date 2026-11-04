@@ -2,7 +2,8 @@
 
 Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
 templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
-Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream
+Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
+implemented on the branch (see §11), the validation (item 8) pending
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -345,7 +346,8 @@ guard.
 **Per subject** (new in 0.4, A22): quotas an admin sets, with a deployment default:
 `templates` (owned, not retired), `buildsQueued` (queued or building at once), `active` (templates
 the subject holds active at once). An activation over the subject's `active` quota replaces that
-subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded`. A
+subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded` (as
+built: refused, `429 quota_exceeded` with `quota: active`; see §6.3). A
 create over `templates` or `buildsQueued` is `429 quota_exceeded` with `Retry-After` for the latter.
 Build claims take subjects in turn, so one subject's batch of 50 does not hold every slot.
 
@@ -366,6 +368,11 @@ Build claims take subjects in turn, so one subject's batch of 50 does not hold e
   subject's own oldest. If no build is free, the activation is refused (`409 no_active_slot`), never
   served by evicting a held one: a batch's waits then measure the host's capacity, not its
   neighbours.
+- **As built (item 5, c5025b05):** a build is wanted active only while a lease stands, so an
+  unleased build is not kept running, and aging is a lease running out. That makes the
+  `lastUsedAt` aging and the replacement of idle unleased builds above moot: no build stays active
+  without a lease to be replaced. Over the subject's `active` quota the activation is refused
+  (`429 quota_exceeded`, `quota: active`); replacing the subject's own oldest is **not built**.
 - **Live sessions:** a build is never stopped under a live session; `deactivating` drains (no new
   sessions, existing ones finish or expire). If every active build on every holding host has live
   sessions, the activation waits (`activating`, `Retry-After`) or is refused with `409 no_active_slot`.
@@ -538,10 +545,10 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    agent reports), `/{id}`, `/builds`, `/builds/{build}`, `/tags`, on **both** profiles (§4.1);
    `404 template_not_found`; readiness `active`/`inactive` from the relay's presence (`unknown` when
    unreadable); `lastUsedAt` and `capacity.inUse` from sandbox records on the sandbox profile (null on
-   the harness profile until `use` records exist). Not yet: `activating`/`deactivating`/`unavailable`
-   and the hosts' contents (the host agent, item 5), the logs route (with builds, item 5), builds from
-   template records (item 5), and the SBX0 token rules of §4.1 (sandbox routes on harness, with the
-   validation deployment).
+   the harness profile until `use` records exist). The transitional readiness states, the hosts'
+   contents and builds from template records came with item 5. Not yet: the client logs route, and
+   the combined harness-and-sandbox control plane of §4.1 with SBX0's token rules (deferred: window 1
+   runs on the sandbox profile, the user's and autobench-moca's choice, 2026-11-04).
 4. Create and policy at create (§4, §8.1), quotas (§6.2). **Built:** `POST /v1/templates` and
    `POST /v1/templates/{id}/builds` (202, a `b-<26 hex>` handle, status `queued`), `GET`/`PUT
 /v1/policy` (admin PUT; every change a `policy` record), `GET /v1/quota`; the create-time rules
@@ -575,7 +582,11 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    carries `buildId` and `templateManifestHash`; a session records `sandboxBuildId` (its
    template's default build at creation; register G19: turns are routed by template, not build).
    Not yet: `use` records.
-8. The validation (§10).
+8. The validation (§10). **Window 1** (decided 2026-11-04): stock agents only, on the SBX0 sandbox
+   profile with `setup.sh SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS=bm1` (a7eca0a7) and a control-plane
+   image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers
+   pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
+   combined control plane.
 
 ## 12. Decisions
 
