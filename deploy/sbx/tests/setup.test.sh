@@ -893,3 +893,16 @@ for r in 'export SBX_TEMPLATE_STORE=2 => SBX_TEMPLATE_STORE must be unset, 0 or 
   ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail "changed something before refusing: $bad"
 done
 pass 'refuses a bad store switch, hosts without the store, a bad or repeated host id'
+
+# 16. SBX_REDIS_IMAGE: Redis 7 for data a Redis 7.4 wrote (Valkey 9 cannot read RDB 12; ykt3, 2026-11-04).
+reset_state
+R7='docker.io/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499'
+run_setup export SBX_REDIS_IMAGE="$R7" || fail "SBX_REDIS_IMAGE run failed: $(cat "$TMP/out")"
+render
+grep -q 'image: docker.io/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499' "$TMP/render.yaml" || fail 'redis does not render as the pinned Redis 7'
+! grep -q 'valkey/valkey' "$TMP/render.yaml" || fail 'valkey is still rendered with SBX_REDIS_IMAGE set'
+reset_state
+! run_setup export SBX_REDIS_IMAGE=docker.io/redis:7-alpine || fail 'accepted an unpinned SBX_REDIS_IMAGE'
+grep -q 'SBX_REDIS_IMAGE must be pinned by digest' "$TMP/out" || fail 'the refusal does not say why'
+! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something before refusing SBX_REDIS_IMAGE'
+pass 'SBX_REDIS_IMAGE renders Redis by digest in place of Valkey; an unpinned one is refused before anything is applied'
