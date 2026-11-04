@@ -176,7 +176,8 @@ handle redirects to it. A create that matches an existing registered build (§3.
 (queued to built) answers `202` with that build and `reused: true`, and queues nothing. As built
 (G21): the match is the image, the spec as sent, the profile and the gate record's sha256 on the
 caller's own template; the builder is not compared (one deployment's hosts build with one builder),
-and a failed or rejected build is never reused.
+a failed or rejected build is never reused, and on a deployment with host agents a registered
+build is reused only while a host reports holding its snapshot (G29).
 
 **Reads (any enrolled client; `private` templates only to their owner and admins).**
 `GET /v1/templates` keeps today's fields and adds, per template, its owner, tags and builds:

@@ -381,7 +381,9 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     // §3.2: the same inputs are the same build. One registered, or still on its way there, is
     // answered instead of a second build (register G21: a duplicate create queued one, and both
     // registered under one manifest hash).
-    reused = cur?.builds.find((x) => REUSABLE.has(x.status) && buildReuseKey(x) === want);
+    reused = cur?.builds.find(
+      (x) => REUSABLE.has(x.status) && buildReuseKey(x) === want && stillHeld(deps, x),
+    );
     if (reused) return cur!;
     const u = await usage(cat, p.sub);
     if (!cur && u.templates >= quota.templates) {
@@ -512,6 +514,18 @@ function reuseKey(
     profile,
     gate: gateRecordSha256 ?? null,
   });
+}
+
+/**
+ * Whether a registered build's snapshot still exists somewhere (register G29): on a deployment with
+ * host agents, a host must report holding it, or a create would be answered with a build no host
+ * can run (its snapshot removed after a window). A build on its way has no snapshot yet and is
+ * always reused. Right after a restart no host has reported, so a create builds again: a duplicate
+ * build, never a wrong answer.
+ */
+function stillHeld(deps: CpDeps, x: TemplateBuild): boolean {
+  if (x.status !== 'registered' || !deps.hosts) return true;
+  return deps.hosts.all().some(([, h]) => h.holds[x.buildId] !== undefined);
 }
 
 /** A stored build's reuse key; none for an imported build (it has no request). */

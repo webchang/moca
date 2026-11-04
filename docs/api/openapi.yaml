@@ -124,7 +124,7 @@ components:
           description: |
             true when the create matched a build of the same inputs (image, spec, profile, gate record's
             sha256) that is registered or on its way there (§3.2): that build is answered, and no second
-            one is queued. Absent for a new build.
+            one is queued. A registered build counts only while a host holds its snapshot (G29). Absent for a new build.
     LimitUse:
       type: object
       required: [limit, used]
