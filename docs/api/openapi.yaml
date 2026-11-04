@@ -379,6 +379,16 @@ components:
             the sandbox template the session runs on (session-templates spec §3.3): present only on
             a deployment that declares templates (SH_SANDBOX_TEMPLATES); null there for a session
             with none, or whose template is no longer declared
+        sandboxBuildId:
+          type: [string, 'null']
+          description: |
+            with sandboxTemplate: the build its default tag named when the session was created
+            (template lifecycle spec §9); null without a template catalog. Turns are routed by
+            template, not build: with two builds of one template active, a turn may run on
+            either (register G19)
+        templateManifestHash:
+          type: [string, 'null']
+          description: with sandboxTemplate, the manifest hash of sandboxBuildId; null for an imported build
         model:
           type: [string, 'null']
           description: |
@@ -447,7 +457,20 @@ components:
       type: object
       description: A sandbox (SBX0 §5.1). Times are epoch seconds.
       required:
-        [id, owner, name, template, state, reason, createdAt, expiresAt, terminatedAt, labels]
+        [
+          id,
+          owner,
+          name,
+          template,
+          buildId,
+          templateManifestHash,
+          state,
+          reason,
+          createdAt,
+          expiresAt,
+          terminatedAt,
+          labels,
+        ]
       additionalProperties: false
       properties:
         id:
@@ -460,6 +483,18 @@ components:
           pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
           description: unique among the owner's live sandboxes; null when unnamed
         template: { type: string }
+        buildId:
+          type: [string, 'null']
+          description: |
+            the build the template reference (id, id:tag or id@sha256:...) resolved to at creation,
+            kept for the sandbox's life (template lifecycle spec §9); null on a sandbox created
+            before tracing
+        templateManifestHash:
+          type: [string, 'null']
+          description: |
+            the snapshot's manifest hash (the build id of a built build); null for a template
+            imported from SH_SANDBOX_TEMPLATES, which names no snapshot. A run's result traces:
+            run -> manifest hash -> build record -> gate record
         state: { type: string, enum: [ready, terminated] }
         reason:
           type: [string, 'null']

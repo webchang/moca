@@ -570,7 +570,11 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
    `install-host.sh --host-agent`, and a run on a KVM host.
 6. Activation by the owner, the limits, aging, replacement and first use (§5.1, §6). Built with
    item 5 (leases, limits, aging as leases ending; no eviction), except first use (§6.4).
-7. Tracing (§9).
+7. Tracing (§9). **Built:** a sandbox's template reference (`id`, `id:tag`, `id@sha256:…`) resolves
+   through the catalog to one registered build at creation, kept for its life, and the Sandbox
+   carries `buildId` and `templateManifestHash`; a session records `sandboxBuildId` (its
+   template's default build at creation; register G19: turns are routed by template, not build).
+   Not yet: `use` records.
 8. The validation (§10).
 
 ## 12. Decisions

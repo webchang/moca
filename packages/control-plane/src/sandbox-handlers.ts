@@ -107,6 +107,10 @@ function sandboxBody(v: SandboxView) {
     owner: v.owner,
     name: v.name || null,
     template: v.template,
+    // The exact build it runs on (template lifecycle spec §9): its manifest hash when the build has
+    // one; null on a record from before tracing.
+    buildId: v.buildId ?? null,
+    templateManifestHash: v.buildId?.startsWith('sha256:') ? v.buildId : null,
     state: v.state,
     reason: v.reason ?? null,
     createdAt: v.createdAt,
@@ -625,6 +629,30 @@ async function deactivate(ctx: RequestCtx, deps: CpDeps) {
   return { status: 200, body: { templateId: d0.id, released: dropped } };
 }
 
+/**
+ * A sandbox's template reference (§3.2, §4): `id`, `id:tag` or `id@sha256:...`, resolved to one
+ * registered build and its worker at creation, and kept for the sandbox's life. A build not
+ * `active` is not refused here (its first Exec waits on the relay, as before); activation on first
+ * use (§6.4) is not built.
+ */
+async function resolveForUse(
+  deps: CpDeps,
+  p: TokenClaims,
+  ref: string,
+): Promise<{ id: string; worker: string; buildId: string }> {
+  const at = ref.indexOf('@');
+  const colon = at < 0 ? ref.indexOf(':') : -1;
+  const id = at >= 0 ? ref.slice(0, at) : colon >= 0 ? ref.slice(0, colon) : ref;
+  const r =
+    at >= 0 ? { build: ref.slice(at + 1) } : colon >= 0 ? { tag: ref.slice(colon + 1) } : {};
+  const d = await catalog(deps).get(id);
+  const b = d && canSee(d, p) ? resolveBuild(d, r) : null;
+  if (!d || !b || b.status !== 'registered' || !b.worker) {
+    throw new CpError('unknown_template', 'no such template (GET /v1/templates lists them)');
+  }
+  return { id: d.id, worker: b.worker, buildId: b.buildId };
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
   activateTemplate: activate,
   deactivateTemplate: deactivate,
@@ -729,10 +757,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const b = asRecord(ctx.body);
     if (typeof b.template !== 'string')
       throw new CpError('invalid_request', 'template is required');
-    const template = cfg.templates.find((t) => t.id === b.template);
-    if (!template) {
-      throw new CpError('unknown_template', 'no such template (GET /v1/templates lists them)');
-    }
+    const template = await resolveForUse(deps, p, b.template);
     if (b.name !== undefined && (typeof b.name !== 'string' || !NAME_RE.test(b.name))) {
       throw new CpError('invalid_request', `name must match ${NAME_RE}`);
     }
@@ -748,6 +773,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       name: (b.name as string | undefined) ?? '',
       template: template.id,
       worker: template.worker,
+      buildId: template.buildId,
       wsk: id,
       labels,
       createdAt: now,

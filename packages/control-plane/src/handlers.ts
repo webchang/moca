@@ -411,7 +411,15 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     // Shown only on a deployment that declares templates, so a view elsewhere is unchanged.
     // Shown wherever the session named one, so a dropped template is visible too (it fails closed).
     ...(deps.config.sessionTemplates || rec.sandboxTemplate
-      ? { sandboxTemplate: rec.sandboxTemplate || null }
+      ? {
+          sandboxTemplate: rec.sandboxTemplate || null,
+          // Template lifecycle spec §9: the build the template resolved to at creation (G19: not
+          // enforced by routing; a sandbox's buildId is).
+          sandboxBuildId: rec.sandboxBuildId || null,
+          templateManifestHash: rec.sandboxBuildId?.startsWith('sha256:')
+            ? rec.sandboxBuildId
+            : null,
+        }
       : {}),
     model: rec.model || null,
   };
@@ -746,6 +754,15 @@ export const HANDLERS: Record<string, Handler> = {
       );
     }
     const sandboxTemplate = requestedTemplate ?? '';
+    // The build its default tag names now (§9), from the catalog when there is one.
+    let sandboxBuildId = '';
+    if (sandboxTemplate && deps.templates) {
+      const doc = await deps.templates.get(sandboxTemplate).catch(() => null);
+      const def = doc?.tags.default
+        ? doc.builds.find((x) => x.buildId === doc.tags.default)
+        : undefined;
+      if (def?.status === 'registered') sandboxBuildId = def.buildId;
+    }
 
     if (configRef) {
       let found: boolean;
@@ -784,6 +801,7 @@ export const HANDLERS: Record<string, Handler> = {
       configRef,
       sandboxTier,
       ...(sandboxTemplate ? { sandboxTemplate } : {}),
+      ...(sandboxBuildId ? { sandboxBuildId } : {}),
       tombstone: false,
       model: choice?.model ?? '',
       ...(choice?.limits ? { modelLimits: choice.limits } : {}),

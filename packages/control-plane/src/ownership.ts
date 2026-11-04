@@ -67,6 +67,13 @@ export interface SessionRecord {
    */
   sandboxTemplate?: string;
   /**
+   * The build `sandboxTemplate`'s default tag resolved to at creation (template lifecycle spec §9),
+   * when the deployment has a template catalog. The harness routes a turn by the worker's
+   * template label, not its build, so this is the build the session was created against, not a
+   * guarantee: with two builds of one template active, a turn may run on either (register G19).
+   */
+  sandboxBuildId?: string;
+  /**
    * The model this session's turns run on (per-session model spec §4.4). '' or absent means the
    * deployment default. Changed by PATCH /v1/sessions/{id}, unlike the fields above.
    */
@@ -179,6 +186,7 @@ export class OwnershipIndex {
         tombstone: rec.tombstone ? '1' : '0',
         sandboxTier: rec.sandboxTier ?? '',
         sandboxTemplate: rec.sandboxTemplate ?? '',
+        sandboxBuildId: rec.sandboxBuildId ?? '',
         model: rec.model ?? '',
         modelLimits: rec.modelLimits ? JSON.stringify(rec.modelLimits) : '',
       }),
@@ -205,6 +213,7 @@ export class OwnershipIndex {
       tombstone: h.tombstone === '1',
       sandboxTier: h.sandboxTier,
       ...(h.sandboxTemplate ? { sandboxTemplate: h.sandboxTemplate } : {}),
+      ...(h.sandboxBuildId ? { sandboxBuildId: h.sandboxBuildId } : {}),
       ...(h.model ? { model: h.model } : {}),
       ...(readLimits(h.modelLimits) ? { modelLimits: readLimits(h.modelLimits) } : {}),
     };

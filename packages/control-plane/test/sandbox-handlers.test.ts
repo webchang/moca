@@ -43,6 +43,9 @@ describe('sandbox handlers (SBX0 §5)', () => {
       owner: 'github:1234',
       name: 'web',
       template: 'node22',
+      // Template lifecycle spec §9: the build it runs on (an imported build has no manifest hash).
+      buildId: b.buildId,
+      templateManifestHash: null,
       state: 'ready',
       reason: null,
       createdAt: NOW,
@@ -53,6 +56,8 @@ describe('sandbox handlers (SBX0 §5)', () => {
     expect(b.id).toMatch(/^sbx-[0-9a-f]{26}$/);
     const rec = await d.sandboxes!.get(b.id as string, NOW);
     expect(rec).toMatchObject({ worker: 'sbx_node22', wsk: b.id, tenant: 'github:1234' });
+    expect(b.buildId).toMatch(/^imported:[0-9a-f]{12}$/);
+    expect(rec?.buildId).toBe(b.buildId);
   });
 
   it('shows an unnamed sandbox as name null', async () => {

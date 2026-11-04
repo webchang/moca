@@ -297,3 +297,56 @@ it("gives each build a distinct handle from a production id's random hex", async
   expect(a).not.toBe(b);
   expect(a).toMatch(/\/b-[0-9a-f]{26}$/);
 });
+
+describe('tracing (§9)', () => {
+  it("records a sandbox's build: id, id:tag and id@build resolve, and the response names it", async () => {
+    const d = stored();
+    const HASH = `sha256:${'a'.repeat(64)}`;
+    // A registered build, as the host flow would leave it (host-flow.test.ts drives the real flow).
+    await d.templates!.update!('tr', async () => ({
+      schema: 'moca-template/1',
+      id: 'tr',
+      owner: alice.sub,
+      visibility: 'deployment',
+      description: 't',
+      tags: { default: HASH, old: 'imported:000000000000' },
+      builds: [
+        {
+          buildId: HASH,
+          status: 'registered',
+          profile: 'base',
+          worker: 'sbx_tr_new',
+          spec: { tools: [] },
+          createdAt: 0,
+        },
+        {
+          buildId: 'imported:000000000000',
+          status: 'registered',
+          profile: 'imported',
+          worker: 'sbx_tr_old',
+          spec: { tools: [] },
+          createdAt: 0,
+        },
+      ],
+      createdAt: 0,
+    }));
+    const mk = async (template: string) =>
+      (await HANDLERS.createSandbox!(ctx({ principal: bob, body: { template } }), d)).body as Body;
+    expect(await mk('tr')).toMatchObject({
+      template: 'tr',
+      buildId: HASH,
+      templateManifestHash: HASH,
+    });
+    expect(await mk('tr:old')).toMatchObject({
+      buildId: 'imported:000000000000',
+      templateManifestHash: null,
+    });
+    expect(await mk(`tr@${HASH}`)).toMatchObject({ buildId: HASH });
+    const rec = (await d.sandboxes!.listAll(Math.floor(NOW_MS / 1000))).find(
+      (r) => r.buildId === 'imported:000000000000',
+    );
+    expect(rec?.worker).toBe('sbx_tr_old');
+    expect(await codeOf(() => mk('tr:nope'))).toBe('unknown_template');
+    expect(await codeOf(() => mk(`tr@sha256:${'0'.repeat(64)}`))).toBe('unknown_template');
+  });
+});

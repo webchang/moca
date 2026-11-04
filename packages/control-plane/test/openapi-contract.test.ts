@@ -103,6 +103,8 @@ describe('§9.3 test 3 — contract drift', () => {
       'owner',
       'name',
       'template',
+      'buildId',
+      'templateManifestHash',
       'state',
       'reason',
       'createdAt',
