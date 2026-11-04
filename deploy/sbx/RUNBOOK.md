@@ -695,7 +695,11 @@ registers or rejects each built build by policy; nobody approves it. It needs:
   `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer. The unit sets
   `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
   `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's home):
-  log root's podman in with `--authfile /run/containers/0/auth.json`. Run a poll through the unit
+  log root's podman in with `--authfile /run/containers/0/auth.json`. It also gives Go a home and caches
+  under `/srv/sbx` (`build-snapshot.sh` compiles the guest agent): run
+  `install -d -m 0700 /srv/sbx/go /srv/sbx/home` first, and seed `/srv/sbx/go/pkg/mod` from root's
+  module cache so no build fetches. Do not set `GOFLAGS=-mod=mod`: the repository is a Go workspace,
+  which refuses it. Run a poll through the unit
   (`systemctl start sbx-host-agent.service`), not by hand: only the unit loads the env file.
 
 It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), and it checks a gate

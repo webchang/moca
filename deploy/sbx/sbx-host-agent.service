@@ -20,6 +20,13 @@ Environment=SBX_TEMPLATE_BUILD=/srv/sbx/src/deploy/sbx/template-onboarding/templ
 # ProtectHome hides root's home, where a podman login may land; use root podman's /run auth file
 # (log in with `podman login --authfile /run/containers/0/auth.json <host>`).
 Environment=REGISTRY_AUTH_FILE=/run/containers/0/auth.json
+# The unit has no HOME and hides root's (ProtectHome), and build-snapshot.sh compiles the guest
+# agent with `go build`: give Go a module cache and build cache of its own (bm1, 2026-11-04: "go:
+# module cache not found"). install -d -m 0700 /srv/sbx/go /srv/sbx/home before the first poll.
+Environment=HOME=/srv/sbx/home
+Environment=GOPATH=/srv/sbx/go
+Environment=GOMODCACHE=/srv/sbx/go/pkg/mod
+Environment=GOCACHE=/srv/sbx/go/cache
 # template-build.sh runs as root (rootfs export, the VMM); it pulls, builds and probes one template.
 ExecStart=/usr/local/libexec/sbx-host-agent.sh --once
 # A SWE-bench build with its probe takes minutes; one poll must not outlive a few of them.
