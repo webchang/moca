@@ -18,6 +18,12 @@ const SHARED = [
   'POST /v1/auth/revoke',
   'POST /v1/auth/revoke-all',
   'GET /v1/me',
+  // Template lifecycle spec §4.1: one catalog for sessions and sandboxes.
+  'GET /v1/templates',
+  'GET /v1/templates/{id}',
+  'GET /v1/templates/{id}/builds',
+  'GET /v1/templates/{id}/builds/{build}',
+  'GET /v1/templates/{id}/tags',
 ];
 
 const servers: Server[] = [];
@@ -37,12 +43,8 @@ const SANDBOX_ONLY = [
   'createSandbox',
   'deleteSandbox',
   'getSandbox',
-  'getTemplate',
-  'getTemplateBuild',
   'janitorSandboxes',
   'listSandboxes',
-  'listTemplateBuilds',
-  'listTemplates',
   'lookupEgressCredential',
   'mintSandboxToken',
 ];

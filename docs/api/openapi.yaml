@@ -104,7 +104,8 @@ components:
     TemplateBuild:
       type: object
       description: One build of a template, an immutable snapshot (template lifecycle spec §3.2, §3.3)
-      required: [buildId, status, profile, readiness, capacity, tags, createdAt, provenance]
+      required:
+        [buildId, status, profile, readiness, capacity, lastUsedAt, tags, createdAt, provenance]
       properties:
         buildId: { type: string, description: '`sha256:<manifest hash>` or `imported:<12 hex>`' }
         status:
@@ -123,7 +124,16 @@ components:
           required: [running, inUse]
           properties:
             running: { type: integer, description: the sandboxes its worker advertises at once }
-            inUse: { type: integer, description: its live sandboxes now }
+            inUse:
+              type: [integer, 'null']
+              description: |
+                its live sandboxes now; null on the harness profile, which holds no sandbox
+                records (sessions name a template, not a worker)
+        lastUsedAt:
+          type: [integer, 'null']
+          description: |
+            epoch seconds of the newest sandbox created on it (retained records included); null
+            when it has none, and on the harness profile
         tags: { type: array, items: { type: string } }
         createdAt: { type: integer, description: epoch seconds }
         provenance:
@@ -1211,9 +1221,10 @@ paths:
       operationId: listTemplates
       summary: The templates a sandbox may be created from, with their builds and readiness
       description: |
-        Sandbox service control planes only (`SH_ROUTE_PROFILE=sandbox`); a MOCA control plane
-        answers 404 (SBX0 §4.1). Enrolled subjects and admins only (`403 not_enrolled`, §4.2).
-        The template lifecycle spec (§3, §4) adds each template's owner, visibility, onboarding
+        Both profiles (template lifecycle spec §4.1): a sandbox client and a session's brain read
+        the same templates. On the sandbox profile, enrolled subjects and admins only
+        (`403 not_enrolled`, SBX0 §4.2); on the harness profile, any logged-in subject, and a
+        deployment that declares no templates lists none. The template lifecycle spec (§3, §4) adds each template's owner, visibility, onboarding
         state, readiness, tags and builds; the first three fields are unchanged, so an older
         client reads the list as before. Templates are the catalog's (imported once from
         SH_SANDBOX_TEMPLATES); a `private` one is listed only to its owner and admins.
@@ -1225,11 +1236,35 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [templates]
+                required: [templates, hosts]
                 properties:
                   templates:
                     type: array
                     items: { $ref: '#/components/schemas/Template' }
+                  hosts:
+                    type: array
+                    description: |
+                      per KVM host, its active limit and use, as its host agent reports them
+                      (template lifecycle spec §6.2). Empty until a host agent reports: that means
+                      no host has reported, never that there is no limit
+                    items:
+                      type: object
+                      required: [id, active, idleLimitSeconds, disk]
+                      properties:
+                        id: { type: string }
+                        active:
+                          type: object
+                          required: [limit, used]
+                          properties:
+                            limit: { type: integer }
+                            used: { type: integer }
+                        idleLimitSeconds: { type: integer }
+                        disk:
+                          type: object
+                          required: [freeGb, floorGb]
+                          properties:
+                            freeGb: { type: integer }
+                            floorGb: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotEnrolled' }
   /v1/templates/{id}:
@@ -1237,7 +1272,7 @@ paths:
       operationId: getTemplate
       summary: One template, its builds with their specs (the seed included)
       description: |
-        Sandbox profile only. `404 template_not_found` for an unknown id and for a `private`
+        Both profiles (§4.1). `404 template_not_found` for an unknown id and for a `private`
         template the caller does not own: the existence check (template lifecycle spec §3.2).
       security: [{ sessionToken: [] }]
       parameters:
@@ -1259,7 +1294,7 @@ paths:
     get:
       operationId: listTemplateBuilds
       summary: A template's builds, newest first, each with its spec
-      description: Sandbox profile only. `404 template_not_found` as for GET /v1/templates/{id}.
+      description: Both profiles (§4.1). `404 template_not_found` as for GET /v1/templates/{id}.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -1282,12 +1317,48 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/templates/{id}/tags:
+    get:
+      operationId: listTemplateTags
+      summary: A template's tags, each with the build it names and when and by whom it was set
+      description: Both profiles (§4.1). `404 template_not_found` as for GET /v1/templates/{id}.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: the tags, sorted by name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tags]
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: object
+                      required: [tag, buildId, assignedAt, assignedBy]
+                      properties:
+                        tag: { type: string }
+                        buildId: { type: string }
+                        assignedAt: { type: integer, description: epoch seconds }
+                        assignedBy:
+                          type: [string, 'null']
+                          description: a subject; null when the deployment set it
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotEnrolled' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/templates/{id}/builds/{build}:
     get:
       operationId: getTemplateBuild
       summary: One build of a template, with its spec, by build id
       description: |
-        Sandbox profile only. The build id is `sha256:<manifest hash>`, or `imported:<12 hex>` for
+        Both profiles (§4.1). The build id is `sha256:<manifest hash>`, or `imported:<12 hex>` for
         a template imported from SH_SANDBOX_TEMPLATES (no snapshot named); URL-encode it.
         `404 template_not_found` for an unknown template or build.
       security: [{ sessionToken: [] }]

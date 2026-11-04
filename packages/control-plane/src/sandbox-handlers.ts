@@ -132,9 +132,16 @@ function parseLabels(raw: unknown): Record<string, string> {
 const audit = (deps: CpDeps, subject: string, sandboxId: string, decision: string) =>
   auditBestEffort(deps, decision, sandboxId, { subject, sandboxId, decision });
 
-/** The catalog (template lifecycle spec §3.1); built from the env list when none is wired. */
+/**
+ * The catalog (template lifecycle spec §3.1); built from the env list when none is wired: the
+ * sandbox profile's SH_SANDBOX_TEMPLATES, or the harness profile's session templates (the same
+ * variable; none declared is an empty catalog there).
+ */
 function catalog(deps: CpDeps): TemplateCatalog {
-  return deps.templates ?? new MemoryTemplateCatalog(service(deps).cfg.templates);
+  return (
+    deps.templates ??
+    new MemoryTemplateCatalog(deps.config.sandbox?.templates ?? deps.config.sessionTemplates ?? [])
+  );
 }
 
 const canSee = (d: TemplateDoc, p: TokenClaims): boolean =>
@@ -151,11 +158,18 @@ async function visibleTemplate(deps: CpDeps, p: TokenClaims, id: string): Promis
   return d;
 }
 
-/** What readiness is derived from (§3.3): attached workers, and the live sandboxes per worker. */
+/**
+ * What readiness is derived from (§3.3): attached workers, and, where this control plane holds
+ * sandbox records (the sandbox profile), the live sandboxes per worker and the latest creation
+ * on each. The harness profile's sessions name a template, not a worker, so there `inUse` and
+ * `lastUsed` are null (not zero): unknown, until use records exist (spec §7.1 `use`).
+ */
 interface ReadinessFacts {
   /** worker sandbox id -> its advertised capacity; present = attached to the relay. */
   attached: Map<string, number> | null;
-  inUse: Map<string, number>;
+  inUse: Map<string, number> | null;
+  /** worker -> epoch seconds of the newest sandbox created on it, retained records included. */
+  lastUsed: Map<string, number> | null;
 }
 
 async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
@@ -168,14 +182,17 @@ async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
       attached = null;
     }
   }
-  const inUse = new Map<string, number>();
-  if (deps.sandboxes) {
-    const now = seconds(deps);
-    for (const r of await deps.sandboxes.listAll(now)) {
-      if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
-    }
+  if (deps.config.routeProfile !== 'sandbox' || !deps.sandboxes) {
+    return { attached, inUse: null, lastUsed: null };
   }
-  return { attached, inUse };
+  const inUse = new Map<string, number>();
+  const lastUsed = new Map<string, number>();
+  const now = seconds(deps);
+  for (const r of await deps.sandboxes.listAll(now)) {
+    if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
+    lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
+  }
+  return { attached, inUse, lastUsed };
 }
 
 function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: boolean) {
@@ -194,8 +211,12 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     readiness,
     capacity:
       readiness === 'active'
-        ? { running: f.attached!.get(b.worker) ?? 0, inUse: f.inUse.get(b.worker) ?? 0 }
+        ? {
+            running: f.attached!.get(b.worker) ?? 0,
+            inUse: f.inUse === null ? null : (f.inUse.get(b.worker) ?? 0),
+          }
         : null,
+    lastUsedAt: f.lastUsed === null ? null : (f.lastUsed.get(b.worker) ?? null),
     tags: Object.entries(d.tags)
       .filter(([, id]) => id === b.buildId)
       .map(([t]) => t)
@@ -230,7 +251,21 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const live = await readinessFacts(deps);
     // The worker id is deployment plumbing; a client names a template, never a worker.
     const templates = docs.map((d) => templateBody(d, live, false));
-    return { status: 200, body: { templates } };
+    // Per-host limits and use (§4, §6.2) are reported by the host agent (§6.1), not built yet:
+    // an empty list means "no host reports", never "no limit".
+    return { status: 200, body: { templates, hosts: [] } };
+  },
+
+  listTemplateTags: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
+    const tags = Object.entries(d.tags)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([tag, buildId]) => {
+        const m = d.tagsMeta?.[tag];
+        return { tag, buildId, assignedAt: m?.at ?? d.createdAt, assignedBy: m?.by ?? d.owner };
+      });
+    return { status: 200, body: { tags } };
   },
 
   getTemplate: async (ctx, deps) => {

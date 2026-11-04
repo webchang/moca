@@ -305,17 +305,17 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/templates',
     auth: 'api',
     sessionScoped: false,
-    profiles: SANDBOX,
+    profiles: BOTH,
     operationId: 'listTemplates',
   },
-  // Template lifecycle spec §4: one template, its builds, one build. Sandbox profile for now; BOTH
-  // profiles (§4.1) once the harness profile has a catalog.
+  // Template lifecycle spec §4: one template, its builds, one build, its tags. On BOTH profiles
+  // (§4.1), so a session's brain and a sandbox client read the same templates.
   {
     method: 'GET',
     path: '/v1/templates/{id}',
     auth: 'api',
     sessionScoped: false,
-    profiles: SANDBOX,
+    profiles: BOTH,
     operationId: 'getTemplate',
   },
   {
@@ -323,7 +323,7 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/templates/{id}/builds',
     auth: 'api',
     sessionScoped: false,
-    profiles: SANDBOX,
+    profiles: BOTH,
     operationId: 'listTemplateBuilds',
   },
   {
@@ -331,8 +331,16 @@ export const ROUTES: readonly RouteSpec[] = [
     path: '/v1/templates/{id}/builds/{build}',
     auth: 'api',
     sessionScoped: false,
-    profiles: SANDBOX,
+    profiles: BOTH,
     operationId: 'getTemplateBuild',
+  },
+  {
+    method: 'GET',
+    path: '/v1/templates/{id}/tags',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'listTemplateTags',
   },
   {
     method: 'POST',

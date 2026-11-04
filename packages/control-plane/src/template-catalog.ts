@@ -61,6 +61,11 @@ export interface TemplateDoc {
   description: string;
   /** tag -> buildId; `default` is the build a bare id resolves to. */
   tags: Record<string, string>;
+  /**
+   * tag -> when it was last assigned (epoch seconds) and by whom (a subject; null for the
+   * deployment). Absent for a tag set at creation: then the template's createdAt and owner.
+   */
+  tagsMeta?: Record<string, { at: number; by: string | null }>;
   /** Newest first. */
   builds: TemplateBuild[];
   createdAt: number;

@@ -287,3 +287,63 @@ describe('presence', () => {
     expect(await r.list()).toEqual([{ sandboxId: 'sbx_a', labels: { x: 'y' }, capacityMax: 4 }]);
   });
 });
+
+describe('increment 2: both profiles, lastUsedAt, tags', () => {
+  const harnessDeps = (over: Parameters<typeof makeDeps>[0] = {}): TestDeps =>
+    makeDeps({
+      ...over,
+      config: { routeProfile: 'harness', sandbox: undefined, ...(over.config ?? {}) },
+    });
+
+  it('serves the harness profile its session templates, with no sandbox counts (null, not 0)', async () => {
+    const d = harnessDeps({
+      config: { sessionTemplates: DECLARED },
+      presence: { list: async () => [{ sandboxId: 'sbx_default', labels: {}, capacityMax: 2 }] },
+    });
+    const ts = (
+      await call('listTemplates', d, {}, { ...alice, sub: 'github:777', tenant: 'github:777' })
+    ).templates as Body[];
+    expect(ts.map((t) => t.id)).toEqual(['default', 'django-django-11133']);
+    expect(ts[0].readiness).toBe('active');
+    expect(ts[0].builds[0].capacity).toEqual({ running: 2, inUse: null });
+    expect(ts[0].builds[0].lastUsedAt).toBeNull();
+    expect(ts[1].readiness).toBe('inactive');
+    const one = await call('getTemplate', d, { id: 'django-django-11133' });
+    expect(one.builds[0].spec.seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+  });
+
+  it('lists nothing on a harness control plane that declares no templates', async () => {
+    expect((await call('listTemplates', harnessDeps())).templates).toEqual([]);
+  });
+
+  it("reports a build's lastUsedAt as its newest sandbox's creation, retained records included", async () => {
+    let now = NOW_MS;
+    const d = sbxDeps({ now: () => now, presence: presence([]) });
+    await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 'default' } }), d);
+    now += 60_000;
+    await HANDLERS.createSandbox!(ctx({ principal: bob, body: { template: 'default' } }), d);
+    const ts = (await call('listTemplates', d)).templates as Body[];
+    expect(ts.find((t) => t.id === 'default')!.builds[0].lastUsedAt).toBe(Math.floor(now / 1000));
+    expect(ts.find((t) => t.id === 'node22')!.builds[0].lastUsedAt).toBeNull();
+  });
+
+  it('lists tags with their build, and when and by whom they were set', async () => {
+    const d = sbxDeps({ templates: new MemoryTemplateCatalog(DECLARED, 500) });
+    const { tags } = (await call('listTemplateTags', d, { id: 'default' })) as { tags: Body[] };
+    expect(tags).toEqual([
+      {
+        tag: 'default',
+        buildId: importedBuildId('sbx_default'),
+        assignedAt: 500,
+        assignedBy: null,
+      },
+    ]);
+    expect(await codeOf(() => call('listTemplateTags', d, { id: 'nope' }))).toBe(
+      'template_not_found',
+    );
+  });
+});
+
+it('lists an empty hosts block until a host agent reports (§6.2)', async () => {
+  expect((await call('listTemplates', sbxDeps())).hosts).toEqual([]);
+});

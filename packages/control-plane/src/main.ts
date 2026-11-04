@@ -414,9 +414,9 @@ export function redisClientOptions(url: string) {
 }
 
 /**
- * `SH_PROVENANCE_DIR` (template lifecycle spec §7.2): a directory on the control plane's
- * persistent volume holding the provenance store and the template catalog. Set, the catalog is
- * the store (SH_SANDBOX_TEMPLATES imported into it once); unset, templates come from
+ * `SH_PROVENANCE_DIR` (template lifecycle spec §7.2), either profile: a directory on the control
+ * plane's persistent volume holding the provenance store and the template catalog. Set, the
+ * catalog is the store (SH_SANDBOX_TEMPLATES imported into it once); unset, templates come from
  * SH_SANDBOX_TEMPLATES at every start, as before, and nothing is recorded.
  */
 export function templateCatalogFromEnv(
@@ -424,12 +424,11 @@ export function templateCatalogFromEnv(
   config: CpConfig,
 ): { templates?: TemplateCatalog } {
   const dir = env.SH_PROVENANCE_DIR;
-  if (!dir || !config.sandbox) return {};
+  if (!dir) return {};
   if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
+  const declared = config.sandbox?.templates ?? config.sessionTemplates ?? [];
   const provenance = new ProvenanceStore({ dir });
-  return {
-    templates: new FileTemplateCatalog({ dir, declared: config.sandbox.templates, provenance }),
-  };
+  return { templates: new FileTemplateCatalog({ dir, declared, provenance }) };
 }
 
 export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
@@ -488,12 +487,12 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
     ...(sandboxProfile
       ? {
           sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike),
-          // Readiness (template lifecycle spec §3.3) from the relay's presence records, which the
-          // sandbox profile's relay writes into this same Redis.
-          presence: redisPresenceReader(client as unknown as PresenceRedisLike),
-          ...templateCatalogFromEnv(env, config),
         }
       : {}),
+    // Readiness (template lifecycle spec §3.3) from the relay's presence records, which the relay
+    // writes into this same Redis on either profile.
+    presence: redisPresenceReader(client as unknown as PresenceRedisLike),
+    ...templateCatalogFromEnv(env, config),
     identity: new GithubOAuthProvider({
       clientId: env.SH_GITHUB_CLIENT_ID!,
       adminSubjects: adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS),

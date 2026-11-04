@@ -38,6 +38,7 @@ describe('the route table', () => {
         'GET /v1/templates/{id}',
         'GET /v1/templates/{id}/builds',
         'GET /v1/templates/{id}/builds/{build}',
+        'GET /v1/templates/{id}/tags',
         'POST /v1/sandboxes',
         'GET /v1/sandboxes',
         'GET /v1/sandboxes/{id}',

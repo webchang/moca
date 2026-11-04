@@ -532,13 +532,16 @@ The process doc (`PROCESS.md`) is updated at each step, and the validation follo
 2. The provenance store and records (§7), with offline verification, for `build`, `check` and
    `policy` first (store and verifiers done: `provenance.ts`, `verify-provenance.py`; records are
    written once the routes exist).
-3. Templates in the store, states and the read API (§3, §4), with owners and visibility. **First
-   increment built** (sandbox profile): the catalog (`template-catalog.ts`; `SH_PROVENANCE_DIR`
-   imports the env list once, with a `create` record each), `GET /v1/templates` extended,
-   `GET /v1/templates/{id}`, `/builds`, `/builds/{build}`, `404 template_not_found`, readiness
-   `active`/`inactive` from the relay's presence (`unknown` when unreadable). Not yet: the hosts
-   block, `lastUsedAt`, `activating`/`deactivating`/`unavailable` (they need the host agent), the
-   logs and tags routes, the harness profile (§4.1), and builds from template records.
+3. Templates in the store, states and the read API (§3, §4), with owners and visibility. **Built**
+   (20d0995c, then increment 2): the catalog (`template-catalog.ts`; `SH_PROVENANCE_DIR` imports the
+   env list once, with a `create` record each), `GET /v1/templates` (with `hosts`, empty until a host
+   agent reports), `/{id}`, `/builds`, `/builds/{build}`, `/tags`, on **both** profiles (§4.1);
+   `404 template_not_found`; readiness `active`/`inactive` from the relay's presence (`unknown` when
+   unreadable); `lastUsedAt` and `capacity.inUse` from sandbox records on the sandbox profile (null on
+   the harness profile until `use` records exist). Not yet: `activating`/`deactivating`/`unavailable`
+   and the hosts' contents (the host agent, item 5), the logs route (with builds, item 5), builds from
+   template records (item 5), and the SBX0 token rules of §4.1 (sandbox routes on harness, with the
+   validation deployment).
 4. Create and policy at create (§4, §8.1), quotas (§6.2).
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2).
