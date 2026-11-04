@@ -43,6 +43,11 @@
 #                           (^[a-z0-9][a-z0-9-]{0,30}$) whose sbx-host-agent may build and run
 #                           templates; one bearer each in the Secret sbx-template-hosts, and a
 #                           host-agent bundle each
+#   SBX_REDIS_IMAGE         optional; repository[:tag]@sha256:<digest>: the image Redis runs instead of the
+#                           base's valkey/valkey:9-alpine. For a namespace whose data a Redis 7.4 wrote
+#                           (RDB format 12, which Valkey 9 cannot read: its AOF load aborts), e.g.
+#                           docker.io/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+#                           (the pin before #670). Unset: the base's image, as before
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
 #                           router's default certificate (API)
@@ -99,6 +104,8 @@ validate() {
   [[ "${SBX_EXEC_HOST:-}" =~ $HOST_RE ]] || die 'SBX_EXEC_HOST is required and must be a DNS name'
   [[ "$SBX_ATTACH_HOST" != "$SBX_EXEC_HOST" ]] || die 'SBX_ATTACH_HOST and SBX_EXEC_HOST must differ (one certificate each)'
   [[ -n "${SBX_IMAGE:-}" && "$SBX_IMAGE" != *[[:space:]]* ]] || die 'SBX_IMAGE is required (the relay image)'
+  [[ -z "${SBX_REDIS_IMAGE:-}" || "$SBX_REDIS_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
+    die 'SBX_REDIS_IMAGE must be pinned by digest: repository[:tag]@sha256:<64 hex>'
   [[ -n "${SBX_WORKERS:-}" ]] || die 'SBX_WORKERS is required: the template worker ids, space-separated'
   local seen=' ' w
   for w in $SBX_WORKERS; do
@@ -715,6 +722,8 @@ write_overlay() {
     printf '      - { op: add, path: /spec/template/metadata/annotations/sbx.moca.dev~1settings-hash, value: "%s" }\n' "$RELAY_HASH"
     printf 'images:\n'
     image_entry ghcr.io/rossoctl/moca "$SBX_IMAGE"
+    # The base names Valkey; an override renames that image, so the StatefulSet's pod spec is untouched.
+    [[ -z "${SBX_REDIS_IMAGE:-}" ]] || image_entry docker.io/valkey/valkey "$SBX_REDIS_IMAGE"
   } >"$GEN/kustomization.yaml"
 }
 
