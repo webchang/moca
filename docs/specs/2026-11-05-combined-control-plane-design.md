@@ -111,6 +111,10 @@ keeps the `sandbox` profile.
   (`session.WithBuild`); the exchange returns `sandboxBuildId` for a manifest-hash build (never an
   `imported:` one); the data plane (`turn-auth`, `run-turn`) passes it to `selectPoolSandbox`, which
   keeps only records labelled with it and refuses the turn when none is attached.
+  **Upgrade order:** sandboxes route by worker id and ignore the label; an unpinned session matches
+  by template as before; only a pinned session refuses a worker without the label. So the worker
+  rebuild must precede the first pinned Moca Pi session on a combined deployment, and nothing else
+  depends on the order (on a `sandbox`-profile deployment, none).
 
 ### 3.5 Settings and stores
 
