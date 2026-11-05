@@ -70,8 +70,10 @@ profile today get one rule each:
 every sandbox route and every template write (create, build, cancel, activate, deactivate, policy
 PUT), and a test user is refused there (`not_enrolled`), as template lifecycle §4.1 requires
 ("on `harness`, the sandbox routes check the subject themselves"). Sessions, models and bundles
-stay open to any logged-in subject, as today on `harness`. `isEnrolled` returns the sandbox
-answer for those routes on `combined` instead of `true`.
+stay open to any logged-in subject, as today on `harness`, and so do the template, policy and quota
+reads (on `sandbox` they stay enrolled-only). **As built (increment 2):** `isEnrolled` is the login
+gate (open on `combined`), `isEnrolledForSandbox` the route gate (`requireEnrolledPrincipal`), and
+`requireReader` the reads.
 
 Consequence to note: on `combined` a non-enrolled GitHub user can log in and use sessions, as on
 `harness`; on `sandbox` they cannot log in at all. A deployment that wants SBX0's closed login

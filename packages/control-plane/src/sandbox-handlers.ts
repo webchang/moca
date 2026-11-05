@@ -4,6 +4,7 @@ import {
   auditBestEffort,
   isAdmin,
   requireEnrolledPrincipal,
+  requireReader,
   seconds,
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
@@ -843,7 +844,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   cancelTemplateBuild: cancelBuild,
 
   getPolicy: async (ctx, deps) => {
-    requireEnrolled(ctx, deps);
+    requireReader(ctx, deps.config);
     if (!deps.policy)
       throw new CpError(
         'invalid_request',
@@ -869,7 +870,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getQuota: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const { cat, policy } = writable(deps);
     const { policy: pol } = await policy.current();
     const u = await usage(cat, p.sub);
@@ -898,7 +899,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   listTemplates: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const docs = await visibleTemplates(deps, p);
     const live = await readinessFacts(deps);
     // The worker id is deployment plumbing; a client names a template, never a worker.
@@ -909,7 +910,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   listTemplateTags: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const tags = Object.entries(d.tags)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -921,20 +922,20 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getTemplate: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     return { status: 200, body: templateBody(d, await readinessFacts(deps), true) };
   },
 
   listTemplateBuilds: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const live = await readinessFacts(deps);
     return { status: 200, body: { builds: d.builds.map((b) => buildBody(d, b, live, true)) } };
   },
 
   getTemplateBuild: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     // By build id, or by the handle the create answered (§4: it keeps resolving once the build is
     // registered and its id becomes the manifest hash); the body's buildId is the real id.

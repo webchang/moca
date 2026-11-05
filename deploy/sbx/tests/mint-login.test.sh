@@ -27,21 +27,23 @@ secret true >"$TMP/secret.json"
 cat >"$TMP/bin/kubectl" <<MOCK
 #!/usr/bin/env bash
 printf 'kubectl %s\n' "\$*" >>"$TMP/kubectl.log"
+if [[ "\$1 \$2 \$3" == 'get deploy moca-control-plane' ]]; then cat "$TMP/live-profile"; exit 0; fi
 [[ "\$*" == 'get secret moca-mu1 -n sbx-test -o json' ]] || exit 1
 cat "$TMP/secret.json"
 MOCK
 chmod +x "$TMP/bin/kubectl"
 export PATH="$TMP/bin:$PATH"
+printf 'sandbox' >"$TMP/live-profile"
 printf 'SBX_NAMESPACE=sbx-test\nSBX_API_HOST=sbx-api.apps.example.invalid\nSBX_ALLOWED_SUBJECTS=github:1234,github:9999\nSBX_ADMIN_SUBJECTS=github:42\n' >"$TMP/env"
 mkdir -p "$TMP/home-a" "$TMP/home-admin"
 
 # The login: the token verifies under the sandbox API issuer with this key, for this subject.
-verify() { # verify HOME SUBJECT ROLES_JSON (from the control-plane package, where tsx resolves)
+verify() { # verify HOME SUBJECT ROLES_JSON [ISSUER_EXPORT] (from the control-plane package, where tsx resolves)
   cd "$SRC/packages/control-plane"
   SBX_PUB="$PUB_B64" SBX_FILE="$1/.config/mocactl/sbx-auth.json" SBX_SUB="$2" SBX_ROLES="$3" \
     node --import tsx --input-type=module -e "
       import { readFileSync } from 'node:fs';
-      import { verifyToken, publicKeyFromBase64, SANDBOX_API_ISSUER } from '$SRC/packages/control-plane/src/token.ts';
+      import { verifyToken, publicKeyFromBase64, ${4:-SANDBOX_API_ISSUER} as SANDBOX_API_ISSUER } from '$SRC/packages/control-plane/src/token.ts';
       const e = process.env, a = JSON.parse(readFileSync(e.SBX_FILE, 'utf8'));
       const keys = new Map([[JSON.parse(Buffer.from(a.apiToken.split('.')[0], 'base64url')).kid, publicKeyFromBase64(e.SBX_PUB)]]);
       const c = verifyToken(a.apiToken, keys, { issuer: SANDBOX_API_ISSUER, requiredScope: 'api' });
@@ -59,6 +61,22 @@ verify "$TMP/home-a" github:1234 '[]' || fail 'the user token does not verify un
 bash "$MINT" --env-file "$TMP/env" --subject github:42 --home "$TMP/home-admin" >"$TMP/out" 2>&1 || fail 'mint an admin login'
 verify "$TMP/home-admin" github:42 '["admin"]' || fail 'an admin subject did not get the admin role'
 pass 'writes a 0600 sbx-auth.json whose token verifies under the sandbox API issuer, with the admin role for an admin'
+
+# A combined control plane (combined control plane spec §3.3): the harness issuer, which a sandbox
+# stack on the same key refuses.
+mkdir -p "$TMP/home-c"
+cp "$TMP/env" "$TMP/env-c"; echo 'SBX_ROUTE_PROFILE=combined' >>"$TMP/env-c"
+# The live control plane must run the same profile, or the login would be refused there.
+! bash "$MINT" --env-file "$TMP/env-c" --subject github:1234 --home "$TMP/home-c" >"$TMP/out" 2>&1 || fail 'minted combined for a sandbox control plane'
+grep -q 'runs SH_ROUTE_PROFILE=sandbox' "$TMP/out" || fail 'the profile mismatch refusal does not say why'
+printf 'combined' >"$TMP/live-profile"
+bash "$MINT" --env-file "$TMP/env-c" --subject github:1234 --home "$TMP/home-c" >"$TMP/out" 2>&1 || fail 'mint a combined login'
+verify "$TMP/home-c" github:1234 '[]' DEFAULT_ISSUER || fail 'the combined token does not verify under the harness issuer'
+! verify "$TMP/home-c" github:1234 '[]' 2>/dev/null || fail 'the combined token verifies under the sandbox issuer'
+echo 'SBX_ROUTE_PROFILE=harness' >>"$TMP/env-c"
+! bash "$MINT" --env-file "$TMP/env-c" --subject github:1234 --home "$TMP/home-c" >"$TMP/out" 2>&1 || fail 'accepted SBX_ROUTE_PROFILE=harness'
+printf 'sandbox' >"$TMP/live-profile"
+pass 'mints under the harness issuer for SBX_ROUTE_PROFILE=combined, never the sandbox one; refuses another profile, and a profile the live control plane does not run'
 
 # Neither the key nor the token in any output.
 tok="$(jq -r .apiToken "$F")"

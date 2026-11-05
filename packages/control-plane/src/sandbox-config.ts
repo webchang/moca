@@ -200,11 +200,26 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
 }
 
 /**
- * Who may use the sandbox profile (spec §4.2): the allow list, plus admins. The harness profile has
- * no allow list (MU1 admits any GitHub account), so this is always true there.
+ * Who may LOG IN (spec §4.2): on the sandbox profile the allow list, plus admins. The harness
+ * profile has no allow list (MU1 admits any GitHub account), and neither does `combined` at login
+ * (combined control plane spec §3.2: login stays open, enrollment moves to the routes).
  */
 export function isEnrolled(subject: string, roles: string[], config: CpConfig): boolean {
   if (config.routeProfile !== 'sandbox') return true;
+  return onAllowList(subject, roles, config);
+}
+
+/**
+ * Who may use the sandbox routes and the template writes: the allow list, plus admins, on `sandbox`
+ * and on `combined` (combined spec §3.2). A test user (`test:<n>`) is never on it: SH_ALLOWED_SUBJECTS
+ * admits only `github:` subjects. Always true on `harness`, which mounts none of those routes.
+ */
+export function isEnrolledForSandbox(subject: string, roles: string[], config: CpConfig): boolean {
+  if (config.routeProfile === 'harness' || config.routeProfile === undefined) return true;
+  return onAllowList(subject, roles, config);
+}
+
+function onAllowList(subject: string, roles: string[], config: CpConfig): boolean {
   return roles.includes('admin') || (config.sandbox?.allowedSubjects ?? []).includes(subject);
 }
 
