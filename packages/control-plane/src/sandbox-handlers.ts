@@ -214,7 +214,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       attached = null;
     }
   }
-  if (deps.config.routeProfile !== 'sandbox' || !deps.sandboxes) {
+  if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
     return { attached, inUse: null, lastUsed: null, placement, nowS };
   }
   const inUse = new Map<string, number>();

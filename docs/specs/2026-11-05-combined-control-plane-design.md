@@ -112,6 +112,12 @@ inference) and everything `sandbox` requires (allowed subjects, exec endpoint an
 token, sandbox caps), and builds both sets of stores on its one Redis. A missing required setting
 of either refuses the start, naming it (as each profile does today).
 
+**As built (increment 3):** `configFromEnv` reads the harness settings, then the sandbox block;
+the one template list is both the sessions' and the sandboxes'. Egress follows `SH_EGRESS_HOSTS`
+alone on `combined`, since the KEK is always set there (the harness credential store's). A local
+run (2026-11-05) booted it on Redis and answered: union discovery; an outsider `200` on `/v1/me` and
+sessions, `403 not_enrolled` on sandboxes; a sandbox-issuer API token `401`.
+
 ### 3.6 Deployment
 
 A new overlay, `deploy/k8s/overlays/ocp-combined`: the harness control plane of `deploy/k8s` with

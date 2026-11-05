@@ -65,13 +65,6 @@ export function routeProfileFromEnv(env: NodeJS.ProcessEnv): RouteProfile {
   if (v !== 'harness' && v !== 'sandbox' && v !== 'combined') {
     throw new Error(`SH_ROUTE_PROFILE must be exactly 'harness', 'sandbox' or 'combined'`);
   }
-  if (v === 'combined') {
-    // Combined control plane spec §4: its settings, stores and enrollment rules (increments 2-3)
-    // are not built yet. Mounting its routes without them would serve sandboxes to anyone.
-    throw new Error(
-      `SH_ROUTE_PROFILE 'combined' is not supported yet (combined control plane spec §4)`,
-    );
-  }
   return v;
 }
 
@@ -147,7 +140,10 @@ export function sessionTemplatesFromEnv(env: NodeJS.ProcessEnv): SandboxTemplate
   return raw ? parseTemplates(raw) : null;
 }
 
-export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
+export function sandboxConfigFromEnv(
+  env: NodeJS.ProcessEnv,
+  opts: { kekIsShared?: boolean } = {},
+): SandboxConfig {
   const allowedSubjects = (env.SH_ALLOWED_SUBJECTS ?? '')
     .split(',')
     .map((s) => s.trim())
@@ -182,7 +178,7 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
     );
   }
   const templates = parseTemplates(env.SH_SANDBOX_TEMPLATES);
-  const egress = egressConfigFromEnv(env, templates);
+  const egress = egressConfigFromEnv(env, templates, opts);
   return {
     templates,
     allowedSubjects,
