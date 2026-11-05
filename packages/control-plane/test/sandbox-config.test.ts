@@ -93,6 +93,13 @@ describe('the sandbox profile config (SBX0 §4.1, §5)', () => {
     );
   });
 
+  it('refuses the combined profile until its settings and enrollment exist (combined spec §4)', () => {
+    // Mounting the sandbox routes without increments 2-3 would serve sandboxes to any login.
+    expect(() => routeProfileFromEnv({ SH_ROUTE_PROFILE: 'combined' })).toThrow(
+      /not supported yet/,
+    );
+  });
+
   it('keeps the harness profile the default, and refuses an unknown one', () => {
     expect(routeProfileFromEnv({})).toBe('harness');
     expect(() => routeProfileFromEnv({ SH_ROUTE_PROFILE: 'sandboxes' })).toThrow(

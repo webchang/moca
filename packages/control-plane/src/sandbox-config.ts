@@ -56,14 +56,21 @@ const WORKER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENDPOINT_RE = /^[A-Za-z0-9.-]+:[0-9]{1,5}$/;
 
 /**
- * `SH_ROUTE_PROFILE`: exactly `harness` or `sandbox`; absent or empty means `harness`. A near-miss
- * (`Sandbox`, ` sandbox`) refuses to boot rather than mounting nothing, `/healthz` included. The
- * value is not echoed, as no boot refusal here echoes one.
+ * `SH_ROUTE_PROFILE`: exactly `harness`, `sandbox` or `combined`; absent or empty means `harness`.
+ * A near-miss (`Sandbox`, ` sandbox`) refuses to boot rather than mounting nothing, `/healthz`
+ * included. The value is not echoed, as no boot refusal here echoes one.
  */
 export function routeProfileFromEnv(env: NodeJS.ProcessEnv): RouteProfile {
   const v = env.SH_ROUTE_PROFILE || 'harness';
-  if (v !== 'harness' && v !== 'sandbox') {
-    throw new Error(`SH_ROUTE_PROFILE must be exactly 'harness' or 'sandbox'`);
+  if (v !== 'harness' && v !== 'sandbox' && v !== 'combined') {
+    throw new Error(`SH_ROUTE_PROFILE must be exactly 'harness', 'sandbox' or 'combined'`);
+  }
+  if (v === 'combined') {
+    // Combined control plane spec §4: its settings, stores and enrollment rules (increments 2-3)
+    // are not built yet. Mounting its routes without them would serve sandboxes to anyone.
+    throw new Error(
+      `SH_ROUTE_PROFILE 'combined' is not supported yet (combined control plane spec §4)`,
+    );
   }
   return v;
 }
