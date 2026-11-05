@@ -5,6 +5,7 @@
 #
 # Built on ocp-single (no Namespace object, no SCC grant, restricted-v2 UIDs, no cluster-scoped
 # object at all), plus SBX0's pieces:
+#   ../ocp-single/routes       the supervisor's Route (Moca Pi clients' turns) and TLS sidecar
 #   ../ocp/p4-relay            the attach Route and its ghostunnel sidecar (KVM hosts' workers dial in)
 #   ../ocp-sbx/exec-tls        the exec Route and its sidecar (stock agents' Execs, sandbox tokens)
 #   ../ocp-sbx/template-store  the template store's PVC and the host agents' tokens
@@ -25,6 +26,9 @@ resources:
   - ../ocp-single
   - api-route.yaml
 components:
+  # The supervisor's passthrough Route (Moca Pi clients send their turns there) and its TLS sidecar.
+  # It also adds a moca-control-plane Route; patch-routes.yaml removes that one (moca-api serves the API).
+  - ../ocp-single/routes
   - ../ocp/p4-relay
   - ../ocp-sbx/exec-tls
   - ../ocp-sbx/template-store
@@ -32,3 +36,9 @@ patches:
   - path: patch-control-plane.yaml
   - path: patch-relay.yaml
   - path: patch-addressing.yaml
+  # One API Route (moca-api, edge, HTTP refused): drop ocp-single/routes' second one and its policy.
+  - patch: |-
+      $patch: delete
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata: { name: moca-control-plane, namespace: moca-single }

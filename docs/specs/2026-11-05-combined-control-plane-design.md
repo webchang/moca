@@ -142,8 +142,10 @@ NetworkPolicy keeps the harness's kube-API egress (the credential store needs it
 **Overlay written (2026-11-05, not deployed):** `deploy/k8s/overlays/ocp-combined`, on ocp-single plus
 SBX0's attach and exec Routes and template store; `deploy/sbx/tests/overlay-combined.test.sh`
 renders it and asserts the combined profile, both profiles' credentials, the relay's two Exec
-callers, one namespace and **no cluster-scoped object**. Still to build: `setup.sh` support (the
-Secrets and ConfigMaps it references).
+callers, one namespace and **no cluster-scoped object**. `deploy/sbx/setup.sh` deploys it with `SBX_PROFILE=combined` (2026-11-05): the harness's keys added to `moca-mu1`
+(the public keyset, KEK, exchange token), the harness's exec token kept, the template store on,
+its own addresses, the supervisor's Route (`SBX_MOCA_HOST`); tested without a cluster in
+`deploy/sbx/tests/setup.test.sh`. Not yet run on a cluster.
 
 **For the validation:** a new namespace on ykt3 (for example `moca-combined`), so the SBX0
 deployment in `moca-sbx-template` stays as it is; the first combined window brings its templates

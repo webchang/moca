@@ -27,12 +27,13 @@ env_of() { # env_of KIND NAME CONTAINER VAR -> its literal value, or "<ref>" whe
 [[ "$(q 'length')" -gt 0 ]] || fail 'the render converted to no objects'
 
 for o in Deployment/moca-control-plane Deployment/moca-supervisor Deployment/sandbox-relay \
-  StatefulSet/redis Route/moca-api Route/moca-relay Route/sbx-exec \
+  StatefulSet/redis Route/moca Route/moca-api Route/moca-relay Route/sbx-exec \
   PersistentVolumeClaim/moca-sbx-templates Role/moca-control-plane-credentials \
   Service/sandbox-relay-exec Service/sbx-relay-exec-tls; do
   has "$o"
 done
-pass 'renders the supervisor and harness beside the relay Routes, the template store and the credentials Role'
+[[ -z "$(obj Route moca-control-plane)" ]] || fail 'a second API Route (moca-control-plane) is rendered'
+pass 'renders the supervisor and its Route beside the relay Routes, one API Route, the template store and the credentials Role'
 
 # Namespaced only: the scope a namespace grant covers.
 n="$(q '[.[] | select(.kind | test("^(Namespace|ClusterRole|ClusterRoleBinding|SecurityContextConstraints|PersistentVolume|StorageClass|CustomResourceDefinition)$"))] | length')"

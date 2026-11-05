@@ -75,7 +75,7 @@ def s_motif(d):
                  "logins, leases, policy"], size=12)
     brain(s, 3.5, 4.3, 3.0, 1.3, "Harness", ["workers running Moca Pi",
           "the model key, per turn"], size=12)
-    orchestrator(s, 7.1, 3.1, 2.0, 1.1, "Relay", ["carries Execs"], size=12)
+    orchestrator(s, 7.1, 3.1, 2.0, 1.1, "Relay", ["carry Execs"], size=12)
     store(s, 9.6, 1.75, 2.8, 1.0, "Template = snapshot", ["e.g. django-11133@sha256:…"],
           size=11)
     hands(s, 9.6, 3.05, 2.8, 1.2, "Template worker", ["one per build, serving", "that build's snapshot"],
@@ -110,8 +110,8 @@ def s_problem(d):
         "clients that are not operators.",
         "**And proof:** which image, which checks, which snapshot served a given run.",
     ], size=15, bullets=True, gap=10)
-    brain(s, 7.4, 1.6, 2.4, 0.9, "Client agent", ["the brain: plans, edits"], size=12)
-    hands(s, 10.3, 1.6, 2.4, 0.9, "microVM", ["the hands: runs commands"], size=12)
+    brain(s, 7.4, 1.6, 2.4, 0.9, "Client agent", ["the brain: plan, edit"], size=12)
+    hands(s, 10.3, 1.6, 2.4, 0.9, "microVM", ["the hands: run commands"], size=12)
     arrow(s, 9.8, 2.05, 10.3, 2.05)
     store(s, 7.4, 3.1, 5.3, 1.0, "One snapshot per template",
           ["the instance's repository, toolchain and tests"], size=12)
@@ -145,29 +145,38 @@ def s_design(d):
 def s_architecture(d):
     s = d.slide("One control plane decides; hosts build and run; clients only ask",
                 "Who runs where: the cluster (OpenShift; e.g. ykt3) and the KVM host (bare metal; e.g. bm1)")
-    brain(s, 0.5, 1.6, 2.6, 1.1, "Client", ["stock agent or `mocactl`"], size=12)
-    orchestrator(s, 4.2, 1.5, 3.4, 1.3, "Control plane", ["catalog, policy, leases"], size=12)
-    store(s, 4.4, 3.3, 3.0, 1.1, "Template store", ["catalog, provenance"], size=12)
-    orchestrator(s, 4.2, 5.0, 3.4, 1.1, "Relay", ["routes Execs to workers"], size=12)
-    brain(s, 9.2, 1.5, 3.4, 1.1, "Host agent", ["claims builds, starts workers"], size=12)
-    hands(s, 9.2, 3.3, 3.4, 1.1, "Template workers", ["one per template, its snapshot"], size=12)
-    hands(s, 9.2, 5.0, 3.4, 1.1, "microVMs", ["one per command, from the snapshot"], size=12)
-    arrow(s, 3.1, 2.15, 4.2, 2.15)
-    label(s, 2.9, 1.75, 1.5, 0.3, "create, activate", size=11)
-    arrow(s, 5.9, 2.8, 5.9, 3.3, both=True)
-    arrow(s, 7.6, 2.0, 9.2, 2.0, both=True)
-    label(s, 7.6, 1.6, 1.6, 0.3, "claim, report", size=11)
-    arrow(s, 10.9, 2.6, 10.9, 3.3)
-    label(s, 11.0, 2.75, 1.6, 0.3, "start, stop", size=11, align=PP_ALIGN.LEFT)
-    arrow(s, 9.2, 3.85, 7.6, 5.4)
-    label(s, 7.8, 4.45, 1.5, 0.3, "attach", size=11)
-    arrow(s, 10.9, 4.4, 10.9, 5.0)
-    arrow(s, 1.8, 2.7, 4.2, 5.55)
-    label(s, 1.4, 4.1, 2.2, 0.3, "Exec (sandbox token)", size=11)
-    text(s, 0.5, 6.35, 12.2, 0.4, [
-        "The cluster holds no VM; the KVM host holds no policy. The host agent reads its wanted state from the "
-        "control plane and reports facts back; readiness is what the relay sees attached."],
-        size=12, color=MUTED)
+    # The two places, as dashed groups; the client is outside both.
+    box(s, 3.75, 1.35, 4.3, 4.95, INFRA, None, [], line_w=1, dash=True)
+    label(s, 3.85, 1.4, 4.0, 0.3, "The cluster (e.g. ykt3)", size=11, align=PP_ALIGN.LEFT)
+    box(s, 8.8, 1.35, 4.2, 4.95, INFRA, None, [], line_w=1, dash=True)
+    label(s, 8.9, 1.4, 4.0, 0.3, "The KVM host (e.g. bm1)", size=11, align=PP_ALIGN.LEFT)
+    brain(s, 0.4, 1.85, 2.6, 1.1, "Client", ["stock agent or `mocactl`"], size=12)
+    orchestrator(s, 4.2, 1.8, 3.4, 1.2, "Control plane", ["catalog, policy, leases"], size=12)
+    store(s, 4.4, 3.3, 3.0, 1.05, "Template store", ["catalog, provenance"], size=12)
+    orchestrator(s, 4.2, 4.8, 3.4, 1.1, "Relay", ["route Execs to workers"], size=12)
+    orchestrator(s, 9.2, 1.8, 3.4, 1.2, "Host agent", ["build templates, start workers"], size=12)
+    hands(s, 9.2, 3.3, 3.4, 1.05, "Template workers", ["one per build, its snapshot"], size=12)
+    hands(s, 9.2, 4.8, 3.4, 1.1, "microVMs", ["run each command"], size=12)
+    # Client -> control plane, and its Execs to the relay (labels beside the lines, not on them).
+    arrow(s, 3.0, 2.4, 4.2, 2.4)
+    label(s, 2.85, 2.0, 1.5, 0.3, "create, activate", size=11)
+    arrow(s, 1.7, 2.95, 4.2, 5.35)
+    label(s, 0.4, 4.25, 2.15, 0.3, "Exec (sandbox token)", size=11, align=PP_ALIGN.RIGHT)
+    arrow(s, 5.9, 3.0, 5.9, 3.3, both=True)
+    # Host agent <-> control plane; host agent starts workers; workers restore microVMs.
+    arrow(s, 7.6, 2.4, 9.2, 2.4, both=True)
+    label(s, 7.6, 1.85, 1.6, 0.45, ["unqueue build", "requests"], size=10)
+    arrow(s, 10.9, 3.0, 10.9, 3.3)
+    label(s, 11.0, 2.98, 1.6, 0.3, "start, stop", size=11, align=PP_ALIGN.LEFT)
+    arrow(s, 10.9, 4.35, 10.9, 4.8)
+    label(s, 11.0, 4.42, 1.95, 0.3, "restore one per command", size=10, align=PP_ALIGN.LEFT)
+    # The worker dials the relay (the relay never dials in).
+    arrow(s, 9.2, 3.95, 7.6, 5.2)
+    label(s, 7.75, 4.15, 1.0, 0.3, "connect", size=11)
+    text(s, 0.4, 6.4, 12.5, 0.6, [
+        "A worker **connects** to the relay and holds one two-way gRPC stream (Attach): commands come "
+        "down it, results go back up. Readiness is a worker connected to the relay; the cluster holds no "
+        "VM, the KVM host no policy."], size=12, color=MUTED)
 
 
 def s_states(d):
@@ -213,7 +222,7 @@ def s_seq_create(d):
     self_msg(s, xs, "Control plane", 2.9, "create-time rules, quota", w=2.6)
     msg(s, xs, "Control plane", "Provenance", 3.35, "create, gate, check")
     msg(s, xs, "Control plane", "Client", 3.75, "202 queued, a build handle", dash=True)
-    msg(s, xs, "Host agent", "Control plane", 4.3, "claim (every 2 min)")
+    msg(s, xs, "Host agent", "Control plane", 4.3, "unqueue a build request (every 2 min)")
     self_msg(s, xs, "Control plane", 4.65, "the host builds: pull, snapshot, probe", w=3.0)
     msg(s, xs, "Host agent", "Control plane", 5.2, "report built: T and S")
     self_msg(s, xs, "Control plane", 5.55, "registration rules", w=2.6)
@@ -301,8 +310,8 @@ def s_seq_session(d):
 def s_combined(d):
     s = d.slide("One control plane serves both kinds of brain",
                 "The combined route profile (combined control plane design, C1-C4)")
-    brain(s, 0.6, 1.6, 3.6, 1.1, "Stock agent", ["creates sandboxes, sends Execs"], size=12)
-    brain(s, 0.6, 3.3, 3.6, 1.1, "Moca Pi client", ["creates sessions, sends prompts"], size=12)
+    brain(s, 0.6, 1.6, 3.6, 1.1, "Stock agent", ["create sandboxes, send Execs"], size=12)
+    brain(s, 0.6, 3.3, 3.6, 1.1, "Moca Pi client", ["create sessions, send prompts"], size=12)
     orchestrator(s, 5.0, 2.2, 3.4, 1.6, "Control plane", ["profile `combined`",
                  "one catalog, quota, lease"], size=12)
     hands(s, 9.3, 2.4, 3.4, 1.1, "Workers of a build", ["serve both"], size=12)

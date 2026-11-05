@@ -17,17 +17,4 @@ spec:
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: None
----
-# Additive: the router may reach the control plane's HTTP port, and nothing else does (the base
-# policy's supervisor ingress is reset in kustomization.yaml; SBX0 runs no supervisor).
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata: { name: moca-control-plane-from-router, namespace: moca }
-spec:
-  podSelector: { matchLabels: { app: moca-control-plane } }
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector: { matchLabels: { 'policy-group.network.openshift.io/ingress': '' } }
-      ports:
-        - { protocol: TCP, port: 8080 }
+# The router -> control plane NetworkPolicy comes from ../ocp-single/routes (identical rule).
