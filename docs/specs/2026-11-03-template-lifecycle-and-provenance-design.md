@@ -573,7 +573,7 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
 | Step | Result                                                                                                                                                                                                 |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 2    | **4 of 4 built fresh and registered** (G29: no reuse of window 1's removed snapshots); the mismatched create refused (X10); the broken probe failed `probe_failed`, its reason without a registry host |
-| 3    | not covered (one subject)                                                                                                                                                                              |
+| 3    | **passed separately (2026-11-05)**: a second subject's create of the same id and its new build `409 template_exists`, its cancel `403`; reads allowed                                                  |
 | 4    | first use passed: `409 template_not_active`, `Retry-After: 30`, the caller's lease taken                                                                                                               |
 | 5    | build check 4 of 4; writes as Exec stdin, no stall (G26 fixed); **patches 4 of 4 match** the recordings                                                                                                |
 | 6    | aging passed: two windows of 2, the second placed as the first's leases ended                                                                                                                          |
@@ -638,7 +638,8 @@ Open from window 2: client-side stalls of about 20 s on some Execs (register G30
    image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers
    pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
    combined control plane. **Run 2026-11-04** (§10.1): window 1 passed steps 1, 2, 4 and 7;
-   window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 not covered, step 8 not started.
+   window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 passed with a second subject
+   (2026-11-05); step 8 not started.
 
 ## 12. Decisions
 
