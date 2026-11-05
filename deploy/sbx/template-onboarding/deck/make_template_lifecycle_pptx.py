@@ -60,6 +60,44 @@ def self_msg(s, xs, a, y, t, w=2.4, size=11):
 
 # --------------------------------------------------------------------------- 1. Why and what
 
+def s_motif(d):
+    # MOCA's motif, as autobench-moca's overview deck draws it (its "brain on host, hands apart"):
+    # the brain thinks and holds the model key; the hands only run commands. Here the hands are
+    # microVMs from a template's snapshot, and the template is what a client names.
+    s = d.slide("The brain thinks, the hands act; a template shapes the hands",
+                "Moca Pi brain, or a stock agent, with MOCA microVM sandbox hands")
+    box(s, 3.1, 1.45, 9.6, 4.6, INFRA, None, [], line_w=1, dash=True)
+    label(s, 3.25, 1.5, 4, 0.3, "MOCA (the cluster and the KVM host)", size=11,
+          align=PP_ALIGN.LEFT)
+    brain(s, 0.4, 1.9, 2.3, 1.1, "Stock agent", ["on the client's machine"], size=12)
+    brain(s, 0.4, 4.4, 2.3, 1.1, "Client", ["`mocactl`: prompts only"], size=12)
+    orchestrator(s, 3.5, 1.9, 3.0, 1.2, "Control plane", ["catalog: templates, builds",
+                 "logins, leases, policy"], size=12)
+    brain(s, 3.5, 4.3, 3.0, 1.3, "Harness", ["workers running Moca Pi",
+          "the model key, per turn"], size=12)
+    orchestrator(s, 7.1, 3.1, 2.0, 1.1, "Relay", ["carries Execs"], size=12)
+    store(s, 9.6, 1.75, 2.8, 1.0, "Template = snapshot", ["e.g. django-11133@sha256:…"],
+          size=11)
+    hands(s, 9.6, 3.05, 2.8, 1.2, "Template worker", ["one per build, serving", "that build's snapshot"],
+          size=12)
+    hands(s, 9.6, 4.6, 2.8, 1.0, "microVM hands", ["one per command"], size=12)
+    arrow(s, 2.7, 2.45, 3.5, 2.45)
+    label(s, 1.8, 1.55, 1.6, 0.3, "create, activate", size=10)
+    arrow(s, 2.7, 4.95, 3.5, 4.95)
+    label(s, 2.72, 5.0, 0.8, 0.3, "a prompt", size=10)
+    arrow(s, 5.0, 3.1, 5.0, 4.3, both=True)
+    label(s, 5.05, 3.5, 1.6, 0.3, "template, build", size=10, align=PP_ALIGN.LEFT)
+    arrow(s, 6.5, 4.9, 7.1, 3.9)
+    arrow(s, 2.1, 3.0, 7.1, 3.5, dash=True)
+    label(s, 3.0, 3.3, 1.9, 0.3, "Exec (sandbox token)", size=10)
+    arrow(s, 9.1, 3.65, 9.6, 3.65, both=True)
+    arrow(s, 11.0, 2.75, 11.0, 3.05)
+    arrow(s, 11.0, 4.25, 11.0, 4.6)
+    note(s, 0.4, 6.2, 12.3, 0.55, "The hands never hold the model key or the agent",
+         ["they get commands and return output; a template decides what the hands contain"],
+         size=11)
+
+
 def s_problem(d):
     s = d.slide("Benchmarks need many templates; adding one was manual",
                 "Where the work started (spec §1-§2)")
@@ -390,7 +428,8 @@ def s_next(d):
 
 
 SECTIONS = [
-    ("1", "Why and what", "the problem, and the design in four ideas", [s_problem, s_design]),
+    ("1", "Why and what", "MOCA's motif, the problem, the design in four ideas",
+     [s_motif, s_problem, s_design]),
     ("2", "Architecture", "where each part runs, and a build's states",
      [s_architecture, s_states]),
     ("3", "Onboarding", "create to registered, and the refusals", [s_seq_create, s_seq_refusals]),
