@@ -107,6 +107,10 @@ keeps the `sandbox` profile.
   start; today it reports only `moca.dev/tier` and `moca.dev/template`, `session/labels.go`), so a
   session pinned to a build never runs on another. A worker without the label serves only
   sessions without a pin (old workers keep working).
+  **As built (increment 5):** `microvm-worker` adds `moca.dev/build` from the manifest it verified
+  (`session.WithBuild`); the exchange returns `sandboxBuildId` for a manifest-hash build (never an
+  `imported:` one); the data plane (`turn-auth`, `run-turn`) passes it to `selectPoolSandbox`, which
+  keeps only records labelled with it and refuses the turn when none is attached.
 
 ### 3.5 Settings and stores
 
