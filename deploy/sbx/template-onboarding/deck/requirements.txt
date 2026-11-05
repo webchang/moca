@@ -1,0 +1,6 @@
+python-pptx==1.0.2
+pypdf==6.19.0              # the PDF's bookmarks: neither renderer writes useful ones
+xlsxwriter==3.2.9          # python-pptx needs it for a native chart's embedded data
+lxml==6.1.3
+pillow==12.3.0
+typing_extensions==4.16.0
