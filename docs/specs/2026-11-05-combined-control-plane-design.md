@@ -139,6 +139,12 @@ component), the relay with both Routes (attach and exec) and the janitor. One na
 Redis, one signing key (Secret `moca-mu1`, made by `deploy/k8s/setup.sh`), one API host. Its
 NetworkPolicy keeps the harness's kube-API egress (the credential store needs it).
 
+**Overlay written (2026-11-05, not deployed):** `deploy/k8s/overlays/ocp-combined`, on ocp-single plus
+SBX0's attach and exec Routes and template store; `deploy/sbx/tests/overlay-combined.test.sh`
+renders it and asserts the combined profile, both profiles' credentials, the relay's two Exec
+callers, one namespace and **no cluster-scoped object**. Still to build: `setup.sh` support (the
+Secrets and ConfigMaps it references).
+
 **For the validation:** a new namespace on ykt3 (for example `moca-combined`), so the SBX0
 deployment in `moca-sbx-template` stays as it is; the first combined window brings its templates
 in by create (the catalog does not move between namespaces).
