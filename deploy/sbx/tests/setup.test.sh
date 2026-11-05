@@ -20,7 +20,7 @@ REPO="$TMP/repo"
 mkdir -p "$REPO/deploy"
 cp -R "$SRC/deploy/sbx" "$REPO/deploy/sbx"
 cp -R "$SRC/deploy/k8s" "$REPO/deploy/k8s"
-rm -rf "$REPO/deploy/sbx/.generated" "$REPO/deploy/k8s/.generated"
+rm -rf "$REPO/deploy/sbx/.generated" "$REPO/deploy/sbx/.generated-"* "$REPO/deploy/k8s/.generated"
 SETUP="$REPO/deploy/sbx/setup.sh"
 GEN="$REPO/deploy/sbx/.generated"
 
@@ -915,11 +915,18 @@ cp "$K" "$TMP/profile-sandbox.yaml"
 run_setup export SBX_PROFILE=sandbox || fail 'SBX_PROFILE=sandbox failed'
 cmp -s "$TMP/profile-sandbox.yaml" "$K" || fail 'SBX_PROFILE=sandbox differs from unset'
 reset_state
+# A sandbox namespace's generated folder, which a combined run from the same checkout must leave alone.
+run_setup true || fail 'the sandbox run before the combined one failed'
+SBXGEN="$TMP/sbx-generated-before"; cp -R "$GEN" "$SBXGEN"
+rm -rf "$MOCK_STATE"; mkdir -p "$MOCK_STATE"; : >"$MOCK_LOG" # the mock cluster is not namespaced
+G0="$GEN"; GEN="$REPO/deploy/sbx/.generated-moca-combined-test"
 RW="ghcr.io/example/moca-remote-worker@sha256:$(printf 'a%.0s' {1..64})"
 MI="ghcr.io/example/moca@sha256:$(printf 'b%.0s' {1..64})"
 C=(eval "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_NAMESPACE=moca-combined-test SBX_SANDBOX_IMAGE=$RW SBX_IMAGE=$MI")
 run_setup "${C[@]}" || fail "the combined run failed: $(cat "$TMP/out")"
 grep -q 'overlays/ocp-combined' "$K" || fail 'the combined run did not render ocp-combined'
+[[ -f "$GEN/kustomization.yaml" && -f "$GEN/moca-ca.crt" ]] || fail 'the combined run did not write .generated-<namespace> (overlay, moca-ca.crt)'
+diff -r "$SBXGEN" "$G0" >/dev/null || fail 'the combined run changed the sandbox namespace'"'"'s .generated'
 for k in SH_SESSION_TOKEN_PRIVATE_KEY SH_SESSION_TOKEN_PUBLIC_KEYS SH_CREDENTIAL_KEK SH_EXCHANGE_TOKEN SH_JANITOR_TOKEN; do
   has_key moca-mu1 "$k" || fail "moca-mu1 has no $k"
 done
@@ -953,7 +960,8 @@ key="$(secret_val moca-mu1 SH_CREDENTIAL_KEK)"; xt="$(secret_val moca-mu1 SH_EXC
 k1="$key" x1="$xt"
 run_setup "${C[@]}" || fail 'the combined re-run failed'
 [[ "$(secret_val moca-mu1 SH_CREDENTIAL_KEK)" == "$k1" && "$(secret_val moca-mu1 SH_EXCHANGE_TOKEN)" == "$x1" ]] || fail 'a re-run rotated the KEK or the exchange token'
-pass 'SBX_PROFILE=combined renders ocp-combined with both profiles'"'"' keys, the harness exec token kept, its own addresses, and keeps the keys on a re-run'
+GEN="$G0"
+pass 'SBX_PROFILE=combined renders ocp-combined with both profiles'"'"' keys, the harness exec token kept, its own addresses and generated folder, and keeps the keys on a re-run'
 
 refusals=(
   'export SBX_PROFILE=harness => SBX_PROFILE must be sandbox or combined'

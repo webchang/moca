@@ -75,6 +75,12 @@ verify "$TMP/home-c" github:1234 '[]' DEFAULT_ISSUER || fail 'the combined token
 ! verify "$TMP/home-c" github:1234 '[]' 2>/dev/null || fail 'the combined token verifies under the sandbox issuer'
 echo 'SBX_ROUTE_PROFILE=harness' >>"$TMP/env-c"
 ! bash "$MINT" --env-file "$TMP/env-c" --subject github:1234 --home "$TMP/home-c" >"$TMP/out" 2>&1 || fail 'accepted SBX_ROUTE_PROFILE=harness'
+# setup.sh's SBX_PROFILE=combined alone does the same (one env file for both scripts).
+printf 'combined' >"$TMP/live-profile"
+cp "$TMP/env" "$TMP/env-p"; echo 'SBX_PROFILE=combined' >>"$TMP/env-p"
+mkdir -p "$TMP/home-p"
+bash "$MINT" --env-file "$TMP/env-p" --subject github:1234 --home "$TMP/home-p" >"$TMP/out" 2>&1 || fail 'mint a login from SBX_PROFILE=combined'
+verify "$TMP/home-p" github:1234 '[]' DEFAULT_ISSUER || fail 'SBX_PROFILE=combined did not mint under the harness issuer'
 printf 'sandbox' >"$TMP/live-profile"
 pass 'mints under the harness issuer for SBX_ROUTE_PROFILE=combined, never the sandbox one; refuses another profile, and a profile the live control plane does not run'
 

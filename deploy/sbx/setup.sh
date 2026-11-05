@@ -83,12 +83,15 @@
 # (egress.env, egress.token [+ api-ca.crt], for install-host.sh --egress). Copy each bundle straight to its host and delete
 # the copy. With SBX_TEMPLATE_STORE=1 and SBX_TEMPLATE_HOSTS, also host-agent/<host id>/
 # (host-agent.env, host-agent.token [+ api-ca.crt]) for deploy/sbx/host-agent.sh (RUNBOOK §15).
-# Users log in with `mocactl sbx login`; nothing here is handed to them.
+# Users log in with `mocactl sbx login`; nothing here is handed to them. With SBX_PROFILE=combined all of
+# it goes to deploy/sbx/.generated-<SBX_NAMESPACE>/ instead, with moca-ca.crt (the supervisor Route's
+# self-signed certificate, the CA its clients trust, e.g. NODE_EXTRA_CA_CERTS) beside the other CAs.
 set -euo pipefail
 
 SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEN="$SBX_DIR/.generated"
 OVERLAY_REL=../../k8s/overlays/ocp-sbx # from $GEN; ocp-combined with SBX_PROFILE=combined (validate)
+# GEN is .generated-<namespace> with SBX_PROFILE=combined (validate), at the same depth, so OVERLAY_REL holds.
 API_ROUTE='sbx-api'
 HOSTS_TO_REINSTALL='' # workers whose SH_WORKSPACE_IDLE this run changes (check_host_idle)
 
@@ -113,6 +116,10 @@ validate() {
   [[ -z "${SBX_CLIENTS:-}" ]] ||
     die 'SBX_CLIENTS was increment 1a (static client tokens) and is gone: unset it; users now run `mocactl sbx login`'
   [[ "${SBX_NAMESPACE:-}" =~ $NS_RE ]] || die 'SBX_NAMESPACE is required and must be a namespace name'
+  # Combined: its own generated folder, so a run from a checkout that also deploys an SBX0 namespace
+  # never rewrites that one's overlay, CAs or bundles (it would delete worker bundles it does not list,
+  # and rewrite a host-agent bundle with another namespace's token). Before check_host_idle reads it.
+  [[ "${SBX_PROFILE:-sandbox}" != combined ]] || GEN="$SBX_DIR/.generated-$SBX_NAMESPACE"
   [[ "${SBX_ATTACH_HOST:-}" =~ $HOST_RE ]] || die 'SBX_ATTACH_HOST is required and must be a DNS name'
   [[ "${SBX_EXEC_HOST:-}" =~ $HOST_RE ]] || die 'SBX_EXEC_HOST is required and must be a DNS name'
   [[ "$SBX_ATTACH_HOST" != "$SBX_EXEC_HOST" ]] || die 'SBX_ATTACH_HOST and SBX_EXEC_HOST must differ (one certificate each)'

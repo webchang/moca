@@ -4,7 +4,8 @@
 #
 #   deploy/sbx/mint-login.sh --env-file FILE --subject github:<id> --home DIR [--ttl-minutes N]
 #
-# The token's issuer follows SBX_ROUTE_PROFILE in the env file (sandbox, the default, or combined).
+# The token's issuer follows SBX_ROUTE_PROFILE in the env file (sandbox, the default, or combined), or
+# else SBX_PROFILE, setup.sh's setting, so one env file serves both scripts.
 #
 # For a deployment whose SBX_GITHUB_CLIENT_ID is a placeholder (no OAuth app), so `mocactl sbx login`
 # cannot run: tests of the template API, the smoke's two users. The subject must be enrolled
@@ -50,7 +51,8 @@ roles='[]'
 [[ ",${SBX_ADMIN_SUBJECTS:-}," != *",$SUBJECT,"* ]] || roles='["admin"]'
 # The API token's issuer follows the deployment's route profile (combined control plane spec §3.3):
 # the sandbox profile's own, or the harness one on a combined control plane. Default: sandbox.
-case "${SBX_ROUTE_PROFILE:-sandbox}" in
+SBX_ROUTE_PROFILE="${SBX_ROUTE_PROFILE:-${SBX_PROFILE:-sandbox}}"
+case "$SBX_ROUTE_PROFILE" in
   sandbox) ISS_NAME=SANDBOX_API_ISSUER ;;
   combined) ISS_NAME=DEFAULT_ISSUER ;;
   *) die "SBX_ROUTE_PROFILE must be sandbox or combined" ;;
@@ -61,8 +63,8 @@ esac
 live="$(kubectl get deploy moca-control-plane -n "$SBX_NAMESPACE" \
   -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SH_ROUTE_PROFILE")].value}')" ||
   die "cannot read the control plane's Deployment in $SBX_NAMESPACE"
-[[ "${live:-harness}" == "${SBX_ROUTE_PROFILE:-sandbox}" ]] ||
-  die "the control plane in $SBX_NAMESPACE runs SH_ROUTE_PROFILE=${live:-harness}, but SBX_ROUTE_PROFILE is ${SBX_ROUTE_PROFILE:-sandbox}: its login would be refused"
+[[ "${live:-harness}" == "$SBX_ROUTE_PROFILE" ]] ||
+  die "the control plane in $SBX_NAMESPACE runs SH_ROUTE_PROFILE=${live:-harness}, but SBX_ROUTE_PROFILE is $SBX_ROUTE_PROFILE: its login would be refused"
 json="$(kubectl get secret moca-mu1 -n "$SBX_NAMESPACE" -o json)" || die "cannot read the Secret moca-mu1 in $SBX_NAMESPACE"
 jq -e '.metadata.labels["sbx.moca.dev/setup"] == "true"' <<<"$json" >/dev/null ||
   die "moca-mu1 in $SBX_NAMESPACE was not written by deploy/sbx/setup.sh"
