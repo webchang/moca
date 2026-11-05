@@ -13,7 +13,8 @@
 # refresh: it ends at its expiry (default 60 minutes, at most 1440); mint another.
 #
 # It reads the key from the Secret moca-mu1 in SBX_NAMESPACE (kubectl, the current context, as
-# setup.sh) and writes DIR/.config/mocactl/sbx-auth.json, mode 0600, with XDG_CONFIG_HOME unset for
+# setup.sh) and writes DIR/.config/mocactl/sbx-auth.json (and, on a combined control plane, the same
+# login as auth.json, for `mocactl run`), mode 0600, with XDG_CONFIG_HOME unset for
 # its users, as smoke.sh runs mocactl. The key and the token never reach argv, the log or stdout:
 # they travel through the environment of one node process.
 #
@@ -73,12 +74,19 @@ cfg="$HOME_DIR/.config/mocactl"
 mkdir -p "$cfg"
 chmod 700 "$HOME_DIR/.config" "$cfg"
 
+# Combined: the same login as mocactl's own auth.json too, so `mocactl run` (Moca Pi sessions) and
+# `mocactl sbx` both use it; the format is the same (mocactl config.ts CachedAuth).
+OUTS="$cfg/sbx-auth.json" REPLACED=''
+if [[ "$SBX_ROUTE_PROFILE" == combined ]]; then
+  OUTS+=":$cfg/auth.json"
+  [[ ! -e "$cfg/auth.json" ]] || REPLACED=' (replacing the auth.json there)'
+fi
 # The key leaves jq on a pipe into node's environment only; node writes the file itself. Run from the
 # control-plane package, where `--import tsx` resolves (as its units start node).
 cd "$SRC/packages/control-plane"
 SBX_KEY_B64="$(jq -r '.data.SH_SESSION_TOKEN_PRIVATE_KEY // empty' <<<"$json")" \
   SBX_SUB="$SUBJECT" SBX_ROLES="$roles" SBX_TTL_S="$((TTL_MIN * 60))" SBX_URL="https://$SBX_API_HOST" \
-  SBX_OUT="$cfg/sbx-auth.json" \
+  SBX_OUT="$OUTS" \
   node --import tsx --input-type=module -e "
     import { writeFileSync, renameSync } from 'node:fs';
     import { makeSigner, $ISS_NAME as ISSUER } from '$SRC/packages/control-plane/src/token.ts';
@@ -89,7 +97,9 @@ SBX_KEY_B64="$(jq -r '.data.SH_SESSION_TOKEN_PRIVATE_KEY // empty' <<<"$json")" 
     const now = Math.floor(Date.now() / 1000), ttl = Number(e.SBX_TTL_S), roles = JSON.parse(e.SBX_ROLES);
     const apiToken = s.mint({ sub: e.SBX_SUB, tenant: e.SBX_SUB, roles, scope: ['api'], ttlSeconds: ttl, now, iss: ISSUER });
     const auth = { apiToken, subject: e.SBX_SUB, roles, expiresAt: now + ttl, controlPlaneUrl: e.SBX_URL };
-    writeFileSync(e.SBX_OUT + '.new', JSON.stringify(auth) + '\n', { mode: 0o600 });
-    renameSync(e.SBX_OUT + '.new', e.SBX_OUT);
+    for (const out of e.SBX_OUT.split(':')) {
+      writeFileSync(out + '.new', JSON.stringify(auth) + '\n', { mode: 0o600 });
+      renameSync(out + '.new', out);
+    }
   " || die 'could not mint the login'
-echo "wrote a login for $SUBJECT ($(jq -r 'if .roles == ["admin"] then "admin" else "user" end' "$cfg/sbx-auth.json"), ${TTL_MIN} min) to $cfg/sbx-auth.json"
+echo "wrote a login for $SUBJECT ($(jq -r 'if .roles == ["admin"] then "admin" else "user" end' "$cfg/sbx-auth.json"), ${TTL_MIN} min) to ${OUTS//:/ and }$REPLACED, each 0600"

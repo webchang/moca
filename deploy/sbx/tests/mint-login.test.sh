@@ -60,6 +60,7 @@ F="$TMP/home-a/.config/mocactl/sbx-auth.json"
 verify "$TMP/home-a" github:1234 '[]' || fail 'the user token does not verify under the sandbox API issuer'
 bash "$MINT" --env-file "$TMP/env" --subject github:42 --home "$TMP/home-admin" >"$TMP/out" 2>&1 || fail 'mint an admin login'
 verify "$TMP/home-admin" github:42 '["admin"]' || fail 'an admin subject did not get the admin role'
+[[ ! -e "$TMP/home-a/.config/mocactl/auth.json" ]] || fail 'a sandbox-profile login wrote auth.json'
 pass 'writes a 0600 sbx-auth.json whose token verifies under the sandbox API issuer, with the admin role for an admin'
 
 # A combined control plane (combined control plane spec §3.3): the harness issuer, which a sandbox
@@ -81,8 +82,15 @@ cp "$TMP/env" "$TMP/env-p"; echo 'SBX_PROFILE=combined' >>"$TMP/env-p"
 mkdir -p "$TMP/home-p"
 bash "$MINT" --env-file "$TMP/env-p" --subject github:1234 --home "$TMP/home-p" >"$TMP/out" 2>&1 || fail 'mint a login from SBX_PROFILE=combined'
 verify "$TMP/home-p" github:1234 '[]' DEFAULT_ISSUER || fail 'SBX_PROFILE=combined did not mint under the harness issuer'
+# Combined: mocactl's own auth.json holds the same login (for `mocactl run`), also 0600.
+cmp -s "$TMP/home-p/.config/mocactl/sbx-auth.json" "$TMP/home-p/.config/mocactl/auth.json" || fail 'no auth.json, or not the same login'
+[[ "$(stat -c %a "$TMP/home-p/.config/mocactl/auth.json" 2>/dev/null || stat -f %Lp "$TMP/home-p/.config/mocactl/auth.json")" == 600 ]] || fail 'auth.json is not 0600'
+grep -q 'sbx-auth.json and .*/auth.json, each 0600' "$TMP/out" || fail 'the summary does not name both files'
+! grep -q 'replacing' "$TMP/out" || fail 'the first mint says it replaced an auth.json'
+bash "$MINT" --env-file "$TMP/env-p" --subject github:1234 --home "$TMP/home-p" >"$TMP/out" 2>&1 || fail 'mint again'
+grep -q 'replacing the auth.json there' "$TMP/out" || fail 'a second mint does not say it replaced auth.json'
 printf 'sandbox' >"$TMP/live-profile"
-pass 'mints under the harness issuer for SBX_ROUTE_PROFILE=combined, never the sandbox one; refuses another profile, and a profile the live control plane does not run'
+pass 'mints under the harness issuer for SBX_ROUTE_PROFILE=combined (and writes it as auth.json too), never the sandbox one; refuses another profile, and a profile the live control plane does not run'
 
 # Neither the key nor the token in any output.
 tok="$(jq -r .apiToken "$F")"
