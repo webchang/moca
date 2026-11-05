@@ -597,6 +597,15 @@ resolved-address dial): activation 10.8-17.4 s from each request (window 3: 86-1
 G31); 0 DNS stalls (G30); the rebuilt workers report `moca.dev/build` (G19); patches and build
 check 4 of 4; a probe failure reported at step `probe`.
 
+**The combined control plane's attach window** (2026-11-05, `moca-combined`, no model): the same four
+templates created self-serve by a user with no role, built by bm1's host agent and registered by
+policy (4 of 4; the broken gate refused at create, X10; the broken probe failed at `probe`); a
+stock-agent sandbox and a **Moca Pi session both pinned to django's build**, on one control plane,
+the session's record carrying `sandboxTemplate` and `sandboxBuildId`; first use through a session
+(`409 template_not_active`, then `201` after 23 s); activation in 13-18 s; the active limit refusing
+a third (`no_active_slot`); 8 chains and 52 records verified offline. Steps 2, 4, 5 (sessions now
+included), 6 and 7 hold on the combined control plane; 8 is not started.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
@@ -614,7 +623,8 @@ check 4 of 4; a probe failure reported at step `probe`.
    the harness profile until `use` records exist). The transitional readiness states, the hosts'
    contents and builds from template records came with item 5. Not yet: the client logs route. The
    combined harness-and-sandbox control plane of §4.1, with SBX0's token rules, is built (its own
-   design, 2026-11-05: the `combined` route profile, increments 1-5), not yet deployed.
+   design, 2026-11-05: the `combined` route profile, increments 1-5), deployed on ykt3 (`moca-combined`, 2026-11-05)
+   and attached to bm1's workers in one window (§10.1).
 4. Create and policy at create (§4, §8.1), quotas (§6.2). **Built:** `POST /v1/templates` and
    `POST /v1/templates/{id}/builds` (202, a `b-<26 hex>` handle, status `queued`), `GET`/`PUT
 /v1/policy` (admin PUT; every change a `policy` record), `GET /v1/quota`; the create-time rules

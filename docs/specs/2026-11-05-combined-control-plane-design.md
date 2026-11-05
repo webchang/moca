@@ -3,7 +3,8 @@
 Version: 0.1 (draft for review) — November 2026
 Status: Accepted (C1-C4, §5) — branch `sbx-template` (webchang/moca), not proposed upstream;
 increments 1-5 and the host-agent work built and pushed (2026-11-05: 69ab7d2b, 4e637974, f480ab70,
-557c4d26, f562b2c1, c93042f6); increments 6 (deployment) and 7 (validation) not started
+557c4d26, f562b2c1, c93042f6); increment 6 (deployment) done 2026-11-05: `moca-combined` on ykt3, bm1's workers attached in one window
+(lifecycle spec §10.1); increment 7 (validation with a model) not started
 Builds on: [template lifecycle and provenance](2026-11-03-template-lifecycle-and-provenance-design.md)
 §4.1 (the decision: "one control plane, the `harness` profile with the sandbox routes added"),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) §4 (the sandbox profile, its token
@@ -171,6 +172,11 @@ in by create (the catalog does not move between namespaces).
    namespace is a cluster-scoped change outside autobench's current scope (`moca-sbx-template`):
    its step list names the namespace, every cluster-scoped object it creates or touches, and its
    teardown, and needs the user's OK for the scope change itself.
+   **Done (2026-11-05):** the user's OK for `moca-combined`; deployed from 3d235bc4
+   (`STEPS-ykt3-combined-deploy.md`, every image pinned, no Role, the file credential store); the
+   policy's four gate records by a temporary admin; bm1's workers attached with the template label
+   `install-host.sh` now sets (b8b4f3a2). A stock-agent sandbox and a Moca Pi session pinned to the
+   same build, first use through a session, and offline provenance all held, with no model.
 7. **Validation:** a window with both brains on the same templates (spec §10, the Moca Pi arm).
 
 Between 5 and 6, on the host agent (not this design's, but needed by its window): the fast
