@@ -476,6 +476,7 @@ export async function cmdRun(rt: Runtime, io: Io, opts: RunOptions): Promise<num
     now: rt.now,
     sleep: rt.sleep,
     maxCapacityWaitMs: HEADLESS_CAPACITY_WAIT_MS,
+    onActivationWait: (s) => io.err(`the session's template is activating; retrying in ${s} s`),
   });
 
   // An explicit empty --session is a mistake (a script whose id lookup came back empty), not a

@@ -769,7 +769,7 @@ async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
  * `active` is not refused here (its first Exec waits on the relay, as before); activation on first
  * use (§6.4) is not built.
  */
-async function resolveForUse(
+export async function resolveForUse(
   deps: CpDeps,
   p: TokenClaims,
   ref: string,
@@ -804,7 +804,7 @@ export const FIRST_USE_RETRY_S = 30;
  * waiting, so a wait never uses the caller's live-sandbox cap. Without host agents (workers run
  * by the deployment, SH_TEMPLATE_HOSTS unset) nothing changes: the create succeeds as before.
  */
-async function requireActive(
+export async function requireActive(
   deps: CpDeps,
   p: TokenClaims,
   t: { doc: TemplateDoc; build: TemplateBuild },

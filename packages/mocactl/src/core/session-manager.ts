@@ -81,7 +81,15 @@ export interface SessionDeps {
    * 2026-10-31: a session retried an empty tier for 10 minutes).
    */
   maxCapacityWaitMs?: number;
+  /**
+   * Told each time a session create waits for its template to become active (template lifecycle
+   * spec §6.4): the control plane started the activation and answered 409 template_not_active.
+   */
+  onActivationWait?: (seconds: number) => void;
 }
+
+/** How long a session create waits for its template to become active (§6.4) before giving up. */
+export const SESSION_ACTIVATION_WAIT_MS = 10 * 60_000;
 
 type PromptJob = { kind: 'prompt'; prompt: string; resend: boolean; conflicts: number };
 type Job =
@@ -799,12 +807,33 @@ export class SessionManager {
   constructor(private readonly deps: SessionDeps) {}
 
   async create(req: CreateSessionRequest): Promise<ActiveSession> {
-    const created = await this.deps.cp.createSession(req);
+    const created = await this.createWaitingForActivation(req);
     this.deps.transcripts?.ensure(created.sessionId);
     return new ActiveSession(this.deps, created.sessionId, {
       token: created.token,
       expiresAt: created.expiresAt,
     });
+  }
+
+  /**
+   * The create, retried while its template activates (§6.4): a 409 template_not_active means the
+   * control plane started the activation, so wait its Retry-After, up to SESSION_ACTIVATION_WAIT_MS.
+   */
+  private async createWaitingForActivation(req: CreateSessionRequest) {
+    const start = this.deps.now();
+    for (;;) {
+      try {
+        return await this.deps.cp.createSession(req);
+      } catch (err) {
+        if (!(err instanceof ApiError && err.status === 409 && err.code === 'template_not_active'))
+          throw err;
+        const left = SESSION_ACTIVATION_WAIT_MS - (this.deps.now() - start);
+        if (left <= 0) throw err;
+        const waitMs = Math.min(Math.max(1, err.retryAfterS ?? 30) * 1000, left);
+        this.deps.onActivationWait?.(Math.ceil(waitMs / 1000));
+        await this.deps.sleep(waitMs);
+      }
+    }
   }
 
   async resume(sessionId: string): Promise<ActiveSession> {

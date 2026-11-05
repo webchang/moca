@@ -1021,7 +1021,15 @@ paths:
                       description: |
                         a template id from GET /v1/discovery's sandboxTemplates; 400 when unknown, or
                         on a deployment that declares none. Omitted: none, and the session runs only
-                        on untemplated workers
+                        on untemplated workers. With a template store (SH_PROVENANCE_DIR) the template
+                        resolves through the catalog as a sandbox's does (combined control plane spec
+                        §3.4): `id`, `id:tag` or `id@sha256:…`, a registered build the caller may see
+                        (`400 unknown_template` otherwise), recorded as the session's sandboxBuildId;
+                        and, with host agents, activation on first use (`409 template_not_active`)
+                    activate:
+                      type: boolean
+                      default: true
+                      description: false to be refused on a template not active without starting its activation (§6.4)
                 model:
                   type: string
                   pattern: '^[\x21-\x7e]{1,256}$'
@@ -1046,6 +1054,14 @@ paths:
                     description: false when the catalog could not be read and the id was accepted unchecked
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: |
+            `template_not_active` (Retry-After): the session's template is not active yet, its
+            activation started unless `sandbox.activate` is false; `no_active_slot` (Retry-After),
+            `template_unavailable`: as activate (template lifecycle spec §6.4)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: |
             `config_bundle_not_found`: `configRef` names a digest that is not stored (never

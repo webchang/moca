@@ -327,6 +327,38 @@ describe('SessionManager', () => {
     expect(cp.calls).not.toContain('mintSessionToken');
   });
 
+  it('create waits while its template activates (§6.4), then gives up after its bound', async () => {
+    const waits: number[] = [];
+    let t = NOW;
+    const { manager, cp, slept } = setup([], {
+      now: () => t,
+      sleep: async (ms) => {
+        slept.push(ms);
+        t += ms;
+      },
+      onActivationWait: (s) => waits.push(s),
+    });
+    const real = cp.createSession.bind(cp);
+    let n = 0;
+    const notActive = () =>
+      new ApiError('control-plane', 409, 'template_not_active', 'activating', 30);
+    cp.createSession = async (req) => {
+      if (++n < 3) throw notActive();
+      return real(req);
+    };
+    const s = await manager.create({ credentials: { inference: 'a' }, sandbox: { template: 't' } });
+    expect(s.sessionId).toBe('s-new');
+    expect(slept).toEqual([30_000, 30_000]);
+    expect(waits).toEqual([30, 30]);
+    // Never active: refused after 10 minutes of waits.
+    cp.createSession = async () => {
+      throw notActive();
+    };
+    await expect(manager.create({ credentials: { inference: 'a' } })).rejects.toMatchObject({
+      code: 'template_not_active',
+    });
+  });
+
   it('remove deletes the session and its transcript', async () => {
     const transcripts = new TranscriptStore(mkdtempSync(join(tmpdir(), 'mocactl-sm-')), {
       subject: 'github:1',

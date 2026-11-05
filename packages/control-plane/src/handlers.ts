@@ -75,7 +75,7 @@ import {
   type SandboxTemplate,
 } from './sandbox-config.js';
 import type { SandboxStore } from './sandbox-store.js';
-import { SANDBOX_HANDLERS } from './sandbox-handlers.js';
+import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handlers.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
 import type { EgressHost } from './egress-config.js';
 import { formatDestination, parseDestination } from './egress-destination.js';
@@ -743,12 +743,26 @@ export const HANDLERS: Record<string, Handler> = {
     if (requestedTemplate !== undefined && typeof requestedTemplate !== 'string') {
       throw new CpError('invalid_request', 'sandbox.template must be a string');
     }
+    const activateField = asRecord(sandbox).activate;
+    if (activateField !== undefined && typeof activateField !== 'boolean') {
+      throw new CpError('invalid_request', 'sandbox.activate must be true or false');
+    }
+    // With a template store, a session's template resolves through the catalog as a sandbox's does
+    // (combined control plane spec §3.4): `id`, `id:tag` or `id@sha256:…`, a registered build the
+    // caller may see, and activation on first use (§6.4) where host agents run the workers.
+    let resolved: { id: string; buildId: string } | undefined;
+    if (requestedTemplate !== undefined && deps.templates && deps.provenance) {
+      const t = await resolveForUse(deps, p, requestedTemplate);
+      await requireActive(deps, p, t, activateField !== false);
+      resolved = { id: t.id, buildId: t.buildId };
+    }
     const templates = deps.config.sessionTemplates;
-    if (requestedTemplate !== undefined && !templates) {
+    if (requestedTemplate !== undefined && !resolved && !templates) {
       throw new CpError('invalid_request', 'this deployment declares no sandbox templates');
     }
     if (
       requestedTemplate !== undefined &&
+      !resolved &&
       templates &&
       !templates.some((t) => t.id === requestedTemplate)
     ) {
@@ -757,10 +771,10 @@ export const HANDLERS: Record<string, Handler> = {
         `unknown sandbox template '${requestedTemplate}': this deployment declares ${templates.map((t) => t.id).join(', ')}`,
       );
     }
-    const sandboxTemplate = requestedTemplate ?? '';
-    // The build its default tag names now (§9), from the catalog when there is one.
-    let sandboxBuildId = '';
-    if (sandboxTemplate && deps.templates) {
+    const sandboxTemplate = resolved?.id ?? requestedTemplate ?? '';
+    // The build the reference names (resolved above), or the default tag's now (§9) without a store.
+    let sandboxBuildId = resolved?.buildId ?? '';
+    if (sandboxTemplate && !resolved && deps.templates) {
       const doc = await deps.templates.get(sandboxTemplate).catch(() => null);
       const def = doc?.tags.default
         ? doc.builds.find((x) => x.buildId === doc.tags.default)

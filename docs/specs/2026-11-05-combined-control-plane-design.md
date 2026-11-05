@@ -98,6 +98,9 @@ keeps the `sandbox` profile.
   agents, a session on a build that is not active takes the caller's lease and answers
   `409 template_not_active` with `Retry-After`; `activate: false` starts nothing. `mocactl`'s
   session create retries it, as `sbx create` does.
+  **As built (increment 4):** with a template store, `createSession` uses the sandbox path's
+  `resolveForUse` and `requireActive` (`sandbox.activate` in the body); without one, the static list
+  as before. `SessionManager.create` waits up to 10 minutes, saying why in headless runs.
 - **Turns by build (G19):** the session records `sandboxBuildId` (as today); `select-sandbox.ts`
   selects workers by the template label **and** a **new** build label the worker
   reports (`moca.dev/build`, its snapshot's manifest hash, which `microvm-worker` already verifies at
