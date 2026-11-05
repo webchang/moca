@@ -409,6 +409,29 @@ describe('activation on first use (§6.4)', () => {
     expect(await leases(d, 't2')).toHaveLength(0);
   });
 
+  it('refuses before any configured host has reported, and serves an attached worker (G32)', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    d.config.templateHosts = [{ id: 'bm1', token: 'f'.repeat(64) }];
+    // No inventory from bm1 yet: refused, not left to wait at the relay; the lease is taken.
+    expect(await refusal(() => createSandbox(d, { template: 't1' }))).toEqual({
+      code: 'template_not_active',
+      readiness: 'activating',
+      retryAfterS: 30,
+    });
+    expect((await leases(d, 't1')).map((l) => l.subject)).toEqual([alice.sub]);
+    expect(await d.sandboxes!.listByOwner(alice.sub, Math.floor(now / 1000))).toHaveLength(0);
+    // Once bm1 reports, it is asked to run the build the lease wants.
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+    // A control plane restarted under attached workers (no inventory yet) still serves them.
+    d.hosts = new HostRegistry();
+    attachedNow = ['sbx_t1'];
+    expect((await createSandbox(d, { template: 't1' })).status).toBe(201);
+  });
+
   it('changes nothing without host agents: the create succeeds as before', async () => {
     const d = await setup();
     attachedNow = [];

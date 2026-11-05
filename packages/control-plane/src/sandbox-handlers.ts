@@ -803,6 +803,9 @@ export const FIRST_USE_RETRY_S = 30;
  * agent starts its worker; the retry succeeds once it is attached. No sandbox record is kept while
  * waiting, so a wait never uses the caller's live-sandbox cap. Without host agents (workers run
  * by the deployment, SH_TEMPLATE_HOSTS unset) nothing changes: the create succeeds as before.
+ * With hosts configured but none reported yet (a fresh deploy, a restart, a host down; register
+ * G32), readiness is the worker's presence alone: an attached worker serves, and an absent one is
+ * refused rather than left to wait at the relay.
  */
 export async function requireActive(
   deps: CpDeps,
@@ -810,7 +813,7 @@ export async function requireActive(
   t: { doc: TemplateDoc; build: TemplateBuild },
   activate: boolean,
 ): Promise<void> {
-  if (hostViews(deps).length === 0) return;
+  if (hostViews(deps).length === 0 && !deps.config.templateHosts?.length) return;
   const facts = await readinessFacts(deps);
   const readiness = readinessOf(t.build, facts.nowS, facts.placement, facts.attached);
   if (readiness === 'active') return;
