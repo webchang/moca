@@ -20,7 +20,7 @@
 #
 # Every patch names the BASE namespace (moca), as ocp-sbx's do. deploy/sbx/setup.sh's generated
 # overlay would set the real namespace, hosts, image and settings hashes; the placeholders keep this
-# one renderable for tests. NOT YET DEPLOYED (combined design increment 6).
+# one renderable for tests. Deployed by deploy/sbx/setup.sh SBX_PROFILE=combined (combined design increment 6).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: moca-combined

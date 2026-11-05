@@ -5,7 +5,8 @@ templates, gated by machine-checked policy; 0.5 applies autobench-moca's client 
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
 implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04, windows
 3 and 4 (measurements) and step 3 on 2026-11-05 (§10.1); the combined control plane of §4.1 is built
-([its design](2026-11-05-combined-control-plane-design.md)), not deployed
+([its design](2026-11-05-combined-control-plane-design.md)) and deployed on ykt3 (`moca-combined`), its attach
+window run 2026-11-05 (§10.1)
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -401,7 +402,9 @@ so a wait never uses the live-sandbox cap. Without host agents nothing changes. 
 and `sbx up` retry it for up to 10 minutes, saying why. **Sessions (Moca Pi)** take the same gate
 where a template store exists (combined control plane increment 4, 557c4d26): `POST /v1/sessions`
 resolves `sandbox.template` through the catalog, `sandbox.activate: false` starts nothing, and
-`mocactl`'s session create waits on the 409.
+`mocactl`'s session create waits on the 409. The gate applies whenever template hosts are
+configured, also before any of them has reported (register G32, 62677b05): until a host's first
+inventory, an attached worker serves and an absent one is refused, not left to wait at the relay.
 
 ## 7. Provenance
 
@@ -665,7 +668,9 @@ included), 6 and 7 hold on the combined control plane; 8 is not started.
    pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
    combined control plane. **Run 2026-11-04** (§10.1): window 1 passed steps 1, 2, 4 and 7;
    window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 passed with a second subject
-   (2026-11-05); step 8 not started.
+   (2026-11-05); windows 3 and 4 measured G30 and G31 (2026-11-05); the combined control plane's attach
+   window passed 2, 4, 5 (a sandbox and a Moca Pi session on one build), 6 and 7 (2026-11-05); step 8
+   not started.
 
 ## 12. Decisions
 

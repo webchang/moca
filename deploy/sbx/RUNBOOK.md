@@ -718,7 +718,8 @@ Each poll also asks the control plane which workers to run and stop (`GET /v1/ho
 builds leased by clients and placed on this host, within `SBX_ACTIVE_LIMIT`), starts and stops
 their `sbx-worker@<id>` units, and reports each start (`attached`), refusal and stop (`detached`). It
 never stops a worker with live sandboxes. It starts only **installed** workers: install a new
-template's worker as in §5 (its relay token comes from `setup.sh`); until then the agent reports
+template's worker as in §5 (its relay token comes from `setup.sh`; the record's id becomes its
+`SANDBOX_TEMPLATE`, the label Moca Pi sessions select by); until then the agent reports
 it `refused` (register gap G18).
 
 **Activations without waiting for a build** (register G31): the build poll applies the wanted

@@ -7,7 +7,7 @@ Sources, in the order they win (a slide restates them; change the source first):
   1. docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md (states §3.3, API §4,
      host agent §6.1, first use §6.4, provenance §7, policy §8, validation §10.1)
   2. docs/specs/2026-11-05-combined-control-plane-design.md (one control plane, turns by build)
-  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G31)
+  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G32)
   4. deploy/sbx/RUNBOOK.md §15 (the host agent, its units)
   5. the run record of windows 1-4 (on the user's machine; its numbers are copied below with the
      window they come from)
@@ -405,23 +405,23 @@ def s_issues(d):
          "w2-w4"],
         ["G31", "activation waited for the build poll", "the wanted-state unit", "w4"],
         ["G19", "a session could run on another build", "the build label and filter",
-         "label w4"],
+         "combined"],
         ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.5, bold_first_col=True)
     note(s, 0.6, 5.3, 12.1, 0.9, "Not yet covered",
-         ["a real model and grading (step 8); the combined control plane deployed (built, "
-          "tested, not on a cluster)"], size=12)
+         ["a real model and grading (step 8); a session turn on the combined control plane "
+          "(deployed, checked with no model)"], size=12)
 
 
 # --------------------------------------------------------------------------- 6. Next
 
 def s_next(d):
-    s = d.slide("Next: deploy the combined plane, then a real model, then upstream",
+    s = d.slide("Next: a real model, both brains, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "Deploy the combined control plane", "a new namespace on the cluster (a cluster-scoped "
-         "change), a new image, a window on the KVM host with both brains"),
-        ("2", "A real model and grading", "spec §10 step 8, with the model spend agreed"),
+        ("1", "A real model and grading", "spec §10 step 8, with the model spend agreed"),
+        ("2", "Both brains on the combined control plane", "deployed and attached; next a "
+         "window on the KVM host with a model, Moca Pi beside a stock agent"),
         ("3", "Propose upstream", "as PRs, from what the windows proved; upstream has no "
          "session templates today"),
     ]
@@ -431,8 +431,8 @@ def s_next(d):
         text(s, 1.55, y + 0.05, 4.4, 0.9, [f"**{t}**"], size=16)
         text(s, 6.0, y + 0.05, 6.7, 0.95, [b], size=14, color=MUTED)
         y += 1.35
-    note(s, 0.6, 5.8, 12.1, 0.6, "Built, not deployed",
-         ["the combined control plane's increments 1-5 are tested and pushed, not run on a cluster"],
+    note(s, 0.6, 5.8, 12.1, 0.6, "Deployed, no model yet",
+         ["the combined control plane runs on the cluster; a sandbox and a session shared one build (no model)"],
          size=12)
 
 

@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-03T21:43:16Z
+**Last modified:** 2026-11-05T21:46:58Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -222,7 +222,8 @@ sudo deploy/sbx/install-host.sh <bundle dir> --snapshot default-eed901b838bf --b
 
 Expected: `sbx-worker@sbx_default_eed901b838bf attached to the relay`. The worker first checks the snapshot against its
 manifest and against the template record `template-build.sh` left in `$SBX_SRV/templates/`
-(`SH_TEMPLATE_RECORD`); a mismatch stops it at start, naming the field.
+(`SH_TEMPLATE_RECORD`); a mismatch stops it at start, naming the field. The record's id also becomes
+the worker's `SANDBOX_TEMPLATE`, so MOCA agent sessions naming the template find it (section 8).
 
 ### 4.5 Use it
 
@@ -417,6 +418,12 @@ Checked live on a MOCA-VM (P6+P4) on 2026-10-31, with a scripted mock model: a s
 `django-django-11133` ran on the templated worker with the repository seeded, its second turn kept
 the workspace and did not seed again, a session with no template ran on the untemplated worker, and
 an unknown template was refused at creation.
+
+On the **combined control plane** (one control plane for both, `setup.sh SBX_PROFILE=combined`), a
+session names a self-serve template the same way, and may pin a build (`ID@sha256:…`): it runs only
+on that build's workers. Checked on ykt3 and bm1 on 2026-11-05, with no model: a stock-agent
+sandbox and a session pinned to the same build, and first use through a session (`409
+template_not_active`, then created 23 s later).
 
 ## 9. Capacity
 
