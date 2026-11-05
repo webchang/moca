@@ -66,7 +66,13 @@ start) touch "$MOCK_STATE/active-$2" ;;
 stop) rm -f "$MOCK_STATE/active-$2" ;;
 esac
 MOCK
-chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl"
+# flock: util-linux on the hosts, absent on a developer's Mac. `flock -n FD` fails while
+# $MOCK_STATE/locked exists, as a lock another run holds.
+cat >"$TMP/bin/flock" <<'MOCK'
+#!/usr/bin/env bash
+[[ ! -e "$MOCK_STATE/locked" ]]
+MOCK
+chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock"
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
@@ -233,5 +239,39 @@ jq -e '.event == "failed" and (.message | startswith("leak_refused: "))' "$R" >/
 ! grep -q 'reg\.internal' "$R" || fail 'the refusal names the registry'
 grep -q '"templateRecord"' "$R" && fail 'the template record was sent'
 pass 'SBX_REGISTRY is redacted exactly, and a template record naming it is never reported (G28)'
+
+# 11. --wanted-only (register G31): the inventory and the wanted state, never a claim or a build; the
+#     lock keeps it and a build poll from applying the wanted state at once; usage refused otherwise.
+job ''
+mkdir -p "$TMP/workers"; : >"$TMP/workers/sbx_t2.env"
+printf '{"run":[{"worker":"sbx_t2","buildId":"sha256:2"}],"stop":[]}' >"$TMP/state/wanted-answer"
+: >"$MOCK_LOG"; rm -f "$TMP/state/POST_"* "$TMP/state/active-sbx-worker@sbx_t2.service"
+bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the wanted-only run failed'
+grep -q 'builds/claim' "$MOCK_LOG" && fail 'the wanted-only run claimed a build'
+grep -q '^build ' "$MOCK_LOG" && fail 'the wanted-only run built'
+grep -q 'hosts/bm1/inventory' "$MOCK_LOG" || fail 'the wanted-only run did not report the inventory'
+grep -q 'systemctl start sbx-worker@sbx_t2.service' "$MOCK_LOG" || fail 'the wanted-only run did not start the wanted worker'
+rm -f "$TMP/state/active-sbx-worker@sbx_t2.service"; touch "$TMP/state/locked"; : >"$MOCK_LOG"
+bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the locked run failed'
+grep -q 'systemctl start' "$MOCK_LOG" && fail 'started a worker while another run held the lock'
+grep -q 'another run is applying the wanted state' "$TMP/out" || fail 'the lock skip does not say why'
+rm -f "$TMP/state/locked"
+! bash "$A" --once --wanted-only >"$TMP/out" 2>&1 || fail 'accepted two modes'
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+pass 'with --wanted-only, applies the wanted state and claims nothing; one run at a time applies it (G31)'
+
+# 12. The failure report's step comes from its code (autobench-moca, 2026-11-05): `probe` for a probe failure.
+job ''
+cat >"$TMP/bin/template-build" <<'MOCK'
+#!/usr/bin/env bash
+printf 'build %s\n' "$*" >>"$MOCK_LOG"
+echo 'build-snapshot.sh: the --verify-command exited 91'
+exit 1
+MOCK
+chmod +x "$TMP/bin/template-build"
+run || fail 'the probe-failure poll failed'
+jq -e '.event == "failed" and .step == "probe" and (.message | startswith("probe_failed: "))' "$R" >/dev/null ||
+  fail 'a probe failure is not reported with step probe'
+pass 'reports a probe failure with step probe, beside its code'
 
 echo 'all host-agent.sh tests passed'

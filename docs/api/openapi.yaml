@@ -395,10 +395,11 @@ components:
         sandboxBuildId:
           type: [string, 'null']
           description: |
-            with sandboxTemplate: the build its default tag named when the session was created
-            (template lifecycle spec §9); null without a template catalog. Turns are routed by
-            template, not build: with two builds of one template active, a turn may run on
-            either (register G19)
+            with sandboxTemplate: the build the session resolved its template to at creation
+            (`id@sha256:…` pins one; `id` and `id:tag` take the tag's), template lifecycle spec §9;
+            null without a template catalog. A manifest-hash build pins the session's turns to
+            workers serving it (`moca.dev/build`, combined control plane spec §3.4, register G19);
+            an `imported:` build routes by template only
         templateManifestHash:
           type: [string, 'null']
           description: with sandboxTemplate, the manifest hash of sandboxBuildId; null for an imported build

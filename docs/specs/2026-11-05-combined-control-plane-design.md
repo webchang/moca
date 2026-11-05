@@ -164,7 +164,9 @@ in by create (the catalog does not move between namespaces).
 
 Between 5 and 6, on the host agent (not this design's, but needed by its window): the fast
 wanted-only unit for register G31 (activation without waiting for a build poll), and the failure
-report's step from its code (`probe`, `pull`, `disk`, `spec`, else `build`).
+report's step from its code (`probe`, `pull`, `disk`, `spec`, else `build`). **Built (2026-11-05):**
+`host-agent.sh --wanted-only` with `sbx-host-agent-wanted.{service,timer}` (15 s), a lock between
+the two runs, and the step from the code.
 
 Increments 1-5 are code and tests only, on the user's machine; 6 and 7 need ykt3 (and bm1 for 7).
 

@@ -720,3 +720,12 @@ their `sbx-worker@<id>` units, and reports each start (`attached`), refusal and 
 never stops a worker with live sandboxes. It starts only **installed** workers: install a new
 template's worker as in §5 (its relay token comes from `setup.sh`); until then the agent reports
 it `refused` (register gap G18).
+
+**Activations without waiting for a build** (register G31): the build poll applies the wanted
+state only after its builds, and its timer starts two minutes after the previous poll ends. Install
+`sbx-host-agent-wanted.service` and its timer beside the agent's (same env file): every 15 s it
+runs `host-agent.sh --wanted-only`, which reports the inventory and starts and stops workers, and
+claims and builds nothing. A lock in the script keeps the two from applying the wanted state at
+once. `install -m 0644 sbx-host-agent-wanted.{service,timer} /etc/systemd/system/`, then
+`systemctl daemon-reload && systemctl enable --now sbx-host-agent-wanted.timer`; remove both in the
+host's teardown with the agent's.

@@ -8,7 +8,11 @@
 # A worker must already be installed (install-host.sh, with its relay token from setup.sh): a wanted
 # build whose worker is not is reported `refused`, never installed here (register gap G18).
 #
-#   sudo deploy/sbx/host-agent.sh --once     one poll (the unit's timer runs it)
+#   sudo deploy/sbx/host-agent.sh --once          one poll (the unit's timer runs it)
+#   sudo deploy/sbx/host-agent.sh --wanted-only   the inventory and the wanted state only: no claim,
+#                                                 no build (sbx-host-agent-wanted's timer, every 15 s,
+#                                                 so an activation waits seconds, not behind a build:
+#                                                 register G31)
 #
 # Run it through the unit (systemctl start sbx-host-agent.service): the unit loads host-agent.env; a
 # bare run sees none of it and refuses (SBX_API_URL). Installed outside the tree, it needs
@@ -51,7 +55,7 @@ error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --a
 
 check_settings() {
   local t
-  for t in jq curl df mktemp base64 sha256sum systemctl; do command -v "$t" >/dev/null || refuse "needs $t on PATH"; done
+  for t in jq curl df mktemp base64 sha256sum systemctl flock; do command -v "$t" >/dev/null || refuse "needs $t on PATH"; done
   SBX_SRV="${SBX_SRV-/srv/sbx}" SBX_ENV_DIR="${SBX_ENV_DIR-/etc/sbx}"
   [[ "$SBX_SRV" =~ ^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$ ]] || refuse "SBX_SRV='$SBX_SRV' must be an absolute path other than /"
   [[ "${SBX_API_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || refuse 'SBX_API_URL must be https://<api host>'
@@ -172,7 +176,10 @@ build_one() { # build_one JOB_JSON
     *"GiB free"* | *"free disk"*) code=disk_floor ;;
     *"spec"*"must"* | *"is not a JSON"*) code=spec_refused ;;
     esac
-    report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" '{event: "failed", step: "build", message: $m}')" >/dev/null ||
+    # The step a client reads without the code (autobench-moca, 2026-11-05): where the build failed.
+    local step=build
+    case "$code" in pull_failed) step=pull ;; probe_failed) step=probe ;; disk_floor) step=disk ;; spec_refused) step=spec ;; esac
+    report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" --arg s "$step" '{event: "failed", step: $s, message: $m}')" >/dev/null ||
       error "report failed for $handle failed"
     say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc}"
     return
@@ -209,9 +216,16 @@ worker_report() { # worker_report BUILD_ID EVENT [REASON]
 }
 
 # Start what is wanted and installed; stop what is not wanted (the control plane leaves out a worker
-# with live sandboxes). Readiness is the relay's attached record, never this report.
+# with live sandboxes). Readiness is the relay's attached record, never this report. Under a lock, so
+# the build poll's pass and the --wanted-only one never start or stop the same worker at once; the
+# one that does not get it skips (the other is applying the same wanted state).
 activation() {
   local wanted w unit
+  exec 9>"$SBX_SRV/.activation.lock"
+  if ! flock -n 9; then
+    say '{"agent":"skipped","why":"another run is applying the wanted state"}'
+    return 0
+  fi
   wanted="$(api GET "/v1/hosts/$SBX_HOST_ID/wanted")" || { error 'wanted state unreadable'; return; }
   jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted" || { error 'wanted state malformed'; return; }
   while IFS=$'\t' read -r w b; do
@@ -239,10 +253,13 @@ activation() {
       error "stop $unit failed"
     fi
   done < <(jq -r '.stop[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+  exec 9>&-
 }
 
 main() {
-  [[ "${1:-}" == --once && $# -eq 1 ]] || { echo 'usage: host-agent.sh --once' >&2; exit 2; }
+  [[ $# -eq 1 && ( "$1" == --once || "$1" == --wanted-only ) ]] ||
+    { echo 'usage: host-agent.sh --once | --wanted-only' >&2; exit 2; }
+  local mode="$1"
   command -v jq >/dev/null || refuse 'needs jq on PATH'
   check_settings
   WORK="$(umask 077 && mktemp -d)"
@@ -252,6 +269,11 @@ main() {
   (umask 077 && printf 'Authorization: Bearer %s\n' "$(<"$SBX_HOST_TOKEN_FILE")" >"$HDR")
   if ! inventory; then
     say '{"agent":"skipped","why":"control plane unreachable or refused the inventory"}'
+    return 0
+  fi
+  if [[ "$mode" == --wanted-only ]]; then
+    activation
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
     return 0
   fi
   local free
