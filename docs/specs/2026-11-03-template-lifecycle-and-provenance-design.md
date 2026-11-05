@@ -3,7 +3,9 @@
 Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
 templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
-implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04 (§10.1)
+implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04, window
+3 (measurements) and step 3 on 2026-11-05 (§10.1); the combined control plane of §4.1 is built
+([its design](2026-11-05-combined-control-plane-design.md)), not deployed
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -396,8 +398,10 @@ wait; autobench-moca's runner can do either.
 and `quota_exceeded` answer as they would) and answers `409 template_not_active` with `readiness`
 and `Retry-After: 30`; `activate: false` starts nothing. No sandbox record is kept while waiting,
 so a wait never uses the live-sandbox cap. Without host agents nothing changes. `mocactl sbx create`
-and `sbx up` retry it for up to 10 minutes, saying why. Sessions (Moca Pi) are not gated yet: they
-wait for the combined control plane (§4.1).
+and `sbx up` retry it for up to 10 minutes, saying why. **Sessions (Moca Pi)** take the same gate
+where a template store exists (combined control plane increment 4, 557c4d26): `POST /v1/sessions`
+resolves `sandbox.template` through the catalog, `sandbox.activate: false` starts nothing, and
+`mocactl`'s session create waits on the 409.
 
 ## 7. Provenance
 
@@ -582,6 +586,12 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
 
 Open from window 2: client-side stalls of about 20 s on some Execs (register G30).
 
+**Window 3** (2026-11-05, measurements, the same image and host setup): builds 4 of 4, patches
+4 of 4, build check 4 of 4; G30's cause is the client's DNS (not MOCA's); G31's baseline, about
+86-108 s from each activation's request, both of a pair together. **Step 3** passed the same day on
+ykt3 with a second enrolled subject (fssapi): its create of an existing id and its new build of
+another's template `409 template_exists`, its cancel `403`.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
@@ -597,9 +607,9 @@ Open from window 2: client-side stalls of about 20 s on some Execs (register G30
    `404 template_not_found`; readiness `active`/`inactive` from the relay's presence (`unknown` when
    unreadable); `lastUsedAt` and `capacity.inUse` from sandbox records on the sandbox profile (null on
    the harness profile until `use` records exist). The transitional readiness states, the hosts'
-   contents and builds from template records came with item 5. Not yet: the client logs route, and
-   the combined harness-and-sandbox control plane of §4.1 with SBX0's token rules (deferred: window 1
-   runs on the sandbox profile, the user's and autobench-moca's choice, 2026-11-04).
+   contents and builds from template records came with item 5. Not yet: the client logs route. The
+   combined harness-and-sandbox control plane of §4.1, with SBX0's token rules, is built (its own
+   design, 2026-11-05: the `combined` route profile, increments 1-5), not yet deployed.
 4. Create and policy at create (§4, §8.1), quotas (§6.2). **Built:** `POST /v1/templates` and
    `POST /v1/templates/{id}/builds` (202, a `b-<26 hex>` handle, status `queued`), `GET`/`PUT
 /v1/policy` (admin PUT; every change a `policy` record), `GET /v1/quota`; the create-time rules
@@ -631,8 +641,9 @@ Open from window 2: client-side stalls of about 20 s on some Execs (register G30
 7. Tracing (§9). **Built:** a sandbox's template reference (`id`, `id:tag`, `id@sha256:…`) resolves
    through the catalog to one registered build at creation, kept for its life, and the Sandbox
    carries `buildId` and `templateManifestHash`; a session records `sandboxBuildId` (its
-   template's default build at creation; register G19: turns are routed by template, not build).
-   Not yet: `use` records.
+   template's default build at creation, or the one `id@sha256:…` pins). Turns run on the session's
+   build's workers (register G19, fixed by the combined control plane's increment 5: the
+   `moca.dev/build` label). Not yet: `use` records.
 8. The validation (§10). **Window 1** (decided 2026-11-04): stock agents only, on the SBX0 sandbox
    profile with `setup.sh SBX_TEMPLATE_STORE=1 SBX_TEMPLATE_HOSTS=bm1` (a7eca0a7) and a control-plane
    image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers

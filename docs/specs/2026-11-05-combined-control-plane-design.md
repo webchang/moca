@@ -1,7 +1,9 @@
 # One control plane for sessions and sandboxes — Design
 
 Version: 0.1 (draft for review) — November 2026
-Status: Accepted (C1-C4, §5) — branch `sbx-template` (webchang/moca), not proposed upstream; increment 1 in progress
+Status: Accepted (C1-C4, §5) — branch `sbx-template` (webchang/moca), not proposed upstream;
+increments 1-5 and the host-agent work built and pushed (2026-11-05: 69ab7d2b, 4e637974, f480ab70,
+557c4d26, f562b2c1, c93042f6); increments 6 (deployment) and 7 (validation) not started
 Builds on: [template lifecycle and provenance](2026-11-03-template-lifecycle-and-provenance-design.md)
 §4.1 (the decision: "one control plane, the `harness` profile with the sandbox routes added"),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) §4 (the sandbox profile, its token
