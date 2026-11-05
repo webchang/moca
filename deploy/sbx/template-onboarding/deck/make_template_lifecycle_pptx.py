@@ -106,7 +106,7 @@ def s_design(d):
 
 def s_architecture(d):
     s = d.slide("One control plane decides; hosts build and run; clients only ask",
-                "Who runs where: ykt3 (OpenShift) and bm1 (bare-metal KVM host)")
+                "Who runs where: the cluster (OpenShift; e.g. ykt3) and the KVM host (bare metal; e.g. bm1)")
     brain(s, 0.5, 1.6, 2.6, 1.1, "Client", ["stock agent or `mocactl`"], size=12)
     orchestrator(s, 4.2, 1.5, 3.4, 1.3, "Control plane", ["catalog, policy, leases"], size=12)
     store(s, 4.4, 3.3, 3.0, 1.1, "Template store", ["catalog, provenance"], size=12)
@@ -127,7 +127,7 @@ def s_architecture(d):
     arrow(s, 1.8, 2.7, 4.2, 5.55)
     label(s, 1.4, 4.1, 2.2, 0.3, "Exec (sandbox token)", size=11)
     text(s, 0.5, 6.35, 12.2, 0.4, [
-        "ykt3 holds no VM; bm1 holds no policy. The host agent reads its wanted state from the "
+        "The cluster holds no VM; the KVM host holds no policy. The host agent reads its wanted state from the "
         "control plane and reports facts back; readiness is what the relay sees attached."],
         size=12, color=MUTED)
 
@@ -372,8 +372,8 @@ def s_next(d):
     s = d.slide("Next: deploy the combined plane, then a real model, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "Deploy the combined control plane", "a new ykt3 namespace (a cluster-scoped "
-         "change), a new image, a bm1 window with both brains"),
+        ("1", "Deploy the combined control plane", "a new namespace on the cluster (a cluster-scoped "
+         "change), a new image, a window on the KVM host with both brains"),
         ("2", "A real model and grading", "spec §10 step 8, with the model spend agreed"),
         ("3", "Propose upstream", "as PRs, from what the windows proved; upstream has no "
          "session templates today"),
