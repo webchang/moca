@@ -3,8 +3,8 @@
 Version: 0.5 (draft for review; **self-serve**: clients build, register and activate their own
 templates, gated by machine-checked policy; 0.5 applies autobench-moca's client review) — November 2026
 Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstream; §11 items 1-7
-implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04, window
-3 (measurements) and step 3 on 2026-11-05 (§10.1); the combined control plane of §4.1 is built
+implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04, windows
+3 and 4 (measurements) and step 3 on 2026-11-05 (§10.1); the combined control plane of §4.1 is built
 ([its design](2026-11-05-combined-control-plane-design.md)), not deployed
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
@@ -591,6 +591,11 @@ Open from window 2: client-side stalls of about 20 s on some Execs (register G30
 86-108 s from each activation's request, both of a pair together. **Step 3** passed the same day on
 ykt3 with a second enrolled subject (fssapi): its create of an existing id and its new build of
 another's template `409 template_exists`, its cancel `403`.
+
+**Window 4** (2026-11-05, measurements with the host agent's `--wanted-only` and the client's
+resolved-address dial): activation 10.8-17.4 s from each request (window 3: 86-108 s, register
+G31); 0 DNS stalls (G30); the rebuilt workers report `moca.dev/build` (G19); patches and build
+check 4 of 4; a probe failure reported at step `probe`.
 
 ## 11. Order of work
 
