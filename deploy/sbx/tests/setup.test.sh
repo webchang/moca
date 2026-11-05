@@ -915,7 +915,9 @@ cp "$K" "$TMP/profile-sandbox.yaml"
 run_setup export SBX_PROFILE=sandbox || fail 'SBX_PROFILE=sandbox failed'
 cmp -s "$TMP/profile-sandbox.yaml" "$K" || fail 'SBX_PROFILE=sandbox differs from unset'
 reset_state
-C=(eval "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_NAMESPACE=moca-combined-test")
+RW="ghcr.io/example/moca-remote-worker@sha256:$(printf 'a%.0s' {1..64})"
+MI="ghcr.io/example/moca@sha256:$(printf 'b%.0s' {1..64})"
+C=(eval "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_NAMESPACE=moca-combined-test SBX_SANDBOX_IMAGE=$RW SBX_IMAGE=$MI")
 run_setup "${C[@]}" || fail "the combined run failed: $(cat "$TMP/out")"
 grep -q 'overlays/ocp-combined' "$K" || fail 'the combined run did not render ocp-combined'
 for k in SH_SESSION_TOKEN_PRIVATE_KEY SH_SESSION_TOKEN_PUBLIC_KEYS SH_CREDENTIAL_KEK SH_EXCHANGE_TOKEN SH_JANITOR_TOKEN; do
@@ -935,6 +937,11 @@ grep -q 'host: moca.apps.example.invalid' "$TMP/render.yaml" || fail 'the superv
 grep -q 'host: sbx-api.apps.example.invalid' "$TMP/render.yaml" || fail 'the API Route (moca-api) has the wrong host'
 grep -q 'sandbox-relay-exec.moca-combined-test.svc:9444' "$TMP/render.yaml" || fail 'the supervisor does not reach the relay in this namespace'
 ! grep -q 'moca-combined\.svc\|moca-single' "$TMP/render.yaml" || fail 'an address still names a placeholder namespace'
+grep -q "image: ghcr.io/example/moca-remote-worker@sha256:" "$TMP/render.yaml" || fail 'the container sandbox image is not pinned by digest'
+! grep -q 'moca-remote-worker:latest' "$TMP/render.yaml" || fail 'the container sandbox still runs a tag'
+# Every image in the namespace is pinned by digest (autobench's review): none left on a tag.
+untagged="$(grep -E '^\s+image: ' "$TMP/render.yaml" | grep -v '@sha256:[0-9a-f]\{64\}' || true)"
+[[ -z "$untagged" ]] || fail "images not pinned by digest: $untagged"
 [[ -n "$(pod_hash moca-supervisor)" && "$(pod_hash moca-supervisor)" == "$(pod_hash moca-control-plane)" ]] ||
   fail 'the supervisor does not roll with the settings'
 grep -q 'rollout status deployment/moca-supervisor' "$MOCK_LOG" || fail 'the combined run did not wait for the supervisor'
@@ -951,9 +958,12 @@ refusals=(
   'export SBX_PROFILE=harness => SBX_PROFILE must be sandbox or combined'
   'export SBX_PROFILE=combined => SBX_MOCA_HOST is required'
   'export SBX_PROFILE=combined SBX_MOCA_HOST=$SBX_API_HOST => SBX_MOCA_HOST must differ'
-  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_EGRESS_CREDENTIALS=1 => not supported with SBX_PROFILE=combined'
-  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_TEMPLATE_STORE=0 => needs the template store'
-  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_REPLICAS=10 => SBX_SANDBOX_REPLICAS must be 0-9'
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_EGRESS_CREDENTIALS=1 => not supported with SBX_PROFILE=combined"
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_TEMPLATE_STORE=0 => needs the template store"
+  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid => SBX_SANDBOX_IMAGE is required'
+  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=x/rw:latest => pinned by digest'
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW => SBX_IMAGE must be pinned by digest"
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_SANDBOX_REPLICAS=10 => SBX_SANDBOX_REPLICAS must be 0-9"
 )
 for r in "${refusals[@]}"; do
   bad="${r%% => *}" want="${r#* => }"

@@ -26,7 +26,6 @@ spec:
       containers:
         - name: control-plane
           env:
-            - { name: SH_CREDENTIAL_NAMESPACE, value: moca-combined }
             - { name: SH_SANDBOX_NAMESPACE, value: moca-combined }
 ---
 apiVersion: apps/v1

@@ -1,17 +1,24 @@
 # The control plane on the combined route profile (combined control plane design §3.5): the
 # harness's settings from the base stay, and SBX0's are added from sbx-settings, as ocp-sbx's
-# patch-control-plane.yaml reads them. The credential store stays (the harness's), so the service
-# account token stays mounted and the credentials Role from the base is kept.
+# patch-control-plane.yaml reads them. The harness's credentials are FILES on their own volume
+# (pvc-credentials.yaml), so the control plane makes no Kubernetes API call: no service account
+# token, and the base's credentials Role is deleted (kustomization.yaml).
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: moca-control-plane, namespace: moca }
 spec:
+  # An RWO volume cannot attach to the surge pod of a rolling update on a multi-node cluster.
+  strategy: { type: Recreate, rollingUpdate: null }
   template:
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: control-plane
           env:
             - { name: SH_ROUTE_PROFILE, value: combined }
+            - { name: SH_CREDENTIAL_STORE, value: file }
+            - { name: SH_CREDENTIAL_DIR, value: /var/lib/moca/credentials }
+            - { name: SH_CREDENTIAL_NAMESPACE, $patch: delete }
             - name: SH_ALLOWED_SUBJECTS
               valueFrom: { configMapKeyRef: { name: sbx-settings, key: SH_ALLOWED_SUBJECTS } }
             - name: SH_SANDBOX_TEMPLATES
@@ -37,7 +44,11 @@ spec:
                 { configMapKeyRef: { name: sbx-settings, key: SH_SANDBOX_MAX_PER_SUBJECT } }
             - name: SH_SANDBOX_MAX_TOTAL
               valueFrom: { configMapKeyRef: { name: sbx-settings, key: SH_SANDBOX_MAX_TOTAL } }
+          volumeMounts:
+            - { name: credential-store, mountPath: /var/lib/moca/credentials }
       volumes:
+        - name: credential-store
+          persistentVolumeClaim: { claimName: moca-credentials }
         # Every credential BOTH profiles need, each a file in /run/credentials: the harness's KEK and
         # exchange token, SBX0's janitor token, the host agents' tokens, and egress (optional). The
         # template-store component REPLACES this projected volume's source list with SBX0's alone,

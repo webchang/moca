@@ -58,8 +58,8 @@
 #                           SH_CREDENTIAL_KEK, SH_EXCHANGE_TOKEN). Egress credentials are refused with it
 #                           (both would mount a KEK). Its namespace must be another than a sandbox one's
 #   SBX_MOCA_HOST           required with SBX_PROFILE=combined: the supervisor Route's host (Moca Pi turns)
-#   SBX_SANDBOX_IMAGE       optional with SBX_PROFILE=combined: the in-cluster container sandbox's image
-#                           (default the base's moca-remote-worker); SBX_SANDBOX_REPLICAS, default 0
+#   SBX_SANDBOX_IMAGE       required with SBX_PROFILE=combined, pinned by digest: the in-cluster container
+#                           sandbox's image (moca-remote-worker); SBX_SANDBOX_REPLICAS, default 0
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
 #                           router's default certificate (API)
 #   SBX_JANITOR_WAIT_MINUTES optional; default max(60, SBX_TOKEN_TTL_MINUTES + 5): how long after a
@@ -214,7 +214,11 @@ validate_profile() {
   done
   [[ -z "$EGRESS_ON" ]] ||
     die 'SBX_EGRESS_CREDENTIALS=1 is not supported with SBX_PROFILE=combined yet: both would mount SH_CREDENTIAL_KEK'
-  [[ -z "${SBX_SANDBOX_IMAGE:-}" || "$SBX_SANDBOX_IMAGE" != *[[:space:]]* ]] || die 'SBX_SANDBOX_IMAGE must be one image reference'
+  # Pinned by digest, as every image in the namespace (autobench's review): a tag can move under a run.
+  [[ "${SBX_SANDBOX_IMAGE:-}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
+    die 'SBX_SANDBOX_IMAGE is required with SBX_PROFILE=combined, pinned by digest: repository[:tag]@sha256:<64 hex>'
+  [[ "$SBX_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
+    die 'SBX_IMAGE must be pinned by digest with SBX_PROFILE=combined: repository[:tag]@sha256:<64 hex>'
   : "${SBX_SANDBOX_REPLICAS:=0}"
   [[ "$SBX_SANDBOX_REPLICAS" =~ ^[0-9]$ ]] || die 'SBX_SANDBOX_REPLICAS must be 0-9'
   [[ "${SBX_TEMPLATE_STORE:-1}" == 1 ]] || die 'SBX_PROFILE=combined needs the template store (SBX_TEMPLATE_STORE=1)'
@@ -809,7 +813,7 @@ write_overlay() {
     image_entry ghcr.io/rossoctl/moca "$SBX_IMAGE"
     # The base names Valkey; an override renames that image, so the StatefulSet's pod spec is untouched.
     [[ -z "${SBX_REDIS_IMAGE:-}" ]] || image_entry docker.io/valkey/valkey "$SBX_REDIS_IMAGE"
-    [[ -z "$COMBINED" || -z "${SBX_SANDBOX_IMAGE:-}" ]] || image_entry ghcr.io/rossoctl/moca-remote-worker "$SBX_SANDBOX_IMAGE"
+    [[ -z "$COMBINED" ]] || image_entry ghcr.io/rossoctl/moca-remote-worker "$SBX_SANDBOX_IMAGE"
   } >"$GEN/kustomization.yaml"
 }
 
@@ -827,7 +831,7 @@ combined_addresses() {
   printf '  - patch: |-\n'
   printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: moca-control-plane, namespace: moca-combined }\n'
   printf '      spec: { template: { spec: { containers: [ { name: control-plane, env: [\n'
-  printf '        { name: SH_CREDENTIAL_NAMESPACE, value: "%s" }, { name: SH_SANDBOX_NAMESPACE, value: "%s" } ] } ] } } }\n' "$NS" "$NS"
+  printf '        { name: SH_SANDBOX_NAMESPACE, value: "%s" } ] } ] } } }\n' "$NS"
   printf '  - patch: |-\n'
   printf '      apiVersion: apps/v1\n      kind: StatefulSet\n      metadata: { name: moca-sandbox, namespace: moca-combined }\n'
   printf '      spec: { template: { spec: { containers: [ { name: sandbox, env: [\n'

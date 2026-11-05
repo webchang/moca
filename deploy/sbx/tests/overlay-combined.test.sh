@@ -28,12 +28,12 @@ env_of() { # env_of KIND NAME CONTAINER VAR -> its literal value, or "<ref>" whe
 
 for o in Deployment/moca-control-plane Deployment/moca-supervisor Deployment/sandbox-relay \
   StatefulSet/redis Route/moca Route/moca-api Route/moca-relay Route/sbx-exec \
-  PersistentVolumeClaim/moca-sbx-templates Role/moca-control-plane-credentials \
+  PersistentVolumeClaim/moca-sbx-templates PersistentVolumeClaim/moca-credentials \
   Service/sandbox-relay-exec Service/sbx-relay-exec-tls; do
   has "$o"
 done
 [[ -z "$(obj Route moca-control-plane)" ]] || fail 'a second API Route (moca-control-plane) is rendered'
-pass 'renders the supervisor and its Route beside the relay Routes, one API Route, the template store and the credentials Role'
+pass 'renders the supervisor and its Route beside the relay Routes, one API Route, the template store '
 
 # Namespaced only: the scope a namespace grant covers.
 n="$(q '[.[] | select(.kind | test("^(Namespace|ClusterRole|ClusterRoleBinding|SecurityContextConstraints|PersistentVolume|StorageClass|CustomResourceDefinition)$"))] | length')"
@@ -49,7 +49,10 @@ items="$(obj Deployment moca-control-plane | jq -r '.spec.template.spec.volumes[
 for k in SH_CREDENTIAL_KEK SH_EXCHANGE_TOKEN SH_JANITOR_TOKEN SH_SESSION_TOKEN_PRIVATE_KEY; do
   [[ " $items" == *" $k "* ]] || fail "the control plane does not mount $k"
 done
-pass 'puts the control plane on the combined profile, with both profiles'"'"' settings and credentials'
+[[ "$(env_of Deployment moca-control-plane control-plane SH_CREDENTIAL_STORE)" == file ]] || fail 'the harness credential store is not the file store'
+[[ "$(q '[.[] | select(.kind == "Role" or .kind == "RoleBinding")] | length')" == 0 ]] || fail 'a Role over the namespace is rendered'
+[[ "$(obj Deployment moca-control-plane | jq -r '.spec.template.spec.automountServiceAccountToken')" == false ]] || fail 'the control plane mounts a service account token'
+pass 'puts the control plane on the combined profile, with both profiles'"'"' settings and credentials, files only: no Role, no API token'
 
 [[ "$(env_of Deployment sandbox-relay sandbox-relay MOCA_RELAY_EXEC_TOKEN)" == '<ref>' ]] || fail 'the relay lost the harness exec token'
 [[ "$(env_of Deployment sandbox-relay sandbox-relay SH_SANDBOX_TOKEN_PUBLIC_KEYS)" == '<ref>' ]] || fail 'the relay has no sandbox keyset'
