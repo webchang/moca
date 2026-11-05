@@ -57,7 +57,8 @@
 #                           and adds the harness's keys to moca-mu1 (SH_SESSION_TOKEN_PUBLIC_KEYS,
 #                           SH_CREDENTIAL_KEK, SH_EXCHANGE_TOKEN). Egress credentials are refused with it
 #                           (both would mount a KEK). Its namespace must be another than a sandbox one's
-#   SBX_MOCA_HOST           required with SBX_PROFILE=combined: the supervisor Route's host (Moca Pi turns)
+#   SBX_MOCA_HOST           required with SBX_PROFILE=combined: the supervisor Route's host (Moca Pi turns);
+#                           SBX_MOCA_TLS_{CERT,KEY} its certificate, otherwise self-signed
 #   SBX_SANDBOX_IMAGE       required with SBX_PROFILE=combined, pinned by digest: the in-cluster container
 #                           sandbox's image (moca-remote-worker); SBX_SANDBOX_REPLICAS, default 0
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
@@ -187,7 +188,7 @@ validate() {
   validate_store
 
   local pair
-  for pair in ATTACH EXEC API; do
+  for pair in ATTACH EXEC API MOCA; do
     local cert="SBX_${pair}_TLS_CERT" key="SBX_${pair}_TLS_KEY"
     [[ -z "${!cert:-}" && -z "${!key:-}" ]] || [[ -f "${!cert:-/nonexistent}" && -f "${!key:-/nonexistent}" ]] ||
       die "$cert and $key must both name readable files, or both be unset"
@@ -667,7 +668,7 @@ apply_configmap() {
 # change rolls the control plane alone and leaves running Execs be (RUNBOOK §5). Runs after
 # route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx relay keys attach_crt exec_crt egress hosts
+  local ca='' moca sbx relay keys attach_crt exec_crt moca_crt egress hosts
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   moca=("SH_GITHUB_CLIENT_ID=$SBX_GITHUB_CLIENT_ID" "SH_ADMIN_SUBJECTS=${SBX_ADMIN_SUBJECTS:-}"
@@ -695,6 +696,8 @@ ensure_settings() {
   keys="$(secret_json sbx-token-keys)"
   attach_crt="$(secret_json moca-relay-tls)"
   exec_crt="$(secret_json sbx-exec-tls)"
+  moca_crt=''
+  [[ -z "$COMBINED" ]] || moca_crt="$(secret_json moca-supervisor-tls)"
   # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
   # token or KEK changes the pod template, so the control plane rolls and rereads its files.
   egress='' hosts=''
@@ -705,6 +708,7 @@ ensure_settings() {
     json_value "$keys" PUBLIC_KEYS
     json_value "$attach_crt" tls.crt
     json_value "$exec_crt" tls.crt
+    [[ -z "$COMBINED" ]] || json_value "$moca_crt" tls.crt
     [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
     [[ -z "$STORE_ON" ]] || printf '%s\n' "$hosts"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
@@ -1008,6 +1012,8 @@ main() {
   ensure_store_secrets
   route_cert moca-relay-tls "$SBX_ATTACH_HOST" "${SBX_ATTACH_TLS_CERT:-}" "${SBX_ATTACH_TLS_KEY:-}" "$GEN/attach-ca.crt"
   route_cert sbx-exec-tls "$SBX_EXEC_HOST" "${SBX_EXEC_TLS_CERT:-}" "${SBX_EXEC_TLS_KEY:-}" "$GEN/exec-ca.crt"
+  # Combined: the supervisor's passthrough Route (Moca Pi turns) terminates TLS in its sidecar.
+  [[ -z "$COMBINED" ]] || route_cert moca-supervisor-tls "$SBX_MOCA_HOST" "${SBX_MOCA_TLS_CERT:-}" "${SBX_MOCA_TLS_KEY:-}" "$GEN/moca-ca.crt"
   ensure_settings
   write_overlay
   apply_stack

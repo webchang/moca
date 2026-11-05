@@ -930,6 +930,7 @@ done
 [[ "$(secret_val moca-relay-attach SH_RELAY_TOKEN)" == "$(secret_val moca-relay SH_RELAY_TOKEN)" ]] || fail 'moca-relay-attach does not mirror SH_RELAY_TOKEN'
 ! grep -q 'MOCA_RELAY_EXEC_TOKEN":null' "$MOCK_LOG" || fail 'the combined run removed the harness exec token'
 [[ -f "$MOCK_STATE/secret-sbx-template-hosts.json" ]] || fail 'the combined run did not turn the template store on'
+[[ -f "$MOCK_STATE/secret-moca-supervisor-tls.json" ]] || fail 'no TLS Secret for the supervisor Route'
 [[ "$(cm moca-settings SH_PUBLIC_HARNESS_URL)" == https://moca.apps.example.invalid ]] || fail 'no SH_PUBLIC_HARNESS_URL'
 [[ "$(cm moca-settings SH_ALLOW_OPERATOR_FALLBACK)" == false ]] || fail 'SH_ALLOW_OPERATOR_FALLBACK is not false'
 render
