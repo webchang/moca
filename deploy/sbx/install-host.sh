@@ -12,7 +12,8 @@
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
 # When template-build.sh's record for it exists ($SBX_SRV/templates/IMAGE.json), the worker env names
 # it (SH_TEMPLATE_RECORD) and the worker checks the record against its snapshot and its own id at
-# every start, refusing a mismatch (template lifecycle spec §8, PV4).
+# every start, refusing a mismatch (template lifecycle spec §8, PV4), and SANDBOX_TEMPLATE is the
+# record's id (the worker's moca.dev/template label, which Moca Pi sessions select by).
 # Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
 # moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
 # SBX_WORKER_BIN (an absolute path) runs another microvm-worker build, so SBX0 beside deploy/microvm's
@@ -292,6 +293,13 @@ snapshot_ca_fingerprint() {
 
 # check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
 # snapshot_guest_ram_mb IMAGE -> the guest_ram_mb recorded in the snapshot's manifest.json, or nothing.
+# record_template_id IMAGE -> the id in template-build.sh's record for IMAGE, or nothing.
+record_template_id() {
+  local r="$SBX_SRV/templates/$1.json"
+  [[ -f "$r" ]] || return 0
+  sed -n 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"\([a-z0-9][a-z0-9-]*\)".*/\1/p' "$r" | head -1
+}
+
 snapshot_guest_ram_mb() {
   local m="$SBX_SRV/snapshots/$1/manifest.json"
   [[ -f "$m" ]] || return 0
@@ -465,7 +473,7 @@ validate_worker() {
 }
 
 install_worker() {
-  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" guest_mb="$W_GUEST_MB" ca=''
+  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" guest_mb="$W_GUEST_MB" ca='' tpl=''
   install -d -m 0700 "$SBX_ENV_DIR" "$SBX_ENV_DIR/workers"
   if [[ -f "$BUNDLE/relay-ca.crt" ]]; then
     grep -q -- '-----BEGIN CERTIFICATE-----' "$BUNDLE/relay-ca.crt" || die "$BUNDLE/relay-ca.crt holds no PEM certificate"
@@ -481,6 +489,11 @@ install_worker() {
       [[ -z "$ca" ]] || printf 'RELAY_CA_FILE=%s\n' "$ca"
       printf 'SH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\nSH_GUEST_RAM_MB=%s\n' "$SBX_SRV/snapshots" "$SNAPSHOT" "$guest_mb"
       [[ ! -f "$SBX_SRV/templates/$SNAPSHOT.json" ]] || printf 'SH_TEMPLATE_RECORD=%s\n' "$SBX_SRV/templates/$SNAPSHOT.json"
+      # The record's template id as the worker's moca.dev/template label, so Moca Pi sessions naming
+      # the template find it (session-templates spec §3.1; combined control plane spec §3.4).
+      # Sandboxes route by worker id and ignore it.
+      tpl="$(record_template_id "$SNAPSHOT")"
+      [[ -z "$tpl" ]] || printf 'SANDBOX_TEMPLATE=%s\n' "$tpl"
       printf 'SH_WORKSPACE_ROOT=%s\nSH_CHROOT_BASE=%s\n' "$SBX_SRV/workspaces/$id" "$(jail_dir "$id")"
       printf 'SH_PARENT_CGROUP=sbx.slice/sbx-%s.slice\n' "$id"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_WORKSPACE_IDLE=%s\nSH_WORKSPACE_IMAGE_MB=%s\n' "$BUDGET_MB" "$idle" "$image_mb"
