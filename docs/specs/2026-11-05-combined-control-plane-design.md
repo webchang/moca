@@ -137,7 +137,7 @@ A new overlay, `deploy/k8s/overlays/ocp-combined`: the harness control plane of 
 `SH_ROUTE_PROFILE=combined`, the SBX0 settings, the template store (the `template-store`
 component), the relay with both Routes (attach and exec) and the janitor. One namespace, one
 Redis, one signing key (Secret `moca-mu1`, made by `deploy/k8s/setup.sh`), one API host. Its
-NetworkPolicy keeps the harness's kube-API egress (the credential store needs it).
+As built, the harness's credentials are files on a volume of their own (`SH_CREDENTIAL_STORE=file`): no Role, no service account token, so no Kubernetes API access (the base NetworkPolicy's egress on 443/6443 stays, for GitHub's device flow).
 
 **Overlay written (2026-11-05, not deployed):** `deploy/k8s/overlays/ocp-combined`, on ocp-single plus
 SBX0's attach and exec Routes and template store; `deploy/sbx/tests/overlay-combined.test.sh`
@@ -145,7 +145,8 @@ renders it and asserts the combined profile, both profiles' credentials, the rel
 callers, one namespace and **no cluster-scoped object**. `deploy/sbx/setup.sh` deploys it with `SBX_PROFILE=combined` (2026-11-05): the harness's keys added to `moca-mu1`
 (the public keyset, KEK, exchange token), the harness's exec token kept, the template store on,
 its own addresses, the supervisor's Route (`SBX_MOCA_HOST`); tested without a cluster in
-`deploy/sbx/tests/setup.test.sh`. Not yet run on a cluster.
+`deploy/sbx/tests/setup.test.sh`. It writes to `deploy/sbx/.generated-<namespace>/`, so the same checkout
+leaves an SBX0 namespace's generated files alone. Not yet run on a cluster.
 
 **For the validation:** a new namespace on ykt3 (for example `moca-combined`), so the SBX0
 deployment in `moca-sbx-template` stays as it is; the first combined window brings its templates
