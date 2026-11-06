@@ -16,10 +16,10 @@ the same processes, the same environment and the same wire. Only the process man
 addressing and the way isolation is enforced differ. Here, isolation comes from namespaces,
 NetworkPolicy, Secrets and pod lifecycle.
 
-**This is not the Knative path.** `deploy/knative/` (the Knative Service, KEDA, `KubectlTransport`
-and pod-exec sandboxes) is the deployment model RA1 deprecates. This directory shares no code and no
-manifest with it, and uses `GrpcRelayTransport` and records-based discovery exactly as `deploy/vm/`
-does. [ADR-0037](../../docs/adrs/0037-p6-on-kubernetes-substrate.md) records the distinction.
+This directory uses `GrpcRelayTransport` and records-based discovery exactly as `deploy/vm/` does —
+the Knative/KEDA deployment model that once shared this name space was removed entirely
+(ADR-0041). [ADR-0037](../../docs/adrs/0037-p6-on-kubernetes-substrate.md) records the
+Kubernetes-substrate distinction.
 
 | Workload                        | Namespace          | Ports                                        | Reached by                                                                     |
 | ------------------------------- | ------------------ | -------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -207,7 +207,7 @@ real `SH_GITHUB_CLIENT_ID` to log in.
 ## 3. The front door is L4
 
 **Nothing that speaks HTTP may sit in front of the supervisor's port 8080.** That rules out an
-Ingress, an OpenShift edge or re-encrypt Route, a service-mesh sidecar, and Knative's queue-proxy.
+Ingress, an OpenShift edge or re-encrypt Route, and a service-mesh sidecar.
 
 The reason is that the supervisor works per connection. It accepts a TCP connection, reads the
 request head, picks a worker (`leastInFlight` or `stickyBySession`), admits or refuses the
@@ -350,7 +350,7 @@ before it touches the cluster. It is sticky (section 2): a re-run keeps the list
 `kubectl get nodes -o wide` (the `INTERNAL-IP` column) when you have node read access, or ask the
 cluster administrator when you do not (`--target ocp-single`).
 
-The only Secret any MOCA object references
+The only Secret any moca object references
 in the sandbox namespace is the attach token (OpenShift adds its own per-ServiceAccount pull Secrets
 there): the exec token, the Redis password and the MU1 keys never exist there. The manifest tests
 check that nothing in it references any other Secret.

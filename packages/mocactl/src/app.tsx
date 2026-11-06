@@ -39,7 +39,9 @@ import {
   addNotice,
   fromTranscript,
   lastTurnState,
+  openTurnId,
   splitStatic,
+  unsentPrompt,
   type BlockState,
 } from './render/blocks.js';
 import { transcriptToMarkdown } from './render/export.js';
@@ -72,6 +74,8 @@ interface Attached {
   session?: ActiveSession;
   initial: BlockState;
   initialUsage?: Usage;
+  /** The detachable turn `initial` left open, so a catch-up on a newer one is told apart (#483). */
+  openTurnId?: string;
   /** The session's config bundle digest, fixed for its life; shown so it is never a guess. */
   configRef?: string;
   /** The session's model; null on the deployment default. */
@@ -98,6 +102,9 @@ export function initialOverlay(
 
 // Stops a session that is being switched away from, so its turn cannot keep running unseen.
 function retire(s: ActiveSession | undefined): void {
+  // Before clearQueue, which is what drops it: a prompt waiting behind another device's turn lives
+  // nowhere else, so leaving without writing it down loses it unsaid (#479).
+  s?.recordUnsentPrompt();
   s?.clearQueue();
   // A detachable turn is left running (the user chose keep, or switched sessions); anything else is
   // cancelled, as before.
@@ -185,6 +192,9 @@ export function App({ rt, opts, env, os, write }: AppProps) {
     } else then();
   };
   const leaveChoice = {
+    // Read at render: the overlay opens through a state change, so this is the queue as it stands
+    // when the question is asked (#479).
+    pendingPrompt: sessionRef.current?.pendingConflictPrompt,
     keep: () => {
       const then = pendingLeave.current;
       pendingLeave.current = undefined;
@@ -196,6 +206,10 @@ export function App({ rt, opts, env, os, write }: AppProps) {
       if (!sessionRef.current?.runningDetachable) return leaveChoice.keep();
       const then = pendingLeave.current;
       void (async () => {
+        // Before the cancel: against a 409's attach it withdraws the held-back prompt, and a
+        // withdrawn prompt is gone from the queue that is the only place it lives (#479). The user
+        // asked to cancel the turn, not to take their own prompt back, so it is kept for them.
+        sessionRef.current?.recordUnsentPrompt();
         const cancelled = await sessionRef.current?.cancelRemote();
         // Stay, or a keep, answered while the cancel was in flight: the question is settled, and
         // whatever is on screen now is not this overlay's to close.
@@ -219,6 +233,8 @@ export function App({ rt, opts, env, os, write }: AppProps) {
     rt.config = { ...rt.config, ...patch };
     saveRuntimeConfig(rt);
   };
+  // Keyed on a nonce, not the text: the same text offered twice must still land (see InputBox).
+  const prefillInput = (text: string) => setPrefill((p) => ({ text, nonce: (p?.nonce ?? 0) + 1 }));
   // <Static> output cannot be re-rendered in place, so a display change (or anything that took
   // over the terminal, like $EDITOR) clears the screen and re-prints history.
   const redraw = () => {
@@ -273,6 +289,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
   const view = useSession(attached.session, {
     initial: attached.initial,
     initialUsage: attached.initialUsage,
+    openTurnId: attached.openTurnId,
     now: rt.now,
     onTurnEnd,
   });
@@ -420,6 +437,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
               session: s,
               initial,
               initialUsage: t?.usage,
+              openTurnId: t ? openTurnId(t) : undefined,
               configRef: configRef ?? undefined,
               model: model ?? null,
             },
@@ -427,6 +445,11 @@ export function App({ rt, opts, env, os, write }: AppProps) {
             [...(t?.prompts ?? [])],
           );
           close();
+          // A prompt a leave dropped before it was ever sent (#479): the transcript already shows it
+          // under a notice, and here it goes back in the input, ready on Enter. Offered, never sent
+          // for them -- the other device's answer may well have changed what they want to ask.
+          const unsent = t ? unsentPrompt(t) : undefined;
+          if (unsent) prefillInput(unsent);
         } catch (err) {
           if (!loginIfExpired(err, { name: 'sessions' })) notify(describeError(err), 'error');
         } finally {
@@ -497,7 +520,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
         else if (!loginIfExpired(err, undefined)) notify(describeError(err), 'error');
       }
     },
-    prefillInput: (text) => setPrefill((p) => ({ text, nonce: (p?.nonce ?? 0) + 1 })),
+    prefillInput,
     toggleDetails: () => {
       setDetails(!details);
       persist({ details: !details });

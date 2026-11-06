@@ -1383,4 +1383,108 @@ describe('leaving a running detachable turn', () => {
     expect(harness.attaches[0]!.lastEventId).toBe('t1:2-0');
     expect(all()).not.toContain("isn't running"); // the attach found the turn: no #472 notice
   });
+
+  // #483: the resume's attach replays the session's LATEST turn, which here is one another device
+  // ran while this one was away. Its reply must not be appended into the turn this device left
+  // open -- the whole path, from the transcript's own turn id to the rendered blocks.
+  it("resume renders another device's newer turn as its own, not as the open turn's reply", async () => {
+    const rt = testRuntime({
+      cp: sessionList('remote-1'),
+      harness: fakeHarness([], {}, [
+        {
+          frames: [
+            { type: 'turn', turnId: 't2', sessionId: 'remote-1' },
+            { type: 'text', delta: 'THEIR REPLY' },
+            doneFrame('remote-1'),
+          ],
+          ids: ['t2:1-0', 't2:2-0', 't2:3-0'],
+        },
+      ]),
+    });
+    rt.transcripts!.appendPrompt('remote-1', 'go');
+    rt.transcripts!.appendFrame(
+      'remote-1',
+      { type: 'turn', turnId: 't1', sessionId: 'remote-1' },
+      't1:1-0',
+    );
+    rt.transcripts!.appendFrame('remote-1', { type: 'text', delta: 'OUR HALF' }, 't1:2-0');
+    rt.transcripts!.flush('remote-1');
+    const { stdin, all, frame, until, ready } = mount(rt);
+    await ready();
+    stdin.write(KEY.ctrl('x'));
+    await tick();
+    stdin.write('l');
+    await until(() => inputReady(stdin) && frame().includes('local history'));
+    await tick();
+    stdin.write(KEY.enter);
+    await until(() => all().includes('THEIR REPLY'));
+    // Our half stands on its own, and the notice separates it from the turn that followed.
+    expect(all()).toContain('OUR HALF');
+    expect(all()).toContain("another device's turn");
+    expect(all().indexOf('OUR HALF')).toBeLessThan(all().indexOf("another device's turn"));
+    expect(all().indexOf("another device's turn")).toBeLessThan(all().indexOf('THEIR REPLY'));
+  });
+
+  // #479, the whole way round: a prompt that met another device's turn (409) lives only in the
+  // queue, which leaving drops. Quitting must write it down, and the next resume must hand it back
+  // -- warned about on the way out, offered back on the way in, and never sent behind the user.
+  it('a prompt held back by another device survives a quit and comes back on the resume', async () => {
+    const harness = fakeHarness(
+      [
+        { error: new ApiError('harness', 409, 'turn_in_progress') },
+        // The same prompt, finally sent by hand from the resume's prefill.
+        { frames: [{ type: 'text', delta: 'at last' }, doneFrame('s-new')] },
+      ],
+      {},
+      [
+        // The conflict attach: the other device's turn, still going when this one leaves.
+        {
+          frames: [
+            { type: 'turn', turnId: 't9', sessionId: 's-new' },
+            { type: 'text', delta: 'their work' },
+          ],
+          ids: ['t9:1-0', 't9:2-0'],
+          hang: true,
+        },
+      ],
+    );
+    const rt = testRuntime({ cp: sessionList('s-new'), harness });
+    const first = mount(rt);
+    await first.ready();
+    await send(first.stdin, 'my own question');
+    await first.until(() => first.all().includes('their work'));
+    first.stdin.write(KEY.ctrl('c'));
+    await first.until(() => inputReady(first.stdin) && first.frame().includes('a turn is running'));
+    expect(first.frame()).toContain('will not be sent');
+    await tick(); // inputReady is Ink's stdin listener; the question's own useInput may lag a tick
+    first.stdin.write('k');
+    await first.until(() => !inputReady(first.stdin));
+    first.unmount();
+
+    // The resume's own catch-up, which finds the other device's turn over by now.
+    harness.attachQueuePush({ frames: [doneFrame('s-new')] });
+    const { stdin, frame, until, ready } = mount(rt);
+    await ready();
+    stdin.write(KEY.ctrl('x'));
+    await tick();
+    stdin.write('l');
+    await until(() => inputReady(stdin) && frame().includes('s-new'));
+    await tick();
+    stdin.write(KEY.enter);
+    await until(() => frame().includes('was not sent'));
+    // Pre-filled, not sent: the words are back in the input box (hence its own placeholder is
+    // gone), and the only turn ever POSTed is still the one the 409 refused.
+    await until(() => !frame().includes('ctrl+p for commands'));
+    expect(frame()).toContain('my own question');
+    expect(harness.turns).toHaveLength(1);
+
+    // Sending it at last. The warning is about this prompt, so the prompt and its reply must read
+    // BELOW it -- not spliced in front of lines <Static> has already printed (#479 review).
+    stdin.write(KEY.enter);
+    await until(() => frame().includes('at last'));
+    expect(harness.turns).toHaveLength(2);
+    expect(harness.turns[1].prompt).toBe('my own question');
+    const out = frame();
+    expect(out.indexOf('was not sent')).toBeLessThan(out.lastIndexOf('at last'));
+  });
 });

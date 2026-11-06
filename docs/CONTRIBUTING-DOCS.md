@@ -1,4 +1,4 @@
-# Writing and maintaining MOCA docs
+# Writing and maintaining moca docs
 
 Conventions for anything under `docs/`, the READMEs and `deploy/*/README*.md`. They exist so the
 docs survive the move from the Knative/KEDA deployment to P6/P4 without another restructure. The
@@ -25,17 +25,7 @@ Every install path, guide and reference page states **Stable**, **Preview** or *
 in the [documentation map](index.md#maturity-labels)). The label must agree with the milestone
 registry; if it does not, fix the registry in the same change.
 
-Use these banners verbatim, changing only the bracketed parts.
-
-Legacy (matches the banners already on `deploy/knative/`):
-
-```markdown
-> **Deprecated 2026-10-11 ([ADR-0041](<relative path>/adrs/0041-deprecate-knative-keda-deployment.md)).**
-> <What this page describes> is deprecated: security and breakage fixes only, and removal comes no
-> earlier than **end of October 2026**, once the remaining users have migrated. P6, the
-> process-manager runtime, is the primary way to run MOCA sessions: see [Migrating off the Knative/KEDA
-> deployment](<relative path>/migrating-from-knative.md).
-```
+Use this banner verbatim, changing only the bracketed parts.
 
 Preview:
 
@@ -44,8 +34,7 @@ Preview:
 > and limits may change. Known limits: <link to the limits section or issues>.
 ```
 
-Do not state a removal date or a support commitment that [ADR-0041](adrs/0041-deprecate-knative-keda-deployment.md)
-and the migration guide do not state.
+Do not state a support commitment the ADRs do not state.
 
 ## Page conventions
 
@@ -64,10 +53,17 @@ and the migration guide do not state.
 ## Terminology
 
 Use [the glossary](glossary.md) terms as defined: `session` (durable, owned, resumable), `turn`
-(one exchange), and not `run`. The product is **MOCA**; packages are `@moca/*`. Legacy names
+(one exchange), and not `run`. The product is **moca**; packages are `@moca/*`. Legacy names
 (`serverless-harness`, `SH_*`, `KAGENTI_*`, `@sh/*`) appear only where a variable or path still has
 that name, never in new prose. "P6" and "P4" are milestone IDs (process manager and microVM
 sandboxes); introduce them with that gloss on first use in a page.
+
+**Capitalization of moca.** The product name is the lowercase `moca` mid-sentence, but a
+sentence begins with capitalized `Moca` (as with most lowercase product
+names in English prose). Historical documents —
+ADRs and specs already published — keep their original `MOCA` spelling; do not rewrite them,
+and do not treat their spelling as precedent for new prose. Remaining user-visible `MOCA`
+strings in source will be cleaned up in a follow-up.
 
 ## Links
 
@@ -75,8 +71,6 @@ sandboxes); introduce them with that gloss on first use in a page.
 - Moving a file: `git mv` it, leave a one-line stub at the old path if anything links to it, and
   fix inbound links in the same change.
 - Run `make check-links` before pushing; CI runs the same check.
-- Do not rename `docs/migrating-from-knative.md` before the Knative path is removed. Banners and
-  the runtime notice link to it.
 
 ## Status vocabulary
 
