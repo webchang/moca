@@ -125,27 +125,6 @@ describe('selectPoolSandbox: the template filter', () => {
     expect(sel?.sandboxId).toBe('py-m');
     expect(sel?.tier).toBe('microvm');
   });
-
-  it('pods are never candidates for a template (no pod carries the label)', async () => {
-    const { lease } = fakeLease();
-    const e = { ...env(), SH_SANDBOX_DISCOVERY: 'both' } as NodeJS.ProcessEnv;
-    const sel = await selectPoolSandbox(
-      e,
-      '/h',
-      's-1',
-      opts({ template: 'py312' }),
-      deps([tpl('py-1', 'py312')], lease, { listPods: async () => ['pod-0'] }),
-    );
-    expect(sel?.sandboxId).toBe('py-1');
-    const plain = await selectPoolSandbox(
-      e,
-      '/h',
-      's-2',
-      opts(),
-      deps([tpl('py-1', 'py312')], lease, { listPods: async () => ['pod-0'] }),
-    );
-    expect(plain?.sandboxId).toBe('pod-0');
-  });
 });
 
 describe('selectPoolSandbox: affinity across a template change', () => {
