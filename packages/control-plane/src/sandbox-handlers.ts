@@ -189,6 +189,8 @@ interface ReadinessFacts {
   lastUsed: Map<string, number> | null;
   /** Where wanted builds are placed (§6.2), when any host agent has reported; else null. */
   placement: Placement | null;
+  /** The hosts as last reported, for each build's `heldBy` (null without host agents). */
+  hosts: HostView[] | null;
   nowS: number;
 }
 
@@ -216,7 +218,14 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     }
   }
   if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
-    return { attached, inUse: null, lastUsed: null, placement, nowS };
+    return {
+      attached,
+      inUse: null,
+      lastUsed: null,
+      placement,
+      hosts: viewsOrNull(deps, hosts),
+      nowS,
+    };
   }
   const inUse = new Map<string, number>();
   const lastUsed = new Map<string, number>();
@@ -225,8 +234,12 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
     lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
   }
-  return { attached, inUse, lastUsed, placement, nowS };
+  return { attached, inUse, lastUsed, placement, hosts: viewsOrNull(deps, hosts), nowS };
 }
+
+/** The host views, or null on a deployment without host agents (no `heldBy` to report). */
+const viewsOrNull = (deps: CpDeps, hosts: HostView[]): HostView[] | null =>
+  hosts.length > 0 || deps.config.templateHosts?.length ? hosts : null;
 
 function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: boolean) {
   const readiness =
@@ -248,6 +261,15 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
           }
         : null,
     lastUsedAt: f.lastUsed === null ? null : (f.lastUsed.get(b.worker) ?? null),
+    // The hosts whose last inventory holds this build's snapshot (§6.1): ids only, no paths. A
+    // client sees a retired build's removal here as its host drops out. Null without host agents.
+    heldBy:
+      f.hosts === null
+        ? null
+        : f.hosts
+            .filter((h) => h.holds[b.buildId] !== undefined)
+            .map((h) => h.id)
+            .sort(),
     tags: Object.entries(d.tags)
       .filter(([, id]) => id === b.buildId)
       .map(([t]) => t)

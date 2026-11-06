@@ -277,8 +277,8 @@ components:
             for a registered build (§3.3): `active` its worker is attached to the relay;
             `activating` leased and placed on a host, not attached yet; `deactivating` attached,
             no lease left (draining); `inactive` neither; `unavailable` leased, but no host holds
-            it or every holder is full; `unknown` the relay's presence could not be read; null
-            for a build that is not registered
+            it or every holder is full; `unknown` the relay's presence could not be read; `retired`
+            for a retired build; null for any other build that is not registered
         capacity:
           type: [object, 'null']
           description: for an active build
@@ -295,6 +295,13 @@ components:
           description: |
             epoch seconds of the newest sandbox created on it (retained records included); null
             when it has none, and on the harness profile
+        heldBy:
+          type: [array, 'null']
+          items: { type: string }
+          description: |
+            the ids of the hosts whose last inventory holds this build's snapshot (template lifecycle
+            spec §6.1), sorted; no paths. A retired build's host drops out once it has removed it.
+            `[]` when no host holds it; null on a deployment without host agents
         tags: { type: array, items: { type: string } }
         createdAt: { type: integer, description: epoch seconds }
         provenance:

@@ -509,6 +509,46 @@ describe('retire (§5.1)', () => {
     expect(q.templates.used).toBe(0);
   });
 
+  it('shows which hosts hold a build (heldBy), and a retired one leaving them', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    const held = async () =>
+      (
+        (
+          await HANDLERS.getTemplateBuild!(
+            ctx({ principal: alice, params: { id: 't1', build: hash('1') } }),
+            d,
+          )
+        ).body as Body
+      ).heldBy;
+    // No host has reported, but hosts are configured: an empty list, not null.
+    d.config.templateHosts = [
+      { id: 'bm1', token: 'f'.repeat(64) },
+      { id: 'bm2', token: 'e'.repeat(64) },
+    ];
+    expect(await held()).toEqual([]);
+    await inventory(d, 'bm2', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    expect(await held()).toEqual(['bm1', 'bm2']);
+    await retire(d, 't1');
+    await inventory(d, 'bm1', {}, 2);
+    expect(await held()).toEqual(['bm2']);
+    await inventory(d, 'bm2', {}, 2);
+    expect(await held()).toEqual([]);
+    // Without host agents, there is nothing to report.
+    const plain = await setup();
+    await registered(plain, 't2', hash('2'), 'sbx_t2');
+    plain.hosts = new HostRegistry();
+    const b = (
+      await HANDLERS.getTemplateBuild!(
+        ctx({ principal: alice, params: { id: 't2', build: hash('2') } }),
+        plain,
+      )
+    ).body as Body;
+    expect(b.heldBy).toBe(null);
+  });
+
   it('asks the holding host to remove a retired build, and records the removal', async () => {
     const d = await setup();
     attachedNow = [];
