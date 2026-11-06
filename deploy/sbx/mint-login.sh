@@ -102,4 +102,6 @@ SBX_KEY_B64="$(jq -r '.data.SH_SESSION_TOKEN_PRIVATE_KEY // empty' <<<"$json")" 
       renameSync(out + '.new', out);
     }
   " || die 'could not mint the login'
-echo "wrote a login for $SUBJECT ($(jq -r 'if .roles == ["admin"] then "admin" else "user" end' "$cfg/sbx-auth.json"), ${TTL_MIN} min) to ${OUTS//:/ and }$REPLACED, each 0600"
+MODES=' (0600)'
+[[ "$OUTS" != *:* ]] || MODES=', each 0600'
+echo "wrote a login for $SUBJECT ($(jq -r 'if .roles == ["admin"] then "admin" else "user" end' "$cfg/sbx-auth.json"), ${TTL_MIN} min) to ${OUTS//:/ and }$REPLACED$MODES"

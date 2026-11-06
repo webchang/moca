@@ -61,6 +61,8 @@ verify "$TMP/home-a" github:1234 '[]' || fail 'the user token does not verify un
 bash "$MINT" --env-file "$TMP/env" --subject github:42 --home "$TMP/home-admin" >"$TMP/out" 2>&1 || fail 'mint an admin login'
 verify "$TMP/home-admin" github:42 '["admin"]' || fail 'an admin subject did not get the admin role'
 [[ ! -e "$TMP/home-a/.config/mocactl/auth.json" ]] || fail 'a sandbox-profile login wrote auth.json'
+bash "$MINT" --env-file "$TMP/env" --subject github:1234 --home "$TMP/home-a" >"$TMP/out" 2>&1 || fail 'mint again'
+grep -q 'sbx-auth.json (0600)$' "$TMP/out" || fail 'a one-file summary does not end "(0600)"'
 pass 'writes a 0600 sbx-auth.json whose token verifies under the sandbox API issuer, with the admin role for an admin'
 
 # A combined control plane (combined control plane spec §3.3): the harness issuer, which a sandbox

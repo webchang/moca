@@ -6,7 +6,7 @@ Status: Proposed — branch `sbx-template` (webchang/moca), not proposed upstrea
 implemented on the branch (see §11); the validation (item 8): windows 1 and 2 run 2026-11-04, windows
 3 and 4 (measurements) and step 3 on 2026-11-05 (§10.1); the combined control plane of §4.1 is built
 ([its design](2026-11-05-combined-control-plane-design.md)) and deployed on ykt3 (`moca-combined`), its attach
-window run 2026-11-05 (§10.1)
+window run 2026-11-05 (§10.1); step 8 (a real model, DeepSeek on CurveBender, graded) run 2026-11-06
 Builds on: [session sandbox templates](2026-10-30-session-sandbox-templates-design.md) (a session
 names a template; one worker serves one template's snapshot),
 [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox profile, the
@@ -607,7 +607,16 @@ stock-agent sandbox and a **Moca Pi session both pinned to django's build**, on 
 the session's record carrying `sandboxTemplate` and `sandboxBuildId`; first use through a session
 (`409 template_not_active`, then `201` after 23 s); activation in 13-18 s; the active limit refusing
 a third (`no_active_slot`); 8 chains and 52 records verified offline. Steps 2, 4, 5 (sessions now
-included), 6 and 7 hold on the combined control plane; 8 is not started.
+included), 6 and 7 hold on the combined control plane.
+
+**Step 8** (2026-11-06, `moca-sbx-template`, a real model): **DeepSeek-V4.1-Flash on CurveBender**, not
+Sonnet; two stock brains (Claude Code 2.1.286 and OpenCode 1.18.35), 3 reps × 4 instances each, on
+fresh self-serve builds (the broken gate refused, X10; the broken probe failed at `probe`). **24 of 24
+reps recorded with no void**, each on its first attempt; every sandbox served its pinned build
+(`buildId` = manifest hash = pin); activations 13.8-21.1 s; a token renewal path through a forwarder
+proven in the dry run. Graded with the official harness; the grading stays in autobench-moca's
+records (`runs/step8-1-b`, not published). Resolution, tokens and model time do not compare with the
+Sonnet baseline (another model); the sandbox-side measures do.
 
 ## 11. Order of work
 
@@ -670,7 +679,7 @@ included), 6 and 7 hold on the combined control plane; 8 is not started.
    window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 passed with a second subject
    (2026-11-05); windows 3 and 4 measured G30 and G31 (2026-11-05); the combined control plane's attach
    window passed 2, 4, 5 (a sandbox and a Moca Pi session on one build), 6 and 7 (2026-11-05); step 8
-   not started.
+   ran 2026-11-06 with DeepSeek on CurveBender: 24 of 24 reps, no void, every one on its pinned build.
 
 ## 12. Decisions
 

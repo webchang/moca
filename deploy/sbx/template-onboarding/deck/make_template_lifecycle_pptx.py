@@ -409,17 +409,18 @@ def s_issues(d):
         ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.5, bold_first_col=True)
     note(s, 0.6, 5.3, 12.1, 0.9, "Not yet covered",
-         ["a real model and grading (step 8); a session turn on the combined control plane "
-          "(deployed, checked with no model)"], size=12)
+         ["a Moca Pi turn with a model on the combined control plane (deployed, checked with "
+          "no model); step 8 ran stock agents with a real model: 24 of 24 reps"], size=12)
 
 
 # --------------------------------------------------------------------------- 6. Next
 
 def s_next(d):
-    s = d.slide("Next: a real model, both brains, then upstream",
+    s = d.slide("Next: both brains on one control plane, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "A real model and grading", "spec §10 step 8, with the model spend agreed"),
+        ("1", "A real model and grading: done", "step 8 (2026-11-06): DeepSeek on CurveBender, "
+         "two stock brains, 24 of 24 reps on pinned builds, no void"),
         ("2", "Both brains on the combined control plane", "deployed and attached; next a "
          "window on the KVM host with a model, Moca Pi beside a stock agent"),
         ("3", "Propose upstream", "as PRs, from what the windows proved; upstream has no "
