@@ -33,6 +33,8 @@
 #   SBX_BUILD_CONCURRENCY    default 1: builds claimed per poll
 #   SBX_ACTIVE_LIMIT, SBX_IDLE_LIMIT_S   reported to the control plane (§6.2); default 0 (none set)
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
+#   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs it
+#                            (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
 #   SBX_REGISTRY             optional; template-build.sh --registry
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account

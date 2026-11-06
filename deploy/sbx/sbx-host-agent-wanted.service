@@ -15,6 +15,9 @@ Environment=SBX_ENV_DIR=/etc/sbx
 Environment=SBX_SRV=/srv/sbx
 Environment=SBX_HOST_TOKEN_FILE=/etc/sbx/host-agent.token
 Environment=SBX_TEMPLATE_BUILD=/srv/sbx/src/deploy/sbx/template-onboarding/template-build.sh
+# The removal of retired builds (§6.1 step 7) runs install-host.sh --uninstall; installed outside the
+# tree, the agent cannot find it from /usr/local/libexec, as with template-build.sh.
+Environment=SBX_INSTALL_HOST=/srv/sbx/src/deploy/sbx/install-host.sh
 ExecStart=/usr/local/libexec/sbx-host-agent.sh --wanted-only
 TimeoutStartSec=5min
 NoNewPrivileges=no
