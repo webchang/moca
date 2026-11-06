@@ -79,6 +79,23 @@ components:
         type: string
         pattern: '^sbx-[0-9a-f]{26}$'
   schemas:
+    RetiredBuild:
+      type: object
+      description: One build a retire answered for, with what ties it to the trace
+      required: [build, buildId, readiness, record]
+      properties:
+        build: { type: string, description: the build's handle (its build id once registered) }
+        buildId:
+          {
+            type: [string, 'null'],
+            description: 'the build id; null for one retired before it registered',
+          }
+        readiness: { type: string, enum: [retired] }
+        record:
+          {
+            type: [string, 'null'],
+            description: 'the retire record written now (sha256:...); null if already retired',
+          }
     WantedWorker:
       type: object
       required: [template, buildId, worker]
@@ -200,7 +217,7 @@ components:
         readiness:
           type: [string, 'null']
           description: the default build's readiness
-          enum: [active, activating, deactivating, inactive, unavailable, unknown, null]
+          enum: [active, activating, deactivating, inactive, unavailable, unknown, retired, null]
         tags:
           type: object
           additionalProperties: { type: string }
@@ -250,7 +267,7 @@ components:
         profile: { type: string, description: the policy profile; `imported` for the env list's }
         readiness:
           type: [string, 'null']
-          enum: [active, activating, deactivating, inactive, unavailable, unknown, null]
+          enum: [active, activating, deactivating, inactive, unavailable, unknown, retired, null]
           description: |
             for a registered build (§3.3): `active` its worker is attached to the relay;
             `activating` leased and placed on a host, not attached yet; `deactivating` attached,
@@ -325,6 +342,8 @@ components:
             - no_active_slot
             - template_unavailable
             - template_not_active
+            - template_retired
+            - build_in_use
             - digest_mismatch
             - bundle_quota_exceeded
             - config_bundle_not_found
@@ -1686,6 +1705,47 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
   /v1/templates/{id}/builds/{build}:
+    delete:
+      operationId: retireTemplateBuild
+      summary: Retire one build (the owner, or an admin)
+      description: |
+        As `POST /v1/templates/{id}/retire`, for one build named by its build id or handle; the
+        template's other builds stay. A tag pointing at it still resolves to it, and a create through
+        that tag is refused `410 template_retired`: move the tag first.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: build, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: retired
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RetiredBuild'
+                  - type: object
+                    required: [templateId, subject, status]
+                    properties:
+                      templateId: { type: string }
+                      subject: { type: string }
+                      status: { type: string, enum: [retired] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`not_enrolled`, or `forbidden`: neither the template's owner nor an admin"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`: no such template, or no such build of it'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`build_in_use`: a live sandbox still runs on the build'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     get:
       operationId: getTemplateBuild
       summary: One build of a template, with its spec, by build id or by the create's handle
@@ -1707,6 +1767,65 @@ paths:
         '403': { $ref: '#/components/responses/NotEnrolled' }
         '404':
           description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/templates/{id}/retire:
+    post:
+      operationId: retireTemplate
+      summary: Retire a template, every build of it (the owner, or an admin)
+      description: |
+        Template lifecycle spec §5.1. Every build not yet retired becomes `retired` (readiness
+        `retired`), its leases go, so it is no longer wanted, and a host holding it is asked to remove
+        it (`GET /v1/hosts/{host}/wanted` `remove`). A sandbox or session naming the template, or a
+        pinned build of it, is then refused `410 template_retired`. Each build retired writes a
+        `retire` record naming the caller; its earlier records stay. Idempotent: an already retired
+        build is listed with `record: null` (no second record). Refused `409 build_in_use` while a
+        live sandbox runs on any of its builds: delete it, then retire.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 1024, description: kept in the retire record }
+      responses:
+        '200':
+          description: retired
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templateId, subject, builds, status]
+                properties:
+                  templateId: { type: string }
+                  subject: { type: string, description: who retired it }
+                  status: { type: string, enum: [retired] }
+                  builds:
+                    type: array
+                    items: { $ref: '#/components/schemas/RetiredBuild' }
+        '400':
+          description: '`invalid_request`: a reason that is not a string of at most 1024 characters'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`not_enrolled`, or `forbidden`: neither the template's owner nor an admin"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`build_in_use`: a live sandbox still runs on one of its builds'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2101,7 +2220,7 @@ paths:
   /v1/hosts/{host}/wanted:
     get:
       operationId: hostWanted
-      summary: The workers a host agent should run (placed on it) and stop (no lease, no live sandbox)
+      summary: The workers a host agent should run (placed on it), stop (no lease, no live sandbox) and remove (retired)
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
@@ -2116,6 +2235,13 @@ paths:
                 properties:
                   run: { type: array, items: { $ref: '#/components/schemas/WantedWorker' } }
                   stop: { type: array, items: { $ref: '#/components/schemas/WantedWorker' } }
+                  remove:
+                    type: array
+                    description: |
+                      Retired builds this host holds, with no live sandbox on their worker (template
+                      lifecycle spec §6.1 step 7): uninstall the worker, delete the snapshot, report
+                      `removed`. Absent from a control plane before retire.
+                    items: { $ref: '#/components/schemas/WantedWorker' }
         '400':
           description: '`invalid_request`: this deployment stores no templates'
           content:
@@ -2138,7 +2264,10 @@ paths:
               required: [buildId, event]
               properties:
                 buildId: { type: string }
-                event: { type: string, enum: [attached, refused, detached] }
+                event:
+                  type: string
+                  enum: [attached, refused, detached, removed]
+                  description: "`removed` (a retired build's worker and snapshot gone) writes a `retire` record"
                 reason: { type: string }
       responses:
         '200':

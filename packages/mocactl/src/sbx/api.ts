@@ -37,6 +37,17 @@ export interface SbxDiscovery {
   profile?: string;
 }
 
+/** What a retire answers (lifecycle spec §5.1): each build retired, with its retire record. */
+export interface SbxRetired {
+  templateId: string;
+  subject: string;
+  status: 'retired';
+  builds?: { build: string; buildId: string | null; readiness: 'retired'; record: string | null }[];
+  build?: string;
+  buildId?: string | null;
+  record?: string | null;
+}
+
 export class SandboxApiClient extends ControlPlaneClient {
   sandboxDiscovery(): Promise<SbxDiscovery> {
     return this.json('GET', '/v1/discovery', { auth: false });
@@ -44,6 +55,16 @@ export class SandboxApiClient extends ControlPlaneClient {
 
   async listTemplates(): Promise<SbxTemplate[]> {
     return (await this.json<{ templates: SbxTemplate[] }>('GET', '/v1/templates')).templates;
+  }
+
+  /** Retire a template, or one build of it (lifecycle spec §5.1): `POST …/retire` or `DELETE …/builds/{b}`. */
+  retireTemplate(id: string, opts: { build?: string; reason?: string } = {}): Promise<SbxRetired> {
+    const t = encodeURIComponent(id);
+    return opts.build
+      ? this.json('DELETE', `/v1/templates/${t}/builds/${encodeURIComponent(opts.build)}`)
+      : this.json('POST', `/v1/templates/${t}/retire`, {
+          body: opts.reason !== undefined ? { reason: opts.reason } : {},
+        });
   }
 
   createSandbox(body: {

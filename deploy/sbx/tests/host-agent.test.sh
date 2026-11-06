@@ -72,7 +72,13 @@ cat >"$TMP/bin/flock" <<'MOCK'
 #!/usr/bin/env bash
 [[ ! -e "$MOCK_STATE/locked" ]]
 MOCK
-chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock"
+# install-host.sh: logs its argv; --uninstall removes the worker's env file, as the real one does.
+cat >"$TMP/bin/install-host" <<'MOCK'
+#!/usr/bin/env bash
+printf 'install-host %s\n' "$*" >>"$MOCK_LOG"
+[[ "$1" == --uninstall ]] && rm -f "$SBX_ENV_DIR/workers/$2.env"
+MOCK
+chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock" "$TMP/bin/install-host"
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
@@ -80,6 +86,7 @@ mkdir -p "$TMP/workers"
 export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/log" MOCK_STATE="$TMP/state" MOCK_TOKEN_FILE="$TMP/token" MOCK_GATE="$GATE"
 export SBX_API_URL=https://cp.example.invalid SBX_HOST_ID=bm1 SBX_HOST_TOKEN_FILE="$TMP/token" SBX_KERNEL="$TMP/kernel"
 export SBX_SRV="$TMP/srv" SBX_ENV_DIR="$TMP" SBX_TEMPLATE_BUILD="$TMP/bin/template-build" SBX_DISK_FLOOR_GB=0
+export SBX_INSTALL_HOST="$TMP/bin/install-host"
 
 job() { # job [GATE_SHA]: the claim answer, one build of the worked example
   jq -n --arg d "$DIGEST" --arg g "${1:-}" '{builds: [{template: "django-django-11133", build: "b-0123456789abcdef0123456789",
@@ -92,7 +99,7 @@ run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --once >"$TMP/out" 
 # 1. A good build: claimed, built, reported with both files; the token only in a header file.
 job "$GATE_SHA"
 run || fail 'a good poll failed'
-grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'summary'
+grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'summary'
 R="$TMP/state/POST_v1_hosts_bm1_builds_b-0123456789abcdef0123456789_report"
 jq -e '.event == "built" and (.templateRecord | fromjson | .manifest_hash == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   and (.manifest | fromjson | .hash_version == 2)' "$R" >/dev/null || fail 'the built report does not carry T and S as files'
@@ -275,3 +282,40 @@ jq -e '.event == "failed" and .step == "probe" and (.message | startswith("probe
 pass 'reports a probe failure with step probe, beside its code'
 
 echo 'all host-agent.sh tests passed'
+
+# 12. Removal of retired builds (§6.1 step 7): only a build the control plane names AND this host's
+#     own record matches (manifest hash and worker), never a running worker, nothing else deleted.
+H="sha256:$(printf 'e%.0s' {1..64})" W=sbx_ret_1 OTHER="sha256:$(printf 'f%.0s' {1..64})"
+mkdir -p "$TMP/srv/snapshots/ret-1" "$TMP/srv/snapshots/keep-1" "$TMP/workers"
+jq -n --arg h "$H" --arg w "$W" '{schema: "moca-sbx-template/1", id: "ret", worker: $w, snapshot: "ret-1", manifest_hash: $h}' >"$TMP/srv/templates/ret-1.json"
+jq -n --arg h "$OTHER" '{schema: "moca-sbx-template/1", id: "keep", worker: "sbx_keep_1", snapshot: "keep-1", manifest_hash: $h}' >"$TMP/srv/templates/keep-1.json"
+: >"$TMP/workers/$W.env"
+printf '{"builds":[]}' >"$TMP/state/claim-answer"
+# A running worker is not removed.
+touch "$TMP/state/active-sbx-worker@$W.service"
+jq -n --arg h "$H" --arg w "$W" '{run: [], stop: [], remove: [{template: "ret", buildId: $h, worker: $w}]}' >"$TMP/state/wanted-answer"
+: >"$MOCK_LOG"; bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the removal run failed'
+grep -q 'still running' "$TMP/out" || fail 'a running worker was not skipped'
+[[ -d "$TMP/srv/snapshots/ret-1" ]] || fail 'removed the snapshot of a running worker'
+grep -q 'install-host --uninstall' "$MOCK_LOG" && fail 'uninstalled a running worker'
+# Stopped: uninstalled, its snapshot and record gone, reported removed; the other build untouched.
+rm -f "$TMP/state/active-sbx-worker@$W.service"; : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*
+bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the removal run failed'
+grep -q "install-host --uninstall $W" "$MOCK_LOG" || fail 'the worker was not uninstalled'
+[[ ! -e "$TMP/srv/snapshots/ret-1" && ! -e "$TMP/srv/templates/ret-1.json" ]] || fail 'the snapshot or its record is still there'
+[[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build it was not asked to'
+jq -e --arg h "$H" '.buildId == $h and .event == "removed"' "$TMP/state/POST_v1_hosts_bm1_workers_report" >/dev/null || fail 'the removal was not reported'
+grep -q '"removed":1' "$TMP/out" || fail 'the summary does not count the removal'
+jq -e '.holds | map(.manifestHash) | index("'"$H"'") == null' "$TMP/state/POST_v1_hosts_bm1_inventory" >/dev/null 2>&1 || true
+# A name the control plane sends that this host's records do not match deletes nothing.
+jq -n --arg h "$OTHER" '{run: [], stop: [], remove: [{template: "keep", buildId: $h, worker: "sbx_wrong_1"}]}' >"$TMP/state/wanted-answer"
+: >"$MOCK_LOG"; bash "$A" --wanted-only >"$TMP/out" 2>&1 || true
+[[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build whose worker did not match'
+grep -q 'no template record here' "$TMP/out" || fail 'a mismatched removal does not say why'
+jq -n '{run: [], stop: [], remove: [{template: "x", buildId: "../../etc", worker: "sbx_x"}]}' >"$TMP/state/wanted-answer"
+: >"$MOCK_LOG"; bash "$A" --wanted-only >"$TMP/out" 2>&1 || true
+grep -q 'build id to remove is malformed' "$TMP/out" || fail 'a malformed build id was not refused'
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+pass 'removes a retired build only when named and matched by its own record, never a running worker, and reports it (§6.1 step 7)'
+
+echo 'all host-agent tests passed'

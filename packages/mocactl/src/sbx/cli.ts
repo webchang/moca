@@ -16,6 +16,7 @@ import {
   cmdLs,
   cmdRm,
   cmdTemplates,
+  cmdRetireTemplate,
   cmdToken,
   failRefresh,
   SBX_EXIT,
@@ -44,6 +45,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  in a local terminal: copies the code, opens the browser)
   mocactl sbx logout                             end the sandbox-service login (deletes sbx-auth.json)
   mocactl sbx templates [--json]                 the templates a sandbox can be created from
+  mocactl sbx templates retire ID [--build BUILD] [--reason TEXT] [--json]
+                                                 retire a template you own (or one build of it): never
+                                                 used again; its records stay (lifecycle spec §5.1)
   mocactl sbx create [--template ID] [--name N] [--label k=v ...] [--json]
                                                  create a sandbox (template: default); prints its id
   mocactl sbx ls [--all] [--json]                your sandboxes (--all: everyone's; admins only)
@@ -350,6 +354,8 @@ export async function sbxMain(
         host: { type: 'string', multiple: true },
         kind: { type: 'string' },
         preset: { type: 'string' },
+        build: { type: 'string' },
+        reason: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -417,6 +423,13 @@ export async function sbxMain(
     io.err(`sbx: --${credFlag} only applies to credentials add\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
+  if (
+    (values.build !== undefined || values.reason !== undefined) &&
+    !(command === 'templates' && arg === 'retire')
+  ) {
+    io.err(`sbx: --build and --reason only apply to templates retire\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
   if (values.cortex && values['no-agent-config']) {
     io.err(
       `sbx: --cortex is a choice about the agent configuration, which --no-agent-config does not write\n${SBX_USAGE}`,
@@ -453,16 +466,18 @@ export async function sbxMain(
     command === 'run' ||
     command === 'claude' ||
     command === 'codex' ||
-    (command === 'credentials'
-      ? arg === undefined ||
-        (arg === 'presets'
-          ? extra.length === 0
-          : arg === 'list'
+    (command === 'templates'
+      ? arg === undefined || (arg === 'retire' && extra.length === 1)
+      : command === 'credentials'
+        ? arg === undefined ||
+          (arg === 'presets'
             ? extra.length === 0
-            : ['add', 'delete'].includes(arg) && extra.length === 1)
-      : command === 'put'
-        ? arg !== undefined && extra.length === 0
-        : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
+            : arg === 'list'
+              ? extra.length === 0
+              : ['add', 'delete'].includes(arg) && extra.length === 1)
+        : command === 'put'
+          ? arg !== undefined && extra.length === 0
+          : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
   if (!argsOk) {
     io.err(
       `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${SBX_USAGE}`,
@@ -630,6 +645,8 @@ export async function sbxMain(
     case 'logout':
       return cmdLogout(ctx);
     case 'templates':
+      if (arg === 'retire')
+        return cmdRetireTemplate(ctx, extra[0]!, { build: values.build, reason: values.reason });
       return cmdTemplates(ctx);
     case 'create':
       return cmdCreate(ctx, createBody!);

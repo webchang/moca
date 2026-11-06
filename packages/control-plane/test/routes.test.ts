@@ -42,6 +42,8 @@ describe('the route table', () => {
         'POST /v1/templates',
         'POST /v1/templates/{id}/builds',
         'POST /v1/templates/{id}/builds/{build}/cancel',
+        'POST /v1/templates/{id}/retire',
+        'DELETE /v1/templates/{id}/builds/{build}',
         'GET /v1/policy',
         'PUT /v1/policy',
         'GET /v1/quota',

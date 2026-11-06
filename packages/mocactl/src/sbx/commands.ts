@@ -181,6 +181,29 @@ export async function cmdTemplates(c: SbxCtx): Promise<number> {
   }
 }
 
+/** `sbx templates retire ID [--build B] [--reason T]` (lifecycle spec §5.1): the owner retires it. */
+export async function cmdRetireTemplate(
+  c: SbxCtx,
+  id: string,
+  opts: { build?: string; reason?: string },
+): Promise<number> {
+  try {
+    const r = await c.api.retireTemplate(id, opts);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else {
+      const builds = r.builds ?? [{ build: r.build ?? '', record: r.record ?? null }];
+      for (const b of builds) {
+        c.io.out(
+          `retired ${sanitizeRemote(r.templateId)} ${sanitizeRemote(b.build)}${b.record ? '' : ' (already retired)'}\n`,
+        );
+      }
+    }
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
 /** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
 export const ACTIVATION_WAIT_MS = 10 * 60_000;
 

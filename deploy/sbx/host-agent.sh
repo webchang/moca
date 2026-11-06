@@ -2,7 +2,8 @@
 # deploy/sbx/host-agent.sh -- sbx-host-agent, a KVM host's template agent
 # (docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md §6.1). One run is one poll:
 # report the inventory, claim queued builds, build each with template-build.sh, report the outcome;
-# then start and stop installed workers as the control plane wants (§6.3). The control plane
+# then start and stop installed workers as the control plane wants (§6.3), and remove retired builds
+# it names (§6.1 step 7: the worker uninstalled, the snapshot and its record deleted). The control plane
 # registers or rejects a built build by policy (§8.2) and decides what runs; nothing here does.
 #
 # A worker must already be installed (install-host.sh, with its relay token from setup.sh): a wanted
@@ -36,7 +37,7 @@
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged. Output: one JSON line per action, then one summary line
-# {"agent":"summary","claimed","built","failed","started","stopped","errors"}. A refusal of its own settings is exit 2.
+# {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}. A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
 
@@ -50,7 +51,8 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
-CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0
+CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
+: "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
 check_settings() {
@@ -253,7 +255,40 @@ activation() {
       error "stop $unit failed"
     fi
   done < <(jq -r '.stop[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+  [[ "$(jq -r '.remove | type' <<<"$wanted")" != array ]] || removal "$wanted"
   exec 9>&-
+}
+
+# Retired builds the control plane names for removal (§6.1 step 7). The snapshot is found from this
+# host's own template record whose manifest hash is the build id AND whose worker is the one named,
+# never from a path the control plane sends; nothing else is deleted. The worker is stopped and
+# uninstalled first (install-host.sh --uninstall, which keeps workspace data for the janitor); a
+# running worker is not removed (the control plane leaves out one with a live sandbox, and this
+# checks again). Each removal is reported `removed`, so the retire's chain shows it.
+removal() {
+  local w b rec snap
+  while IFS=$'\t' read -r w b; do
+    [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to remove is malformed'; continue; }
+    [[ "$b" =~ ^sha256:[0-9a-f]{64}$ ]] || { error 'a build id to remove is malformed'; continue; }
+    rec=''
+    for f in "$SBX_SRV"/templates/*.json; do
+      [[ -f "$f" ]] || continue
+      jq -e --arg b "$b" --arg w "$w" '.schema == "moca-sbx-template/1" and .manifest_hash == $b and .worker == $w' "$f" >/dev/null 2>&1 && { rec="$f"; break; }
+    done
+    [[ -n "$rec" ]] || { error "no template record here for build $b of worker $w"; continue; }
+    snap="$(jq -r .snapshot "$rec")"
+    [[ "$snap" =~ ^[A-Za-z0-9._-]+$ && "$snap" != . && "$snap" != .. ]] || { error 'a template record names a bad snapshot'; continue; }
+    if systemctl is-active --quiet "sbx-worker@$w.service"; then
+      say "{\"agent\":\"skipped\",\"worker\":\"$w\",\"why\":\"still running: removed once it is stopped\"}"
+      continue
+    fi
+    if [[ -f "$SBX_ENV_DIR/workers/$w.env" ]]; then
+      "$SBX_INSTALL_HOST" --uninstall "$w" >"$WORK/uninstall-$w.log" 2>&1 || { error "install-host.sh --uninstall $w failed"; continue; }
+    fi
+    rm -rf -- "${SBX_SRV:?}/snapshots/$snap"
+    rm -f -- "$rec"
+    REMOVED=$((REMOVED + 1)); worker_report "$b" removed; say "{\"agent\":\"removed\",\"worker\":\"$w\"}"
+  done < <(jq -r '.remove[] | [.worker, .buildId] | @tsv' <<<"$1")
 }
 
 main() {
@@ -273,7 +308,7 @@ main() {
   fi
   if [[ "$mode" == --wanted-only ]]; then
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
     return 0
   fi
   local free
@@ -283,7 +318,7 @@ main() {
   if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
     say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
     return 0
   fi
   if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
@@ -298,7 +333,7 @@ main() {
     fi
   fi
   activation
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS}"
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
 }
 
 main "$@"

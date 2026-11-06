@@ -271,6 +271,75 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     ]);
   });
 
+  it('retires a template, or one build, saying which; refuses misplaced flags (lifecycle §5.1)', async () => {
+    const { home, env, io } = setup();
+    const rec = `sha256:${'a'.repeat(64)}`;
+    const cp = fakeCp({
+      'POST /v1/templates/node22/retire': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          status: 'retired',
+          builds: [
+            {
+              build: `sha256:${'1'.repeat(64)}`,
+              buildId: `sha256:${'1'.repeat(64)}`,
+              readiness: 'retired',
+              record: rec,
+            },
+            {
+              build: `sha256:${'2'.repeat(64)}`,
+              buildId: `sha256:${'2'.repeat(64)}`,
+              readiness: 'retired',
+              record: null,
+            },
+          ],
+        },
+      }),
+      [`DELETE /v1/templates/node22/builds/${encodeURIComponent(`sha256:${'1'.repeat(64)}`)}`]:
+        () => ({
+          status: 200,
+          body: {
+            templateId: 'node22',
+            subject: 'github:1',
+            status: 'retired',
+            build: `sha256:${'1'.repeat(64)}`,
+            buildId: `sha256:${'1'.repeat(64)}`,
+            readiness: 'retired',
+            record: rec,
+          },
+        }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(['templates', 'retire', 'node22', '--reason', 'done'], env, io, opts),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({
+      method: 'POST',
+      path: '/v1/templates/node22/retire',
+      body: { reason: 'done' },
+    });
+    expect(io.outs.join('')).toMatch(/retired node22 sha256:1{64}\n/);
+    expect(io.outs.join('')).toMatch(/retired node22 sha256:2{64} \(already retired\)\n/);
+    io.outs.length = 0;
+    expect(
+      await sbxMain(
+        ['templates', 'retire', 'node22', '--build', `sha256:${'1'.repeat(64)}`, '--json'],
+        env,
+        io,
+        opts,
+      ),
+    ).toBe(0);
+    expect(cp.calls.at(-1)!.method).toBe('DELETE');
+    expect(JSON.parse(io.outs.join(''))).toMatchObject({ templateId: 'node22', record: rec });
+    expect(await sbxMain(['templates', 'retire'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'retire', 'a', 'b'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', '--build', 'x'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['ls', '--reason', 'x'], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/--build and --reason only apply to templates retire/);
+  });
+
   it('creates a sandbox with a template, a name and labels, and prints its id and expiry', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({ 'POST /v1/sandboxes': () => ({ status: 201, body: sandbox() }) });

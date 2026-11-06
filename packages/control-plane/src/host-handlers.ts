@@ -185,15 +185,23 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     }
     const run: Record<string, unknown>[] = [];
     const stop: Record<string, unknown>[] = [];
+    // Retired builds this host still holds, with no live sandbox on their worker (§6.1 step 7): the
+    // agent stops and uninstalls the worker and removes the snapshot. Never one with a live sandbox.
+    const remove: Record<string, unknown>[] = [];
     for (const d of docs) {
       for (const b of d.builds) {
-        if (b.status !== 'registered' || !mine || mine.holds[b.buildId] === undefined) continue;
+        if (!mine || mine.holds[b.buildId] === undefined) continue;
         const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
+        if (b.status === 'retired') {
+          if (b.worker && !busy.has(b.worker)) remove.push(entry);
+          continue;
+        }
+        if (b.status !== 'registered') continue;
         if (p.placed.get(b.buildId) === host) run.push(entry);
         else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) stop.push(entry);
       }
     }
-    return { status: 200, body: { run, stop } };
+    return { status: 200, body: { run, stop, remove } };
   },
 
   hostWorkerReport: async (ctx, deps) => {
@@ -201,20 +209,27 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     const { cat, prov } = catalogOf(deps);
     const b = asRecord(ctx.body);
     const event = b.event;
-    if (event !== 'attached' && event !== 'refused' && event !== 'detached') {
-      throw new CpError('invalid_request', 'event must be attached, refused or detached');
+    if (
+      event !== 'attached' &&
+      event !== 'refused' &&
+      event !== 'detached' &&
+      event !== 'removed'
+    ) {
+      throw new CpError('invalid_request', 'event must be attached, refused, detached or removed');
     }
     const buildId = typeof b.buildId === 'string' ? b.buildId : '';
+    // `removed` is reported for a retired build (§6.1 step 7); the others for a registered one.
+    const want = event === 'removed' ? 'retired' : 'registered';
     const doc = (await cat.list()).find((d) =>
-      d.builds.some((x) => x.buildId === buildId && x.status === 'registered'),
+      d.builds.some((x) => x.buildId === buildId && x.status === want),
     );
     if (!doc || deps.hosts?.get(host)?.holds[buildId] === undefined) {
-      throw new CpError('not_found', 'no registered build this host holds');
+      throw new CpError('not_found', `no ${want} build this host holds`);
     }
     const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;
     await prov.append({
       stream: `template/${doc.id}`,
-      kind: event === 'detached' ? 'deactivate' : 'activate',
+      kind: event === 'removed' ? 'retire' : event === 'detached' ? 'deactivate' : 'activate',
       subject: `host:${host}`,
       body: { buildId, event, ...(reason ? { reason } : {}) },
     });
