@@ -7,7 +7,7 @@ Sources, in the order they win (a slide restates them; change the source first):
   1. docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md (states §3.3, API §4,
      host agent §6.1, first use §6.4, provenance §7, policy §8, validation §10.1)
   2. docs/specs/2026-11-05-combined-control-plane-design.md (one control plane, turns by build)
-  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G32)
+  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G33)
   4. deploy/sbx/RUNBOOK.md §15 (the host agent, its units)
   5. the run record of windows 1-4 (on the user's machine; its numbers are copied below with the
      window they come from)
