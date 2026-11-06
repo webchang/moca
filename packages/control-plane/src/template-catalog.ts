@@ -68,7 +68,13 @@ export interface TemplateBuild {
    * Activation leases (§6.3): each subject's hold on this build, until (epoch seconds). The build
    * is wanted active while any lease is unexpired; aging is a lease running out.
    */
-  leases?: { subject: string; until: number; since?: number }[];
+  leases?: {
+    subject: string;
+    until: number;
+    since?: number;
+    /** The digest of the `activate` record this grant wrote (§7.1): a sandbox names it as its lease. */
+    record?: string;
+  }[];
   /** The host agent's build log, newest last, at most LOG_MAX entries (§4 logs). */
   log?: { at: number; level: 'info' | 'warn' | 'error'; step: string; message: string }[];
 }

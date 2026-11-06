@@ -9,7 +9,7 @@ import {
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { isEnrolledForSandbox, type SandboxConfig } from './sandbox-config.js';
-import { canonicalJson, type ProvenanceStore } from './provenance.js';
+import { buildRecordOf, canonicalJson, type ProvenanceStore } from './provenance.js';
 import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
 import {
   checkCreate,
@@ -638,12 +638,20 @@ async function takeLease(
       { quota: 'active' },
     );
   }
-  const withLease = (x: TemplateBuild): TemplateBuild => {
+  const withLease = (x: TemplateBuild, record?: string): TemplateBuild => {
     const others = (x.leases ?? []).filter((l) => l.subject !== p.sub && l.until > nowS);
     const mine = (x.leases ?? []).find((l) => l.subject === p.sub && l.until > nowS);
     return {
       ...x,
-      leases: [...others, { subject: p.sub, until: nowS + want, since: mine?.since ?? nowS }],
+      leases: [
+        ...others,
+        {
+          subject: p.sub,
+          until: nowS + want,
+          since: mine?.since ?? nowS,
+          ...(record ? { record } : {}),
+        },
+      ],
     };
   };
   // Would it be placed? Judge with this lease added, before keeping it.
@@ -674,11 +682,9 @@ async function takeLease(
       Number.isFinite(free) ? Math.max(1, free) : 60,
     );
   }
-  await cat.update(d0.id, async (cur) => ({
-    ...cur!,
-    builds: cur!.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)),
-  }));
-  await prov.append({
+  // The record first, so the lease can name it (a sandbox under this lease cites it, §7.1), and no
+  // lease is ever stored without its record.
+  const rec = await prov.append({
     stream: `template/${d0.id}`,
     kind: 'activate',
     subject: p.sub,
@@ -690,6 +696,10 @@ async function takeLease(
       ...(reason === 'first_use' ? { reason } : {}),
     },
   });
+  await cat.update(d0.id, async (cur) => ({
+    ...cur!,
+    builds: cur!.builds.map((x) => (x.buildId === target.buildId ? withLease(x, rec.digest) : x)),
+  }));
   return { until: nowS + want, host: pl.placed.get(target.buildId) ?? null };
 }
 
@@ -866,6 +876,7 @@ async function retireBuilds(
       body: {
         build: x.handle ?? x.buildId,
         ...(x.status === 'registered' ? { buildId: x.buildId } : {}),
+        buildRecord: await buildRecordOf(prov, d0.id, x.buildId),
         from: x.status,
         ...(typeof reason === 'string' ? { reason } : {}),
       },
@@ -1143,6 +1154,57 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
     ).digest;
   }
   return { status: 200, body: { templateId: d0.id, subject: p.sub, owner, before, record } };
+}
+
+/**
+ * A sandbox's end on its build's chain (§7.1): `deleted` when DELETE ends it, `expired` when it is
+ * first seen past its expiresAt (expiry is computed, not an event, so that record comes when it is
+ * noticed; its body's expiresAt is the true end).
+ */
+async function sandboxEnded(
+  deps: CpDeps,
+  rec: SandboxRecord,
+  subject: string,
+  reason: 'deleted' | 'expired',
+  nowS: number,
+): Promise<void> {
+  if (!deps.provenance) return;
+  await deps.provenance.append({
+    stream: `template/${rec.template}`,
+    kind: 'sandbox',
+    subject,
+    body: {
+      sandboxId: rec.id,
+      buildId: rec.buildId ?? null,
+      state: 'terminated',
+      reason,
+      expiresAt: rec.expiresAt,
+      ...(reason === 'deleted' ? { endedAt: nowS } : {}),
+    },
+  });
+}
+
+/**
+ * The `expired` end records (§7.1), written when expiry is first noticed: the janitor's sweep reads
+ * every sandbox, so it is where an expired one is seen. Once per sandbox: a template chain already
+ * holding this sandbox's terminated record is skipped (the chain is the marker, no store field).
+ */
+async function recordExpiries(deps: CpDeps, recs: SandboxRecord[], nowS: number): Promise<void> {
+  if (!deps.provenance) return;
+  const expired = recs.filter((r) => r.deletedAt === undefined && nowS >= r.expiresAt);
+  const byTemplate = new Map<string, SandboxRecord[]>();
+  for (const r of expired) byTemplate.set(r.template, [...(byTemplate.get(r.template) ?? []), r]);
+  for (const [template, rs] of byTemplate) {
+    const ended = new Set(
+      (await deps.provenance.chain(`template/${template}`))
+        .filter(
+          (x) => x.kind === 'sandbox' && (x.body as { state?: string }).state === 'terminated',
+        )
+        .map((x) => (x.body as { sandboxId?: string }).sandboxId),
+    );
+    for (const r of rs)
+      if (!ended.has(r.id)) await sandboxEnded(deps, r, 'janitor', 'expired', nowS);
+  }
 }
 
 async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
@@ -1462,6 +1524,24 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       throw new CpError('name_conflict', `you already have a live sandbox named '${rec.name}'`);
     }
     await audit(deps, p.sub, id, 'sandbox_created');
+    // The sandbox on its build's chain (§7.1): its lease is the caller's live lease on the build, as
+    // the digest of the activate record that granted it (null: no lease, e.g. no host agents).
+    if (deps.provenance) {
+      const live = (template.build.leases ?? []).find((l) => l.subject === p.sub && l.until > now);
+      await deps.provenance.append({
+        stream: `template/${template.id}`,
+        kind: 'sandbox',
+        subject: p.sub,
+        body: {
+          sandboxId: id,
+          buildId: template.buildId,
+          templateManifestHash: template.build.status === 'registered' ? template.buildId : null,
+          lease: live?.record ?? null,
+          state: 'created',
+          expiresAt: rec.expiresAt,
+        },
+      });
+    }
     return { status: 201, body: sandboxBody(viewOf(rec, now)) };
   },
 
@@ -1498,7 +1578,10 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const outcome = await store.markDeleted(rec.id, now, cfg.retentionS);
     // Retention ran out between the read and the delete: it is gone, as it would read now.
     if (outcome === 'not_found') throw new CpError('sandbox_not_found', 'no such sandbox');
-    if (outcome === 'deleted') await audit(deps, ctx.principal!.sub, rec.id, 'sandbox_deleted');
+    if (outcome === 'deleted') {
+      await audit(deps, ctx.principal!.sub, rec.id, 'sandbox_deleted');
+      await sandboxEnded(deps, rec, ctx.principal!.sub, 'deleted', now);
+    }
     // Idempotent: a second delete, or a delete after expiry, reports how it actually ended.
     const ended = viewOf(outcome === 'deleted' ? { ...rec, deletedAt: now } : rec, now);
     return {
@@ -1553,11 +1636,13 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const now = seconds(deps);
     const live: { wsk: string; wrk: string }[] = [];
     const terminated: { wsk: string; wrk: string; terminatedAt: number }[] = [];
-    for (const rec of await store.listAll(now)) {
+    const all = await store.listAll(now);
+    for (const rec of all) {
       const v = viewOf(rec, now);
       if (v.state === 'ready') live.push({ wsk: v.wsk, wrk: v.worker });
       else terminated.push({ wsk: v.wsk, wrk: v.worker, terminatedAt: v.terminatedAt! });
     }
+    await recordExpiries(deps, all, now);
     return { status: 200, body: { live, terminated } };
   },
 };

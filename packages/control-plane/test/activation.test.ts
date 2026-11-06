@@ -7,7 +7,7 @@ import { writeError } from '../src/errors.js';
 import { exchangeCredential } from '../src/exchange.js';
 import { HANDLERS } from '../src/handlers.js';
 import { HostRegistry } from '../src/host-handlers.js';
-import { ProvenanceStore, sha256Hex } from '../src/provenance.js';
+import { ProvenanceStore, recordDigest as recordDigestOf, sha256Hex } from '../src/provenance.js';
 import { FileTemplateCatalog, type TemplateDoc } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
 import { DEFAULT_POLICY } from '../src/template-policy.js';
@@ -1034,6 +1034,91 @@ describe('admin quotas (§5.2)', () => {
       await refusal(() => putQuota(d, alice.sub, { templates: -1, buildsQueued: 1, active: 1 })),
     ).toBe('invalid_request');
     expect(await refusal(() => putQuota(d, 'default', null))).toBe('invalid_request');
+  });
+});
+
+describe('every link of a sandbox is a record digest (§7.1)', () => {
+  it('sandbox -> its lease (the activate record) -> the build record; ends and the retire cite them', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    const sb = (
+      await HANDLERS.createSandbox!(
+        ctx({ principal: alice, body: { template: `t1@${hash('1')}` } }),
+        d,
+      )
+    ).body as Body;
+    const chain = await d.provenance!.chain('template/t1');
+    const digestOf = (r: (typeof chain)[number]) => recordDigestOf(r);
+    const created = chain.find(
+      (r) => r.kind === 'sandbox' && (r.body as Body).state === 'created',
+    )!;
+    expect(created).toMatchObject({
+      subject: alice.sub,
+      body: { sandboxId: sb.id, buildId: hash('1'), templateManifestHash: hash('1') },
+    });
+    // The lease is exactly the activate record that granted it.
+    const act = chain.find((r) => digestOf(r) === (created.body as Body).lease)!;
+    expect(act).toMatchObject({
+      kind: 'activate',
+      subject: alice.sub,
+      body: { buildId: hash('1') },
+    });
+    // The build record, by its manifest hash, is what the registration check cited.
+    const build = chain.find(
+      (r) => r.kind === 'build' && (r.body as Body).manifest_hash === hash('1'),
+    )!;
+    const check = chain.find((r) => r.kind === 'check' && (r.body as Body).at === 'registration')!;
+    expect((check.body as Body).build).toBe(digestOf(build));
+    // The end, and the retire and the host's removal, cite the same build record.
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id } }), d);
+    await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' } }), d);
+    await HANDLERS.hostWorkerReport!(
+      asHost('bm1', {}, { buildId: hash('1'), event: 'removed' }),
+      d,
+    );
+    const after = await d.provenance!.chain('template/t1');
+    expect(
+      after.find((r) => r.kind === 'sandbox' && (r.body as Body).state === 'terminated'),
+    ).toMatchObject({
+      subject: alice.sub,
+      body: { sandboxId: sb.id, reason: 'deleted' },
+    });
+    const retires = after.filter((r) => r.kind === 'retire');
+    expect(retires.map((r) => (r.body as Body).buildRecord)).toEqual([
+      digestOf(build),
+      digestOf(build),
+    ]);
+  });
+
+  it("an expired sandbox's end is recorded once, by the janitor's sweep, with its true end", async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    const sb = (
+      await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d)
+    ).body as Body;
+    const janitor = () =>
+      HANDLERS.janitorSandboxes!({ ...ctx({}), janitorAuthorized: true } as never, d);
+    await janitor();
+    const ends = async () =>
+      (await d.provenance!.chain('template/t1')).filter(
+        (r) => r.kind === 'sandbox' && (r.body as Body).state === 'terminated',
+      );
+    expect(await ends()).toHaveLength(0);
+    now += 8 * 86_400_000;
+    await janitor();
+    await janitor();
+    const e = await ends();
+    expect(e).toHaveLength(1);
+    expect(e[0]).toMatchObject({
+      subject: 'janitor',
+      body: { sandboxId: sb.id, reason: 'expired', expiresAt: sb.expiresAt },
+    });
   });
 });
 

@@ -41,6 +41,9 @@ export const RECORD_KINDS = [
   'retire',
   'reject',
   'use',
+  // A sandbox's span on a build (§7.1): written at create (its lease's activate record named) and
+  // when it ends. Added 2026-11-06; a verifier that predates it refuses a store holding one.
+  'sandbox',
 ] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
@@ -116,6 +119,25 @@ export function canonicalJson(value: unknown): string {
 
 export function sha256Hex(data: string | Buffer): string {
   return createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * The digest of a build's `build` record in a template's chain (§7.1), found by its manifest hash:
+ * what a check, a retire, a reject and a host's removal cite as `buildRecord`. Null for a build that
+ * never produced one (imported, or retired before it was built).
+ */
+export async function buildRecordOf(
+  store: ProvenanceStore,
+  template: string,
+  buildId: string,
+): Promise<string | null> {
+  const r = (await store.chain(`template/${template}`)).find(
+    (x) =>
+      x.kind === 'build' &&
+      (x.body as { outcome?: string }).outcome === 'built' &&
+      (x.body as { manifest_hash?: string }).manifest_hash === buildId,
+  );
+  return r ? recordDigest(r) : null;
 }
 
 export function recordDigest(r: ProvenanceRecord): string {

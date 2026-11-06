@@ -1,7 +1,7 @@
 import { CpError } from './errors.js';
 import { asRecord, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import { recordDigest } from './provenance.js';
+import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
 import { liveLeases, place } from './activation.js';
 import { isLive } from './sandbox-store.js';
@@ -236,7 +236,12 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       stream: `template/${doc.id}`,
       kind: event === 'removed' ? 'retire' : event === 'detached' ? 'deactivate' : 'activate',
       subject: `host:${host}`,
-      body: { buildId, event, ...(reason ? { reason } : {}) },
+      body: {
+        buildId,
+        event,
+        ...(event === 'removed' ? { buildRecord: await buildRecordOf(prov, doc.id, buildId) } : {}),
+        ...(reason ? { reason } : {}),
+      },
     });
     return { status: 200, body: { recorded: event } };
   },
