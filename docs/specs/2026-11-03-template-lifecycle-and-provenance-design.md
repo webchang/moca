@@ -624,7 +624,9 @@ differs and the gateway's cache was bypassed (the run record), so 12 of 12 count
 independent fixes. **It is an easy set:** these four are the instances the windows built, and they
 have resolved before. Medians per rep, over 12 reps each, Claude Code against OpenCode: wall 39.0
 against 30.0 s, `sbx` Execs 9 against 7.5, sandbox time 12.0 against 5.5 s. Resolution, tokens and model
-time do not compare with the Sonnet baseline (another model); the sandbox-side measures do.
+time do not compare with the Sonnet baseline (another model); the sandbox-side measures do. Step 7 again
+afterwards: 8 chains and 291 records verified offline, each of the four builds with its `build`
+record and its activations in the chain.
 
 ## 11. Order of work
 
