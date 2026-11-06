@@ -812,6 +812,161 @@ describe('reject after the fact (§5.2)', () => {
   });
 });
 
+describe('edit description and visibility (§5.1)', () => {
+  const refusal = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      return (e as { code: string }).code;
+    }
+    return 'none';
+  };
+  const patch = (d: TestDeps, id: string, body: unknown, principal = alice) =>
+    HANDLERS.updateTemplate!(ctx({ principal, params: { id }, body }), d);
+
+  it('the owner makes it private: others no longer see or use it; each change is a record', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    expect(
+      ((await HANDLERS.getTemplate!(ctx({ principal: bob, params: { id: 't1' } }), d)).body as Body)
+        .id,
+    ).toBe('t1');
+    const r = (await patch(d, 't1', { visibility: 'private', description: 'Django 11133, v1' }))
+      .body as Body;
+    expect(r).toMatchObject({
+      templateId: 't1',
+      subject: alice.sub,
+      visibility: 'private',
+      description: 'Django 11133, v1',
+    });
+    expect(r.changes.map((c: Body) => [c.field, c.value, c.before])).toEqual([
+      ['visibility', 'private', 'deployment'],
+      ['description', 'Django 11133, v1', expect.any(String)],
+    ]);
+    expect(r.changes[0].record).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const chain = await d.provenance!.chain('template/t1');
+    expect(chain.at(-2)).toMatchObject({
+      kind: 'visibility',
+      subject: alice.sub,
+      body: { field: 'visibility', value: 'private', before: 'deployment' },
+    });
+    expect(chain.at(-1)).toMatchObject({ kind: 'visibility', body: { field: 'description' } });
+    // Bob no longer sees it (404), nor uses it; the owner and an admin still do.
+    expect(
+      await refusal(() => HANDLERS.getTemplate!(ctx({ principal: bob, params: { id: 't1' } }), d)),
+    ).toBe('template_not_found');
+    expect(
+      await refusal(() =>
+        HANDLERS.createSandbox!(ctx({ principal: bob, body: { template: 't1' } }), d),
+      ),
+    ).toBe('unknown_template');
+    expect(
+      (
+        (
+          await HANDLERS.getTemplate!(
+            ctx({ principal: { ...bob, roles: ['admin'] }, params: { id: 't1' } }),
+            d,
+          )
+        ).body as Body
+      ).id,
+    ).toBe('t1');
+    // An edit to the same values writes nothing.
+    const n = (await d.provenance!.chain('template/t1')).length;
+    expect(((await patch(d, 't1', { visibility: 'private' })).body as Body).changes).toEqual([]);
+    expect((await d.provenance!.chain('template/t1')).length).toBe(n);
+    // Back to deployment.
+    await patch(d, 't1', { visibility: 'deployment' });
+    expect(
+      ((await HANDLERS.getTemplate!(ctx({ principal: bob, params: { id: 't1' } }), d)).body as Body)
+        .id,
+    ).toBe('t1');
+  });
+
+  it('refuses bad values, an empty edit, and another subject', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    expect(await refusal(() => patch(d, 't1', { visibility: 'public' }))).toBe('invalid_request');
+    expect(await refusal(() => patch(d, 't1', { description: 7 }))).toBe('invalid_request');
+    expect(await refusal(() => patch(d, 't1', { description: 'x'.repeat(1025) }))).toBe(
+      'invalid_request',
+    );
+    expect(await refusal(() => patch(d, 't1', {}))).toBe('invalid_request');
+    expect(await refusal(() => patch(d, 't1', { description: 'mine now' }, bob))).toBe('forbidden');
+  });
+});
+
+describe('owner transfer (§5.2)', () => {
+  const refusal = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      return (e as { code: string }).code;
+    }
+    return 'none';
+  };
+  const admin = { ...bob, sub: 'github:42', tenant: 'github:42', roles: ['admin'] };
+  const transfer = (d: TestDeps, id: string, owner: unknown, principal = admin) =>
+    HANDLERS.transferTemplateOwner!(ctx({ principal, params: { id }, body: { owner } }), d);
+
+  it('an admin moves a template to another enrolled subject, who then owns its actions', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // Bob cannot retire alice's template, until it is his.
+    expect(
+      await refusal(() =>
+        HANDLERS.retireTemplate!(ctx({ principal: bob, params: { id: 't1' } }), d),
+      ),
+    ).toBe('forbidden');
+    const r = (await transfer(d, 't1', bob.sub)).body as Body;
+    expect(r).toMatchObject({
+      templateId: 't1',
+      subject: admin.sub,
+      owner: bob.sub,
+      before: alice.sub,
+    });
+    expect(r.record).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect((await d.templates!.get('t1'))!.owner).toBe(bob.sub);
+    const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(rec).toMatchObject({
+      kind: 'owner',
+      subject: admin.sub,
+      body: { owner: bob.sub, before: alice.sub },
+    });
+    // Now bob owns it, and alice no longer does.
+    expect(
+      await refusal(() =>
+        HANDLERS.updateTemplate!(
+          ctx({ principal: alice, params: { id: 't1' }, body: { description: 'x' } }),
+          d,
+        ),
+      ),
+    ).toBe('forbidden');
+    expect(
+      (
+        await HANDLERS.updateTemplate!(
+          ctx({ principal: bob, params: { id: 't1' }, body: { description: 'bob' } }),
+          d,
+        )
+      ).status,
+    ).toBe(200);
+    // A transfer to the current owner writes nothing.
+    expect(((await transfer(d, 't1', bob.sub)).body as Body).record).toBe(null);
+  });
+
+  it('refuses a non-admin, a malformed or unenrolled subject, and a declared template', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    expect(await refusal(() => transfer(d, 't1', bob.sub, alice))).toBe('forbidden');
+    expect(await refusal(() => transfer(d, 't1', 'bob'))).toBe('invalid_request');
+    expect(await refusal(() => transfer(d, 't1', 'github:5555'))).toBe('invalid_request');
+    expect(await refusal(() => transfer(d, 'nope', bob.sub))).toBe('template_not_found');
+  });
+});
+
 describe('place, alone', () => {
   const doc = (id: string, h: string, sinceS: number, until = 10_000): TemplateDoc => ({
     schema: 'moca-template/1',

@@ -8,7 +8,7 @@ import {
   seconds,
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import type { SandboxConfig } from './sandbox-config.js';
+import { isEnrolledForSandbox, type SandboxConfig } from './sandbox-config.js';
 import { canonicalJson, type ProvenanceStore } from './provenance.js';
 import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
 import {
@@ -1041,6 +1041,109 @@ async function rejectTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
   };
 }
 
+/**
+ * Edit (§5.1): the owner, or an admin, changes a template's description or visibility. Visibility
+ * `private` hides it from other subjects (they get 404, as for an id that does not exist) and
+ * refuses their new use; their sandboxes and sessions already created keep running. A `visibility`
+ * record (the new value and the one before) is written for a visibility change; a description change
+ * is a `visibility` record too, with the field it changed, so every edit is on the chain.
+ */
+async function updateTemplate(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0 } = await ownTemplate(ctx, deps, 'edits it');
+  const b = asRecord(ctx.body);
+  const changes: { field: 'visibility' | 'description'; value: string; before: string }[] = [];
+  if (b.visibility !== undefined) {
+    if (b.visibility !== 'private' && b.visibility !== 'deployment')
+      throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
+    if (b.visibility !== d0.visibility)
+      changes.push({ field: 'visibility', value: b.visibility, before: d0.visibility });
+  }
+  if (b.description !== undefined) {
+    if (typeof b.description !== 'string' || b.description.length > 1024)
+      throw new CpError(
+        'invalid_request',
+        'description must be a string of at most 1024 characters',
+      );
+    if (b.description !== d0.description)
+      changes.push({ field: 'description', value: b.description, before: d0.description });
+  }
+  if (b.visibility === undefined && b.description === undefined)
+    throw new CpError('invalid_request', 'nothing to change: send visibility or description');
+  if (changes.length > 0)
+    await cat.update(d0.id, async (cur) => {
+      const next = { ...cur! };
+      for (const c of changes) {
+        if (c.field === 'visibility') next.visibility = c.value as 'private' | 'deployment';
+        else next.description = c.value;
+      }
+      return next;
+    });
+  const records: Record<string, string> = {};
+  for (const c of changes) {
+    const rec = await prov.append({
+      stream: `template/${d0.id}`,
+      kind: 'visibility',
+      subject: p.sub,
+      body: { field: c.field, value: c.value, before: c.before },
+    });
+    records[c.field] = rec.digest;
+  }
+  const after = (await cat.get(d0.id))!;
+  return {
+    status: 200,
+    body: {
+      templateId: d0.id,
+      subject: p.sub,
+      visibility: after.visibility,
+      description: after.description,
+      changes: changes.map((c) => ({ ...c, record: records[c.field] })),
+    },
+  };
+}
+
+/**
+ * Transfer ownership (§5.2): an admin makes another enrolled subject the template's owner, for
+ * example when its creator leaves. The new owner gets every owner action; quotas count it as theirs
+ * from now on. Leases, sandboxes and sessions already made keep their own subjects. An `owner`
+ * record names the admin, the new owner and the one before.
+ */
+async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  if (!isAdmin(p))
+    throw new CpError('forbidden', 'transferring a template requires the admin role');
+  const { cat, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const owner = asRecord(ctx.body).owner;
+  if (typeof owner !== 'string' || !/^github:[0-9]+$/.test(owner))
+    throw new CpError('invalid_request', 'owner must be a subject, github:<numeric id>');
+  if (d0.owner === null)
+    throw new CpError(
+      'invalid_request',
+      'a template the deployment declared has no owner to transfer',
+    );
+  // The new owner must be able to act on it: enrolled (admins are, by their role, but a role is not
+  // known for another subject here, so the allow list decides).
+  if (!isEnrolledForSandbox(owner, [], deps.config))
+    throw new CpError(
+      'invalid_request',
+      `${owner} is not enrolled: enroll them first (SBX_ALLOWED_SUBJECTS)`,
+    );
+  const before = d0.owner;
+  let record: string | null = null;
+  if (owner !== before) {
+    await cat.update(d0.id, async (cur) => ({ ...cur!, owner }));
+    record = (
+      await prov.append({
+        stream: `template/${d0.id}`,
+        kind: 'owner',
+        subject: p.sub,
+        body: { owner, before },
+      })
+    ).digest;
+  }
+  return { status: 200, body: { templateId: d0.id, subject: p.sub, owner, before, record } };
+}
+
 async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
   const r = await retireBuilds(ctx, deps, () => true);
   return { status: 200, body: { ...r, status: 'retired' } };
@@ -1154,6 +1257,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   moveTemplateTags,
   removeTemplateTag,
   rejectTemplateBuild,
+  updateTemplate,
+  transferTemplateOwner,
 
   getPolicy: async (ctx, deps) => {
     requireReader(ctx, deps.config);

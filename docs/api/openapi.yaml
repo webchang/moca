@@ -1566,6 +1566,66 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
   /v1/templates/{id}:
+    patch:
+      operationId: updateTemplate
+      summary: Change a template's description or visibility (the owner, or an admin)
+      description: |
+        Template lifecycle spec §5.1. `private` hides it from other subjects (they get 404, as for an
+        id that does not exist) and refuses their new use; their sandboxes and sessions already made
+        keep running. Each field that changes writes a `visibility` record (`field`, the new value
+        and the one before); a field already at its value changes nothing.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                visibility: { type: string, enum: [private, deployment] }
+                description: { type: string, maxLength: 1024 }
+      responses:
+        '200':
+          description: changed (or already so)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templateId, subject, visibility, description, changes]
+                properties:
+                  templateId: { type: string }
+                  subject: { type: string }
+                  visibility: { type: string, enum: [private, deployment] }
+                  description: { type: string }
+                  changes:
+                    type: array
+                    items:
+                      type: object
+                      required: [field, value, before, record]
+                      properties:
+                        field: { type: string, enum: [visibility, description] }
+                        value: { type: string }
+                        before: { type: string }
+                        record: { type: string }
+        '400':
+          description: '`invalid_request`: no field, or a bad value'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`not_enrolled`, or `forbidden`: neither the template's owner nor an admin"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     get:
       operationId: getTemplate
       summary: One template, its builds with their specs (the seed included)
@@ -2021,6 +2081,58 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: '`build_in_use`: a live sandbox runs on the build, or an active session is pinned to it'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/templates/{id}/owner:
+    put:
+      operationId: transferTemplateOwner
+      summary: Transfer a template to another enrolled subject (an admin)
+      description: |
+        Template lifecycle spec §5.2. The new owner gets every owner action and its quota counts the
+        template from now on; leases, sandboxes and sessions already made keep their subjects. An
+        `owner` record names the admin, the new owner and the one before; a transfer to the current
+        owner changes nothing (`record: null`). The new owner must be enrolled (the allow list); a
+        template the deployment declared has no owner to transfer.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner]
+              properties:
+                owner: { type: string, pattern: '^github:[0-9]+$' }
+      responses:
+        '200':
+          description: transferred (or already theirs)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templateId, subject, owner, before, record]
+                properties:
+                  templateId: { type: string }
+                  subject: { type: string, description: the admin }
+                  owner: { type: string }
+                  before: { type: [string, 'null'] }
+                  record: { type: [string, 'null'] }
+        '400':
+          description: '`invalid_request`: a malformed or unenrolled subject, or a declared template'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`not_enrolled`, or `forbidden`: not an admin'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

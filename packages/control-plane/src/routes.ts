@@ -425,6 +425,22 @@ export const ROUTES: readonly RouteSpec[] = [
     operationId: 'rejectTemplateBuild',
   },
   {
+    method: 'PATCH',
+    path: '/v1/templates/{id}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'updateTemplate',
+  },
+  {
+    method: 'PUT',
+    path: '/v1/templates/{id}/owner',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'transferTemplateOwner',
+  },
+  {
     method: 'POST',
     path: '/v1/templates/{id}/tags',
     auth: 'api',

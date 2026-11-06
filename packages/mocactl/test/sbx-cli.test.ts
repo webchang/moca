@@ -397,6 +397,60 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(await sbxMain(['templates', 'untag', 'node22'], env, io, opts)).toBe(2);
   });
 
+  it('edits a template and transfers it, saying what changed (lifecycle §5.1, §5.2)', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'PATCH /v1/templates/node22': (req) => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          visibility: 'private',
+          description: 'Node',
+          changes: (req.body as { visibility?: string } | undefined)?.visibility
+            ? [
+                {
+                  field: 'visibility',
+                  value: 'private',
+                  before: 'deployment',
+                  record: `sha256:${'a'.repeat(64)}`,
+                },
+              ]
+            : [],
+        },
+      }),
+      'PUT /v1/templates/node22/owner': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          owner: 'github:9',
+          before: 'github:1',
+          record: `sha256:${'b'.repeat(64)}`,
+        },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(['templates', 'edit', 'node22', '--visibility', 'private'], env, io, opts),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({ method: 'PATCH', body: { visibility: 'private' } });
+    expect(io.outs.join('')).toContain('node22: visibility changed');
+    io.outs.length = 0;
+    expect(
+      await sbxMain(['templates', 'edit', 'node22', '--description', 'Node'], env, io, opts),
+    ).toBe(0);
+    expect(io.outs.join('')).toContain('node22: unchanged');
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'transfer', 'node22', 'github:9'], env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({ method: 'PUT', body: { owner: 'github:9' } });
+    expect(io.outs.join('')).toContain('node22: owner github:9 (was github:1)');
+    expect(await sbxMain(['templates', 'edit', 'node22'], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/templates edit needs --visibility or --description/);
+    expect(await sbxMain(['ls', '--visibility', 'private'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'transfer', 'node22'], env, io, opts)).toBe(2);
+  });
+
   it('creates a sandbox with a template, a name and labels, and prints its id and expiry', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({ 'POST /v1/sandboxes': () => ({ status: 201, body: sandbox() }) });

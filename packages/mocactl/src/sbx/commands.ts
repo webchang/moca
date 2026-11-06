@@ -246,6 +246,40 @@ export async function cmdUntagTemplate(c: SbxCtx, id: string, tag: string): Prom
   }
 }
 
+/** `sbx templates edit ID [--visibility V] [--description D]` (lifecycle spec §5.1). */
+export async function cmdEditTemplate(
+  c: SbxCtx,
+  id: string,
+  body: { visibility?: string; description?: string },
+): Promise<number> {
+  try {
+    const r = await c.api.updateTemplate(id, body);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else if (r.changes.length === 0) c.io.out(`${sanitizeRemote(r.templateId)}: unchanged\n`);
+    else
+      for (const ch of r.changes)
+        c.io.out(`${sanitizeRemote(r.templateId)}: ${sanitizeRemote(ch.field)} changed\n`);
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** `sbx templates transfer ID SUBJECT` (lifecycle spec §5.2; admins only). */
+export async function cmdTransferTemplate(c: SbxCtx, id: string, owner: string): Promise<number> {
+  try {
+    const r = await c.api.transferTemplateOwner(id, owner);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else
+      c.io.out(
+        `${sanitizeRemote(r.templateId)}: owner ${sanitizeRemote(r.owner)}${r.record ? ` (was ${sanitizeRemote(r.before ?? 'none')})` : ' (unchanged)'}\n`,
+      );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
 /** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
 export const ACTIVATION_WAIT_MS = 10 * 60_000;
 
