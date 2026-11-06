@@ -98,6 +98,12 @@ export const sessionKey = (sid: string): string => `sh:cp:session:${sid}`;
 export const runtimeKey = (sid: string): string => `sh:cp:session:${sid}:runtime`;
 /** Hashed, so the keyspace itself discloses no logins -- same derivation as the Secret name. */
 export const ownerKey = (subject: string): string => `sh:cp:owner:${subjectHash(subject)}:sessions`;
+/**
+ * The sessions pinned to one template build (lifecycle spec §5.1): a retire is refused while one is
+ * active, as a sandbox's live record refuses it. The build id is hashed into the key, as the owner is.
+ */
+export const buildSessionsKey = (buildId: string): string =>
+  `sh:cp:build:${subjectHash(buildId)}:sessions`;
 
 /** Keys of session DATA the cascade can address by name (plan gap #10). */
 const dataKeys = (sid: string): string[] => [
@@ -194,6 +200,30 @@ export class OwnershipIndex {
     await this.guard(() =>
       this.redis.zAdd(ownerKey(rec.owner), { score: rec.createdAt, value: rec.sessionId }),
     );
+    if (rec.sandboxBuildId) {
+      await this.guard(() =>
+        this.redis.zAdd(buildSessionsKey(rec.sandboxBuildId!), {
+          score: rec.createdAt,
+          value: rec.sessionId,
+        }),
+      );
+    }
+  }
+
+  /**
+   * Whether an active session is pinned to this build (lifecycle spec §5.1). A member whose record
+   * is gone or deleting does not count, so a crash between the cascade's steps cannot block a retire.
+   */
+  async hasActiveSessionOnBuild(buildId: string): Promise<boolean> {
+    const ids = await this.guard(() =>
+      this.redis.zRange(buildSessionsKey(buildId), '+inf', '-inf', { BY: 'SCORE', REV: true }),
+    );
+    for (const sid of ids) {
+      const rec = await this.get(sid);
+      if (rec && rec.state === 'active' && !rec.tombstone && rec.sandboxBuildId === buildId)
+        return true;
+    }
+    return false;
   }
 
   async get(sid: string): Promise<SessionRecord | null> {
@@ -371,6 +401,9 @@ export class OwnershipIndex {
     await this.tombstone(rec.sessionId);
     await this.guard(() => this.redis.del([...dataKeys(rec.sessionId), runtimeKey(rec.sessionId)]));
     await this.guard(() => this.redis.zRem(ownerKey(rec.owner), rec.sessionId));
+    if (rec.sandboxBuildId) {
+      await this.guard(() => this.redis.zRem(buildSessionsKey(rec.sandboxBuildId!), rec.sessionId));
+    }
     await this.guard(() => this.redis.del([sessionKey(rec.sessionId)]));
   }
 }

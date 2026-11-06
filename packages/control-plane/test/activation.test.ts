@@ -570,6 +570,26 @@ describe('retire (§5.1)', () => {
     expect(await refusal(() => retireBuild(d, 't1', hash('9')))).toBe('template_not_found');
   });
 
+  it('never retires a build an active session is pinned to; deleting the session frees it', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    await seedCredential(d);
+    const s = (
+      await HANDLERS.createSession!(
+        ctx({ principal: alice, body: { sandbox: { template: `t1@${hash('1')}` } } }),
+        d,
+      )
+    ).body as Body;
+    expect(await refusal(() => retire(d, 't1'))).toBe('build_in_use');
+    expect(await refusal(() => retireBuild(d, 't1', hash('1')))).toBe('build_in_use');
+    expect((await d.templates!.get('t1'))!.builds[0].status).toBe('registered');
+    await HANDLERS.deleteSession!(ctx({ principal: alice, params: { id: s.sessionId } }), d);
+    expect((await retire(d, 't1')).status).toBe(200);
+  });
+
   it("refuses another subject; an admin may retire anyone's", async () => {
     const d = await setup();
     attachedNow = [];

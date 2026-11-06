@@ -798,6 +798,15 @@ async function retireBuilds(
   if (deps.sandboxes) {
     for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
   }
+  // A Moca Pi session pinned to the build is live use too: its next turn needs the worker. Read
+  // before the catalog update, so no session lookup runs inside it.
+  const pinned = new Set<string>();
+  if (deps.index?.hasActiveSessionOnBuild) {
+    for (const x of d0.builds.filter(which)) {
+      if (x.status !== 'retired' && (await deps.index.hasActiveSessionOnBuild(x.buildId)))
+        pinned.add(x.buildId);
+    }
+  }
   const done: TemplateBuild[] = [];
   await cat.update(d0.id, async (cur) => {
     const targets = cur!.builds.filter(which);
@@ -809,6 +818,13 @@ async function retireBuilds(
         'build_in_use',
         `build ${inUse.handle ?? inUse.buildId} still serves a live sandbox: delete it, then retire`,
       );
+    const held = targets.find((x) => x.status !== 'retired' && pinned.has(x.buildId));
+    if (held)
+      throw new CpError(
+        'build_in_use',
+        `build ${held.handle ?? held.buildId} is pinned by an active session: delete it, then retire`,
+      );
+
     done.push(...targets.filter((x) => x.status !== 'retired'));
     return {
       ...cur!,

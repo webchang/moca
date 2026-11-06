@@ -1742,7 +1742,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: '`build_in_use`: a live sandbox still runs on the build'
+          description: '`build_in_use`: a live sandbox runs on the build, or an active session is pinned to it'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1781,7 +1781,9 @@ paths:
         pinned build of it, is then refused `410 template_retired`. Each build retired writes a
         `retire` record naming the caller; its earlier records stay. Idempotent: an already retired
         build is listed with `record: null` (no second record). Refused `409 build_in_use` while a
-        live sandbox runs on any of its builds: delete it, then retire.
+        live sandbox runs on any of its builds, or an active session is pinned to one: delete it,
+        then retire. A retire never cuts off running work. It cannot be undone: a new build of the
+        template (`POST /v1/templates/{id}/builds`) is the way back.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -1825,7 +1827,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: '`build_in_use`: a live sandbox still runs on one of its builds'
+          description: '`build_in_use`: a live sandbox runs on one of its builds, or an active session is pinned to one'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
