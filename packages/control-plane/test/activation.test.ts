@@ -737,6 +737,81 @@ describe('tags (§3.2, §5.1)', () => {
   });
 });
 
+describe('reject after the fact (§5.2)', () => {
+  const refusal = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      return (e as { code: string }).code;
+    }
+    return 'none';
+  };
+  const admin = { ...bob, roles: ['admin'] };
+  const reject = (d: TestDeps, id: string, build: string, principal: typeof alice, body: unknown) =>
+    HANDLERS.rejectTemplateBuild!(ctx({ principal, params: { id, build }, body }), d);
+
+  it('an admin rejects a registered build with a reason: use refused, leases gone, host removes it', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    // Not the owner's to reject, and never without a reason.
+    expect(await refusal(() => reject(d, 't1', hash('1'), alice, { reason: 'X12 broken' }))).toBe(
+      'forbidden',
+    );
+    expect(await refusal(() => reject(d, 't1', hash('1'), admin, {}))).toBe('invalid_request');
+    const r = (await reject(d, 't1', hash('1'), admin, { reason: 'X12 was mis-scored' }))
+      .body as Body;
+    expect(r).toMatchObject({
+      templateId: 't1',
+      subject: admin.sub,
+      buildId: hash('1'),
+      status: 'rejected',
+    });
+    expect(r.record).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const b = (await d.templates!.get('t1'))!.builds[0];
+    expect(b).toMatchObject({
+      status: 'rejected',
+      leases: [],
+      reason: { message: 'X12 was mis-scored', rule: 'admin' },
+    });
+    const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(rec).toMatchObject({
+      kind: 'reject',
+      subject: admin.sub,
+      body: { buildId: hash('1'), from: 'registered', reason: 'X12 was mis-scored' },
+    });
+    expect(
+      await refusal(() =>
+        HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d),
+      ),
+    ).toBe('unknown_template');
+    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.remove).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+    expect(
+      (
+        (
+          await HANDLERS.hostWorkerReport!(
+            asHost('bm1', {}, { buildId: hash('1'), event: 'removed' }),
+            d,
+          )
+        ).body as Body
+      ).recorded,
+    ).toBe('removed');
+    // Only a registered build is rejected after the fact; a second reject records nothing.
+    const n = (await d.provenance!.chain('template/t1')).length;
+    expect(
+      ((await reject(d, 't1', hash('1'), admin, { reason: 'again' })).body as Body).record,
+    ).toBe(null);
+    expect((await d.provenance!.chain('template/t1')).length).toBe(n);
+    await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' } }), d);
+    expect(await refusal(() => reject(d, 't1', hash('1'), admin, { reason: 'x' }))).toBe(
+      'invalid_request',
+    );
+  });
+});
+
 describe('place, alone', () => {
   const doc = (id: string, h: string, sinceS: number, until = 10_000): TemplateDoc => ({
     schema: 'moca-template/1',

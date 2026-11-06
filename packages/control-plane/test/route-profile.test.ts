@@ -31,6 +31,7 @@ const SHARED = [
   'DELETE /v1/templates/{id}/builds/{build}',
   'POST /v1/templates/{id}/tags',
   'DELETE /v1/templates/{id}/tags/{tag}',
+  'POST /v1/templates/{id}/builds/{build}/reject',
   'GET /v1/policy',
   'PUT /v1/policy',
   'GET /v1/quota',

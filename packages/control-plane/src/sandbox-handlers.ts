@@ -780,6 +780,7 @@ async function retireBuilds(
   ctx: RequestCtx,
   deps: CpDeps,
   which: (b: TemplateBuild) => boolean,
+  mode: 'retire' | 'reject' = 'retire',
 ): Promise<{
   templateId: string;
   subject: string;
@@ -788,9 +789,16 @@ async function retireBuilds(
   const p = requireEnrolled(ctx, deps);
   const { cat, prov } = writable(deps);
   const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
-  if (d0.owner !== p.sub && !isAdmin(p))
-    throw new CpError('forbidden', "only the template's owner, or an admin, retires it");
+  if (mode === 'reject' ? !isAdmin(p) : d0.owner !== p.sub && !isAdmin(p))
+    throw new CpError(
+      'forbidden',
+      mode === 'reject'
+        ? 'rejecting a build after the fact requires the admin role'
+        : "only the template's owner, or an admin, retires it",
+    );
   const reason = asRecord(ctx.body).reason;
+  if (mode === 'reject' && (typeof reason !== 'string' || !reason.trim()))
+    throw new CpError('invalid_request', 'a reject needs a reason: the rule found broken, and why');
   if (reason !== undefined && (typeof reason !== 'string' || reason.length > 1024))
     throw new CpError('invalid_request', 'reason must be a string of at most 1024 characters');
   const nowS = seconds(deps);
@@ -812,6 +820,11 @@ async function retireBuilds(
     const targets = cur!.builds.filter(which);
     if (targets.length === 0)
       throw new CpError('template_not_found', 'no such build of this template');
+    if (
+      mode === 'reject' &&
+      targets.some((x) => x.status !== 'registered' && x.status !== 'rejected')
+    )
+      throw new CpError('invalid_request', 'only a registered build is rejected after the fact');
     const inUse = targets.find((x) => x.status !== 'retired' && x.worker && busy.has(x.worker));
     if (inUse)
       throw new CpError(
@@ -825,11 +838,21 @@ async function retireBuilds(
         `build ${held.handle ?? held.buildId} is pinned by an active session: delete it, then retire`,
       );
 
-    done.push(...targets.filter((x) => x.status !== 'retired'));
+    const end = mode === 'reject' ? ('rejected' as const) : ('retired' as const);
+    done.push(...targets.filter((x) => x.status !== end && x.status !== 'retired'));
     return {
       ...cur!,
       builds: cur!.builds.map((x) =>
-        done.includes(x) ? { ...x, status: 'retired' as const, leases: [] } : x,
+        done.includes(x)
+          ? {
+              ...x,
+              status: end,
+              leases: [],
+              ...(mode === 'reject'
+                ? { reason: { message: String(reason), rule: 'admin', step: 'rejected' } }
+                : {}),
+            }
+          : x,
       ),
     };
   });
@@ -837,7 +860,7 @@ async function retireBuilds(
   for (const x of done) {
     const rec = await prov.append({
       stream: `template/${d0.id}`,
-      kind: 'retire',
+      kind: mode,
       subject: p.sub,
       body: {
         build: x.handle ?? x.buildId,
@@ -849,10 +872,15 @@ async function retireBuilds(
     records.set(x, rec.digest);
   }
   if (done.length > 0)
-    await auditBestEffort(deps, 'template_retired', d0.id, {
-      subject: p.sub,
-      decision: 'template_retired',
-    });
+    await auditBestEffort(
+      deps,
+      mode === 'reject' ? 'template_build_rejected' : 'template_retired',
+      d0.id,
+      {
+        subject: p.sub,
+        decision: mode === 'reject' ? 'template_build_rejected' : 'template_retired',
+      },
+    );
   // What ties the answer to the trace (the client's request, 2026-11-06): each build, its id, its
   // readiness and the record written now (null for one already retired: no second record).
   const byHandle = new Map([...records].map(([x, d]) => [x.handle ?? x.buildId, d]));
@@ -861,7 +889,7 @@ async function retireBuilds(
     templateId: d0.id,
     subject: p.sub,
     builds: after.builds
-      .filter((x) => x.status === 'retired' && which(x))
+      .filter((x) => x.status === (mode === 'reject' ? 'rejected' : 'retired') && which(x))
       .map((x) => ({
         build: x.handle ?? x.buildId,
         buildId:
@@ -990,6 +1018,29 @@ async function removeTemplateTag(ctx: RequestCtx, deps: CpDeps) {
   };
 }
 
+/**
+ * Reject after the fact (§5.2): an admin rejects a registered build (a rule found broken), with the
+ * reason. As a retire, it ends the build's use, drops its leases, a host holding it removes it, and
+ * it is refused under a live sandbox or session; a create naming it answers `400 unknown_template`,
+ * as for a build policy rejected at registration. A `reject` record names the admin and the reason.
+ */
+async function rejectTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
+  const ref = ctx.params.build ?? '';
+  const r = await retireBuilds(ctx, deps, (x) => x.handle === ref || x.buildId === ref, 'reject');
+  const b = r.builds[0];
+  return {
+    status: 200,
+    body: {
+      templateId: r.templateId,
+      subject: r.subject,
+      build: b?.build ?? ref,
+      buildId: b?.buildId ?? null,
+      record: b?.record ?? null,
+      status: 'rejected',
+    },
+  };
+}
+
 async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
   const r = await retireBuilds(ctx, deps, () => true);
   return { status: 200, body: { ...r, status: 'retired' } };
@@ -1102,6 +1153,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   retireTemplateBuild,
   moveTemplateTags,
   removeTemplateTag,
+  rejectTemplateBuild,
 
   getPolicy: async (ctx, deps) => {
     requireReader(ctx, deps.config);

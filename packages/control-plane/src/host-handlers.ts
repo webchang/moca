@@ -192,7 +192,8 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       for (const b of d.builds) {
         if (!mine || mine.holds[b.buildId] === undefined) continue;
         const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
-        if (b.status === 'retired') {
+        // Rejected after the fact by an admin (§5.2) ends a build's use as a retire does.
+        if (b.status === 'retired' || (b.status === 'rejected' && b.reason?.rule === 'admin')) {
           if (b.worker && !busy.has(b.worker)) remove.push(entry);
           continue;
         }
@@ -219,9 +220,13 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     }
     const buildId = typeof b.buildId === 'string' ? b.buildId : '';
     // `removed` is reported for a retired build (§6.1 step 7); the others for a registered one.
-    const want = event === 'removed' ? 'retired' : 'registered';
+    const want = event === 'removed' ? 'retired or rejected' : 'registered';
+    const ok = (x: { status: string }) =>
+      event === 'removed'
+        ? x.status === 'retired' || x.status === 'rejected'
+        : x.status === 'registered';
     const doc = (await cat.list()).find((d) =>
-      d.builds.some((x) => x.buildId === buildId && x.status === want),
+      d.builds.some((x) => x.buildId === buildId && ok(x)),
     );
     if (!doc || deps.hosts?.get(host)?.holds[buildId] === undefined) {
       throw new CpError('not_found', `no ${want} build this host holds`);

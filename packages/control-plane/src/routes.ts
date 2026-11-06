@@ -418,6 +418,14 @@ export const ROUTES: readonly RouteSpec[] = [
   },
   {
     method: 'POST',
+    path: '/v1/templates/{id}/builds/{build}/reject',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'rejectTemplateBuild',
+  },
+  {
+    method: 'POST',
     path: '/v1/templates/{id}/tags',
     auth: 'api',
     sessionScoped: false,

@@ -1953,6 +1953,77 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/templates/{id}/builds/{build}/reject:
+    post:
+      operationId: rejectTemplateBuild
+      summary: Reject a registered build after the fact (an admin)
+      description: |
+        Template lifecycle spec §5.2: an admin rejects a registered build when a rule is found
+        broken, with the reason. The build becomes `rejected` (`reason.rule` `admin`), its leases go,
+        a host holding it removes it (`GET /v1/hosts/{host}/wanted` `remove`), and a create naming it
+        answers `400 unknown_template`, as for a build policy rejected at registration. A `reject`
+        record names the admin and the reason. Refused `409 build_in_use` under a live sandbox or an
+        active session pinned to it. Not reversible: a new build is the way back.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: build, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  {
+                    type: string,
+                    minLength: 1,
+                    maxLength: 1024,
+                    description: the rule found broken,
+                    and why,
+                  }
+      responses:
+        '200':
+          description: rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templateId, subject, build, buildId, record, status]
+                properties:
+                  templateId: { type: string }
+                  subject: { type: string, description: the admin }
+                  build: { type: string }
+                  buildId: { type: [string, 'null'] }
+                  record:
+                    {
+                      type: [string, 'null'],
+                      description: 'the reject record written; null if already rejected',
+                    }
+                  status: { type: string, enum: [rejected] }
+        '400':
+          description: '`invalid_request`: no reason, or a build that is not registered'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`not_enrolled`, or `forbidden`: not an admin'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`build_in_use`: a live sandbox runs on the build, or an active session is pinned to it'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/templates/{id}/builds/{build}/cancel:
     post:
       operationId: cancelTemplateBuild
