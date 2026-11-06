@@ -654,6 +654,14 @@ span, and the retire with the host's removal (register G33 validated). Earlier r
 `sandbox` record kind existed, still read their lease by time, as §7.1 says a store spanning the
 change does.
 
+**Step 8 again** (2026-11-06, `moca-sbx-template` on the lifecycle image): the same design as step
+8 (DeepSeek-V4.1-Flash on CurveBender, two stock brains, the same four instances), on fresh builds of
+the templates the lifecycle window had retired, ending in retire with the host's own removal. Every
+rep recorded on its pinned build; graded with the official harness (the grading stays in
+autobench-moca's records). Provenance after: every earlier chain an unchanged prefix, and the
+composer joined **every link of every rep** uniquely: the first graded reps whose whole chain, from
+the gate record to the sandbox's lease and the build's retire, composes exactly.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
@@ -724,6 +732,7 @@ change does.
    ran 2026-11-06 with DeepSeek on CurveBender: every rep completed with no void, every one on its pinned build.
    The lifecycle window (2026-11-06) ran create through retire through the API, with the host's
    own removal and every provenance link unique.
+   Step 8 again, on the lifecycle image (2026-11-06): every link of every real-model rep unique.
 
 ## 12. Decisions
 
