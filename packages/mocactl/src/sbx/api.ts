@@ -48,6 +48,14 @@ export interface SbxRetired {
   record?: string | null;
 }
 
+/** What a tag move answers (lifecycle spec §5.1). */
+export interface SbxTagsMoved {
+  templateId: string;
+  subject: string;
+  buildId: string;
+  tags: { tag: string; buildId: string; before: string | null; record: string | null }[];
+}
+
 export class SandboxApiClient extends ControlPlaneClient {
   sandboxDiscovery(): Promise<SbxDiscovery> {
     return this.json('GET', '/v1/discovery', { auth: false });
@@ -65,6 +73,24 @@ export class SandboxApiClient extends ControlPlaneClient {
       : this.json('POST', `/v1/templates/${t}/retire`, {
           body: opts.reason !== undefined ? { reason: opts.reason } : {},
         });
+  }
+
+  /** Move tags onto a build (lifecycle spec §5.1): `POST /v1/templates/{id}/tags`. */
+  moveTemplateTags(id: string, tags: string[], build: string): Promise<SbxTagsMoved> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/tags`, {
+      body: { tags, build },
+    });
+  }
+
+  /** Remove a tag; its build stays (lifecycle spec §5.1). */
+  removeTemplateTag(
+    id: string,
+    tag: string,
+  ): Promise<{ templateId: string; tag: string; before: string; record: string }> {
+    return this.json(
+      'DELETE',
+      `/v1/templates/${encodeURIComponent(id)}/tags/${encodeURIComponent(tag)}`,
+    );
   }
 
   createSandbox(body: {

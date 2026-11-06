@@ -872,6 +872,124 @@ async function retireBuilds(
   };
 }
 
+/**
+ * Tags (§3.2, §5.1): the owner, or an admin, moves tags onto a registered build without rebuilding,
+ * or removes one; a reference `id:tag` (and `id` for `default`) then resolves to the new build for new
+ * sandboxes and sessions; those already created keep theirs. Removing a tag never deletes its build;
+ * `default` is moved, never removed (the bare `id` must resolve). Each change is a `tag` record with
+ * the new value and the one before (§7).
+ */
+async function ownTemplate(ctx: RequestCtx, deps: CpDeps, verb: string) {
+  const p = requireEnrolled(ctx, deps);
+  const w = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  if (d0.owner !== p.sub && !isAdmin(p))
+    throw new CpError('forbidden', `only the template's owner, or an admin, ${verb}`);
+  return { p, ...w, d0 };
+}
+
+async function moveTemplateTags(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0 } = await ownTemplate(ctx, deps, 'moves its tags');
+  const b = asRecord(ctx.body);
+  const tags = b.tags;
+  if (!Array.isArray(tags) || tags.length === 0 || tags.length > 16)
+    throw new CpError('invalid_request', 'tags must be a list of 1-16 tag names');
+  for (const t of tags)
+    if (typeof t !== 'string' || !TEMPLATE_ID_RE.test(t))
+      throw new CpError(
+        'invalid_request',
+        `tag '${String(t)}' must match ${TEMPLATE_ID_RE.source}`,
+      );
+  if (new Set(tags).size !== tags.length)
+    throw new CpError('invalid_request', 'a tag is listed twice');
+  const ref = typeof b.build === 'string' ? b.build : '';
+  const target = d0.builds.find((x) => x.buildId === ref || x.handle === ref);
+  if (!target) throw new CpError('template_not_found', 'no such build of this template');
+  if (target.status === 'retired')
+    throw new CpError('template_retired', `build ${target.buildId} is retired: tag a live build`);
+  if (target.status !== 'registered')
+    throw new CpError(
+      'invalid_request',
+      `the build is ${target.status}; only a registered build is tagged`,
+    );
+  const nowS = seconds(deps);
+  const moved: { tag: string; from: string | null }[] = [];
+  await cat.update(d0.id, async (cur) => {
+    const next = { ...cur!.tags };
+    const meta = { ...(cur!.tagsMeta ?? {}) };
+    for (const t of tags as string[]) {
+      if (next[t] === target.buildId) continue;
+      moved.push({ tag: t, from: next[t] ?? null });
+      next[t] = target.buildId;
+      meta[t] = { at: nowS, by: p.sub };
+    }
+    return { ...cur!, tags: next, tagsMeta: meta };
+  });
+  const records: Record<string, string> = {};
+  for (const m of moved) {
+    const rec = await prov.append({
+      stream: `template/${d0.id}`,
+      kind: 'tag',
+      subject: p.sub,
+      body: { tag: m.tag, buildId: target.buildId, before: m.from },
+    });
+    records[m.tag] = rec.digest;
+  }
+  if (moved.length > 0)
+    await auditBestEffort(deps, 'template_tags_moved', d0.id, {
+      subject: p.sub,
+      decision: 'template_tags_moved',
+    });
+  return {
+    status: 200,
+    body: {
+      templateId: d0.id,
+      subject: p.sub,
+      buildId: target.buildId,
+      // `before`: what the tag named until now (null: it is new); unchanged tags name their build.
+      tags: (tags as string[]).map((t) => {
+        const m = moved.find((x) => x.tag === t);
+        return {
+          tag: t,
+          buildId: target.buildId,
+          before: m ? m.from : target.buildId,
+          record: records[t] ?? null,
+        };
+      }),
+    },
+  };
+}
+
+async function removeTemplateTag(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0 } = await ownTemplate(ctx, deps, 'removes its tags');
+  const tag = ctx.params.tag ?? '';
+  if (tag === 'default')
+    throw new CpError(
+      'invalid_request',
+      'the default tag is moved (POST …/tags), never removed: the bare id must resolve',
+    );
+  const before = d0.tags[tag];
+  if (before === undefined)
+    throw new CpError('template_not_found', `no tag '${tag}' on this template`);
+  await cat.update(d0.id, async (cur) => {
+    const next = { ...cur!.tags };
+    const meta = { ...(cur!.tagsMeta ?? {}) };
+    delete next[tag];
+    delete meta[tag];
+    return { ...cur!, tags: next, tagsMeta: meta };
+  });
+  const rec = await prov.append({
+    stream: `template/${d0.id}`,
+    kind: 'tag',
+    subject: p.sub,
+    body: { tag, buildId: null, before },
+  });
+  return {
+    status: 200,
+    body: { templateId: d0.id, subject: p.sub, tag, buildId: null, before, record: rec.digest },
+  };
+}
+
 async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
   const r = await retireBuilds(ctx, deps, () => true);
   return { status: 200, body: { ...r, status: 'retired' } };
@@ -982,6 +1100,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   cancelTemplateBuild: cancelBuild,
   retireTemplate,
   retireTemplateBuild,
+  moveTemplateTags,
+  removeTemplateTag,
 
   getPolicy: async (ctx, deps) => {
     requireReader(ctx, deps.config);

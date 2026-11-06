@@ -17,6 +17,8 @@ import {
   cmdRm,
   cmdTemplates,
   cmdRetireTemplate,
+  cmdTagTemplate,
+  cmdUntagTemplate,
   cmdToken,
   failRefresh,
   SBX_EXIT,
@@ -48,6 +50,10 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx templates retire ID [--build BUILD] [--reason TEXT] [--json]
                                                  retire a template you own (or one build of it): never
                                                  used again; its records stay (lifecycle spec §5.1)
+  mocactl sbx templates tag ID TAG... --build BUILD [--json]
+                                                 move tags onto a registered build (default: what
+                                                 the bare ID names); sandboxes made earlier keep theirs
+  mocactl sbx templates untag ID TAG [--json]    remove a tag; its build stays (never default)
   mocactl sbx create [--template ID] [--name N] [--label k=v ...] [--json]
                                                  create a sandbox (template: default); prints its id
   mocactl sbx ls [--all] [--json]                your sandboxes (--all: everyone's; admins only)
@@ -423,11 +429,19 @@ export async function sbxMain(
     io.err(`sbx: --${credFlag} only applies to credentials add\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
+  if (values.reason !== undefined && !(command === 'templates' && arg === 'retire')) {
+    io.err(`sbx: --reason only applies to templates retire\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
   if (
-    (values.build !== undefined || values.reason !== undefined) &&
-    !(command === 'templates' && arg === 'retire')
+    values.build !== undefined &&
+    !(command === 'templates' && (arg === 'retire' || arg === 'tag'))
   ) {
-    io.err(`sbx: --build and --reason only apply to templates retire\n${SBX_USAGE}`);
+    io.err(`sbx: --build only applies to templates retire and tag\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (command === 'templates' && arg === 'tag' && !values.build) {
+    io.err(`sbx: templates tag needs --build BUILD\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
   if (values.cortex && values['no-agent-config']) {
@@ -467,7 +481,10 @@ export async function sbxMain(
     command === 'claude' ||
     command === 'codex' ||
     (command === 'templates'
-      ? arg === undefined || (arg === 'retire' && extra.length === 1)
+      ? arg === undefined ||
+        (arg === 'retire' && extra.length === 1) ||
+        (arg === 'untag' && extra.length === 2) ||
+        (arg === 'tag' && extra.length >= 2)
       : command === 'credentials'
         ? arg === undefined ||
           (arg === 'presets'
@@ -647,6 +664,8 @@ export async function sbxMain(
     case 'templates':
       if (arg === 'retire')
         return cmdRetireTemplate(ctx, extra[0]!, { build: values.build, reason: values.reason });
+      if (arg === 'tag') return cmdTagTemplate(ctx, extra[0]!, extra.slice(1), values.build!);
+      if (arg === 'untag') return cmdUntagTemplate(ctx, extra[0]!, extra[1]!);
       return cmdTemplates(ctx);
     case 'create':
       return cmdCreate(ctx, createBody!);

@@ -337,7 +337,64 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(await sbxMain(['templates', 'retire', 'a', 'b'], env, io, opts)).toBe(2);
     expect(await sbxMain(['templates', '--build', 'x'], env, io, opts)).toBe(2);
     expect(await sbxMain(['ls', '--reason', 'x'], env, io, opts)).toBe(2);
-    expect(io.errs.join('\n')).toMatch(/--build and --reason only apply to templates retire/);
+    expect(io.errs.join('\n')).toMatch(/--build only applies to templates retire and tag/);
+    expect(io.errs.join('\n')).toMatch(/--reason only applies to templates retire/);
+  });
+
+  it('moves tags onto a build and removes one, saying what changed (lifecycle §5.1)', async () => {
+    const { home, env, io } = setup();
+    const b2 = `sha256:${'2'.repeat(64)}`;
+    const b1 = `sha256:${'1'.repeat(64)}`;
+    const cp = fakeCp({
+      'POST /v1/templates/node22/tags': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          buildId: b2,
+          tags: [
+            { tag: 'default', buildId: b2, before: b1, record: `sha256:${'a'.repeat(64)}` },
+            { tag: 'stable', buildId: b2, before: null, record: `sha256:${'b'.repeat(64)}` },
+            { tag: 'v2', buildId: b2, before: b2, record: null },
+          ],
+        },
+      }),
+      'DELETE /v1/templates/node22/tags/stable': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          tag: 'stable',
+          buildId: null,
+          before: b2,
+          record: `sha256:${'c'.repeat(64)}`,
+        },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(
+        ['templates', 'tag', 'node22', 'default', 'stable', 'v2', '--build', b2],
+        env,
+        io,
+        opts,
+      ),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({
+      method: 'POST',
+      body: { tags: ['default', 'stable', 'v2'], build: b2 },
+    });
+    const out = io.outs.join('');
+    expect(out).toContain(`node22:default -> ${b2} (was ${b1})`);
+    expect(out).toContain(`node22:stable -> ${b2} (new)`);
+    expect(out).toContain(`node22:v2 -> ${b2} (unchanged)`);
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'untag', 'node22', 'stable'], env, io, opts)).toBe(0);
+    expect(io.outs.join('')).toContain(`removed node22:stable (was ${b2})`);
+    expect(await sbxMain(['templates', 'tag', 'node22', 'x'], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/templates tag needs --build BUILD/);
+    expect(await sbxMain(['templates', 'tag', 'node22', '--build', b2], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'untag', 'node22'], env, io, opts)).toBe(2);
   });
 
   it('creates a sandbox with a template, a name and labels, and prints its id and expiry', async () => {

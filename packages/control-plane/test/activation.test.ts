@@ -601,6 +601,142 @@ describe('retire (§5.1)', () => {
   });
 });
 
+describe('tags (§3.2, §5.1)', () => {
+  const refusal = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      return (e as { code: string }).code;
+    }
+    return 'none';
+  };
+  const move = (d: TestDeps, id: string, body: unknown, principal = alice) =>
+    HANDLERS.moveTemplateTags!(ctx({ principal, params: { id }, body }), d);
+  const remove = (d: TestDeps, id: string, tag: string, principal = alice) =>
+    HANDLERS.removeTemplateTag!(ctx({ principal, params: { id, tag } }), d);
+  const tagsOf = async (d: TestDeps, id: string) =>
+    ((await HANDLERS.listTemplateTags!(ctx({ principal: alice, params: { id } }), d)).body as Body)
+      .tags as { tag: string; buildId: string; assignedBy: string | null }[];
+
+  it('moves default to a new build: new creates follow it, a pinned one keeps its build', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1', 'sbx_t1b'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // A second build of the same template.
+    await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: alice,
+        params: { id: 't1' },
+        body: { image: IMAGE, spec: { ...BASE_SPEC, description: 'v2' } },
+      }),
+      d,
+    );
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    await HANDLERS.hostBuildReport!(
+      asHost(
+        'bm1',
+        { build: c.builds[0].build },
+        {
+          event: 'built',
+          templateRecord: JSON.stringify({
+            schema: 'moca-sbx-template/1',
+            id: 't1',
+            worker: 'sbx_t1b',
+            snapshot: 't1-y',
+            image: IMAGE,
+            guest_ram_mb: 4096,
+            manifest_hash: hash('2'),
+          }),
+          manifest: JSON.stringify({
+            hash_version: 2,
+            hash: hash('2'),
+            guest_ram_mb: 4096,
+            vcpus: 2,
+            source_image_digest: DIGEST,
+          }),
+        },
+      ),
+      d,
+    );
+    expect((await tagsOf(d, 't1')).find((t) => t.tag === 'default')?.buildId).toBe(hash('1'));
+    const r = (await move(d, 't1', { tags: ['default', 'stable'], build: hash('2') })).body as Body;
+    expect(r).toMatchObject({ templateId: 't1', subject: alice.sub, buildId: hash('2') });
+    expect(r.tags).toEqual([
+      expect.objectContaining({ tag: 'default', buildId: hash('2'), before: hash('1') }),
+      expect.objectContaining({ tag: 'stable', buildId: hash('2'), before: null }),
+    ]);
+    expect(r.tags[0].record).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const tags = await tagsOf(d, 't1');
+    expect(tags.map((t) => [t.tag, t.buildId, t.assignedBy])).toEqual([
+      ['default', hash('2'), alice.sub],
+      ['stable', hash('2'), alice.sub],
+    ]);
+    const rec = (await d.provenance!.chain('template/t1')).at(-2)!;
+    expect(rec).toMatchObject({
+      kind: 'tag',
+      subject: alice.sub,
+      body: { tag: 'default', buildId: hash('2'), before: hash('1') },
+    });
+    // A bare id and a tag follow it; a pinned build does not move.
+    const sandbox = async (template: string) =>
+      (
+        (await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template } }), d))
+          .body as Body
+      ).buildId;
+    expect(await sandbox('t1')).toBe(hash('2'));
+    expect(await sandbox('t1:stable')).toBe(hash('2'));
+    expect(await sandbox(`t1@${hash('1')}`)).toBe(hash('1'));
+    // A move onto the build a tag already names writes no record.
+    const n = (await d.provenance!.chain('template/t1')).length;
+    const again = (await move(d, 't1', { tags: ['stable'], build: hash('2') })).body as Body;
+    expect(again.tags[0].record).toBe(null);
+    expect((await d.provenance!.chain('template/t1')).length).toBe(n);
+    // Removing a tag keeps its build; default is never removed.
+    const rm = (await remove(d, 't1', 'stable')).body as Body;
+    expect(rm).toMatchObject({ tag: 'stable', buildId: null, before: hash('2') });
+    expect((await tagsOf(d, 't1')).map((t) => t.tag)).toEqual(['default']);
+    expect((await d.templates!.get('t1'))!.builds.map((x) => x.status)).toEqual([
+      'registered',
+      'registered',
+    ]);
+    expect(await refusal(() => sandbox('t1:stable'))).not.toBe('none');
+  });
+
+  it('refuses bad tags, unknown or unusable builds, removing default, and other subjects', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    expect(await refusal(() => move(d, 't1', { tags: [], build: hash('1') }))).toBe(
+      'invalid_request',
+    );
+    expect(await refusal(() => move(d, 't1', { tags: ['Bad Tag'], build: hash('1') }))).toBe(
+      'invalid_request',
+    );
+    expect(await refusal(() => move(d, 't1', { tags: ['a', 'a'], build: hash('1') }))).toBe(
+      'invalid_request',
+    );
+    expect(await refusal(() => move(d, 't1', { tags: ['a'], build: hash('9') }))).toBe(
+      'template_not_found',
+    );
+    expect(await refusal(() => remove(d, 't1', 'default'))).toBe('invalid_request');
+    expect(await refusal(() => remove(d, 't1', 'nope'))).toBe('template_not_found');
+    expect(await refusal(() => move(d, 't1', { tags: ['a'], build: hash('1') }, bob))).toBe(
+      'forbidden',
+    );
+    await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' } }), d);
+    expect(await refusal(() => move(d, 't1', { tags: ['a'], build: hash('1') }))).toBe(
+      'template_retired',
+    );
+    expect(
+      (
+        await move(d, 't1', { tags: ['x'], build: hash('1') }, { ...bob, roles: ['admin'] }).catch(
+          (e) => e,
+        )
+      ).code,
+    ).toBe('template_retired');
+  });
+});
+
 describe('place, alone', () => {
   const doc = (id: string, h: string, sinceS: number, until = 10_000): TemplateDoc => ({
     schema: 'moca-template/1',

@@ -417,6 +417,23 @@ export const ROUTES: readonly RouteSpec[] = [
     operationId: 'retireTemplateBuild',
   },
   {
+    method: 'POST',
+    path: '/v1/templates/{id}/tags',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'moveTemplateTags',
+  },
+  {
+    method: 'DELETE',
+    path: '/v1/templates/{id}/tags/{tag}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    bodyRequired: false,
+    operationId: 'removeTemplateTag',
+  },
+  {
     method: 'GET',
     path: '/v1/policy',
     auth: 'api',

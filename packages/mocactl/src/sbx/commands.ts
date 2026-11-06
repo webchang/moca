@@ -204,6 +204,48 @@ export async function cmdRetireTemplate(
   }
 }
 
+/** `sbx templates tag ID TAG... --build B` (lifecycle spec §5.1): move tags onto a build. */
+export async function cmdTagTemplate(
+  c: SbxCtx,
+  id: string,
+  tags: string[],
+  build: string,
+): Promise<number> {
+  try {
+    const r = await c.api.moveTemplateTags(id, tags, build);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else
+      for (const t of r.tags) {
+        const was = !t.record
+          ? ' (unchanged)'
+          : t.before
+            ? ` (was ${sanitizeRemote(t.before)})`
+            : ' (new)';
+        c.io.out(
+          `${sanitizeRemote(r.templateId)}:${sanitizeRemote(t.tag)} -> ${sanitizeRemote(t.buildId)}${was}\n`,
+        );
+      }
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** `sbx templates untag ID TAG` (lifecycle spec §5.1): remove a tag; its build stays. */
+export async function cmdUntagTemplate(c: SbxCtx, id: string, tag: string): Promise<number> {
+  try {
+    const r = await c.api.removeTemplateTag(id, tag);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else
+      c.io.out(
+        `removed ${sanitizeRemote(r.templateId)}:${sanitizeRemote(r.tag)} (was ${sanitizeRemote(r.before)})\n`,
+      );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
 /** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
 export const ACTIVATION_WAIT_MS = 10 * 60_000;
 
