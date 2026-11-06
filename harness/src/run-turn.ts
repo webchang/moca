@@ -17,9 +17,10 @@ import {
 import { RedisSessionBackend } from '@moca/session-backend';
 import { BufferedRedisBackend } from './buffered-redis-backend.js';
 import { flushExtension } from './flush-extension.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   createCapacityLatch,
+  DEFAULT_OUTPUT_CAP,
   k8sSandboxExtension,
   SandboxCapacityRefusedError,
   type SandboxTransport,
@@ -150,7 +151,38 @@ export interface TurnPlacement {
   tier: string;
   /** The session's sandbox template; absent for none (session-templates spec §6). */
   template?: string;
+  /** The seed the session's workspace is filled with: where it came from (session-templates spec §5). */
+  seed?: TurnSeed;
   workspaceReset?: WorkspaceReset;
+}
+
+/**
+ * Where a templated session's seed came from (session-templates spec §5): `build`, the pinned
+ * build's own spec in the control plane's template store (then `buildId` is that build), or
+ * `declared`, the deployment's SH_SANDBOX_TEMPLATES. A client checks it against its pin, as it
+ * checks a sandbox's served build.
+ */
+export interface TurnSeed {
+  source: 'build' | 'declared';
+  buildId?: string;
+}
+
+/**
+ * The end state of a templated session's workspace after a turn (session-templates spec §5.1): the
+ * diff from the seed's baseline commit to everything in the workspace now, binary-safe. `patch` is
+ * the diff as text, or `patchBase64` when it is not valid UTF-8; either is whole, never truncated.
+ * Over SH_TURN_PATCH_MAX_BYTES it is left out and `patchRefused` says so (`patchSha256` and
+ * `patchBytes` still describe it when the transport returned it whole). `error` alone: the capture
+ * failed (no git, no baseline commit), which never fails the turn.
+ */
+export interface TurnWorkspace {
+  baseline?: string;
+  patch?: string;
+  patchBase64?: string;
+  patchSha256?: string;
+  patchBytes?: number;
+  patchRefused?: 'too_large';
+  error?: string;
 }
 
 /**
@@ -219,7 +251,7 @@ export async function acquireTurnSandbox(
   sessionId: string | undefined,
   deps: SelectDeps = {},
   tier?: string,
-  template?: { id: string; seed?: string; build?: string },
+  template?: { id: string; seed?: string; seedSource?: 'build' | 'declared'; build?: string },
 ): Promise<AcquiredTurnSandbox> {
   const noop = async () => {};
   if (injected) return { sandbox: injected, leased: false, heartbeat: noop, release: noop };
@@ -289,9 +321,16 @@ export async function acquireTurnSandbox(
       sandboxId: selected.sandboxId,
       tier: selected.tier ?? '',
       ...(template ? { template: template.id } : {}),
+      ...(template?.seed ? { seed: seedOrigin(template) } : {}),
       ...(selected.workspaceReset ? { workspaceReset: selected.workspaceReset } : {}),
     },
   };
+}
+
+/** A seeded template's TurnSeed: an absent source is a control plane from before it was sent. */
+function seedOrigin(t: { seedSource?: 'build' | 'declared'; build?: string }): TurnSeed {
+  const source = t.seedSource ?? 'declared';
+  return { source, ...(source === 'build' && t.build ? { buildId: t.build } : {}) };
 }
 
 /**
@@ -302,6 +341,12 @@ export async function acquireTurnSandbox(
 export const SEED_MARKER = '.moca-seeded';
 /** The seed's own output, kept in the workspace for the operator; the agent never reads it. */
 export const SEED_LOG = '.moca-seed.log';
+/**
+ * The commit the seed left the workspace at (`git rev-parse HEAD` right after it), relative to the
+ * workspace like the marker: the base a turn's patch is taken against (spec §5.1). Absent when the
+ * seed left no git repository; the capture then uses HEAD.
+ */
+export const SEED_BASELINE = '.moca-baseline';
 
 /** A template's seed failed: the turn cannot start on a workspace that is not the template's. */
 export class SandboxSeedError extends Error {
@@ -332,7 +377,9 @@ export async function seedWorkspace(
   seed: string,
   workspace = '/workspace',
 ): Promise<void> {
-  const body = `[ -e ${SEED_MARKER} ] || { bash -c ${shq(seed)} >${SEED_LOG} 2>&1 && touch ${SEED_MARKER}; }`;
+  // The baseline is best effort: a seed that leaves no repository still seeds, with no baseline.
+  const baseline = `{ git rev-parse --verify -q HEAD >${SEED_BASELINE} 2>/dev/null || rm -f ${SEED_BASELINE}; true; }`;
+  const body = `[ -e ${SEED_MARKER} ] || { bash -c ${shq(seed)} >${SEED_LOG} 2>&1 && ${baseline} && touch ${SEED_MARKER}; }`;
   // flock(1) is util-linux, in every shipped sandbox image; without it the guard still runs, unlocked.
   const command =
     `cd ${shq(workspace)} && if command -v flock >/dev/null 2>&1; then ` +
@@ -345,6 +392,94 @@ export async function seedWorkspace(
     throw new SandboxSeedError(template, (err as Error)?.message ?? String(err));
   }
   if (res.exitCode !== 0) throw new SandboxSeedError(template, res.exitCode);
+}
+
+/** The patch cap's default (SH_TURN_PATCH_MAX_BYTES): 4 MiB, half the transport's output cap. */
+export const DEFAULT_PATCH_MAX_BYTES = 4 * 1024 * 1024;
+
+/** SH_TURN_PATCH_MAX_BYTES, a positive whole number, at most the transport's output cap. */
+export function patchMaxBytes(env: NodeJS.ProcessEnv): number {
+  const n = Number(env.SH_TURN_PATCH_MAX_BYTES);
+  const v =
+    env.SH_TURN_PATCH_MAX_BYTES && Number.isInteger(n) && n > 0 ? n : DEFAULT_PATCH_MAX_BYTES;
+  return Math.min(v, DEFAULT_OUTPUT_CAP - 4096);
+}
+
+/**
+ * The capture (spec §5.1), run in the session's workspace: the baseline on the first line, then
+ * `git diff --cached --binary` from it to the whole workspace now, staged in a throwaway index so
+ * the workspace's own index is untouched. MOCA's own files (`.moca-*`, `.sh-config`) are left out;
+ * the workspace's .gitignore applies, as in a stock agent's `git add -A`.
+ */
+export function buildPatchCaptureScript(workspace: string): string {
+  return [
+    `cd ${shq(workspace)} || exit 90`,
+    `BASE=$(cat ${SEED_BASELINE} 2>/dev/null || git rev-parse --verify -q HEAD) && [ -n "$BASE" ] || exit 91`,
+    `D=$(mktemp -d) || exit 92`,
+    `export GIT_INDEX_FILE="$D/index"`,
+    `git read-tree "$BASE" && git add -A -- . ':(exclude).moca-*' ':(exclude).sh-config' && printf '%s\\n' "$BASE" && git diff --cached --binary "$BASE"`,
+    `rc=$?; rm -rf "$D"; exit $rc`,
+  ].join('\n');
+}
+
+/**
+ * Takes a templated session's patch after its turn (spec §5.1). Never throws: a capture that fails
+ * is reported as `{ error }` on the result, and the turn's own outcome stands.
+ */
+export async function captureTurnPatch(
+  transport: Pick<SandboxTransport, 'exec'>,
+  workspace: string,
+  maxBytes: number,
+): Promise<TurnWorkspace> {
+  try {
+    const { stdout, exitCode, truncated } = await transport.exec(
+      buildPatchCaptureScript(workspace),
+      { timeout: 120 },
+    );
+    if (truncated) return { patchRefused: 'too_large' };
+    if (exitCode !== 0) {
+      const why =
+        exitCode === 91
+          ? 'no baseline commit in the workspace'
+          : `capture exited ${exitCode ?? 'none: signal'}`;
+      return { error: why };
+    }
+    const nl = stdout.indexOf(0x0a);
+    if (nl < 0) return { error: 'capture printed no baseline' };
+    const baseline = stdout.subarray(0, nl).toString('utf8').trim();
+    const patch = stdout.subarray(nl + 1);
+    const facts = {
+      baseline,
+      patchSha256: `sha256:${createHash('sha256').update(patch).digest('hex')}`,
+      patchBytes: patch.byteLength,
+    };
+    if (patch.byteLength > maxBytes) return { ...facts, patchRefused: 'too_large' };
+    const text = patch.toString('utf8');
+    return Buffer.from(text, 'utf8').equals(patch)
+      ? { ...facts, patch: text }
+      : { ...facts, patchBase64: patch.toString('base64') };
+  } catch (err) {
+    return { error: `capture failed: ${(err as Error)?.message ?? String(err)}` };
+  }
+}
+
+/**
+ * The result with a templated session's patch (spec §5.1): only for a turn that leased its sandbox
+ * (an injected one is its caller's; a leaf takes its own patch) on a session with a template.
+ */
+export async function withWorkspacePatch(
+  result: TurnResult,
+  acquired: Pick<AcquiredTurnSandbox, 'leased' | 'sandbox'>,
+  template: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Promise<TurnResult> {
+  if (!acquired.leased || !acquired.sandbox || !template) return result;
+  const workspace = await captureTurnPatch(
+    acquired.sandbox.transport,
+    acquired.sandbox.podCwd,
+    patchMaxBytes(env),
+  );
+  return { ...result, workspace };
 }
 
 /** The `workspace_reset` frame for a placement that moved the session, else null (P6.3 spec §6). */
@@ -368,6 +503,7 @@ function placementView(p: TurnPlacement): NonNullable<TurnResult['sandbox']> {
     id: p.sandboxId,
     tier: p.tier,
     ...(p.template ? { template: p.template } : {}),
+    ...(p.seed ? { seed: p.seed } : {}),
     ...(p.workspaceReset ? { workspaceReset: p.workspaceReset } : {}),
   };
 }
@@ -448,6 +584,8 @@ export interface TurnConfig {
    */
   sandboxTemplate?: string;
   sandboxSeed?: string;
+  /** Where sandboxSeed came from, from the exchange: the pinned build's spec, or the declared list. */
+  sandboxSeedSource?: 'build' | 'declared';
   /**
    * The build the session's template resolved to (`sha256:…`, combined control plane spec §3.4,
    * register G19). Set: only workers labelled `moca.dev/build=<it>` serve the turn.
@@ -705,7 +843,15 @@ export interface TurnResult {
   stopReason: string;
   errorMessage?: string;
   usage?: LeafUsage;
-  sandbox?: { id: string; tier: string; template?: string; workspaceReset?: WorkspaceReset };
+  sandbox?: {
+    id: string;
+    tier: string;
+    template?: string;
+    seed?: TurnSeed;
+    workspaceReset?: WorkspaceReset;
+  };
+  /** A templated session's workspace patch after the turn (session-templates spec §5.1). */
+  workspace?: TurnWorkspace;
 }
 
 /**
@@ -1017,6 +1163,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
       ? {
           id: input.config.sandboxTemplate,
           ...(input.config.sandboxSeed ? { seed: input.config.sandboxSeed } : {}),
+          ...(input.config.sandboxSeedSource ? { seedSource: input.config.sandboxSeedSource } : {}),
           ...(input.config.sandboxBuildId ? { build: input.config.sandboxBuildId } : {}),
         }
       : undefined,
@@ -1069,7 +1216,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     // throws still releases the lease below.
     const resetFrame = placementFrame(opened.sessionManager.getSessionId(), acquired.placement);
     if (resetFrame) input.onEvent?.(resetFrame);
-    return withPlacement(
+    const result = withPlacement(
       await executeTurnCore(
         attached ? { ...input, promotedConfig: attached.promotedConfig } : input,
         acquired.sandbox,
@@ -1077,6 +1224,8 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
       ),
       acquired.placement,
     );
+    // A templated session's end state, while the lease is still held and renewed (spec §5.1).
+    return await withWorkspacePatch(result, acquired, input.config?.sandboxTemplate, process.env);
   } finally {
     // Detach while the lease is still renewed: it is a remote exec that can outlast the lease TTL.
     // Then clear before release, so a throwing release never leaves the interval running.
