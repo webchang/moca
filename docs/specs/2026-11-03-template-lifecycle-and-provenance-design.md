@@ -485,7 +485,7 @@ offers named **profiles**; an admin writes them (§5.2), and each create names o
 | `base`      | any client's own image (a toolchain, a project's env) | MOCA's rules M1-M4, M7-M17; the image from an allowed registry; the size envelope; a probe (the default probe `true` if none) passing in a restored VM (M12)                                                      |
 | `benchmark` | SWE-bench, TB and the like                            | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
 
-TB-like benchmarks that need packages from the network (23-30 of 90 TB2 reps reached PyPI or
+TB-like benchmarks that need packages from the network (a large share of TB2 reps reached PyPI or
 GitHub) do not fit X11; a `benchmark-egress` profile (egress through `moca-egress` with an allowlist
 whose digest is in the spec and the build record) is open (O13). Until it is decided, TB templates are
 created under `base`.
@@ -577,16 +577,16 @@ Window 1: stock agents only, the sandbox profile, the control-plane image
 `sbx-template-0fb59160`, bm1's host agent, autobench-moca's runner as a non-admin client, K = 4
 (django-11133, astropy-14995, sympy-12481, sympy-18189).
 
-| Step | Result                                                                                                                                                                                                   |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | done: image-factory's four records the policy's trusted gate records (A23)                                                                                                                               |
-| 2    | **4 of 4 built by the host agent and registered by policy**, no approver; the mismatched create refused at create (`422`, X10); the broken probe not reached (host-agent fixes made during the window)   |
-| 3    | not run as designed: a duplicate create queued a second build (G21, reuse not built)                                                                                                                     |
-| 4    | all four `active` by lease within 143 s, no eviction; first use (§6.4) not built                                                                                                                         |
-| 5    | sandboxes on `id@buildId`: served `buildId` and `templateManifestHash` = the pinned ones, 4 of 4; the replays' patches **not compared**: commands of about 40 KB or more stall over the exec Route (G26) |
-| 6    | not exercised                                                                                                                                                                                            |
-| 7    | **8 chains, 83 records verified offline** (`verify-provenance.py`, rc 0); 12 of 12 snapshot digests match the chain                                                                                      |
-| 8    | not started                                                                                                                                                                                              |
+| Step | Result                                                                                                                                                                                                              |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | done: image-factory's four records the policy's trusted gate records (A23)                                                                                                                                          |
+| 2    | **all four built by the host agent and registered by policy**, no approver; the mismatched create refused at create (`422`, X10); the broken probe not reached (host-agent fixes made during the window)            |
+| 3    | not run as designed: a duplicate create queued a second build (G21, reuse not built)                                                                                                                                |
+| 4    | all four `active` by lease within 143 s, no eviction; first use (§6.4) not built                                                                                                                                    |
+| 5    | sandboxes on `id@buildId`: served `buildId` and `templateManifestHash` = the pinned ones, for every sandbox; the replays' patches **not compared**: commands of about 40 KB or more stall over the exec Route (G26) |
+| 6    | not exercised                                                                                                                                                                                                       |
+| 7    | **8 chains, 83 records verified offline** (`verify-provenance.py`, rc 0); every snapshot digest matches the chain                                                                                                   |
+| 8    | not started                                                                                                                                                                                                         |
 
 Also found: Valkey 9 cannot read Redis 7.4's RDB 12 (G20, `SBX_REDIS_IMAGE`); a registry host
 reached one build's reason and record and four build logs, now redacted by the agent and removed
@@ -596,20 +596,20 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
 
 **Window 2** (2026-11-04, the same four instances, code 521efe5c, `SBX_ACTIVE_LIMIT=2`):
 
-| Step | Result                                                                                                                                                                                                 |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2    | **4 of 4 built fresh and registered** (G29: no reuse of window 1's removed snapshots); the mismatched create refused (X10); the broken probe failed `probe_failed`, its reason without a registry host |
-| 3    | **passed separately (2026-11-05)**: a second subject's create of the same id and its new build `409 template_exists`, its cancel `403`; reads allowed                                                  |
-| 4    | first use passed: `409 template_not_active`, `Retry-After: 30`, the caller's lease taken                                                                                                               |
-| 5    | build check 4 of 4; writes as Exec stdin, no stall (G26 fixed); **patches 4 of 4 match** the recordings                                                                                                |
-| 6    | aging passed: two windows of 2, the second placed as the first's leases ended                                                                                                                          |
-| 7    | **8 chains, 140 records verified offline**; 12 of 12 snapshot digests match                                                                                                                            |
-| 8    | not started                                                                                                                                                                                            |
+| Step | Result                                                                                                                                                                                                   |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2    | **all four built fresh and registered** (G29: no reuse of window 1's removed snapshots); the mismatched create refused (X10); the broken probe failed `probe_failed`, its reason without a registry host |
+| 3    | **passed separately (2026-11-05)**: a second subject's create of the same id and its new build `409 template_exists`, its cancel `403`; reads allowed                                                    |
+| 4    | first use passed: `409 template_not_active`, `Retry-After: 30`, the caller's lease taken                                                                                                                 |
+| 5    | the build check passed for each; writes as Exec stdin, no stall (G26 fixed); **every patch matches** its recording                                                                                       |
+| 6    | aging passed: two windows of 2, the second placed as the first's leases ended                                                                                                                            |
+| 7    | **8 chains, 140 records verified offline**; every snapshot digest matches                                                                                                                                |
+| 8    | not started                                                                                                                                                                                              |
 
 Open from window 2: client-side stalls of about 20 s on some Execs (register G30).
 
-**Window 3** (2026-11-05, measurements, the same image and host setup): builds 4 of 4, patches
-4 of 4, build check 4 of 4; G30's cause is the client's DNS (not MOCA's); G31's baseline, about
+**Window 3** (2026-11-05, measurements, the same image and host setup): every build, patch and build check
+as in window 2; G30's cause is the client's DNS (not MOCA's); G31's baseline, about
 86-108 s from each activation's request, both of a pair together. **Step 3** passed the same day on
 ykt3 with a second enrolled subject (fssapi): its create of an existing id and its new build of
 another's template `409 template_exists`, its cancel `403`.
@@ -617,11 +617,11 @@ another's template `409 template_exists`, its cancel `403`.
 **Window 4** (2026-11-05, measurements with the host agent's `--wanted-only` and the client's
 resolved-address dial): activation 10.8-17.4 s from each request (window 3: 86-108 s, register
 G31); 0 DNS stalls (G30); the rebuilt workers report `moca.dev/build` (G19); patches and build
-check 4 of 4; a probe failure reported at step `probe`.
+check passed for each; a probe failure reported at step `probe`.
 
 **The combined control plane's attach window** (2026-11-05, `moca-combined`, no model): the same four
 templates created self-serve by a user with no role, built by bm1's host agent and registered by
-policy (4 of 4; the broken gate refused at create, X10; the broken probe failed at `probe`); a
+policy (all four; the broken gate refused at create, X10; the broken probe failed at `probe`); a
 stock-agent sandbox and a **Moca Pi session both pinned to django's build**, on one control plane,
 the session's record carrying `sandboxTemplate` and `sandboxBuildId`; first use through a session
 (`409 template_not_active`, then `201` after 23 s); activation in 13-18 s; the active limit refusing
@@ -630,8 +630,8 @@ included), 6 and 7 hold on the combined control plane.
 
 **Step 8** (2026-11-06, `moca-sbx-template`, a real model): **DeepSeek-V4.1-Flash on CurveBender**, not
 Sonnet; two stock brains (Claude Code 2.1.286 and OpenCode 1.18.35), 3 reps × 4 instances each, on
-fresh self-serve builds (the broken gate refused, X10; the broken probe failed at `probe`). **24 of 24
-reps recorded with no void**, each on its first attempt; every sandbox served its pinned build
+fresh self-serve builds (the broken gate refused, X10; the broken probe failed at `probe`). **every rep
+recorded with no void**, each on its first attempt; every sandbox served its pinned build
 (`buildId` = manifest hash = pin); activations 13.8-21.1 s; a token renewal path through a forwarder
 proven in the dry run. Graded with the official harness; the grading stays in autobench-moca's records (`runs/step8-1-b`,
 not published). Resolution, tokens and model time do not compare with the Sonnet baseline (another
@@ -642,7 +642,7 @@ record and its activations in the chain.
 **The lifecycle window** (2026-11-06, `moca-sbx-template` on the lifecycle image `40fc7a80`, no
 model): the whole template lifecycle through the API, by a user with no role, no operator step.
 Four templates created self-serve and registered by policy (the broken gate refused, X10; the broken
-probe failed at `probe`); first use; replays on pinned builds (4 of 4); then **retire**: each
+probe failed at `probe`); first use; replays on pinned builds (every patch matched); then **retire**: each
 template's every build retired (a whole-template retire includes earlier windows' builds), a create
 after it refused `410 template_retired`, readiness `retired` within about a second, and bm1's host
 agent **removed each build's worker and snapshot by itself** (step 7), seen through the API as
@@ -718,10 +718,10 @@ change does.
    image built from the branch (`ghcr.io/webchang/moca:sbx-template-0fb59160`); template workers
    pre-installed on bm1 (G18); autobench-moca's runner as the client. The Moca Pi arm follows with the
    combined control plane. **Run 2026-11-04** (§10.1): window 1 passed steps 1, 2, 4 and 7;
-   window 2 passed 2, 4, 5 (patches 4 of 4), 6 and 7; step 3 passed with a second subject
+   window 2 passed 2, 4, 5 (every patch matched), 6 and 7; step 3 passed with a second subject
    (2026-11-05); windows 3 and 4 measured G30 and G31 (2026-11-05); the combined control plane's attach
    window passed 2, 4, 5 (a sandbox and a Moca Pi session on one build), 6 and 7 (2026-11-05); step 8
-   ran 2026-11-06 with DeepSeek on CurveBender: 24 of 24 reps, no void, every one on its pinned build.
+   ran 2026-11-06 with DeepSeek on CurveBender: every rep completed with no void, every one on its pinned build.
    The lifecycle window (2026-11-06) ran create through retire through the API, with the host's
    own removal and every provenance link unique.
 

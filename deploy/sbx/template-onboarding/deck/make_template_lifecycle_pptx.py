@@ -380,13 +380,13 @@ def s_windows(d):
                 "Spec §10 steps, as run 2026-11-04 to 2026-11-05 (no model)")
     table(s, 0.6, 1.5, 12.1, [
         ["Step", "Window 1", "Window 2", "Windows 3-4"],
-        ["Create, build, register", "4 of 4", "4 of 4, fresh", "4 of 4 each"],
+        ["Create, build, register", "all four", "all four, fresh", "all four, each"],
         ["Refused create (X10)", "yes", "yes", "yes"],
         ["Broken probe", "not reached", "`probe_failed`", "step `probe` (w4)"],
         ["First use", "not built", "409, then active", "as w2"],
-        ["Served build = pinned", "4 of 4", "4 of 4", "4 of 4"],
-        ["Patches match recordings", "not compared", "4 of 4", "4 of 4"],
-        ["Offline verification", "83 records", "140 records, 12/12", "not repeated"],
+        ["Served build = pinned", "every sandbox", "every sandbox", "every sandbox"],
+        ["Patches match recordings", "not compared", "every patch", "every patch"],
+        ["Offline verification", "83 records", "140 records, all chains verified", "not repeated"],
     ], [3.4, 2.6, 3.0, 3.1], right_from=-1, size=13, row_h=0.5, bold_first_col=True)
     text(s, 0.6, 5.7, 12.1, 0.8, [
         "Step 3 (a second client on the same instance) passed separately with a second enrolled "
@@ -398,7 +398,7 @@ def s_lifecycle_window(d):
                 "The lifecycle window, 2026-11-06: a user with no role; no operator step (no model)")
     table(s, 0.6, 1.5, 12.1, [
         ["Stage", "What happened"],
-        ["create, build, register", "4 of 4 by policy; the bad gate refused (X10); the bad probe failed"],
+        ["create, build, register", "all four by policy; the bad gate refused (X10); the bad probe failed"],
         ["activate, first use, use", "a lease in 23-26 s; every sandbox on its pinned build"],
         ["retire", "every build; a later create refused `410`; readiness `retired` in ~1 s"],
         ["the host removes it", "bm1's agent, by itself; `heldBy` emptied in 17-32 s"],
@@ -448,7 +448,7 @@ def s_issues(d):
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.44, bold_first_col=True)
     note(s, 0.6, 5.55, 12.1, 0.8, "Not yet covered",
          ["a Moca Pi turn with a model on the combined control plane (deployed, checked with "
-          "no model); step 8 ran stock agents with a real model: 24 of 24 reps"], size=12)
+          "no model); step 8 ran stock agents with a real model, every rep completed"], size=12)
 
 
 # --------------------------------------------------------------------------- 6. Next
@@ -458,7 +458,7 @@ def s_next(d):
                 "In order, each with the user's decision first")
     rows = [
         ("1", "A real model and grading: done", "step 8 (2026-11-06): DeepSeek on CurveBender, "
-         "two stock brains, 24 of 24 reps on pinned builds, no void"),
+         "two stock brains, every rep on its pinned build, no void"),
         ("2", "Both brains on the combined control plane", "deployed and attached; next a "
          "window on the KVM host with a model, Moca Pi beside a stock agent"),
         ("3", "Propose upstream", "as PRs, from what the windows proved; upstream has no "

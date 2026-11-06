@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-06T17:01:36Z
+**Last modified:** 2026-11-06T17:33:14Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -452,7 +452,7 @@ Measured on one host (188 GiB, 93 GB free) on 2026-10-31, with SWE-bench templat
 | disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                          | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
 | memory per template | each attached worker keeps its snapshot's memory mapped, idle or not                                                | ~4.1 GiB each                                                                                           |
 | disk, sandboxes     | each seeded sandbox's workspace                                                                                     | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
-| commands at once    | `--budget-mb` ≥ (guest + 32) × 3 + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; 11 of 11 at 65536 MiB, with almost no real memory used                       |
+| commands at once    | `--budget-mb` ≥ (guest + 32) × 3 + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; every one at 65536 MiB, with almost no real memory used                      |
 | quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                              | deployment settings                                                                                     |
 | logins              | a minted login lasts at most 24 h                                                                                   | —                                                                                                       |
 
