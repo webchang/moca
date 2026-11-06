@@ -15,6 +15,7 @@ import {
   checkCreate,
   policyDigest,
   policyProblems,
+  quotaFor,
   TEMPLATE_ID_RE,
   type Policy,
   type PolicyStore,
@@ -372,7 +373,7 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
   }
   const now = seconds(deps);
   const handle = buildHandle(deps.newId());
-  const quota = pol.quota;
+  const quota = quotaFor(pol, p.sub);
   const want = reuseKey(b.image as string, spec, result.profile, result.gateRecordSha256);
   let reused: TemplateBuild | undefined;
   const doc = await cat.update(id, async (cur) => {
@@ -629,10 +630,10 @@ async function takeLease(
     .filter(
       (x) => x.buildId !== target.buildId && liveLeases(x, nowS).some((l) => l.subject === p.sub),
     );
-  if (held.length >= pol.quota.active) {
+  if (held.length >= quotaFor(pol, p.sub).active) {
     throw new CpError(
       'quota_exceeded',
-      `at most ${pol.quota.active} active templates per subject`,
+      `at most ${quotaFor(pol, p.sub).active} active templates per subject`,
       undefined,
       { quota: 'active' },
     );
@@ -1271,6 +1272,57 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     return { status: 200, body: { policy, digest: policyDigest(policy), record } };
   },
 
+  /**
+   * Admin quotas (§5.2): `PUT /v1/quota/default` sets the deployment default, `PUT
+   * /v1/quota/{subject}` one subject's override; a body of `null` for a subject removes its
+   * override. Each is a policy change: a new `policy` record (the whole policy, as `PUT /v1/policy`
+   * writes), so the chain shows who set which quota when.
+   */
+  putQuota: async (ctx, deps) => {
+    const p = requireEnrolled(ctx, deps);
+    if (!isAdmin(p)) throw new CpError('forbidden', 'setting quotas requires the admin role');
+    if (!deps.policy)
+      throw new CpError(
+        'invalid_request',
+        'this deployment does not store templates (SH_PROVENANCE_DIR is unset)',
+      );
+    const subject = ctx.params.subject ?? '';
+    const isDefault = subject === 'default';
+    if (!isDefault && !/^github:[0-9]+$/.test(subject))
+      throw new CpError(
+        'invalid_request',
+        "the quota's target is 'default' or a subject, github:<id>",
+      );
+    const { policy: cur } = await deps.policy.current();
+    const body = ctx.body;
+    const next: Policy = { ...cur, quotaBySubject: { ...(cur.quotaBySubject ?? {}) } };
+    let before: unknown;
+    if (isDefault) {
+      before = cur.quota;
+      next.quota = body as Policy['quota'];
+    } else {
+      before = cur.quotaBySubject?.[subject] ?? null;
+      if (body === null) delete next.quotaBySubject![subject];
+      else next.quotaBySubject![subject] = body as Policy['quota'];
+    }
+    if (Object.keys(next.quotaBySubject!).length === 0) delete next.quotaBySubject;
+    const bad = policyProblems(next);
+    if (bad.length) throw new CpError('invalid_request', bad.join('; '));
+    const { record } = await deps.policy.set(next, p.sub);
+    await auditBestEffort(deps, 'quota_set', subject, { subject: p.sub, decision: 'quota_set' });
+    return {
+      status: 200,
+      body: {
+        target: subject,
+        subject: p.sub,
+        quota: isDefault ? next.quota : (next.quotaBySubject?.[subject] ?? null),
+        before,
+        policy: policyDigest(next),
+        record,
+      },
+    };
+  },
+
   putPolicy: async (ctx, deps) => {
     const p = requireEnrolled(ctx, deps);
     if (!isAdmin(p)) throw new CpError('forbidden', 'setting the policy requires the admin role');
@@ -1307,9 +1359,11 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       status: 200,
       body: {
         subject: p.sub,
-        templates: { limit: pol.quota.templates, used: u.templates },
-        buildsQueued: { limit: pol.quota.buildsQueued, used: u.buildsQueued },
-        active: { limit: pol.quota.active, used: active },
+        templates: { limit: quotaFor(pol, p.sub).templates, used: u.templates },
+        buildsQueued: { limit: quotaFor(pol, p.sub).buildsQueued, used: u.buildsQueued },
+        active: { limit: quotaFor(pol, p.sub).active, used: active },
+        // Whether this subject has an admin-set quota (§5.2) or the deployment default.
+        quotaSource: pol.quotaBySubject?.[p.sub] ? 'subject' : 'default',
         ...(sandboxes ? { sandboxes } : {}),
       },
     };

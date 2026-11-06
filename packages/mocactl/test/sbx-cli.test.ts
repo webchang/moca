@@ -451,6 +451,59 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(await sbxMain(['templates', 'transfer', 'node22'], env, io, opts)).toBe(2);
   });
 
+  it("sets a subject's quota or the default, and clears an override (admins, lifecycle §5.2)", async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'PUT /v1/quota/github%3A9': (req) => ({
+        status: 200,
+        body: {
+          target: 'github:9',
+          subject: 'github:1',
+          quota: req.body ?? null,
+          before: null,
+          policy: 'sha256:p',
+          record: 'sha256:r',
+        },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(
+        [
+          'templates',
+          'quota',
+          'github:9',
+          '--templates',
+          '5',
+          '--builds-queued',
+          '2',
+          '--active',
+          '1',
+        ],
+        env,
+        io,
+        opts,
+      ),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({
+      method: 'PUT',
+      path: '/v1/quota/github%3A9',
+      body: { templates: 5, buildsQueued: 2, active: 1 },
+    });
+    expect(io.outs.join('')).toContain('github:9: templates 5, builds queued 2, active 1');
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'quota', 'github:9', '--clear'], env, io, opts)).toBe(0);
+    expect(io.outs.join('')).toContain('github:9: back to the default quota');
+    expect(await sbxMain(['templates', 'quota', 'github:9', '--active', '1'], env, io, opts)).toBe(
+      2,
+    );
+    expect(io.errs.join('\n')).toMatch(/needs --templates, --builds-queued and --active/);
+    expect(
+      await sbxMain(['templates', 'quota', 'github:9', '--clear', '--active', '1'], env, io, opts),
+    ).toBe(2);
+    expect(await sbxMain(['ls', '--active', '1'], env, io, opts)).toBe(2);
+  });
+
   it('creates a sandbox with a template, a name and labels, and prints its id and expiry', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({ 'POST /v1/sandboxes': () => ({ status: 201, body: sandbox() }) });

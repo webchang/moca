@@ -49,6 +49,7 @@ describe('the route table', () => {
         'POST /v1/templates/{id}/builds/{build}/reject',
         'PATCH /v1/templates/{id}',
         'PUT /v1/templates/{id}/owner',
+        'PUT /v1/quota/{subject}',
         'GET /v1/policy',
         'PUT /v1/policy',
         'GET /v1/quota',

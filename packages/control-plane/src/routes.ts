@@ -441,6 +441,14 @@ export const ROUTES: readonly RouteSpec[] = [
     operationId: 'transferTemplateOwner',
   },
   {
+    method: 'PUT',
+    path: '/v1/quota/{subject}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'putQuota',
+  },
+  {
     method: 'POST',
     path: '/v1/templates/{id}/tags',
     auth: 'api',

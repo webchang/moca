@@ -21,6 +21,7 @@ import {
   cmdUntagTemplate,
   cmdEditTemplate,
   cmdTransferTemplate,
+  cmdSetQuota,
   cmdToken,
   failRefresh,
   SBX_EXIT,
@@ -60,6 +61,11 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  change who sees it, or its description
   mocactl sbx templates transfer ID SUBJECT [--json]
                                                  make SUBJECT (github:<id>) its owner (admins only)
+  mocactl sbx templates quota TARGET --templates N --builds-queued N --active N [--json]
+  mocactl sbx templates quota TARGET --clear [--json]
+                                                 set a subject's quota (TARGET github:<id>) or the
+                                                 default (TARGET default); --clear removes an override
+                                                 (admins only)
   mocactl sbx create [--template ID] [--name N] [--label k=v ...] [--json]
                                                  create a sandbox (template: default); prints its id
   mocactl sbx ls [--all] [--json]                your sandboxes (--all: everyone's; admins only)
@@ -370,6 +376,10 @@ export async function sbxMain(
         reason: { type: 'string' },
         visibility: { type: 'string' },
         description: { type: 'string' },
+        templates: { type: 'string' },
+        'builds-queued': { type: 'string' },
+        active: { type: 'string' },
+        clear: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -464,6 +474,37 @@ export async function sbxMain(
     io.err(`sbx: templates edit needs --visibility or --description\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
+  const quotaFlags = (['templates', 'builds-queued', 'active', 'clear'] as const).filter(
+    (f) => values[f] !== undefined,
+  );
+  if (quotaFlags.length > 0 && !(command === 'templates' && arg === 'quota')) {
+    io.err(`sbx: --${quotaFlags[0]} only applies to templates quota\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  let quotaBody: { templates: number; buildsQueued: number; active: number } | null | undefined;
+  if (command === 'templates' && arg === 'quota') {
+    if (values.clear) {
+      if (quotaFlags.length > 1) {
+        io.err(`sbx: --clear takes no other quota flag\n${SBX_USAGE}`);
+        return SBX_EXIT.usage;
+      }
+      quotaBody = null;
+    } else {
+      const n = (v: string | undefined) => (v !== undefined && /^\d+$/.test(v) ? Number(v) : NaN);
+      const q = {
+        templates: n(values.templates),
+        buildsQueued: n(values['builds-queued']),
+        active: n(values.active),
+      };
+      if (![q.templates, q.buildsQueued, q.active].every(Number.isSafeInteger)) {
+        io.err(
+          `sbx: templates quota needs --templates, --builds-queued and --active (whole numbers), or --clear\n${SBX_USAGE}`,
+        );
+        return SBX_EXIT.usage;
+      }
+      quotaBody = q;
+    }
+  }
   if (command === 'templates' && arg === 'tag' && !values.build) {
     io.err(`sbx: templates tag needs --build BUILD\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
@@ -510,6 +551,7 @@ export async function sbxMain(
         (arg === 'untag' && extra.length === 2) ||
         (arg === 'edit' && extra.length === 1) ||
         (arg === 'transfer' && extra.length === 2) ||
+        (arg === 'quota' && extra.length === 1) ||
         (arg === 'tag' && extra.length >= 2)
       : command === 'credentials'
         ? arg === undefined ||
@@ -698,6 +740,7 @@ export async function sbxMain(
           description: values.description,
         });
       if (arg === 'transfer') return cmdTransferTemplate(ctx, extra[0]!, extra[1]!);
+      if (arg === 'quota') return cmdSetQuota(ctx, extra[0]!, quotaBody!);
       return cmdTemplates(ctx);
     case 'create':
       return cmdCreate(ctx, createBody!);

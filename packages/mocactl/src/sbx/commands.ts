@@ -280,6 +280,27 @@ export async function cmdTransferTemplate(c: SbxCtx, id: string, owner: string):
   }
 }
 
+/** `sbx templates quota TARGET (--templates N --builds-queued N --active N | --clear)` (§5.2). */
+export async function cmdSetQuota(
+  c: SbxCtx,
+  target: string,
+  quota: { templates: number; buildsQueued: number; active: number } | null,
+): Promise<number> {
+  try {
+    const r = await c.api.putQuota(target, quota);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else
+      c.io.out(
+        quota === null
+          ? `${sanitizeRemote(r.target)}: back to the default quota\n`
+          : `${sanitizeRemote(r.target)}: templates ${quota.templates}, builds queued ${quota.buildsQueued}, active ${quota.active}\n`,
+      );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
 /** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
 export const ACTIVATION_WAIT_MS = 10 * 60_000;
 

@@ -114,6 +114,14 @@ export class SandboxApiClient extends ControlPlaneClient {
     return this.json('PUT', `/v1/templates/${encodeURIComponent(id)}/owner`, { body: { owner } });
   }
 
+  /** Set a subject's quota, or the default; null removes a subject's override (spec §5.2; admins). */
+  putQuota(
+    target: string,
+    quota: { templates: number; buildsQueued: number; active: number } | null,
+  ): Promise<{ target: string; quota: unknown; before: unknown; policy: string; record: string }> {
+    return this.json('PUT', `/v1/quota/${encodeURIComponent(target)}`, { body: quota });
+  }
+
   createSandbox(body: {
     template: string;
     name?: string;
