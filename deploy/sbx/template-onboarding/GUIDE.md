@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-05T21:46:58Z
+**Last modified:** 2026-11-06T04:50:02Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -404,6 +404,24 @@ sudo deploy/sbx/install-host.sh --uninstall <old worker id>
 Removing a template entirely is `--remove ID`. On 2026-10-30 retiring `django-django-11133` revoked its
 worker's token, a create of it was refused (`no such template`), and an astropy sandbox created
 before kept running.
+
+**Self-serve, through the API** (a deployment with the template store and host agents; built
+2026-11-06, not yet deployed): the template's owner does it all, with no operator step.
+
+Point `default` at a new build (new creates use it), then retire the old build, or the whole
+template:
+
+```bash
+mocactl sbx templates tag django-django-11133 default --build sha256:<new build>
+mocactl sbx templates retire django-django-11133 --build sha256:<old build>
+mocactl sbx templates retire django-django-11133 --reason 'done'
+```
+
+A retire is refused while a sandbox or a session still uses the build (`409 build_in_use`): delete
+it first. A retired build is never used again (`410 template_retired`), and the host agent then
+removes its worker and snapshot. Every step is a record naming who did it. The owner also changes
+the description and visibility (`templates edit`); an admin rejects a build after the fact,
+transfers a template (`templates transfer`) and sets quotas (`templates quota`).
 
 ## 8. Templates in MOCA agent sessions
 

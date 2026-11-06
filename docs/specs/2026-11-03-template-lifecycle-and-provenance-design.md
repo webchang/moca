@@ -269,6 +269,13 @@ separation (to be checked in code and tests when it is built):
 
 ### 5.1 The owner's (self-serve)
 
+**Built (2026-11-06):** every route of §5.1 and §5.2; `mocactl sbx templates` has `retire`, `tag`,
+`untag`, `edit`, `transfer` and `quota`. A retire and a reject end a build's use for good (a new
+build is the way back), never cut off running work (`409 build_in_use` under a live sandbox or an
+active pinned session), and have a holding host remove the snapshot and worker (§6.1 step 7). A
+retired or rejected build: `410 template_retired` (retired) or `400 unknown_template` (rejected) on
+use. Each answer carries the subject, the build ids and the record's digest.
+
 | Route                                                                                 | Who                                      | Does                                                                                                            |
 | ------------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `POST /v1/templates` · `POST /v1/templates/{id}/builds`                               | any client; a new build: the owner       | creates a template or a build (§4)                                                                              |
@@ -414,17 +421,29 @@ Every step writes one record. A record is JSON, append-only, with `prev` (the di
 follows) so the chain from the image to a session can be walked and checked. Every record names its
 **subject** (who, or `policy`, or a host) and when:
 
-| Record                         | Written when                                               | Holds                                                                                                                                                                                                                                                                                 | Source (workload plane) |
-| ------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| `policy`                       | an admin sets the policy                                   | the profiles, in full; its digest is what every `check` cites                                                                                                                                                                                                                         | the control plane       |
-| `create`                       | a client creates a template or a build                     | the subject, id, image digest, spec, profile, visibility, the gate record's sha256 if given (the record itself stored beside it)                                                                                                                                                      | the control plane       |
-| `gate`                         | a gate record is cited                                     | the gate record's digest, its sha256, its source (a trusted source and commit, or `client`) and its gate fields (GATING-RULES §3)                                                                                                                                                     | the image builder       |
-| `build`                        | a snapshot is built and its probe passed                   | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent/vmstate/memfile digests, probe and its result, the MOCA commit, the host, when                                                                                     | the host agent          |
-| `check`                        | policy is applied, at create and at registration           | the policy's digest, the profile, each rule and its result, the outcome (`admitted`, `registered`, `rejected`); at registration, `build` is the **digest of the `build` record** it judged (not the manifest hash, which that record holds), so a check cites exactly what it checked | the control plane       |
-| `activate` · `deactivate`      | readiness changes                                          | host, worker, manifest hash, subject, reason (owner, first use, aging, replacement, admin)                                                                                                                                                                                            | the host agent's report |
-| `tag` · `visibility` · `owner` | the owner or an admin changes one                          | the new value, the one before                                                                                                                                                                                                                                                         | the control plane       |
-| `retire` · `reject`            | a template or build is retired, or rejected after the fact | subject, reason                                                                                                                                                                                                                                                                       | the control plane       |
-| `use` (summary)                | sessions start                                             | per build and day: count, first and last, by subject                                                                                                                                                                                                                                  | the control plane       |
+| Record                         | Written when                                                                           | Holds                                                                                                                                                                                                                                                                                 | Source (workload plane) |
+| ------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `policy`                       | an admin sets the policy                                                               | the profiles, in full; its digest is what every `check` cites                                                                                                                                                                                                                         | the control plane       |
+| `create`                       | a client creates a template or a build                                                 | the subject, id, image digest, spec, profile, visibility, the gate record's sha256 if given (the record itself stored beside it)                                                                                                                                                      | the control plane       |
+| `gate`                         | a gate record is cited                                                                 | the gate record's digest, its sha256, its source (a trusted source and commit, or `client`) and its gate fields (GATING-RULES §3)                                                                                                                                                     | the image builder       |
+| `build`                        | a snapshot is built and its probe passed                                               | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent/vmstate/memfile digests, probe and its result, the MOCA commit, the host, when                                                                                     | the host agent          |
+| `check`                        | policy is applied, at create and at registration                                       | the policy's digest, the profile, each rule and its result, the outcome (`admitted`, `registered`, `rejected`); at registration, `build` is the **digest of the `build` record** it judged (not the manifest hash, which that record holds), so a check cites exactly what it checked | the control plane       |
+| `activate` · `deactivate`      | readiness changes                                                                      | host, worker, manifest hash, subject, reason (owner, first use, aging, replacement, admin); each lease stores its `activate` record's digest                                                                                                                                          |
+| `tag` · `visibility` · `owner` | the owner or an admin changes one                                                      | the new value and the one before: `tag` {tag, buildId (null when removed), before}; `visibility` {field (visibility or description), value, before}; `owner` {owner, before}                                                                                                          |
+| `retire` · `reject`            | a template or build is retired, or rejected after the fact, and when a host removes it | subject, reason, `from` (the status before), `buildRecord`; a host's removal is a `retire` by `host:<id>` with `event: removed`                                                                                                                                                       |
+| `sandbox`                      | a sandbox is created, and when it ends                                                 | at create: sandboxId, buildId, templateManifestHash, `lease` (null with no lease), expiresAt; at end: `state: terminated`, `reason` (`deleted` with endedAt, or `expired`: written by the janitor's sweep when it first sees it, once; the true end is expiresAt)                     |
+| `use` (summary)                | sessions start                                                                         | per build and day: count, first and last, by subject                                                                                                                                                                                                                                  | the control plane       |
+
+**Every cross-record reference is a record digest** (the sha256 of the referenced record's
+canonical JSON), never a time or a name, so a chain composes with no rule but equality: `check.policy`
+(the policy record), `check.build`, `retire.buildRecord`, `reject.buildRecord` (the build's `build`
+record), `sandbox.lease` (the `activate` record the sandbox's lease came from). A rep then joins
+exactly: its build id is the `build` record's `manifest_hash` and the `activate` and `sandbox`
+records' `buildId`. **As of the 2026-11-06 image** (the `sandbox` kind, `lease` and `buildRecord`):
+a store older than that has none of them, and one that spans the change mixes exact links with
+links only time can infer (a sandbox under a lease taken before the image has `lease: null`); a
+composer should report the two apart. A verifier from before the change refuses a store holding a
+`sandbox` record.
 
 ### 7.2 Hosting, persistence and offline verification
 
@@ -645,8 +664,14 @@ record and its activations in the chain.
    (`template-policy.ts`: M1, M7, M8, M9, the registry allowlist, the envelope, X1 + trusted gate
    records (A23), X10, X11, X12 (fail closed), X14, X15), `422 policy_refused` with `rule`,
    `409 template_exists`, `429 quota_exceeded` with `quota`; `create`, `gate` and `check` records.
-   The repository's SWE-bench example passes the benchmark profile in full. Cancel built (G22); the quota shows active leases and the live-sandbox cap (G27). Not yet: retire,
-   visibility and tag changes (§5.1), admin quota overrides, and the activation quota's use.
+   The repository's SWE-bench example passes the benchmark profile in full. Cancel built (G22); the quota shows active leases and the live-sandbox cap (G27). **Every
+   §5 activity is built (2026-11-06, the user: "our APIs must cover all lifecycle management
+   activities for templates, from creation to retire"):** retire a template or one build
+   (65e5b500; refused under a live sandbox or an active pinned session, c571226a), tags moved and
+   removed (03d5a4b9), an admin's reject after the fact (f5bc68a7), description and visibility,
+   and an admin's owner transfer (5aa8789a), admin quotas by subject (13bc0f72); each writes its
+   record naming the caller, and `mocactl sbx templates` has a subcommand for each. Not yet
+   deployed (the image after the v0.10.0 merge).
 5. The host agent: builds (claim, run `template-build.sh`, logs, report) and automatic registration
    (§6.1, §8.2). **Built, first increment:** the host routes (`auth: host`, `SH_TEMPLATE_HOSTS` and
    `SH_HOST_TOKEN_<ID>`; a host reports only for itself) for inventory, claim (oldest first,

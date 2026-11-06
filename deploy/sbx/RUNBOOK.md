@@ -717,7 +717,10 @@ Name the image in the spec without its registry; `SBX_REGISTRY` supplies it at t
 Each poll also asks the control plane which workers to run and stop (`GET /v1/hosts/{host}/wanted`:
 builds leased by clients and placed on this host, within `SBX_ACTIVE_LIMIT`), starts and stops
 their `sbx-worker@<id>` units, and reports each start (`attached`), refusal and stop (`detached`). It
-never stops a worker with live sandboxes. It starts only **installed** workers: install a new
+never stops a worker with live sandboxes. It also removes what the control plane lists in `remove` (a
+retired build, or one an admin rejected): it stops the worker, runs `install-host.sh --uninstall`,
+deletes the snapshot and its template record, and reports `removed`; only a build its own template
+record matches (the build id and the worker), never a running worker. It starts only **installed** workers: install a new
 template's worker as in §5 (its relay token comes from `setup.sh`; the record's id becomes its
 `SANDBOX_TEMPLATE`, the label Moca Pi sessions select by); until then the agent reports
 it `refused` (register gap G18).

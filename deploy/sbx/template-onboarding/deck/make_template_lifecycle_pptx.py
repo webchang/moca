@@ -307,6 +307,26 @@ def s_seq_session(d):
           "label"], size=11)
 
 
+def s_lifecycle_api(d):
+    s = d.slide("The API covers the whole lifecycle, create to retire",
+                "Each activity a route and a mocactl subcommand; each writes a record naming who")
+    table(s, 0.6, 1.5, 12.1, [
+        ["Activity", "Who", "Record it writes"],
+        ["create a template, or a new build", "any enrolled client", "create, gate, check"],
+        ["build, probe, register by policy", "the host agent, then policy", "build, check"],
+        ["activate, deactivate (a lease)", "the owner; anyone, if shared", "activate, deactivate"],
+        ["move a tag onto a new build", "the owner", "tag (new and old build)"],
+        ["edit description, visibility", "the owner", "visibility (new and old)"],
+        ["retire a template or a build", "the owner", "retire (and the host's removal)"],
+        ["reject a build after the fact", "an admin, with a reason", "reject"],
+        ["transfer ownership", "an admin", "owner"],
+        ["set quotas, default or per user", "an admin", "policy"],
+    ], [4.6, 3.6, 3.9], right_from=-1, size=12, row_h=0.42, bold_first_col=False)
+    note(s, 0.6, 5.85, 12.1, 0.6, "Built, not yet deployed",
+         ["a retire never cuts off running work: refused while a sandbox or session uses the build"],
+         size=12)
+
+
 def s_combined(d):
     s = d.slide("One control plane serves both kinds of brain",
                 "The combined route profile (combined control plane design, C1-C4)")
@@ -406,9 +426,10 @@ def s_issues(d):
         ["G31", "activation waited for the build poll", "the wanted-state unit", "w4"],
         ["G19", "a session could run on another build", "the build label and filter",
          "combined"],
+        ["G33", "a rep's lease found only by time", "sandbox records by digest", "not yet"],
         ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
-    ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.5, bold_first_col=True)
-    note(s, 0.6, 5.3, 12.1, 0.9, "Not yet covered",
+    ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.44, bold_first_col=True)
+    note(s, 0.6, 5.55, 12.1, 0.8, "Not yet covered",
          ["a Moca Pi turn with a model on the combined control plane (deployed, checked with "
           "no model); step 8 ran stock agents with a real model: 24 of 24 reps"], size=12)
 
@@ -443,8 +464,8 @@ SECTIONS = [
     ("2", "Architecture", "where each part runs, and a build's states",
      [s_architecture, s_states]),
     ("3", "Onboarding", "create to registered, and the refusals", [s_seq_create, s_seq_refusals]),
-    ("4", "Using a template", "activation, first use, sessions, one control plane",
-     [s_seq_activate, s_first_use, s_seq_session, s_combined]),
+    ("4", "Using a template", "activation, first use, sessions, one plane, every route",
+     [s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
     ("5", "Provenance and validation", "records chained by digest; windows 1-4",
      [s_provenance, s_windows, s_activation_chart, s_issues]),
     ("6", "Next", "deploy, model, upstream", [s_next]),
