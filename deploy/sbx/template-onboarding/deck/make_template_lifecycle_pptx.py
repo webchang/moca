@@ -322,7 +322,7 @@ def s_lifecycle_api(d):
         ["transfer ownership", "an admin", "owner"],
         ["set quotas, default or per user", "an admin", "policy"],
     ], [4.6, 3.6, 3.9], right_from=-1, size=12, row_h=0.42, bold_first_col=False)
-    note(s, 0.6, 5.85, 12.1, 0.6, "Built, not yet deployed",
+    note(s, 0.6, 5.85, 12.1, 0.6, "Deployed and shown end to end",
          ["a retire never cuts off running work: refused while a sandbox or session uses the build"],
          size=12)
 
@@ -393,6 +393,23 @@ def s_windows(d):
         "subject: its create and its new build `409`, its cancel `403`."], size=12, color=MUTED)
 
 
+def s_lifecycle_window(d):
+    s = d.slide("Create to retire, through the API alone, on the cluster",
+                "The lifecycle window, 2026-11-06: a user with no role; no operator step (no model)")
+    table(s, 0.6, 1.5, 12.1, [
+        ["Stage", "What happened"],
+        ["create, build, register", "4 of 4 by policy; the bad gate refused (X10); the bad probe failed"],
+        ["activate, first use, use", "a lease in 23-26 s; every sandbox on its pinned build"],
+        ["retire", "every build; a later create refused `410`; readiness `retired` in ~1 s"],
+        ["the host removes it", "bm1's agent, by itself; `heldBy` emptied in 17-32 s"],
+        ["provenance", "every chain before is an unchanged prefix after; 84 records appended"],
+        ["composition", "an independent composer: every link of each rep unique"],
+    ], [3.6, 8.5], right_from=-1, size=13, row_h=0.5, bold_first_col=True)
+    note(s, 0.6, 5.3, 12.1, 0.9, "A whole-template retire is every build",
+         ["earlier windows' builds of those templates were retired too: a new build is the way back"],
+         size=12)
+
+
 def s_activation_chart(d):
     s = d.slide("Activation fell from ~100 s to ~11-17 s",
                 "Seconds from each activation's request to `active`, both builds of a pair "
@@ -426,7 +443,7 @@ def s_issues(d):
         ["G31", "activation waited for the build poll", "the wanted-state unit", "w4"],
         ["G19", "a session could run on another build", "the build label and filter",
          "combined"],
-        ["G33", "a rep's lease found only by time", "sandbox records by digest", "not yet"],
+        ["G33", "a rep's lease found only by time", "sandbox records by digest", "lifecycle"],
         ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.44, bold_first_col=True)
     note(s, 0.6, 5.55, 12.1, 0.8, "Not yet covered",
@@ -466,8 +483,8 @@ SECTIONS = [
     ("3", "Onboarding", "create to registered, and the refusals", [s_seq_create, s_seq_refusals]),
     ("4", "Using a template", "activation, first use, sessions, one plane, every route",
      [s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
-    ("5", "Provenance and validation", "records chained by digest; windows 1-4",
-     [s_provenance, s_windows, s_activation_chart, s_issues]),
+    ("5", "Provenance and validation", "records chained by digest; windows 1-4; create to retire",
+     [s_provenance, s_windows, s_lifecycle_window, s_activation_chart, s_issues]),
     ("6", "Next", "deploy, model, upstream", [s_next]),
 ]
 

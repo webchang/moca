@@ -211,7 +211,7 @@ Both workers hold their snapshot's memory file until the old one is retired, so 
 for both.
 
 **On a deployment with the template store and host agents, a client does this itself through the
-API**, with no operator step (template lifecycle spec §5; built 2026-11-06, not yet deployed): a new
+API**, with no operator step (template lifecycle spec §5; deployed and shown end to end on 2026-11-06): a new
 build (`POST /v1/templates/{id}/builds`), `default` moved onto it (`mocactl sbx templates tag ID
 default --build B`), then the old build retired (`mocactl sbx templates retire ID --build OLD`). A
 retire is refused while a sandbox or session still uses the build (`409 build_in_use`); after it, the

@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-06T04:50:02Z
+**Last modified:** 2026-11-06T17:01:36Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -405,8 +405,8 @@ Removing a template entirely is `--remove ID`. On 2026-10-30 retiring `django-dj
 worker's token, a create of it was refused (`no such template`), and an astropy sandbox created
 before kept running.
 
-**Self-serve, through the API** (a deployment with the template store and host agents; built
-2026-11-06, not yet deployed): the template's owner does it all, with no operator step.
+**Self-serve, through the API** (a deployment with the template store and host agents; deployed and
+shown end to end on 2026-11-06): the template's owner does it all, with no operator step.
 
 Point `default` at a new build (new creates use it), then retire the old build, or the whole
 template:

@@ -639,6 +639,21 @@ model); the sandbox-side measures do. Step 7 again
 afterwards: 8 chains and 291 records verified offline, each of the four builds with its `build`
 record and its activations in the chain.
 
+**The lifecycle window** (2026-11-06, `moca-sbx-template` on the lifecycle image `40fc7a80`, no
+model): the whole template lifecycle through the API, by a user with no role, no operator step.
+Four templates created self-serve and registered by policy (the broken gate refused, X10; the broken
+probe failed at `probe`); first use; replays on pinned builds (4 of 4); then **retire**: each
+template's every build retired (a whole-template retire includes earlier windows' builds), a create
+after it refused `410 template_retired`, readiness `retired` within about a second, and bm1's host
+agent **removed each build's worker and snapshot by itself** (step 7), seen through the API as
+`heldBy` emptying in 17-32 s. Provenance after: 375 records verified, and every chain from before
+the window an unchanged prefix of its chain after (84 records appended, none rewritten). An
+independent composer (autobench-moca's) joined each of the window's reps through the store with
+**every link unique**: build, registration, policy, create, gate, the sandbox's lease, the sandbox's
+span, and the retire with the host's removal (register G33 validated). Earlier reps, made before the
+`sandbox` record kind existed, still read their lease by time, as §7.1 says a store spanning the
+change does.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
@@ -707,6 +722,8 @@ record and its activations in the chain.
    (2026-11-05); windows 3 and 4 measured G30 and G31 (2026-11-05); the combined control plane's attach
    window passed 2, 4, 5 (a sandbox and a Moca Pi session on one build), 6 and 7 (2026-11-05); step 8
    ran 2026-11-06 with DeepSeek on CurveBender: 24 of 24 reps, no void, every one on its pinned build.
+   The lifecycle window (2026-11-06) ran create through retire through the API, with the host's
+   own removal and every provenance link unique.
 
 ## 12. Decisions
 
