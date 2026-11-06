@@ -80,7 +80,7 @@ keyset, a route certificate, the token issuer or `SBX_MAX_INFLIGHT` rolls the co
 relay. Any other setting (templates, subjects, quotas, lifetimes) rolls the control plane alone, so
 running commands carry on ([the runbook](RUNBOOK.md#2-upgrading)).
 
-**One namespace per SBX stack.** The run refuses a `moca-mu1` Secret it did not create: a MOCA
+**One namespace per SBX stack.** The run refuses a `moca-mu1` Secret it did not create: a moca
 control plane's signing key, in a shared namespace or copied in. The two stacks also mint API tokens
 under different issuers, so neither accepts the other's.
 
