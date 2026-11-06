@@ -614,17 +614,9 @@ Sonnet; two stock brains (Claude Code 2.1.286 and OpenCode 1.18.35), 3 reps × 4
 fresh self-serve builds (the broken gate refused, X10; the broken probe failed at `probe`). **24 of 24
 reps recorded with no void**, each on its first attempt; every sandbox served its pinned build
 (`buildId` = manifest hash = pin); activations 13.8-21.1 s; a token renewal path through a forwarder
-proven in the dry run. Graded with the official SWE-bench harness (swebench 5.0.2, at the pinned Lite revision) on these
-**4 SWE-bench Lite instances × 3 reps**, model **DeepSeek-V4.1-Flash on CurveBender**: **Claude Code
-12 of 12 resolved, OpenCode 12 of 12** (published 2026-11-06, the user's decision; records:
-autobench-moca `runs/step8-1-b`). Two caveats travel with these counts. **They are not independent
-samples:** the 24 patches are 11 distinct texts (sympy-18189 has one text in all 6 reps of both
-brains, and the other three each repeat a text across reps and brains), though every trajectory
-differs and the gateway's cache was bypassed (the run record), so 12 of 12 counts reps, not
-independent fixes. **It is an easy set:** these four are the instances the windows built, and they
-have resolved before. Medians per rep, over 12 reps each, Claude Code against OpenCode: wall 39.0
-against 30.0 s, `sbx` Execs 9 against 7.5, sandbox time 12.0 against 5.5 s. Resolution, tokens and model
-time do not compare with the Sonnet baseline (another model); the sandbox-side measures do. Step 7 again
+proven in the dry run. Graded with the official harness; the grading stays in autobench-moca's records (`runs/step8-1-b`,
+not published). Resolution, tokens and model time do not compare with the Sonnet baseline (another
+model); the sandbox-side measures do. Step 7 again
 afterwards: 8 chains and 291 records verified offline, each of the four builds with its `build`
 record and its activations in the chain.
 
