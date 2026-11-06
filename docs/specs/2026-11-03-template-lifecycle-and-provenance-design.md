@@ -432,18 +432,22 @@ follows) so the chain from the image to a session can be walked and checked. Eve
 | `tag` · `visibility` · `owner` | the owner or an admin changes one                                                      | the new value and the one before: `tag` {tag, buildId (null when removed), before}; `visibility` {field (visibility or description), value, before}; `owner` {owner, before}                                                                                                          |
 | `retire` · `reject`            | a template or build is retired, or rejected after the fact, and when a host removes it | subject, reason, `from` (the status before), `buildRecord`; a host's removal is a `retire` by `host:<id>` with `event: removed`                                                                                                                                                       |
 | `sandbox`                      | a sandbox is created, and when it ends                                                 | at create: sandboxId, buildId, templateManifestHash, `lease` (null with no lease), expiresAt; at end: `state: terminated`, `reason` (`deleted` with endedAt, or `expired`: written by the janitor's sweep when it first sees it, once; the true end is expiresAt)                     |
+| `session`                      | a Moca Pi session pinned through the store is created, and when it is deleted          | at create: sessionId, buildId, templateManifestHash, `lease` (null with no lease), `state: created`; at delete: sessionId, buildId, `state: terminated`, `reason: deleted`, endedAt                                                                                                   |
 | `use` (summary)                | sessions start                                                                         | per build and day: count, first and last, by subject                                                                                                                                                                                                                                  | the control plane       |
 
 **Every cross-record reference is a record digest** (the sha256 of the referenced record's
 canonical JSON), never a time or a name, so a chain composes with no rule but equality: `check.policy`
 (the policy record), `check.build`, `retire.buildRecord`, `reject.buildRecord` (the build's `build`
-record), `sandbox.lease` (the `activate` record the sandbox's lease came from). A rep then joins
-exactly: its build id is the `build` record's `manifest_hash` and the `activate` and `sandbox`
-records' `buildId`. **As of the 2026-11-06 image** (the `sandbox` kind, `lease` and `buildRecord`):
+record), `sandbox.lease` and `session.lease` (the `activate` record the sandbox's or session's lease came
+from). A rep then joins exactly: its build id is the `build` record's `manifest_hash` and the
+`activate`, `sandbox` and `session` records' `buildId`; a session rep's span is its two `session`
+records, by sessionId. **As of the 2026-11-06 image** (the `sandbox` kind, `lease` and `buildRecord`):
 a store older than that has none of them, and one that spans the change mixes exact links with
 links only time can infer (a sandbox under a lease taken before the image has `lease: null`); a
 composer should report the two apart. A verifier from before the change refuses a store holding a
-`sandbox` record.
+`sandbox` record. The `session` kind came later the same day (a Moca Pi session's span, as
+`sandbox` for a sandbox): a verifier from before it refuses a store holding one, and sessions
+created before it have no `created` record.
 
 ### 7.2 Hosting, persistence and offline verification
 

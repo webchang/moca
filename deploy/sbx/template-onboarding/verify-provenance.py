@@ -25,7 +25,7 @@ import sys
 EXPORT_SCHEMA = "moca-provenance-export/1"
 RECORD_SCHEMA = "moca-provenance-record/1"
 KINDS = {"policy", "create", "gate", "build", "check", "activate", "deactivate", "tag", "visibility",
-         "owner", "retire", "reject", "use", "sandbox"}
+         "owner", "retire", "reject", "use", "sandbox", "session"}
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 

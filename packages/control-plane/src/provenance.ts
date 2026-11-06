@@ -44,6 +44,9 @@ export const RECORD_KINDS = [
   // A sandbox's span on a build (§7.1): written at create (its lease's activate record named) and
   // when it ends. Added 2026-11-06; a verifier that predates it refuses a store holding one.
   'sandbox',
+  // A Moca Pi session's span on a build (§7.1), as `sandbox` for a sandbox: written when a session
+  // pinned through the store is created and deleted. Added 2026-11-06, after `sandbox`.
+  'session',
 ] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 

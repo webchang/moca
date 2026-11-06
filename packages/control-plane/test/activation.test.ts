@@ -382,6 +382,123 @@ describe('activation on first use (§6.4)', () => {
     });
   });
 
+  it("a pinned session's seed is its build's, and its span is on the build's chain (§7.1)", async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await seedCredential(d);
+    await activate(d, 't1');
+    const act = (await d.provenance!.chain('template/t1'))
+      .filter((x) => x.kind === 'activate')
+      .at(-1)!;
+    const r = await HANDLERS.createSession!(
+      ctx({ principal: alice, body: { sandbox: { template: `t1@${hash('1')}` } } }),
+      d,
+    );
+    expect(r.status).toBe(201);
+    const sid = (r.body as Body).sessionId as string;
+    const created = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(created).toMatchObject({
+      kind: 'session',
+      subject: alice.sub,
+      body: {
+        sessionId: sid,
+        buildId: hash('1'),
+        templateManifestHash: hash('1'),
+        lease: recordDigestOf(act),
+        state: 'created',
+      },
+    });
+    // The seed is the pinned build's own spec.seed, not the env list's (t1 is in none).
+    const ex = await exchangeCredential((r.body as Body).token as string, d);
+    expect(ex).toMatchObject({
+      sandboxTemplate: 't1',
+      sandboxBuildId: hash('1'),
+      sandboxSeed: SPEC.seed,
+      sandboxSeedSource: 'build',
+    });
+    expect(SPEC.seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    // Its end, on the same chain, once.
+    now += 5000;
+    await HANDLERS.deleteSession!(ctx({ principal: alice, params: { id: sid } }), d);
+    const ended = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(ended).toMatchObject({
+      kind: 'session',
+      body: {
+        sessionId: sid,
+        buildId: hash('1'),
+        state: 'terminated',
+        reason: 'deleted',
+        endedAt: Math.floor(now / 1000),
+      },
+    });
+    expect(
+      (await d.provenance!.chain('template/t1')).filter((x) => x.kind === 'session'),
+    ).toHaveLength(2);
+  });
+
+  it('a build without a seed sends none, even where the env list declares one', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    const { seed: _seed, ...noSeed } = BASE_SPEC as Body;
+    await HANDLERS.createTemplate!(
+      ctx({
+        principal: alice,
+        body: { id: 't1', image: IMAGE, spec: { ...noSeed, seed: '' }, profile: 'base' },
+      }),
+      d,
+    );
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    await HANDLERS.hostBuildReport!(
+      asHost(
+        'bm1',
+        { build: c.builds[0].build },
+        {
+          event: 'built',
+          templateRecord: JSON.stringify({
+            schema: 'moca-sbx-template/1',
+            id: 't1',
+            worker: 'sbx_t1',
+            snapshot: 't1-x',
+            image: IMAGE,
+            guest_ram_mb: 4096,
+            manifest_hash: hash('1'),
+          }),
+          manifest: JSON.stringify({
+            hash_version: 2,
+            hash: hash('1'),
+            guest_ram_mb: 4096,
+            vcpus: 2,
+            source_image_digest: DIGEST,
+          }),
+        },
+      ),
+      d,
+    );
+    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await seedCredential(d);
+    await activate(d, 't1');
+    const declared = {
+      ...d,
+      config: {
+        ...d.config,
+        sessionTemplates: [
+          { id: 't1', worker: 'sbx_t1', description: '', tools: [], seed: 'echo env' },
+        ],
+      },
+    };
+    const r = await HANDLERS.createSession!(
+      ctx({ principal: alice, body: { sandbox: { template: 't1' } } }),
+      declared,
+    );
+    expect(r.status).toBe(201);
+    const ex = await exchangeCredential((r.body as Body).token as string, declared);
+    expect(ex).toMatchObject({ sandboxTemplate: 't1', sandboxBuildId: hash('1') });
+    expect(ex).not.toHaveProperty('sandboxSeed');
+    expect(ex).not.toHaveProperty('sandboxSeedSource');
+  });
+
   it('with activate: false, answers 409 and starts nothing', async () => {
     const d = await setup();
     attachedNow = [];

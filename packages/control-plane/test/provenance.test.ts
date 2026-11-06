@@ -283,6 +283,45 @@ describe.skipIf(!havePython)('verify-provenance.py agrees with verifyExport', ()
     expect(r.out).toContain('ok template/django-django-11133: 6 records');
   });
 
+  it('verifies a store holding the session kind (added 2026-11-06), created and terminated', async () => {
+    const s = store();
+    await onboard(s);
+    const act = await s.append({
+      stream: 'template/django-django-11133',
+      kind: 'activate',
+      subject: 'github:1',
+      body: { buildId: 'sha256:' + 'a'.repeat(64), leaseSeconds: 3600 },
+    });
+    for (const body of [
+      {
+        sessionId: 'sess-1',
+        buildId: 'sha256:' + 'a'.repeat(64),
+        templateManifestHash: 'sha256:' + 'a'.repeat(64),
+        lease: act.digest,
+        state: 'created',
+      },
+      {
+        sessionId: 'sess-1',
+        buildId: 'sha256:' + 'a'.repeat(64),
+        state: 'terminated',
+        reason: 'deleted',
+        endedAt: 1,
+      },
+    ]) {
+      await s.append({
+        stream: 'template/django-django-11133',
+        kind: 'session',
+        subject: 'github:1',
+        body,
+      });
+    }
+    const doc = JSON.parse(JSON.stringify(await s.export(['template/django-django-11133'])));
+    expect(verifyExport(doc).ok).toBe(true);
+    const r = runVerifier(doc);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain('ok template/django-django-11133: 7 records');
+  });
+
   it('fails where verifyExport fails', async () => {
     const s = store();
     await onboard(s);
