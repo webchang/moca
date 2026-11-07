@@ -529,6 +529,40 @@ describe('sandboxTemplateField (session-templates spec §6)', () => {
     expect(r).toEqual({ status: 'ready', values: { sandboxTemplate: '' }, request: {} });
   });
 
+  it('sends an undeclared value as given, for the control plane to resolve (G37: id@build, id:tag)', async () => {
+    for (const v of [
+      'django-django-11133@sha256:' + 'a'.repeat(64),
+      'py312:stable',
+      'self-serve-id',
+    ]) {
+      const r = await resolveSessionOptions(
+        api(T),
+        [sandboxTemplateField],
+        { sandboxTemplate: v },
+        {},
+        { interactive: false },
+      );
+      expect(r).toEqual({
+        status: 'ready',
+        values: { sandboxTemplate: v },
+        request: { sandbox: { template: v } },
+      });
+    }
+  });
+
+  it('sends an undeclared value even on a deployment that declares none (a store-only template)', async () => {
+    const r = await resolveSessionOptions(
+      api(undefined),
+      [sandboxTemplateField],
+      { sandboxTemplate: 'astropy-astropy-14995@sha256:' + 'b'.repeat(64) },
+      {},
+    );
+    expect(r).toMatchObject({
+      status: 'ready',
+      request: { sandbox: { template: expect.any(String) } },
+    });
+  });
+
   it('is in SESSION_OPTION_FIELDS, after the tier', () => {
     const keys = SESSION_OPTION_FIELDS.map((f) => f.key);
     expect(keys.indexOf('sandboxTemplate')).toBe(keys.indexOf('sandboxTier') + 1);

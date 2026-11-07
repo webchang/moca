@@ -134,6 +134,60 @@ describe('cmdRun', () => {
     );
   });
 
+  it('sends an undeclared --option sandboxTemplate (id@build), and waits out template_not_active (G37)', async () => {
+    const asked: unknown[] = [];
+    const pin = 'django-django-11133@sha256:' + 'c'.repeat(64);
+    const cp = fakeControlPlane({
+      listCredentials: async () => [credential('a')],
+      discovery: async () =>
+        ({
+          harnessUrl: null,
+          sandboxTiers: null,
+          sandboxTemplates: [{ id: 'matplotlib-matplotlib-23476', description: '', tools: [] }],
+        }) as never,
+      createSession: async (req) => {
+        asked.push(req);
+        if (asked.length === 1)
+          throw new ApiError('control-plane', 409, 'template_not_active', 'activating', 1);
+        return { sessionId: 's-pin', token: 'st', expiresAt: 4_000_000_000 };
+      },
+    });
+    const o = io();
+    expect(
+      await cmdRun(runtime({ cp }), o, {
+        prompt: 'hi',
+        options: { sandboxTemplate: pin },
+        json: false,
+      }),
+    ).toBe(0);
+    expect(asked).toHaveLength(2);
+    expect(asked[0]).toMatchObject({ sandbox: { template: pin } });
+    expect(o.stderr.join('\n')).toContain("the session's template is activating; retrying in 1 s");
+  });
+
+  it('reports unknown_template and template_retired from the control plane as given', async () => {
+    for (const [status, code, msg] of [
+      [400, 'unknown_template', 'no such template (GET /v1/templates lists them)'],
+      [410, 'template_retired', "template 'x' build sha256:… is retired"],
+    ] as const) {
+      const o = io();
+      const cp = fakeControlPlane({
+        listCredentials: async () => [credential('a')],
+        createSession: async () => {
+          throw new ApiError('control-plane', status, code, msg);
+        },
+      });
+      expect(
+        await cmdRun(runtime({ cp }), o, {
+          prompt: 'hi',
+          options: { sandboxTemplate: 'x@sha256:' + 'd'.repeat(64) },
+          json: false,
+        }),
+      ).toBe(1);
+      expect(o.stderr.join('\n')).toContain(msg);
+    }
+  });
+
   it('uses the credential named with --option', async () => {
     let asked: unknown;
     const rt = runtime({

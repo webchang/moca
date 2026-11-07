@@ -179,7 +179,11 @@ An injected sandbox (a leaf's) is its caller's, and a leaf takes its own patch: 
 ## 6. User surface
 
 - mocactl: `--option sandboxTemplate=<id>` (a `SESSION_OPTION_FIELDS` entry; its choices from
-  `/v1/discovery`), shown in the session list beside the tier.
+  `/v1/discovery`), shown in the session list beside the tier. A value that is not among those
+  choices is sent as given, for the control plane to resolve: on a deployment with a template store,
+  `id`, `id:tag` or `id@sha256:…` (register G37). Its refusals (`unknown_template`,
+  `template_retired`) are shown as the control plane words them; a `409 template_not_active` is
+  waited out after its Retry-After, as for any create (lifecycle spec §6.4).
 - The JSON turn result's `sandbox` gains `template` when the session has one, and `seed`
   (`{source, buildId?}`) when a seed applied; the result gains `workspace` (§5.1).
 

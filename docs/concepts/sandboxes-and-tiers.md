@@ -76,7 +76,8 @@ saturated the turn gets 503 `sandbox_unavailable` with `Retry-After`.
   (`SANDBOX_TEMPLATE` in its environment). The control plane declares the templates in
   `SH_SANDBOX_TEMPLATES`, a JSON list of `{id, worker, description, tools, seed?}`.
 - A user picks a template once, at session creation (`mocactl run --option sandboxTemplate=ID`), beside the
-  tier. Every turn then runs on a worker of that template. A session that names none runs only on workers
+  tier. With a template store, `ID` may also pin a build (`ID@sha256:…`) or a tag (`ID:TAG`); mocactl
+  passes such a value through and the control plane resolves it. Every turn then runs on a worker of that template. A session that names none runs only on workers
   with no template, so it never gets a benchmark image by accident.
 - Leaves (`/runs`) and unauthenticated turns name no template either: keep at least one untemplated
   worker for them. If every worker is templated they fail with `sandbox_unavailable`.
