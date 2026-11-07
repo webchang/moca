@@ -224,9 +224,11 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
     },
   );
 
-  it('exits 124 for a timed-out or killed command and 125 for a sandbox failure', async () => {
+  it('exits 124 for a timed-out or killed command, 125 for a sandbox failure, 75 for a refusal before start', async () => {
     const run = async (answer: ExecResult | Error) => {
-      const { home, env, io } = setup();
+      const { home, env: env0, io } = setup();
+      // No retry here (G36's retry has its own tests below): every failure exits on the first try.
+      const env = { ...env0, MOCACTL_SBX_BUSY_RETRIES: '0' };
       const x = fakeExec(() => answer);
       const code = await sbxMain(['run', '--sandbox', SBX, '--', 'sleep', '9'], env, io, {
         home,
@@ -253,12 +255,13 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
     const busy = await run(
       new ExecMachineryError('sandbox busy: 4 Execs already in flight', 8, 'busy'),
     );
-    expect(busy.code).toBe(125);
+    // Refused before start: nothing ran, so its own exit (75, register G36), not a sandbox failure.
+    expect(busy.code).toBe(75);
     expect(busy.err).toContain(SANDBOX_BUSY_TEXT);
     const full = await run(
       new ExecMachineryError('template busy: busy: queue full', 2, 'template_busy'),
     );
-    expect(full.code).toBe(125);
+    expect(full.code).toBe(75);
     expect(full.err).toContain(TEMPLATE_BUSY_TEXT);
     // Cut mid-command: the CLI says it may have partly run (final review M2).
     const cut = await run(
@@ -278,6 +281,117 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
     );
     expect(expired.code).toBe(125);
     expect(expired.err).toContain(TOKEN_EXPIRED_TEXT);
+  });
+
+  describe('a refusal before start is retried (register G36)', () => {
+    const memoryBudget = () =>
+      new ExecMachineryError(
+        'template busy: memory-budget: promoting a standby would re-price it',
+        2,
+        'template_busy',
+      );
+    /** Answers `failures` in order, then a clean result; records the waits. */
+    async function runWith(
+      failures: Error[],
+      over: {
+        env?: Record<string, string>;
+        signal?: AbortSignal;
+        abortOnSleep?: AbortController;
+      } = {},
+    ) {
+      const { home, env, io } = setup();
+      let n = 0;
+      const x = fakeExec(() => (n < failures.length ? failures[n++]! : res({ exitCode: 3 })));
+      const waits: number[] = [];
+      const code = await sbxMain(
+        ['run', '--sandbox', SBX, '--', 'git', 'status'],
+        { ...env, ...over.env },
+        io,
+        {
+          home,
+          fetchImpl: mint().fetchImpl,
+          execFactory: x.factory,
+          random: () => 0.5,
+          sleep: async (ms) => {
+            waits.push(ms);
+            over.abortOnSleep?.abort();
+          },
+          ...(over.signal ? { signal: over.signal } : {}),
+        },
+      );
+      return { code, sent: x.sent.length, waits, err: io.errs.join('\n') };
+    }
+
+    it("sends it again after a backoff, and exits with the command's code once it runs", async () => {
+      const r = await runWith([
+        memoryBudget(),
+        new ExecMachineryError('sandbox busy: 4 Execs already in flight', 8, 'busy'),
+      ]);
+      expect(r.code).toBe(3);
+      expect(r.sent).toBe(3);
+      expect(r.waits).toEqual([1000, 2000]);
+      expect(r.err).toMatch(/nothing ran; retrying in 1\.0s \(1\/4\)/);
+      expect(r.err).toMatch(/nothing ran; retrying in 2\.0s \(2\/4\)/);
+    });
+
+    it('exits 75 when every try is refused, the waits under 30 s in all', async () => {
+      const r = await runWith(Array.from({ length: 9 }, memoryBudget));
+      expect(r.code).toBe(75);
+      expect(r.sent).toBe(5);
+      expect(r.waits).toEqual([1000, 2000, 4000, 8000]);
+      expect(r.err).toMatch(
+        /refused the command 5 times before starting it; nothing ran \(exit 75\)/,
+      );
+    });
+
+    it('keeps the waits under 30 s at the most jitter', async () => {
+      const { home, env, io } = setup();
+      const x = fakeExec(() => memoryBudget());
+      const waits: number[] = [];
+      await sbxMain(['run', '--sandbox', SBX, '--', 'true'], env, io, {
+        home,
+        fetchImpl: mint().fetchImpl,
+        execFactory: x.factory,
+        random: () => 1,
+        sleep: async (ms) => void waits.push(ms),
+      });
+      expect(waits.reduce((a, b) => a + b, 0)).toBeLessThan(30_000);
+    });
+
+    it('never retries a machinery failure, a token expiry, or a failure after the command may have run', async () => {
+      for (const err of [
+        new ExecMachineryError('sandbox failure: vm boot failed'),
+        new ExecMachineryError('sandbox token expired during the Exec', 4, 'token_expired'),
+        new ExecMachineryError('template busy: max-runs: full', 2, 'template_busy', true),
+      ]) {
+        const r = await runWith([err]);
+        expect(r.code).toBe(125);
+        expect(r.sent).toBe(1);
+        expect(r.waits).toEqual([]);
+      }
+    });
+
+    it('stops with 130 when interrupted while waiting', async () => {
+      const ac = new AbortController();
+      const r = await runWith([memoryBudget(), memoryBudget()], {
+        signal: ac.signal,
+        abortOnSleep: ac,
+      });
+      expect(r.code).toBe(130);
+      expect(r.sent).toBe(1);
+    });
+
+    it('MOCACTL_SBX_BUSY_RETRIES=0 turns it off (exit 75 on the first refusal), and sets the count', async () => {
+      const off = await runWith([memoryBudget()], { env: { MOCACTL_SBX_BUSY_RETRIES: '0' } });
+      expect(off.code).toBe(75);
+      expect(off.sent).toBe(1);
+      expect(off.waits).toEqual([]);
+      const one = await runWith([memoryBudget(), memoryBudget()], {
+        env: { MOCACTL_SBX_BUSY_RETRIES: '1' },
+      });
+      expect(one.code).toBe(75);
+      expect(one.sent).toBe(2);
+    });
   });
 
   it('says when the sandbox cut the output or the timeout', async () => {
@@ -509,6 +623,31 @@ describe('mocactl sbx put (SBX0 §6.1)', () => {
     const { home, env, io } = setup();
     expect(await sbxMain(['put', '--sandbox', SBX], env, io, { home })).toBe(2);
     expect(await sbxMain(['put', 'a', 'b', '--sandbox', SBX], env, io, { home })).toBe(2);
+  });
+});
+
+describe('mocactl sbx put: a refusal before start (register G36)', () => {
+  it("is retried as run's, and the write goes out once it is accepted", async () => {
+    const { home, env, io } = setup();
+    let n = 0;
+    const x = fakeExec(() =>
+      n++ === 0
+        ? new ExecMachineryError('template busy: busy: queue full', 2, 'template_busy')
+        : res({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }),
+    );
+    const waits: number[] = [];
+    const code = await sbxMain(['put', 'a.txt', '--sandbox', SBX], env, io, {
+      home,
+      fetchImpl: mint().fetchImpl,
+      execFactory: x.factory,
+      stdinIsTTY: false,
+      readStdinBytes: async () => Buffer.from('x'),
+      random: () => 0.5,
+      sleep: async (ms) => void waits.push(ms),
+    });
+    expect(code).toBe(0);
+    expect(x.sent).toHaveLength(2);
+    expect(waits).toEqual([1000]);
   });
 });
 
