@@ -7,10 +7,12 @@ Sources, in the order they win (a slide restates them; change the source first):
   1. docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md (states §3.3, API §4,
      host agent §6.1, first use §6.4, provenance §7, policy §8, validation §10.1)
   2. docs/specs/2026-11-05-combined-control-plane-design.md (one control plane, turns by build)
-  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G33)
+  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G37)
   4. deploy/sbx/RUNBOOK.md §15 (the host agent, its units)
   5. the run record of windows 1-4 (on the user's machine; its numbers are copied below with the
-     window they come from)
+     window they come from); spec §10.1's Lite-28 and Moca Pi window entries (words, no counts)
+  6. docs/specs/2026-10-30-session-sandbox-templates-design.md §5, §5.1 (seed from the build, the
+     turn's workspace patch)
 """
 import sys
 from pathlib import Path
@@ -401,13 +403,52 @@ def s_lifecycle_window(d):
         ["create, build, register", "all four by policy; the bad gate refused (X10); the bad probe failed"],
         ["activate, first use, use", "a lease in 23-26 s; every sandbox on its pinned build"],
         ["retire", "every build; a later create refused `410`; readiness `retired` in ~1 s"],
-        ["the host removes it", "bm1's agent, by itself; `heldBy` emptied in 17-32 s"],
+        ["the host removes it", "the KVM host's agent, by itself; `heldBy` emptied in 17-32 s"],
         ["provenance", "every chain before is an unchanged prefix after; 84 records appended"],
         ["composition", "an independent composer: every link of each rep unique"],
     ], [3.6, 8.5], right_from=-1, size=13, row_h=0.5, bold_first_col=True)
     note(s, 0.6, 5.3, 12.1, 0.9, "A whole-template retire is every build",
          ["earlier windows' builds of those templates were retired too: a new build is the way back"],
          size=12)
+
+
+def s_two_brains(d):
+    s = d.slide("Two brains on one build, every link exact",
+                "The Moca Pi window, 2026-11-07: a stock agent and Moca Pi, a real model, the "
+                "combined control plane")
+    brain(s, 0.6, 1.6, 3.5, 1.05, "Stock agent (OpenCode)", ["a sandbox on `id@build`"], size=12)
+    brain(s, 0.6, 3.05, 3.5, 1.05, "Moca Pi", ["a session on `id@build`"], size=12)
+    orchestrator(s, 4.9, 1.95, 3.1, 1.8, "Control plane", ["one catalog, lease,", "provenance"],
+                 size=12)
+    hands(s, 8.8, 2.3, 3.9, 1.1, "Workers of that build", ["sized for both at once"], size=12)
+    arrow(s, 4.1, 2.12, 4.9, 2.55)
+    arrow(s, 4.1, 3.58, 4.9, 3.15)
+    arrow(s, 8.0, 2.85, 8.8, 2.85)
+    table(s, 0.6, 4.45, 12.1, [
+        ["What the session now does", "Seen"],
+        ["seeded from its build's own spec", "`sandbox.seed.source: build`, the build = the pin"],
+        ["returns the workspace's patch with the turn", "whole, its sha256 and size matching"],
+        ["leaves a `session` record at create and delete", "its lease and build, on the template's chain"],
+        ["composes like a sandbox", "every link of every rep unique, for both brains"],
+    ], [5.0, 7.1], right_from=-1, size=12, row_h=0.38, bold_first_col=False)
+
+
+def s_lite28(d):
+    s = d.slide("SWE-bench Lite on templates, in groups, retire between",
+                "Lite-28 on templates, 2026-11-06/07: stock brains, the sandbox profile, a real model")
+    text(s, 0.6, 1.55, 7.2, 3.9, [
+        "**Self-serve, in three groups:** each group created, built and registered by policy, used "
+        "on pinned builds, then retired; the host agent's removal checked before the next group.",
+        "**Provenance:** every chain before an unchanged prefix after; an independent composer "
+        "joined every link of every rep uniquely.",
+        "**One instance left out:** its id is a template the deployment declares, which blocks a "
+        "self-serve create under that id (G34).",
+    ], size=14, bullets=True, gap=10)
+    note(s, 8.2, 1.6, 4.5, 1.45, "Two agents on one template at once",
+         ["the one-session minimum budget refused some commands at admission (G36): clients now "
+          "retry and exit 75; budgets sized for the work run at once"], size=12)
+    note(s, 8.2, 3.3, 4.5, 0.85, "Removal keeps workspaces",
+         ["for the janitor; without it they stay on the host's disk"], size=12)
 
 
 def s_activation_chart(d):
@@ -444,25 +485,29 @@ def s_issues(d):
         ["G19", "a session could run on another build", "the build label and filter",
          "combined"],
         ["G33", "a rep's lease found only by time", "sandbox records by digest", "lifecycle"],
+        ["G35", "a session got no seed, no patch, no record", "seed from the build; patch; `session`",
+         "Moca Pi"],
+        ["G36", "commands refused at a one-session budget", "client retry; budget sizing",
+         "Moca Pi"],
         ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
-    ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.44, bold_first_col=True)
-    note(s, 0.6, 5.55, 12.1, 0.8, "Not yet covered",
-         ["a Moca Pi turn with a model on the combined control plane (deployed, checked with "
-          "no model); step 8 ran stock agents with a real model, every rep completed"], size=12)
+    ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.4, bold_first_col=True)
+    note(s, 0.6, 5.8, 12.1, 0.65, "Open",
+         ["G34: a declared template's id blocks self-serve creates; G37: mocactl's template "
+          "option takes only declared ids, not `id@build`"], size=12)
 
 
 # --------------------------------------------------------------------------- 6. Next
 
 def s_next(d):
-    s = d.slide("Next: both brains on one control plane, then upstream",
+    s = d.slide("Next: the two open gaps, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "A real model and grading: done", "step 8 (2026-11-06): DeepSeek on CurveBender, "
-         "two stock brains, every rep on its pinned build, no void"),
-        ("2", "Both brains on the combined control plane", "deployed and attached; next a "
-         "window on the KVM host with a model, Moca Pi beside a stock agent"),
-        ("3", "Propose upstream", "as PRs, from what the windows proved; upstream has no "
-         "session templates today"),
+        ("1", "Both brains on one control plane: done", "the Moca Pi window (2026-11-07): a stock "
+         "agent and Moca Pi on the same builds, every provenance link exact"),
+        ("2", "Close G34 and G37", "hand a declared template to a subject; let mocactl take "
+         "`id@build` for a session"),
+        ("3", "Propose upstream", "as reviewable PRs, from what the windows proved; upstream has "
+         "no session templates today"),
     ]
     y = 1.65
     for n, t, b in rows:
@@ -470,8 +515,8 @@ def s_next(d):
         text(s, 1.55, y + 0.05, 4.4, 0.9, [f"**{t}**"], size=16)
         text(s, 6.0, y + 0.05, 6.7, 0.95, [b], size=14, color=MUTED)
         y += 1.35
-    note(s, 0.6, 5.8, 12.1, 0.6, "Deployed, no model yet",
-         ["the combined control plane runs on the cluster; a sandbox and a session shared one build (no model)"],
+    note(s, 0.6, 5.8, 12.1, 0.6, "Deployed and validated with a model",
+         ["the combined control plane runs on the cluster; both kinds of client shared one build"],
          size=12)
 
 
@@ -484,8 +529,9 @@ SECTIONS = [
     ("4", "Using a template", "activation, first use, sessions, one plane, every route",
      [s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
     ("5", "Provenance and validation", "records chained by digest; windows 1-4; create to retire",
-     [s_provenance, s_windows, s_lifecycle_window, s_activation_chart, s_issues]),
-    ("6", "Next", "deploy, model, upstream", [s_next]),
+     [s_provenance, s_windows, s_lifecycle_window, s_activation_chart]),
+    ("6", "At scale, and next", "Lite-28; two brains on one build; findings; the open gaps",
+     [s_lite28, s_two_brains, s_issues, s_next]),
 ]
 
 if __name__ == "__main__":
@@ -501,4 +547,4 @@ if __name__ == "__main__":
              ])
     d.build(SECTIONS, lambda d: d.title_slide(
         "Self-serve sandbox templates, gated by policy, with provenance",
-        "sbx-template · 2026-11-05"))
+        "sbx-template · 2026-11-07"))

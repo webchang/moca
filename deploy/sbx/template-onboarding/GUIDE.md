@@ -1,6 +1,6 @@
 # MOCA — Template Onboarding Guide
 
-**Last modified:** 2026-11-06T17:33:14Z
+**Last modified:** 2026-11-07T15:16:38Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -9,7 +9,9 @@ agent session, asks for by id, and whose commands then run in microVMs restored 
 snapshot. It walks through two worked examples end to end: MOCA's public sandbox image (anyone can
 reproduce it) and a SWE-bench instance (the benchmark case it was built for). It was validated on
 2026-10-29 and 2026-10-30 against an SBX0 deployment: the control plane and relay on OpenShift, and
-the workers on a bare-metal KVM host.
+the workers on a bare-metal KVM host. Since then the same flow has run self-serve through the API
+for the SWE-bench Lite instances on templates, and for two kinds of client (a stock agent and Moca
+Pi) on one control plane and one build, with every provenance link exact (2026-11-07, §8).
 
 - **A template is one worker serving one snapshot.** Onboarding is: build a snapshot from the image,
   check it in a real microVM, give it a worker, register it, use it, and retire it when a new
@@ -53,6 +55,7 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
 - [6. Two templates side by side: the client chooses](#6-two-templates-side-by-side-the-client-chooses)
 - [7. Update and retire](#7-update-and-retire)
 - [8. Templates in MOCA agent sessions](#8-templates-in-moca-agent-sessions)
+  - [A session pinned to a build, end to end](#a-session-pinned-to-a-build-end-to-end)
 - [9. Capacity](#9-capacity)
 - [10. Troubleshooting (what we actually hit)](#10-troubleshooting-what-we-actually-hit)
 - [11. Regenerating the documents](#11-regenerating-the-documents)
@@ -423,6 +426,15 @@ removes its worker and snapshot. Every step is a record naming who did it. The o
 the description and visibility (`templates edit`); an admin rejects a build after the fact,
 transfers a template (`templates transfer`) and sets quotas (`templates quota`).
 
+The host agent's removal keeps each retired build's sandbox and session **workspaces** for the
+janitor (`install-host.sh --janitor`), which frees them once their sandboxes have ended. On a host
+without the janitor they stay on disk: about a few hundred MB to a GB per template used, so a long
+run of retires fills `/srv/sbx` unless the janitor is installed or the workspaces are removed.
+
+A template the deployment declares (`SH_SANDBOX_TEMPLATES`) has no owner, so a subject cannot create
+a self-serve template under the same id (`409 template_exists`), and no admin can hand it over yet
+(register G34): use another id.
+
 ## 8. Templates in MOCA agent sessions
 
 MOCA's own agent sessions (Moca Pi, P6) can name a template too: `mocactl run --option
@@ -439,25 +451,82 @@ an unknown template was refused at creation.
 
 On the **combined control plane** (one control plane for both, `setup.sh SBX_PROFILE=combined`), a
 session names a self-serve template the same way, and may pin a build (`ID@sha256:…`): it runs only
-on that build's workers. Checked on ykt3 and bm1 on 2026-11-05, with no model: a stock-agent
-sandbox and a session pinned to the same build, and first use through a session (`409
+on that build's workers. Checked on the cluster and the KVM host on 2026-11-05, with no model: a
+stock-agent sandbox and a session pinned to the same build, and first use through a session (`409
 template_not_active`, then created 23 s later).
+
+### A session pinned to a build, end to end
+
+On a deployment with the template store (the combined control plane, image `87b02d64` or later):
+
+- **The seed is the build's own.** The harness seeds the session's workspace from the pinned build's
+  `spec.seed`, the same seed a stock agent's client reads for that build, and reports where it came
+  from: `sandbox.seed: {source: "build", buildId: "sha256:…"}` in the turn's result. A client checks
+  that `buildId` equals its pin. (`source: "declared"` is a template from `SH_SANDBOX_TEMPLATES`.)
+- **The turn returns the patch.** After each turn on a templated session, the result carries
+  `workspace: {baseline, patch, patchSha256, patchBytes}`: the whole workspace's diff from the commit
+  the seed left (`git diff --cached --binary` on a throwaway index, MOCA's own `.moca-*` files left
+  out), also on the terminal `done` and `error` frames, so `mocactl run --json` prints it. It is
+  never truncated: over `SH_TURN_PATCH_MAX_BYTES` (4 MiB by default) `patch` is left out and
+  `patchRefused: "too_large"` says so; a patch that is not UTF-8 comes as `patchBase64`; a failed
+  capture is `{error}` and does not fail the turn. Each turn's patch is the whole end state, so a
+  client takes the last turn's. Extract it with `jq -j` (shell `$(…)` drops the trailing newline, and
+  the checksum then differs).
+- **Creating the session for `ID@build`:** today `mocactl run --option sandboxTemplate=` accepts
+  only the deployment's declared ids, and refuses `ID@sha256:…` before sending anything (register
+  G37). Create the session through the API, then run it:
+
+  ```bash
+  curl -sS -X POST -H @<header file with your api token> -H 'Content-Type: application/json' --data '{"sandbox": {"template": "django-django-11133@sha256:<build>"}, "model": "<model id>", "credentials": {"inference": "<name>"}}' https://sbx-api.example.com/v1/sessions
+  mocactl run "<prompt>" --session <sessionId> --json
+  mocactl sessions delete <sessionId>
+  ```
+
+  A first create on an inactive template is `409 template_not_active` with `Retry-After`: retry.
+  Without the gateway's host in `SH_MODEL_CATALOG_HOSTS`, the model id is accepted unverified
+  (`modelVerified: false`) and `GET /v1/sessions/{id}` shows it.
+
+- **Provenance:** a `session` record at create (its lease's `activate` record and its build) and one
+  at delete, on the template's stream, as a sandbox has. A session that is never deleted has no end
+  record: delete each session when its work is done (an active pinned session also blocks the
+  build's retire).
+
+**Validated on 2026-11-07** (the combined control plane on the cluster, workers on the KVM host, a
+real model): on four SWE-bench templates built fresh, a stock agent (OpenCode) on a sandbox and
+Moca Pi on a session, both pinned to the same build. Every session was seeded from its build and
+returned its patch whole, and an independent composer joined every provenance link of every rep
+exactly, for both kinds of client.
 
 ## 9. Capacity
 
 Measured on one host (188 GiB, 93 GB free) on 2026-10-31, with SWE-bench templates of 4 GiB guests:
 
-| Limit               | Rule                                                                                                                | Measured                                                                                                |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                          | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
-| memory per template | each attached worker keeps its snapshot's memory mapped, idle or not                                                | ~4.1 GiB each                                                                                           |
-| disk, sandboxes     | each seeded sandbox's workspace                                                                                     | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
-| commands at once    | `--budget-mb` ≥ (guest + 32) × 3 + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; every one at 65536 MiB, with almost no real memory used                      |
-| quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                              | deployment settings                                                                                     |
-| logins              | a minted login lasts at most 24 h                                                                                   | —                                                                                                       |
+| Limit               | Rule                                                                                                                            | Measured                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                                      | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
+| memory per template | each attached worker keeps its snapshot's memory mapped, idle or not                                                            | ~4.1 GiB each                                                                                           |
+| disk, sandboxes     | each seeded sandbox's workspace                                                                                                 | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
+| commands at once    | `--budget-mb` ≥ (guest + 32) × (running VMs) + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; every one at 65536 MiB, with almost no real memory used                      |
+| quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                                          | deployment settings                                                                                     |
+| logins              | a minted login lasts at most 24 h                                                                                               | —                                                                                                       |
 
 So on a host like this, disk limits templates and sandboxes before memory does, and the default
 budget allows far fewer commands at once than memory holds: raise `--budget-mb` for parallel runs.
+
+**Size the budget for the work run at once on the template, not for one session.**
+`template-build.sh`'s `min_budget_mb`, (guest + 32) × 3 + 1024 (13408 MiB for a 4 GiB guest), fits
+about two running VMs plus a standby. Two agents working one template at once, each with
+back-to-back commands, then hit admission refusals (`memory-budget: promoting a standby …`, register
+G36). Allow one running VM per command that may run at once: **17536 MiB for four 4 GiB VMs**, as
+the 2026-11-07 runs used with no refusal. The worker's start-up warning (slots × per-VM size against
+the budget) is expected at any budget below its slot count.
+
+**A refused command never ran, and the clients retry it.** `mocactl sbx run` and `sbx put` retry an
+Exec the worker or relay refused before it started (`template_busy`, `busy`), with backoff of 1, 2, 4
+and 8 s (`MOCACTL_SBX_BUSY_RETRIES`, 4 by default, 0 to turn off), and exit **75** when every try is
+refused. The static client (`remote-worker/cmd/sbx`, and its Python twin) does the same within
+`SBX_BUSY_RETRY_S` (30 s by default) and logs each refusal. **125** stays for every other sandbox
+failure, where the command may have run.
 
 ## 10. Troubleshooting (what we actually hit)
 
@@ -471,6 +540,10 @@ budget allows far fewer commands at once than memory holds: raise `--budget-mb` 
 | `sbx up` sandbox has the client's repo, not the template's   | `up` pushes the client repository                                     | `sbx create`, then the seed (§5.3)                                             |
 | every restore after `vm-9` fails "API socket never appeared" | the jail path overflowed a Unix socket for a 31-character template id | fixed (2026-10-31): jails are keyed by a short hash of the worker id           |
 | "no capacity" for minutes, never ending                      | the session's tier or template has no worker attached                 | the retry line (and the harness log) now name the cause; attach a worker of it |
+| `memory-budget: promoting a standby would re-price it …`     | the worker's `--budget-mb` fits fewer running VMs than the work needs | size the budget for the commands run at once (§9); clients retry, then exit 75 |
+| `unknown sandbox template 'ID@sha256:…'; declared: …`        | mocactl checks `--option sandboxTemplate` against the declared list   | create the session through the API, then `mocactl run --session` (§8)          |
+| a session's patch checksum does not match                    | `$(…)` in the shell dropped the patch's trailing newline              | write it with `jq -j '.workspace.patch'` (§8)                                  |
+| a self-serve create is `409 template_exists`, nobody owns it | the id is a template the deployment declares                          | use another id (§7; register G34)                                              |
 
 ## 11. Regenerating the documents
 

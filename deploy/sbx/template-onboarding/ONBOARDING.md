@@ -181,6 +181,12 @@ sudo deploy/sbx/install-host.sh <bundle> --snapshot <snapshot> --budget-mb <at l
 snapshot's manifest. A budget below one session is refused. Each extra 13408 MiB holds one more
 4 GiB session warm.
 
+**Size `--budget-mb` for the commands run at once on this template**, not for one session: a
+running VM is charged its full guest size, so the minimum fits about two at once, and a third is
+refused at admission (`memory-budget: …`, register G36). Allow (guest + 32) × (running VMs) + 1024:
+17536 MiB for four 4 GiB VMs, as used for two agents working one template at once. Clients retry a
+command refused before it started and exit 75 if every try is refused (125 is any other failure).
+
 ## 5. Check it live
 
 `deploy/sbx/templates-check.sh` (RUNBOOK §14) lists the templates and creates a sandbox of each. It
@@ -216,6 +222,8 @@ build (`POST /v1/templates/{id}/builds`), `default` moved onto it (`mocactl sbx 
 default --build B`), then the old build retired (`mocactl sbx templates retire ID --build OLD`). A
 retire is refused while a sandbox or session still uses the build (`409 build_in_use`); after it, the
 host agent removes the worker and the snapshot. Every step is a provenance record naming who did it.
+The removal keeps the build's workspaces for the janitor (`install-host.sh --janitor`): without
+it they stay on the host's disk.
 
 ## What a client does
 
@@ -250,3 +258,10 @@ Limits a long-running client meets:
 - 3 live sandboxes per user and 40 in all by default (`SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`);
 - 2 commands in flight per sandbox (`SBX_MAX_INFLIGHT`);
 - a template with `egress: false` has no network.
+
+**A Moca Pi session on a template** (the combined control plane): the harness runs the seed itself,
+from the pinned build's own spec (the turn's `sandbox.seed.source` is `build`), and each turn's result
+carries the workspace's patch against the seed's baseline (`workspace.patch`, with its sha256 and
+size). For `id@buildId`, create the session through the API (`POST /v1/sessions
+{sandbox:{template:"id@sha256:…"}}`), then `mocactl run --session <id>`, and delete the session
+when done. The [guide](GUIDE.md#a-session-pinned-to-a-build-end-to-end) has the whole path.
