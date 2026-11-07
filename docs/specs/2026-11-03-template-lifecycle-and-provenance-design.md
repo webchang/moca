@@ -666,6 +666,28 @@ autobench-moca's records). Provenance after: every earlier chain an unchanged pr
 composer joined **every link of every rep** uniquely: the first graded reps whose whole chain, from
 the gate record to the sandbox's lease and the build's retire, composes exactly.
 
+**Lite-28 on templates** (2026-11-06/07, `moca-sbx-template`, stock brains on DeepSeek): the SWE-bench
+Lite instances image-factory records, as self-serve templates in three groups, each group built and
+registered by policy, used on pinned builds, then retired, with the host agent's removal checked
+before the next group created. One instance was left out: its id is a template the deployment
+declares, which blocks a self-serve create under the same id (register G34). Provenance after: every
+earlier chain an unchanged prefix, and the composer joined every link of every rep uniquely. Two reps
+on one template at once at the minimum worker budget hit admission refusals (register G36), fixed in
+the clients and by sizing the budget for the reps run at once.
+
+**The Moca Pi window** (2026-11-07, `moca-combined` on `87b02d64`): **two brains on one control plane
+and one build.** On each of window 4's four templates, built fresh, a stock agent (OpenCode) on a
+sandbox and Moca Pi on a session, both pinned to the same `id@buildId`, DeepSeek on CurveBender.
+Every Moca Pi session was seeded from its pinned build's own spec (`sandbox.seed.source: build`),
+returned its workspace's patch against the seed's baseline with the turn (`TurnResult.workspace`,
+checksum and size matching), and was deleted at the end of its rep. At a worker budget sized for the
+reps run at once, no admission refusal. Retire and the host's removal as before. Provenance after:
+every earlier chain an unchanged prefix, a `session` record at each session's create (naming its
+lease and build) and delete, and the composer joined **every link of every rep uniquely for both
+brains**: the stock agent's through its `sandbox` records, Moca Pi's through its `session` records.
+Found: mocactl's `--option sandboxTemplate` accepts only declared ids, not `id@buildId` (register G37):
+the session is created through the API, then run with `mocactl run --session`.
+
 ## 11. Order of work
 
 1. §8.2's remaining gating changes (PV2, PV3, PV4): no API change, testable alone (X10, X12 and the
