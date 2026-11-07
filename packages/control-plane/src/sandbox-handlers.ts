@@ -1140,6 +1140,11 @@ async function updateTemplate(ctx: RequestCtx, deps: CpDeps) {
  * example when its creator leaves. The new owner gets every owner action; quotas count it as theirs
  * from now on. Leases, sandboxes and sessions already made keep their own subjects. An `owner`
  * record names the admin, the new owner and the one before.
+ *
+ * A template the deployment declared (imported from SH_SANDBOX_TEMPLATES, owner null) can be handed
+ * to a subject the same way (register G34): its id otherwise blocks every self-serve create under it
+ * (`409 template_exists`), retired or not. The record's `before` is null. The import runs once, into
+ * an empty catalog, so a restart does not take it back.
  */
 async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const p = requireEnrolled(ctx, deps);
@@ -1150,11 +1155,6 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const owner = asRecord(ctx.body).owner;
   if (typeof owner !== 'string' || !/^github:[0-9]+$/.test(owner))
     throw new CpError('invalid_request', 'owner must be a subject, github:<numeric id>');
-  if (d0.owner === null)
-    throw new CpError(
-      'invalid_request',
-      'a template the deployment declared has no owner to transfer',
-    );
   // The new owner must be able to act on it: enrolled (admins are, by their role, but a role is not
   // known for another subject here, so the allow list decides).
   if (!isEnrolledForSandbox(owner, [], deps.config))
