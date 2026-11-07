@@ -2104,8 +2104,10 @@ paths:
         Template lifecycle spec §5.2. The new owner gets every owner action and its quota counts the
         template from now on; leases, sandboxes and sessions already made keep their subjects. An
         `owner` record names the admin, the new owner and the one before; a transfer to the current
-        owner changes nothing (`record: null`). The new owner must be enrolled (the allow list); a
-        template the deployment declared has no owner to transfer.
+        owner changes nothing (`record: null`). The new owner must be enrolled (the allow list). A
+        template the deployment declared (imported from SH_SANDBOX_TEMPLATES, no owner) is handed
+        to a subject the same way, `before: null` (register G34); its id then belongs to that
+        subject, who can build, tag and retire it. A restart does not re-import it.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }

@@ -38,6 +38,14 @@ export interface SessionOptionField {
    * the server to check, rather than blocking (per-session model spec §4.2: accepted unverified).
    */
   acceptUnlisted?: boolean;
+  /**
+   * A value the caller gave that is not among the choices is still sent, even when there are
+   * choices, for the server to resolve and check: the sandbox template, whose choices are only the
+   * deployment's declared ids while the control plane's template store also resolves `id`,
+   * `id:tag` and `id@sha256:…` (combined control plane spec §3.4; register G37). A wrong one is
+   * the server's refusal (`unknown_template`, `template_retired`, `template_not_active`).
+   */
+  sendUnlisted?: boolean;
   /** `values` are the fields resolved before this one, so a choice can depend on them (the model on the credential). */
   source(api: ControlPlaneApi, values: Record<string, string>): Promise<Choice[]>;
   toRequest(value: string, req: CreateSessionRequest): CreateSessionRequest;
@@ -105,6 +113,7 @@ export const sandboxTemplateField: SessionOptionField = {
   emptyHint: 'this deployment declares no sandbox templates',
   serverMayResolve: true,
   serverDefaults: true,
+  sendUnlisted: true,
   async source(api, _values) {
     let templates: Discovery['sandboxTemplates'];
     try {
@@ -229,6 +238,10 @@ export async function resolveSessionOptions(
     const choices = await field.source(api, values);
     const wanted = given[field.key];
     if (wanted !== undefined && choices.some((c) => c.value === wanted)) {
+      values[field.key] = wanted;
+      continue;
+    }
+    if (wanted !== undefined && wanted !== '' && field.sendUnlisted) {
       values[field.key] = wanted;
       continue;
     }

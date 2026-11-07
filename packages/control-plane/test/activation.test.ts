@@ -1113,7 +1113,73 @@ describe('owner transfer (§5.2)', () => {
     expect(((await transfer(d, 't1', bob.sub)).body as Body).record).toBe(null);
   });
 
-  it('refuses a non-admin, a malformed or unenrolled subject, and a declared template', async () => {
+  it('an admin hands a declared template to a subject (G34); a restart keeps it; its new owner retires it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-act-decl-'));
+    const declared = [
+      { id: 'decl-1', worker: 'sbx_decl_1', description: 'declared', tools: ['bash'] },
+    ];
+    const provenance = new ProvenanceStore({ dir, now: () => now });
+    const mk = () =>
+      makeDeps({
+        newId: () => `${(++seq).toString(16).padStart(26, '0')}000000`,
+        now: () => now,
+        templates: new FileTemplateCatalog({ dir, declared, provenance, now: () => now }),
+        provenance,
+        policy: new FilePolicyStore({ dir, provenance }),
+        hosts: new HostRegistry(),
+        config: { routeProfile: 'sandbox' },
+      });
+    const d = mk();
+    expect((await d.templates!.get('decl-1'))!.owner).toBe(null);
+    // Before: a subject cannot retire it (no owner), as before.
+    expect(
+      await refusal(() =>
+        HANDLERS.retireTemplate!(ctx({ principal: bob, params: { id: 'decl-1' } }), d),
+      ),
+    ).toBe('forbidden');
+    const r = (await transfer(d, 'decl-1', bob.sub)).body as Body;
+    expect(r).toMatchObject({ templateId: 'decl-1', owner: bob.sub, before: null });
+    expect((await provenance.chain('template/decl-1')).at(-1)).toMatchObject({
+      kind: 'owner',
+      subject: admin.sub,
+      body: { owner: bob.sub, before: null },
+    });
+    // A restart: a new catalog over the same directory, with the same declared list, does not
+    // re-import it or reset its owner (the import runs only into an empty catalog).
+    const d2 = mk();
+    expect((await d2.templates!.get('decl-1'))!.owner).toBe(bob.sub);
+    // Its new owner can now create a build under the id: the create no longer meets another's
+    // template (G34's block was `409 template_exists`).
+    await d2.policy!.set(DEFAULT_POLICY, 'github:admin');
+    const made = await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: bob,
+        params: { id: 'decl-1' },
+        body: { image: IMAGE, spec: BASE_SPEC, profile: 'base' },
+      }),
+      d2,
+    );
+    expect(made.status).toBe(202);
+    // A retire by the new owner works, as for any template of theirs.
+    expect(
+      (await HANDLERS.retireTemplate!(ctx({ principal: bob, params: { id: 'decl-1' } }), d2))
+        .status,
+    ).toBe(200);
+    // Retired, the id stays its owner's: another subject's create is still another's template.
+    expect(
+      await refusal(() =>
+        HANDLERS.createTemplate!(
+          ctx({
+            principal: alice,
+            body: { id: 'decl-1', image: IMAGE, spec: BASE_SPEC, profile: 'base' },
+          }),
+          d2,
+        ),
+      ),
+    ).toBe('template_exists');
+  });
+
+  it('refuses a non-admin, and a malformed or unenrolled subject', async () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');

@@ -301,10 +301,17 @@ policy allows and act where self-serve cannot:
 | `PUT /v1/quota/{subject}` · `PUT /v1/quota/default` | a subject's quotas (§6.2)                                                                               |
 | every owner action, on any template                 | e.g. deactivate or retire another's template, move its tags                                             |
 | `POST /v1/templates/{id}/builds/{build}/reject`     | rejects a registered build after the fact (a rule found broken), with the reason; deactivates it        |
-| `PUT /v1/templates/{id}/owner`                      | transfers ownership                                                                                     |
+| `PUT /v1/templates/{id}/owner`                      | transfers ownership; also hands a declared template (no owner) to a subject (G34)                       |
 
 Host limits stay in each host's settings file (§6.2), set by its operator. Every action, the owner's
 or the admin's, writes a provenance record naming its subject (§7).
+
+A template the deployment declared (imported once from `SH_SANDBOX_TEMPLATES` into an empty
+catalog, §3.1) has no owner, so its id blocks every self-serve create under it: `409
+template_exists` (register G34). An admin hands it to a subject with `PUT
+/v1/templates/{id}/owner` (an `owner` record with `before: null`); the subject then builds, tags and
+retires it like any template of theirs. A retired template's id stays its owner's: another subject's
+create under it is still `409 template_exists`.
 
 ## 6. Builds and activation on a host
 
