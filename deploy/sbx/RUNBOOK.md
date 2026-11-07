@@ -53,7 +53,12 @@ gitignored).
    RAM (`SH_GUEST_RAM_MB`) is taken from the snapshot's `manifest.json` (`guest_ram_mb`), never set
    by hand: a snapshot without it is refused. `--budget-mb` (default 8192) must hold at least one
    session, (guest RAM + 32) × 3 + 1024 MiB at the unit's standby depth of 2: 13408 MiB for a
-   4096 MiB guest. A smaller budget is refused, naming the minimum.
+   4096 MiB guest. A smaller budget is refused, naming the minimum. **That minimum fits one
+   session, not overlapping use:** size the budget for the commands that may run at once on the
+   template, (guest RAM + 32) × running VMs + 1024 MiB, for example 17536 MiB for four 4096 MiB
+   VMs (two agents on one template, each with a command and a standby being promoted). Below that,
+   a command is refused at admission before it starts (`memory-budget`, register G36); `sbx run`
+   and the static `sbx` client retry such a refusal and exit 75 if every try is refused.
 
 6. **The janitor,** once per KVM host:
 
