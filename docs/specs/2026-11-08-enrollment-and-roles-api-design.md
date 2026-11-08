@@ -1,6 +1,6 @@
-# Enrollment and roles through the API (DRAFT)
+# Enrollment and roles through the API
 
-- **Status:** draft for review (register G38). Not implemented.
+- **Status:** design accepted (the user, 2026-11-08: all four proposals in §6); not implemented (register G38).
 - **Date:** 2026-11-08
 - **Builds on:** [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) §4.2 (enrollment),
   [template lifecycle](2026-11-03-template-lifecycle-and-provenance-design.md) §5 (D10: authorization
@@ -36,7 +36,8 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 **Non-goals:**
 
 - An identity provider: the subjects stay `github:<id>`, from the existing login.
-- Fine-grained permissions beyond the roles below. Per-template roles are an open question (§6).
+- Fine-grained permissions beyond the roles below: no per-template roles (§6, decision 2).
+- Self-enrollment requests (§6, decision 3).
 - Groups or tenants. MU2's tenant partition is separate.
 
 ## 3. The model
@@ -51,16 +52,21 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
   bootstrap: say it in every answer.
 - **Roles are evaluated per request** from the store, plus the bootstrap list, not only at token issue.
   A revoked admin loses the role at its next request. Token claims keep `roles` for display only.
+- **An admin grant may carry an expiry** (`until`, epoch seconds). Past it, the role is no longer
+  evaluated as held. The store keeps the grant, and the first request that sees it lapsed writes a
+  `role` record (`expired`) once, as the janitor's sweep does for an expired sandbox.
+- **Any admin may grant admin,** bootstrap or API-granted alike. Every grant is recorded, naming
+  who granted it.
 
 ## 4. The API (admin only, both profiles where templates are)
 
-| Route                                       | Body               | Effect                                                              | Record                        |
-| ------------------------------------------- | ------------------ | ------------------------------------------------------------------- | ----------------------------- |
-| `GET /v1/subjects`                          |                    | every enrolled subject, with roles and `source: env \| api`         |                               |
-| `PUT /v1/subjects/{subject}`                | `{enrolled: true}` | enroll                                                              | `member` (enrolled, before)   |
-| `DELETE /v1/subjects/{subject}`             |                    | unenroll (refused for a bootstrap subject: `409 bootstrap_subject`) | `member` (unenrolled, before) |
-| `PUT /v1/subjects/{subject}/roles/admin`    |                    | grant admin                                                         | `role` (granted, before)      |
-| `DELETE /v1/subjects/{subject}/roles/admin` |                    | revoke admin (refused for a bootstrap admin and for oneself)        | `role` (revoked, before)      |
+| Route                                       | Body               | Effect                                                              | Record                          |
+| ------------------------------------------- | ------------------ | ------------------------------------------------------------------- | ------------------------------- |
+| `GET /v1/subjects`                          |                    | every enrolled subject, with roles and `source: env \| api`         |                                 |
+| `PUT /v1/subjects/{subject}`                | `{enrolled: true}` | enroll                                                              | `member` (enrolled, before)     |
+| `DELETE /v1/subjects/{subject}`             |                    | unenroll (refused for a bootstrap subject: `409 bootstrap_subject`) | `member` (unenrolled, before)   |
+| `PUT /v1/subjects/{subject}/roles/admin`    | `{until?}`         | grant admin (any admin may; `until` optional)                       | `role` (granted, until, before) |
+| `DELETE /v1/subjects/{subject}/roles/admin` |                    | revoke admin (refused for a bootstrap admin and for oneself)        | `role` (revoked, before)        |
 
 - **Errors:** 400 for a malformed subject, 403 for a caller who isn't an admin, and 409 for a bootstrap
   subject or for revoking oneself.
@@ -74,19 +80,22 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
   - its live sandboxes run to their expiry (or an admin deletes them);
   - its templates keep their owner (an admin can transfer them, `PUT …/owner`);
   - its logins are refused at the next request (`403 not_enrolled`), as a refresh is today.
-- **G34-style handovers** need no `setup.sh`: an API-granted admin acts, then is revoked.
+- **G34-style handovers** need no `setup.sh`: an admin grants a temporary admin with `until`, which
+  acts and then lapses on its own, with no revoke step.
 - **The harness profile:** enrollment doesn't gate sessions there today (`isEnrolledForSandbox` is
   always true on `harness`). This design doesn't change that.
 
-## 6. Open questions (for the user)
+## 6. Decisions (the user, 2026-11-08: each proposal accepted)
 
-1. **Who may grant admin:** any admin (proposed), or only bootstrap admins?
-2. **Per-template roles:** is a `maintainer` beside the owner wanted? It could move tags, add builds and
-   retire, but not transfer ownership. Proposed: not now; owner plus admin covers what we have seen.
-3. **Self-enrollment requests:** should a subject be able to ask to be enrolled (a pending state an
-   admin approves)? Proposed: not now.
-4. **Expiry:** should an API grant of admin carry an optional expiry (`until`), so a temporary admin
-   needs no revoke step? Proposed: yes, `{until}` on the role PUT; the record names it.
+1. **Who may grant admin:** any admin, bootstrap or API-granted. Every grant is a record naming its
+   grantor. The bootstrap admins in settings stay the recovery path: they can't be revoked through
+   the API.
+2. **Per-template roles:** none for now. The owner and the admins cover every case seen so far. A
+   `maintainer` role (tags, builds, retire; no ownership transfer) can be added later without changing
+   this design.
+3. **Self-enrollment requests:** none for now. An admin enrolls a subject directly.
+4. **Expiry:** an admin grant may carry an optional `until`. The role then lapses by itself, so a
+   temporary admin needs no revoke step, and the record names the expiry.
 
 ## 7. Tests and validation (when built)
 
