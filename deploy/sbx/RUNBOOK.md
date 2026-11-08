@@ -179,6 +179,24 @@ It takes effect at the subject's next request. A subject in `SBX_ALLOWED_SUBJECT
 `SBX_ADMIN_SUBJECTS` can't be unenrolled or revoked this way (`409 bootstrap_subject`): change the
 settings for those. An admin can't revoke its own role.
 
+**What this changes for an operator** (once deployed):
+
+- **Who controls access.** Without it, every enrollment or admin change is a `setup.sh` run by
+  whoever operates the namespace. With it, any admin can enroll subjects and grant admin through the
+  API, with no `setup.sh` run. The record on the `members` stream is then the only trace, so read it
+  (`GET /v1/subjects`, the provenance export) as part of any access review.
+- **Roles come from the store, not the login.** On a deployment with a store, the control plane
+  replaces a token's `roles` claim, on every request, with the subject's roles now (the settings plus
+  the store's grants). Two consequences:
+  - **A login minted as a user acts as an admin** if its subject holds an API admin grant. Check
+    `GET /v1/subjects` before treating a mint as user-only.
+  - **Revocation is immediate.** Removing a subject from `SBX_ADMIN_SUBJECTS` (a `setup.sh` run), or
+    revoking an API grant, takes effect at the subject's next request, even for an admin token that
+    is still valid. But `setup.sh` can't remove an API grant (those live in the store, on the PVC). So
+    after removing a temporary admin from the settings, check `GET /v1/subjects` for API admins too
+    before concluding there is no admin. For a temporary admin, prefer an API grant with `--until`:
+    it lapses by itself.
+
 **A test login without GitHub.** A deployment whose `SBX_GITHUB_CLIENT_ID` is a placeholder (no OAuth
 app) has no device flow. To test it, an operator mints a login for an enrolled subject with the
 deployment's own signing key:
