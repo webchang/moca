@@ -31,6 +31,7 @@ import {
   asRecord,
   auditBestEffort,
   isAdmin,
+  membershipNow,
   requireEnrolledPrincipal,
   seconds,
 } from './handler-util.js';
@@ -76,6 +77,8 @@ import {
 } from './sandbox-config.js';
 import type { SandboxStore } from './sandbox-store.js';
 import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handlers.js';
+import { MEMBER_HANDLERS } from './member-handlers.js';
+import type { MembersStore } from './members.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
 import type { EgressHost } from './egress-config.js';
 import { formatDestination, parseDestination } from './egress-destination.js';
@@ -210,6 +213,11 @@ export interface CpDeps {
   policy?: PolicyStore;
   /** The provenance store (§7), when SH_PROVENANCE_DIR is set. */
   provenance?: ProvenanceStore;
+  /**
+   * Enrollment and roles through the API (register G38), with the provenance store: absent without
+   * SH_PROVENANCE_DIR, when roles and enrollment come from the settings alone, as before.
+   */
+  members?: MembersStore;
   /** The template hosts' inventories and limits (§6.1), as their agents last reported them. */
   hosts?: HostRegistry;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
@@ -547,10 +555,13 @@ export const HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', 'deviceCode is required');
     }
     // A pending authorization propagates as authorization_pending (428) -- the client polls.
-    const principal = await deps.identity.completeDeviceAuth(deviceCode);
+    const fromIdp = await deps.identity.completeDeviceAuth(deviceCode);
+    // Roles and store enrollment now (register G38): an API grant counts at login as at every request.
+    const m = await membershipNow(deps, fromIdp.subject, fromIdp.roles);
+    const principal = { ...fromIdp, roles: m.roles };
     // SBX0 §4.2: on the sandbox profile only enrolled subjects (and admins) get a login, and the
     // refusal comes BEFORE a refresh family is issued, so nothing is left behind for them.
-    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+    if (!isEnrolled(principal.subject, principal.roles, deps.config, m.enrolled)) {
       throw notEnrolled(principal.subject);
     }
     const label = asRecord(ctx.body).label;
@@ -600,10 +611,12 @@ export const HANDLERS: Record<string, Handler> = {
     if (typeof index !== 'number' || !provider.has(index)) {
       throw new CpError('invalid_request', `index must be a whole number in 1..${provider.count}`);
     }
-    const principal = provider.principalFor(index);
+    const fromProvider = provider.principalFor(index);
+    const m = await membershipNow(deps, fromProvider.subject, fromProvider.roles);
+    const principal = { ...fromProvider, roles: m.roles };
     // SBX0 §4.2's enrolment gate still applies: main.ts refuses to boot test users on the sandbox
     // profile, and this keeps the invariant even if that guard were ever relaxed.
-    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+    if (!isEnrolled(principal.subject, principal.roles, deps.config, m.enrolled)) {
       throw notEnrolled(principal.subject);
     }
     const label = body.label;
@@ -630,15 +643,17 @@ export const HANDLERS: Record<string, Handler> = {
     const r = await deps.refresh.rotate(token, deps.now());
     // One code for every refusal: the client's only move is to log in again (errors.ts).
     if (!r.ok) throw new CpError('invalid_grant', `refresh token refused: ${r.reason}`);
-    const roles = deps.identity.rolesFor(r.subject);
-    // A subject removed from SH_ALLOWED_SUBJECTS loses access at its next refresh, not its next login.
+    const m = await membershipNow(deps, r.subject, deps.identity.rolesFor(r.subject));
+    const roles = m.roles;
+    // A subject removed from SH_ALLOWED_SUBJECTS (or unenrolled through the API, G38) loses access at
+    // its next refresh, not its next login.
     // rotate() has already stored a successor the client never sees, so the token it still holds is
     // superseded: presented again after the grace window it would read as reuse, revoke the family
     // as theft and audit refresh_reuse_detected. Revoke the family here, under a reason of its own,
     // so that token is a plain `revoked` refusal instead.
     // The revoke is best effort: a store failure here must not turn the answer into a 503, which a
     // client reads as "unreachable" and so keeps the superseded token. The refusal is the 403.
-    if (!isEnrolled(r.subject, roles, deps.config)) {
+    if (!isEnrolled(r.subject, roles, deps.config, m.enrolled)) {
       try {
         await deps.refresh.revoke(r.refreshToken, deps.now(), 'not_enrolled');
       } catch (err) {
@@ -1241,6 +1256,7 @@ export const HANDLERS: Record<string, Handler> = {
 
   // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
   ...SANDBOX_HANDLERS,
+  ...MEMBER_HANDLERS,
   ...HOST_HANDLERS,
   ...EGRESS_HANDLERS,
 };

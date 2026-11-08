@@ -3,6 +3,7 @@ import {
   asRecord,
   auditBestEffort,
   isAdmin,
+  membershipNow,
   requireEnrolledPrincipal,
   requireReader,
   seconds,
@@ -1155,12 +1156,13 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const owner = asRecord(ctx.body).owner;
   if (typeof owner !== 'string' || !/^github:[0-9]+$/.test(owner))
     throw new CpError('invalid_request', 'owner must be a subject, github:<numeric id>');
-  // The new owner must be able to act on it: enrolled (admins are, by their role, but a role is not
-  // known for another subject here, so the allow list decides).
-  if (!isEnrolledForSandbox(owner, [], deps.config))
+  // The new owner must be able to act on it: enrolled now, by the allow list, an admin role or the
+  // members store (register G38).
+  const om = await membershipNow(deps, owner, []);
+  if (!isEnrolledForSandbox(owner, om.roles, deps.config, om.enrolled))
     throw new CpError(
       'invalid_request',
-      `${owner} is not enrolled: enroll them first (SBX_ALLOWED_SUBJECTS)`,
+      `${owner} is not enrolled: enroll them first (PUT /v1/subjects/${owner}, or SBX_ALLOWED_SUBJECTS)`,
     );
   const before = d0.owner;
   let record: string | null = null;
