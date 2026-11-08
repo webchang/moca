@@ -56,6 +56,15 @@ export interface Policy {
    */
   allowedRegistries: string[];
   /**
+   * Optional, per registry (the key as `registryOf` returns it): the repositories an image may come
+   * from there. A registry with no list allows every repository it serves (as before); one with a
+   * list allows only those, each an exact repository path (`library/python`) or a prefix ending in
+   * `/*` (`library/*`), matched on whole path segments. A registry named here must also be in
+   * `allowedRegistries` (register G41's document samples: Docker Hub opened to named repositories
+   * only, not to all of it).
+   */
+  allowedRepositories?: Record<string, string[]>;
+  /**
    * The sha256 of each gate record the benchmark profile trusts (spec §8.3, A23: an admin-loaded
    * copy of the trusted source's records, until G13's fetch exists).
    */
@@ -205,14 +214,61 @@ function sortKeys(v: unknown): unknown {
   return v;
 }
 
-/** The registry host an image reference names, or `<default>` for one with no host. */
+/**
+ * The registry host an image reference names, or `<default>` for one with no host.
+ *
+ * `<default>` is NOT Docker Hub here: a reference with no host is pulled from the build host's
+ * configured registry (template-build.sh's `--registry`, the host agent's SBX_REGISTRY), which on
+ * this deployment is the curated image registry. Docker Hub is therefore always written with its host,
+ * `docker.io/…`, and `index.docker.io` is read as `docker.io`, so one key covers Docker Hub without
+ * ever merging it with the build host's default registry.
+ */
 export function registryOf(image: string): string {
+  const r = registryHostOf(image);
+  return r === 'index.docker.io' ? 'docker.io' : r;
+}
+
+function registryHostOf(image: string): string {
   const first = image.split('/')[0] ?? '';
   return image.includes('/') &&
     (first.includes('.') || first.includes(':') || first === 'localhost')
     ? first
     : '<default>';
 }
+
+/**
+ * The repository path of an image reference: without its registry host, its digest and any tag.
+ * On Docker Hub (`docker.io`) a one-segment name is an official image, `library/<name>`, as Docker
+ * reads it. Paths compare as given otherwise (registries are case-sensitive for paths only in
+ * lowercase form, which IMAGE_RE's reference already is).
+ */
+export function repositoryOf(image: string): string {
+  const name = image.split('@')[0] ?? '';
+  const host = registryHostOf(image);
+  let path = host === '<default>' ? name : name.slice(host.length + 1);
+  // A tag is a final `:x` after the last `/` (a port is in the host, already removed).
+  const slash = path.lastIndexOf('/');
+  const colon = path.lastIndexOf(':');
+  if (colon > slash) path = path.slice(0, colon);
+  if (registryOf(image) === 'docker.io' && !path.includes('/')) path = `library/${path}`;
+  return path;
+}
+
+/**
+ * Whether `repo` is admitted by one allowlist entry: an exact path, or a `prefix/*` entry that admits
+ * any repository with at least one more path segment under `prefix`. Whole segments only, so
+ * `library/python` never admits `library/python-evil` or `library/python/x`.
+ */
+export function repositoryAllowed(repo: string, entry: string): boolean {
+  if (entry.endsWith('/*')) {
+    const prefix = entry.slice(0, -2);
+    return prefix.length > 0 && repo.startsWith(`${prefix}/`) && repo.length > prefix.length + 1;
+  }
+  return repo === entry;
+}
+
+const REPOSITORY_ENTRY_RE =
+  /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?:\/\*)?$/;
 
 const int = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v);
 
@@ -249,6 +305,18 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     IMAGE_RE.test(input.image ?? '') && policy.allowedRegistries.includes(registryOf(input.image)),
     `image registry ${IMAGE_RE.test(input.image ?? '') ? registryOf(input.image) : '?'} is not allowed (policy allowedRegistries)`,
   );
+  if (IMAGE_RE.test(input.image ?? '')) {
+    const reg = registryOf(input.image);
+    const list = policy.allowedRepositories?.[reg];
+    if (list) {
+      const repo = repositoryOf(input.image);
+      rule(
+        'registry.repository',
+        list.some((e) => repositoryAllowed(repo, e)),
+        `image repository ${repo} is not allowed from registry ${reg} (policy allowedRepositories)`,
+      );
+    }
+  }
   const guest = s.guest_mb ?? s.guest_ram_mb;
   rule(
     'M7.guest',
@@ -503,6 +571,24 @@ export function policyProblems(p: unknown): string[] {
     !o.allowedRegistries.every((r) => typeof r === 'string' && r.length > 0)
   )
     out.push('allowedRegistries must be a list of hosts');
+  const repos = (o as { allowedRepositories?: unknown }).allowedRepositories;
+  if (repos !== undefined) {
+    if (!repos || typeof repos !== 'object' || Array.isArray(repos))
+      out.push('allowedRepositories must map a registry to a list of repositories');
+    else
+      for (const [reg, list] of Object.entries(repos as Record<string, unknown>)) {
+        if (!Array.isArray(o.allowedRegistries) || !o.allowedRegistries.includes(reg))
+          out.push(`allowedRepositories.${reg}: the registry must also be in allowedRegistries`);
+        if (
+          !Array.isArray(list) ||
+          list.length === 0 ||
+          !list.every((e) => typeof e === 'string' && REPOSITORY_ENTRY_RE.test(e))
+        )
+          out.push(
+            `allowedRepositories.${reg} must be a non-empty list of repository paths (a/b, or a/* for a prefix)`,
+          );
+      }
+  }
   if (
     !Array.isArray(o.trustedGateRecords) ||
     !o.trustedGateRecords.every((r) => typeof r === 'string' && /^sha256:[0-9a-f]{64}$/.test(r))
