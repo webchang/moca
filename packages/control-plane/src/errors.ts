@@ -39,6 +39,7 @@ export const CP_ERROR_CODES = [
   'template_not_active',
   'template_retired',
   'build_in_use',
+  'self_attested',
   'bootstrap_subject',
   'self_revoke',
   'digest_mismatch',
@@ -106,6 +107,7 @@ const STATUS: Record<CpErrorCode, number> = {
   template_retired: 410,
   // 409: a live sandbox still runs on the build; delete it (or let it end) and retry (§5.1).
   build_in_use: 409,
+  self_attested: 409,
   bootstrap_subject: 409,
   self_revoke: 409,
   // A client-built bundle whose bytes do not hash to the digest it claimed (config-bundle store).

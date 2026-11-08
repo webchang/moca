@@ -216,7 +216,7 @@ Another user's session returns 404, not 403. Control-plane error codes and statu
 `token_invalid`, `token_expired`, `unauthorized`), 403 (`forbidden`, `not_enrolled`), 404 (`session_not_found`, `config_bundle_not_found`,
 `credential_not_found`, `template_not_found`, `sandbox_not_found`), 409 (`template_exists`, `template_not_active`,
 `template_unavailable`, `no_active_slot`, `build_in_use`, `name_conflict`, `sandbox_terminated`, `bootstrap_subject`,
-`self_revoke`), 410 (`device_code_expired`,
+`self_revoke`, `self_attested`), 410 (`device_code_expired`,
 `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429 (`quota_exceeded`,
 `bundle_quota_exceeded`), 500 `internal_error`, 502 `identity_provider_misconfigured`, 503
 (`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in

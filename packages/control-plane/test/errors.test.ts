@@ -41,6 +41,7 @@ const EXPECTED: Record<CpErrorCode, number> = {
   template_not_active: 409,
   template_retired: 410,
   build_in_use: 409,
+  self_attested: 409,
   bootstrap_subject: 409,
   self_revoke: 409,
   digest_mismatch: 400,
