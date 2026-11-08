@@ -175,6 +175,13 @@ components:
                   on a self-attested record only, whether spec.egress may be true (the KVM host's
                   allowlisted egress, never unrestricted). Absent: false. `benchmark-self` keeps it
                   false (benchmark integrity); `general-self` sets it
+              requireOfflineGate:
+                type: boolean
+                description: |
+                  whether the gate's test floor must have been checked offline (X1.offline). A
+                  general-gate record (`image-factory/gate/1`) needs `gate.floor_checked_offline:
+                  true` (fail closed); a curated family record predates the field and passes without
+                  it. Absent: true on a profile that requires X1; `general-self` sets it false
               envelope:
                 type: object
                 required: [maxGuestMb, maxVcpus, maxWorkspaceMb]
@@ -325,6 +332,17 @@ components:
             register G41 (c), recomputed on every read from the current policy: `self` when the build
             was created on a selfAttest profile with a gate record trustedGateRecords does not list;
             `deployment` otherwise (a promotion or removal of the record changes it, nothing rewritten)
+        gateFloorCheckedOffline:
+          type: [boolean, 'null']
+          description: |
+            its gate record's `gate.floor_checked_offline` (true for a curated family record, which
+            predates the field); false only on a profile that allows it (`general-self`); null with
+            no gate record
+        gateFloorMetOffline:
+          type: boolean
+          description: |
+            present only for a gate from a `network_needed` contract: its `gate.floor_met_offline`,
+            whether the offline run met the floor anyway
         heldBy:
           type: [array, 'null']
           items: { type: string }

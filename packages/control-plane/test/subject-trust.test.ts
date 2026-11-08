@@ -41,6 +41,8 @@ const general = (over: Record<string, unknown> = {}) =>
       rootfs: 'read-only',
       user: 'root',
       floor: { rc: 0 },
+      floor_checked_offline: true,
+      network_needed: false,
     },
     observed: {
       testbed: { agent_can_commit: 'no' },
@@ -270,6 +272,73 @@ describe('a subject self-attests its own gate record (G41 (c))', () => {
       }),
     );
     expect(await codeOf(() => create(d, body()))).toBe('self_attested');
+  });
+});
+
+describe("a gate's floor checked offline (X1.offline, image-factory ec4b5a0)", () => {
+  const gate1 = (g: Record<string, unknown>) =>
+    general({
+      gate: {
+        passed: true,
+        kind: 'general',
+        network: 'none',
+        rootfs: 'read-only',
+        user: 'root',
+        floor: { rc: 0 },
+        ...g,
+      },
+    });
+  const online = gate1({
+    floor_checked_offline: false,
+    network_needed: true,
+    floor_met_offline: false,
+  });
+  const missing = gate1({});
+  const shaOf = (x: string) => `sha256:${sha256Hex(Buffer.from(x, 'utf8'))}`;
+  // A curated family record (moca-microvm) predates the field: absence is offline.
+  const FAMILY = readFileSync(join(EX, 'django__django-11133.gate-record.json'), 'utf8');
+
+  it('passes a family-schema record with no field on benchmark (the trusted records keep working)', async () => {
+    const d = await setup({ ...DEFAULT_POLICY, trustedGateRecords: [shaOf(FAMILY)] });
+    const fam = JSON.parse(FAMILY) as { gate?: Record<string, unknown> };
+    expect(fam.gate?.floor_checked_offline).toBeUndefined();
+    const r = await create(
+      d,
+      body({ id: 'django-django-11133', profile: 'benchmark', gateRecord: FAMILY, spec }),
+    );
+    expect(r.status).toBe(202);
+    expect((await view(d, 'django-django-11133')).builds[0].gateFloorCheckedOffline).toBe(true);
+  });
+
+  it('refuses a gate/1 record with floor_checked_offline false on benchmark and benchmark-self', async () => {
+    const d = await setup({ ...DEFAULT_POLICY, trustedGateRecords: [shaOf(online)] });
+    expect(await rule(() => create(d, body({ profile: 'benchmark', gateRecord: online })))).toBe(
+      'X1.offline',
+    );
+    const d2 = await setup();
+    expect(await rule(() => create(d2, body({ gateRecord: online })))).toBe('X1.offline');
+  });
+
+  it('refuses a gate/1 record missing the field on benchmark (fail closed)', async () => {
+    const d = await setup({ ...DEFAULT_POLICY, trustedGateRecords: [shaOf(missing)] });
+    expect(await rule(() => create(d, body({ profile: 'benchmark', gateRecord: missing })))).toBe(
+      'X1.offline',
+    );
+  });
+
+  it('accepts either value on general-self, shown on the build', async () => {
+    const d = await setup();
+    expect((await create(d, body({ profile: 'general-self', gateRecord: online }))).status).toBe(
+      202,
+    );
+    const b = (await view(d)).builds[0];
+    expect(b.gateFloorCheckedOffline).toBe(false);
+    expect(b.gateFloorMetOffline).toBe(false);
+    const d2 = await setup();
+    expect((await create(d2, body({ profile: 'general-self' }))).status).toBe(202);
+    const b2 = (await view(d2)).builds[0];
+    expect(b2.gateFloorCheckedOffline).toBe(true);
+    expect(b2).not.toHaveProperty('gateFloorMetOffline');
   });
 });
 

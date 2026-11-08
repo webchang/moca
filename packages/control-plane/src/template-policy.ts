@@ -29,6 +29,12 @@ export interface Profile {
    * `general-self` sets it, for general users whose sandboxes need the host's allowlisted network.
    */
   selfAttestEgress?: boolean;
+  /**
+   * Whether the gate's test floor must have been checked offline (X1.offline,
+   * gateFloorCheckedOffline). Absent: true on any profile that requires X1, so `benchmark` and
+   * `benchmark-self` refuse a record whose floor needed the network; `general-self` sets it false.
+   */
+  requireOfflineGate?: boolean;
   /** The size envelope: a spec outside it is refused (X15 for benchmark). */
   envelope: {
     maxGuestMb: number;
@@ -106,6 +112,7 @@ export const DEFAULT_POLICY: Policy = {
       requires: ['X1', 'X10', 'X12', 'X14', 'X15'],
       selfAttest: true,
       selfAttestEgress: true,
+      requireOfflineGate: false,
       envelope: {
         maxGuestMb: 4096,
         maxVcpus: 2,
@@ -119,6 +126,20 @@ export const DEFAULT_POLICY: Policy = {
   trustedGateRecords: [],
   quota: { templates: 100, buildsQueued: 10, active: 8 },
 };
+
+/** image-factory's general-gate record schema (its docs/GENERAL_GATE.md). */
+export const GENERAL_GATE_SCHEMA = 'image-factory/gate/1';
+
+/**
+ * Whether a gate record's test floor was checked offline (image-factory ec4b5a0): a general-gate
+ * record (`image-factory/gate/1`) always carries `gate.floor_checked_offline`, false only from a
+ * contract with `network_needed`; fail closed, so absent or false is not offline. Any other schema
+ * (the curated family records) predates the field, and their gates ran offline: absent is offline.
+ */
+export function gateFloorCheckedOffline(gate: Record<string, unknown>): boolean {
+  const v = (gate.gate as Record<string, unknown> | undefined)?.floor_checked_offline;
+  return gate.schema === GENERAL_GATE_SCHEMA ? v === true : v !== false;
+}
 
 /** The template id rule (M7); refused past 31 characters, never truncated. */
 export const TEMPLATE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -162,6 +183,8 @@ export interface CheckResult {
    * `self`, only by its submitter on a `selfAttest` profile. Absent with no gate record.
    */
   gateTrust?: 'trusted' | 'self';
+  /** The gate record's offline facts (gate.floor_checked_offline, gate.floor_met_offline). */
+  gateFloor?: { checkedOffline: boolean; metOffline?: boolean };
 }
 
 export function policyDigest(p: Policy): string {
@@ -364,6 +387,12 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
       gate !== null && gate.image?.digest === digest,
       'the gate record is for another image',
     );
+    if (profile?.requireOfflineGate !== false)
+      rule(
+        'X1.offline',
+        gate === null || gateFloorCheckedOffline(gate),
+        `the ${profileName} profile needs the gate's floor checked offline (the record's run needed the network)`,
+      );
   }
   if (req.has('X10') && s.source_record_digest === undefined) {
     rule('X10', false, 'the benchmark profile needs spec.source_record_digest (X10)');
@@ -428,6 +457,16 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     passed: failed === undefined,
     ...(failed ? { failed } : {}),
     ...(gateSha ? { gateRecordSha256: gateSha, gateTrust: trusted ? 'trusted' : 'self' } : {}),
+    ...(gate !== null
+      ? {
+          gateFloor: {
+            checkedOffline: gateFloorCheckedOffline(gate),
+            ...(typeof gate.gate?.floor_met_offline === 'boolean'
+              ? { metOffline: gate.gate.floor_met_offline as boolean }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -448,7 +487,7 @@ export function policyProblems(p: unknown): string[] {
         out.push(`${n}.requires must be a list of rule ids`);
       if (!e || ![e.maxGuestMb, e.maxVcpus, e.maxWorkspaceMb].every((x) => int(x) && x > 0))
         out.push(`${n}.envelope must hold positive maxGuestMb, maxVcpus, maxWorkspaceMb`);
-      for (const f of ['selfAttest', 'selfAttestEgress'] as const)
+      for (const f of ['selfAttest', 'selfAttestEgress', 'requireOfflineGate'] as const)
         if (pr?.[f] !== undefined && typeof pr[f] !== 'boolean')
           out.push(`${n}.${f} must be true or false`);
       if (pr?.selfAttestEgress === true && pr.selfAttest !== true)

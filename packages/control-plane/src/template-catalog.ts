@@ -64,6 +64,11 @@ export interface TemplateBuild {
    * (attestationOf): an admin's promotion or removal of the record needs no rewrite.
    */
   selfAttested?: boolean;
+  /**
+   * Its gate record's offline facts (image-factory ec4b5a0): whether the floor was checked offline,
+   * and, from a `network_needed` contract, whether the offline run met it. Absent: no gate record.
+   */
+  gateFloor?: { checkedOffline: boolean; metOffline?: boolean };
   /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */
   queuedAtMs?: number;
   /** The host that claimed it, and when (epoch seconds). */

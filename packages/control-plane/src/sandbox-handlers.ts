@@ -331,6 +331,14 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     reason: b.reason ?? null,
     // G41 (c): whether its gate record is trusted deployment-wide now, or only by its submitter.
     attestation: attestationOf(b, f.trusted),
+    // Its gate's floor checked offline (gate.floor_checked_offline); null with no gate record, and
+    // true for a gate record created before the field (whose gates ran offline).
+    gateFloorCheckedOffline:
+      b.gateFloor?.checkedOffline ?? (b.request?.gateRecordSha256 ? true : null),
+    // Only from a network_needed gate: whether its offline run met the floor anyway.
+    ...(b.gateFloor?.metOffline !== undefined
+      ? { gateFloorMetOffline: b.gateFloor.metOffline }
+      : {}),
     ...(full ? { spec: b.spec } : {}),
   };
 }
@@ -580,6 +588,7 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
       },
       ...(selfAttestedCreate ? { selfAttested: true } : {}),
+      ...(result.gateFloor ? { gateFloor: result.gateFloor } : {}),
     };
     const base: TemplateDoc = cur ?? {
       schema: TEMPLATE_DOC_SCHEMA,
