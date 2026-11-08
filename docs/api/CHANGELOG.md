@@ -11,7 +11,7 @@ changes, the major only with a `/v2` ([change policy](../reference/change-policy
 ### 1.4.0
 
 Enrollment and roles through the API ([enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md),
-register G38). On both route profiles, when the deployment keeps a template store (`SH_PROVENANCE_DIR`); admin only.
+register G38). On both route profiles, when the deployment keeps a template store (`SH_PROVENANCE_DIR`). The list: any admin; every change: an admin named in `SH_ADMIN_SUBJECTS` (others `403 forbidden`).
 
 - New GET /v1/subjects: every enrolled subject with its roles, each with `source: env | api`, and
   an admin grant's `until`.

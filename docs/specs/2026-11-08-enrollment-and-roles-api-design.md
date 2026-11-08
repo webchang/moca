@@ -55,17 +55,19 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 - **An admin grant may carry an expiry** (`until`, epoch seconds). Past it, the role is no longer
   evaluated as held. The store keeps the grant, and the first request that sees it lapsed writes a
   `role` record (`expired`) once, as the janitor's sweep does for an expired sandbox.
-- **Any admin may grant admin,** bootstrap or API-granted alike. Every grant is recorded, naming
-  who granted it.
+- **Only the settings' admins change access.** Enrolling, unenrolling, granting and revoking need an
+  admin named in `SH_ADMIN_SUBJECTS`. An API-granted admin holds the role for templates, policy and
+  quota, and may read the list, but changes no one's access (`403 forbidden`). Every change is
+  recorded, naming who made it.
 
-## 4. The API (admin only, both profiles where templates are)
+## 4. The API (reads: any admin; changes: an admin named in the settings; both profiles where templates are)
 
 | Route                                       | Body               | Effect                                                              | Record                          |
 | ------------------------------------------- | ------------------ | ------------------------------------------------------------------- | ------------------------------- |
 | `GET /v1/subjects`                          |                    | every enrolled subject, with roles and `source: env \| api`         |                                 |
 | `PUT /v1/subjects/{subject}`                | `{enrolled: true}` | enroll                                                              | `member` (enrolled, before)     |
 | `DELETE /v1/subjects/{subject}`             |                    | unenroll (refused for a bootstrap subject: `409 bootstrap_subject`) | `member` (unenrolled, before)   |
-| `PUT /v1/subjects/{subject}/roles/admin`    | `{until?}`         | grant admin (any admin may; `until` optional)                       | `role` (granted, until, before) |
+| `PUT /v1/subjects/{subject}/roles/admin`    | `{until?}`         | grant admin (a settings admin; `until` optional)                    | `role` (granted, until, before) |
 | `DELETE /v1/subjects/{subject}/roles/admin` |                    | revoke admin (refused for a bootstrap admin and for oneself)        | `role` (revoked, before)        |
 
 - **Errors:** 400 for a malformed subject, 403 for a caller who isn't an admin, and 409 for a bootstrap
@@ -85,11 +87,13 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 - **The harness profile:** enrollment doesn't gate sessions there today (`isEnrolledForSandbox` is
   always true on `harness`). This design doesn't change that.
 
-## 6. Decisions (the user, 2026-11-08: each proposal accepted)
+## 6. Decisions (the user, 2026-11-08: proposals 2-4 accepted; decision 1 narrowed the same day)
 
-1. **Who may grant admin:** any admin, bootstrap or API-granted. Every grant is a record naming its
-   grantor. The bootstrap admins in settings stay the recovery path: they can't be revoked through
-   the API.
+1. **Who may change access:** only an admin named in the settings (`SH_ADMIN_SUBJECTS`) may enroll,
+   unenroll, grant or revoke (the user, in sbx-template's and autobench's sessions, 2026-11-08,
+   replacing the earlier "any admin"). An API-granted admin can't widen or narrow access, so
+   access never goes beyond what the settings' admins choose. They stay the recovery path: they
+   can't be revoked through the API, and none can revoke itself.
 2. **Per-template roles:** none for now. The owner and the admins cover every case seen so far. A
    `maintainer` role (tags, builds, retire; no ownership transfer) can be added later without changing
    this design.

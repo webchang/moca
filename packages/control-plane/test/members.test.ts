@@ -156,31 +156,40 @@ describe('enroll and unenroll (spec §4)', () => {
 });
 
 describe('the admin role (spec §3, §6)', () => {
-  it('lets any admin grant admin, effective at the next request, and records who', async () => {
+  it('grants admin by a settings admin, effective at the next request, and records who', async () => {
     const d = setup();
     await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
     // CAROL, holding a token minted with no roles, is an admin at its next request.
     expect((await asRequest(d, who(CAROL))).roles).toEqual(['admin']);
-    // An API-granted admin may grant admin too (decision 1).
-    const r = (await call(d, 'grantAdmin', who(CAROL), { subject: DAVE }, {})).body as {
-      roles: { by: string; source: string }[];
-    };
-    expect(r.roles).toEqual([{ role: 'admin', source: 'api', until: null, by: CAROL }]);
     const chain = await d.provenance.chain('members');
     expect(chain.map((x) => [x.subject, x.body.subject, x.body.state])).toEqual([
       [ENV_ADMIN, CAROL, 'granted'],
-      [CAROL, DAVE, 'granted'],
     ]);
     // An admin is enrolled by its role.
-    await call(d, 'listTemplates', who(DAVE));
+    await call(d, 'listTemplates', who(CAROL));
   });
 
-  it('revokes at the next request, refuses a self-revoke, and a non-admin', async () => {
+  it('refuses every enrollment and role change by an API-granted admin (settings admins only)', async () => {
     const d = setup();
     await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
-    expect(await codeOf(() => call(d, 'revokeAdmin', who(CAROL), { subject: CAROL }))).toBe(
-      'self_revoke',
-    );
+    const asCarol = who(CAROL);
+    // CAROL is an admin (templates, policy, quota) and may read the list ...
+    await call(d, 'listSubjects', asCarol);
+    // ... but changes nothing about who has access.
+    for (const [op, args, body] of [
+      ['grantAdmin', { subject: DAVE }, {}],
+      ['revokeAdmin', { subject: CAROL }, undefined],
+      ['enrollSubject', { subject: DAVE }, { enrolled: true }],
+      ['unenrollSubject', { subject: ALLOWED }, undefined],
+    ] as const) {
+      expect(await codeOf(() => call(d, op, asCarol, args, body))).toBe('forbidden');
+    }
+    expect((await d.provenance.chain('members')).length).toBe(1);
+  });
+
+  it('revokes at the next request, and refuses a non-admin', async () => {
+    const d = setup();
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
     expect(await codeOf(() => call(d, 'grantAdmin', who(DAVE), { subject: DAVE }, {}))).toBe(
       'not_enrolled',
     );
@@ -195,6 +204,10 @@ describe('the admin role (spec §3, §6)', () => {
       state: 'revoked',
       before: 'granted',
     });
+    // A settings admin's own role is the settings' (bootstrap_subject), so no admin can revoke itself.
+    expect(await codeOf(() => call(d, 'revokeAdmin', who(ENV_ADMIN), { subject: ENV_ADMIN }))).toBe(
+      'bootstrap_subject',
+    );
   });
 
   it('lapses a grant at its until by itself, recording the expiry once', async () => {

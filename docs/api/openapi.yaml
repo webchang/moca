@@ -2104,7 +2104,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2163,7 +2163,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2338,7 +2338,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2368,7 +2368,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2414,7 +2414,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2452,7 +2452,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2466,7 +2466,8 @@ paths:
       operationId: grantAdmin
       summary: Grant the admin role, optionally until a time (an admin)
       description: |
-        Any admin may grant it, bootstrap or API-granted (spec §6, decision 1). An optional `until`
+        Only an admin named in the settings (SH_ADMIN_SUBJECTS) may grant it (spec §6, decision 1);
+        an API-granted admin is refused `403 forbidden`. An optional `until`
         (epoch seconds, in the future) makes it lapse by itself (decision 4); the first request that
         sees it lapsed writes a `role` record `expired`, once. A grant writes a `role` record
         `granted`, naming the admin and `until`. Effective at the subject's next request.
@@ -2509,7 +2510,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2552,7 +2553,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin'
+          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

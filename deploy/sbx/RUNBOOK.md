@@ -165,8 +165,8 @@ Admins (`SBX_ADMIN_SUBJECTS`) may list, read and delete every sandbox, but never
 another user's: they cannot run commands in another user's code.
 
 **Enrollment and admins through the API** (register G38, on a deployment with a template store,
-`SBX_TEMPLATE_STORE`). The settings above stay the bootstrap; an admin adds to them without a
-`setup.sh` run, each change a record on the `members` provenance stream:
+`SBX_TEMPLATE_STORE`). The settings above stay the bootstrap; an admin named in `SBX_ADMIN_SUBJECTS`
+adds to them without a `setup.sh` run (an API-granted admin can't change access: `403`), each change a record on the `members` provenance stream:
 
 ```bash
 mocactl sbx admin subjects                                   # who is enrolled, and how
@@ -182,7 +182,8 @@ settings for those. An admin can't revoke its own role.
 **What this changes for an operator** (once deployed):
 
 - **Who controls access.** Without it, every enrollment or admin change is a `setup.sh` run by
-  whoever operates the namespace. With it, any admin can enroll subjects and grant admin through the
+  whoever operates the namespace. With it, an admin named in `SBX_ADMIN_SUBJECTS` can enroll subjects
+  and grant admin through the
   API, with no `setup.sh` run. The record on the `members` stream is then the only trace, so read it
   (`GET /v1/subjects`, the provenance export) as part of any access review.
 - **Roles come from the store, not the login.** On a deployment with a store, the control plane

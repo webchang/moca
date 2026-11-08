@@ -24,6 +24,21 @@ function admin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: Member
   return { p, members: deps.members };
 }
 
+/**
+ * Who may CHANGE enrollment or roles (the user, 2026-11-08): only an admin named in the settings
+ * (SH_ADMIN_SUBJECTS). An admin by an API grant holds the role for templates, policy and quota, but
+ * cannot change who has access, so the API never widens access beyond what the settings' admins do.
+ */
+function settingsAdmin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: MembersStore } {
+  const a = admin(ctx, deps);
+  if (!a.members.bootstrap.admins.includes(a.p.sub))
+    throw new CpError(
+      'forbidden',
+      'changing enrollment or roles requires an admin named in the settings (SH_ADMIN_SUBJECTS)',
+    );
+  return a;
+}
+
 function subjectParam(ctx: RequestCtx): string {
   const s = ctx.params.subject ?? '';
   if (!GITHUB_SUBJECT_RE.test(s))
@@ -46,7 +61,7 @@ export const MEMBER_HANDLERS: Record<string, Handler> = {
   },
 
   enrollSubject: async (ctx, deps) => {
-    const { p, members } = admin(ctx, deps);
+    const { p, members } = settingsAdmin(ctx, deps);
     const subject = subjectParam(ctx);
     if (asRecord(ctx.body).enrolled !== true)
       throw new CpError('invalid_request', 'the body is {"enrolled": true}');
@@ -66,7 +81,7 @@ export const MEMBER_HANDLERS: Record<string, Handler> = {
   },
 
   unenrollSubject: async (ctx, deps) => {
-    const { p, members } = admin(ctx, deps);
+    const { p, members } = settingsAdmin(ctx, deps);
     const subject = subjectParam(ctx);
     if (members.bootstrap.allowed.includes(subject) || members.bootstrap.admins.includes(subject))
       throw new CpError(
@@ -89,7 +104,7 @@ export const MEMBER_HANDLERS: Record<string, Handler> = {
   },
 
   grantAdmin: async (ctx, deps) => {
-    const { p, members } = admin(ctx, deps);
+    const { p, members } = settingsAdmin(ctx, deps);
     const subject = subjectParam(ctx);
     const raw = asRecord(ctx.body).until;
     const nowS = seconds(deps);
@@ -137,15 +152,16 @@ export const MEMBER_HANDLERS: Record<string, Handler> = {
   },
 
   revokeAdmin: async (ctx, deps) => {
-    const { p, members } = admin(ctx, deps);
+    const { p, members } = settingsAdmin(ctx, deps);
     const subject = subjectParam(ctx);
     if (members.bootstrap.admins.includes(subject))
       throw new CpError(
         'bootstrap_subject',
         `${subject} is an admin by the deployment's settings (SH_ADMIN_SUBJECTS); remove it there`,
       );
-    // An admin cannot take its own role: the last API admin could otherwise lock the API out. A
-    // bootstrap admin, or another API admin, revokes it.
+    // Defence in depth: only a settings admin reaches here (settingsAdmin), and a settings admin's own
+    // role is refused above as bootstrap_subject, so this is unreachable today. Kept so a later change
+    // to who may revoke can never let an admin take its own role.
     if (subject === p.sub)
       throw new CpError('self_revoke', 'an admin cannot revoke its own admin role');
     const nowS = seconds(deps);
