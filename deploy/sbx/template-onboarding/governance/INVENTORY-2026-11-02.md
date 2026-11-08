@@ -1,8 +1,8 @@
-# MOCA's existing rules for sandbox images and microVM templates: inventory (2026-11-02)
+# Moca's existing rules for sandbox images and microVM templates: inventory (2026-11-02)
 
 From sbx-template, read-only, on branch sbx-template at 22e19036. A snapshot in time, not kept current:
-the living rules are [`GATING-RULES.md`](GATING-RULES.md). Input for image-factory, which owns MOCA's
-gating rules (the user, 2026-11-02). Paths are relative to the MOCA repository.
+the living rules are [`GATING-RULES.md`](GATING-RULES.md). Input for image-factory, which owns Moca's
+gating rules (the user, 2026-11-02). Paths are relative to the Moca repository.
 
 ## 1. Image rules
 

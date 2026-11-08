@@ -1,4 +1,4 @@
-# MOCA — Template Onboarding Guide
+# Moca — Template Onboarding Guide
 
 **Last modified:** 2026-11-07T15:16:38Z
 
@@ -6,7 +6,7 @@
 
 This guide takes a container image to a **sandbox template**: a named image that a client, or an
 agent session, asks for by id, and whose commands then run in microVMs restored from that image's
-snapshot. It walks through two worked examples end to end: MOCA's public sandbox image (anyone can
+snapshot. It walks through two worked examples end to end: Moca's public sandbox image (anyone can
 reproduce it) and a SWE-bench instance (the benchmark case it was built for). It was validated on
 2026-10-29 and 2026-10-30 against an SBX0 deployment: the control plane and relay on OpenShift, and
 the workers on a bare-metal KVM host. Since then the same flow has run self-serve through the API
@@ -21,7 +21,7 @@ Pi) on one control plane and one build, with every provenance link exact (2026-1
 - The short reference for the same steps is [`deploy/sbx/template-onboarding/ONBOARDING.md`](ONBOARDING.md).
   Deploying SBX0 itself is [`deploy/sbx/README.md`](../README.md) and
   [`RUNBOOK.md`](../RUNBOOK.md); using a sandbox is the
-  [user guide](../../../docs/sbx/user-guide.md); templates in MOCA's own agent sessions are designed in
+  [user guide](../../../docs/sbx/user-guide.md); templates in Moca's own agent sessions are designed in
   [`2026-10-30-session-sandbox-templates-design.md`](../../../docs/specs/2026-10-30-session-sandbox-templates-design.md).
 - **Every host and registry below is a placeholder:** `sbx-api.example.com`, `registry.example.com`.
   No real host, account id or token appears here.
@@ -41,7 +41,7 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
 - [2. The flow on one page](#2-the-flow-on-one-page)
 - [3. The template spec](#3-the-template-spec)
   - [The probe must be shareable](#the-probe-must-be-shareable)
-- [4. Example 1: MOCA's public sandbox image](#4-example-1-mocas-public-sandbox-image)
+- [4. Example 1: Moca's public sandbox image](#4-example-1-mocas-public-sandbox-image)
   - [4.1 Write the spec](#41-write-the-spec)
   - [4.2 Build and probe on the KVM host](#42-build-and-probe-on-the-kvm-host)
   - [4.3 Register (operator machine)](#43-register-operator-machine)
@@ -54,7 +54,7 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
   - [5.4 An agent: OpenCode on the template](#54-an-agent-opencode-on-the-template)
 - [6. Two templates side by side: the client chooses](#6-two-templates-side-by-side-the-client-chooses)
 - [7. Update and retire](#7-update-and-retire)
-- [8. Templates in MOCA agent sessions](#8-templates-in-moca-agent-sessions)
+- [8. Templates in Moca agent sessions](#8-templates-in-moca-agent-sessions)
   - [A session pinned to a build, end to end](#a-session-pinned-to-a-build-end-to-end)
 - [9. Capacity](#9-capacity)
 - [10. Troubleshooting (what we actually hit)](#10-troubleshooting-what-we-actually-hit)
@@ -76,14 +76,14 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
 
 ### What a snapshot holds
 
-Every template is its own bootable image: there is no common MOCA image underneath. What templates
-share is MOCA's thin boot layer, which `build-snapshot.sh` copies into each snapshot.
+Every template is its own bootable image: there is no common Moca image underneath. What templates
+share is Moca's thin boot layer, which `build-snapshot.sh` copies into each snapshot.
 
 | In a snapshot        | Shared by every template?                                                               | Size (a 4 GiB SWE-bench guest)    |
 | -------------------- | --------------------------------------------------------------------------------------- | --------------------------------- |
 | `kernel`             | yes: the host's one guest kernel (`--kernel`)                                           | ~28 MB                            |
-| `agent`              | yes: MOCA's guest agent, from `remote-worker`                                           | ~3 MB                             |
-| `/sbin/init`         | yes: MOCA's init (mounts, `/dev/fd`, `/var` overlay, `HOME`), inside the rootfs         | a few KB                          |
+| `agent`              | yes: Moca's guest agent, from `remote-worker`                                           | ~3 MB                             |
+| `/sbin/init`         | yes: Moca's init (mounts, `/dev/fd`, `/var` overlay, `HOME`), inside the rootfs         | a few KB                          |
 | `rootfs`             | no: an ext4 image of the template's container image (OS, toolchain, repository, `/var`) | 3.5-9 GB                          |
 | `memfile`, `vmstate` | no: the guest's RAM and CPU state after it booted                                       | the guest's RAM (4 GiB), a few KB |
 
@@ -149,9 +149,9 @@ benchmark, **use a public test target, never the tests that grade a fix**: their
 are answer-key material. Match the runner's output as it prints it (§10 has two ways this went
 wrong).
 
-## 4. Example 1: MOCA's public sandbox image
+## 4. Example 1: Moca's public sandbox image
 
-MOCA's own sandbox image, `ghcr.io/rossoctl/moca-remote-worker`, is public, so this example needs no
+Moca's own sandbox image, `ghcr.io/rossoctl/moca-remote-worker`, is public, so this example needs no
 registry key. It is the image SBX0's `default` template ran on 2026-10-29 (built then with
 `build-snapshot.sh` directly). On 2026-10-31 this exact spec was built with `template-build.sh`
 (with `--egress-ca`, for egress credentials) and its probe passed in the restored VM.
@@ -226,7 +226,7 @@ sudo deploy/sbx/install-host.sh <bundle dir> --snapshot default-eed901b838bf --b
 Expected: `sbx-worker@sbx_default_eed901b838bf attached to the relay`. The worker first checks the snapshot against its
 manifest and against the template record `template-build.sh` left in `$SBX_SRV/templates/`
 (`SH_TEMPLATE_RECORD`); a mismatch stops it at start, naming the field. The record's id also becomes
-the worker's `SANDBOX_TEMPLATE`, so MOCA agent sessions naming the template find it (section 8).
+the worker's `SANDBOX_TEMPLATE`, so Moca agent sessions naming the template find it (section 8).
 
 ### 4.5 Use it
 
@@ -435,16 +435,16 @@ A template the deployment declares (`SH_SANDBOX_TEMPLATES`) has no owner, so a s
 a self-serve template under the same id (`409 template_exists`), and no admin can hand it over yet
 (register G34): use another id.
 
-## 8. Templates in MOCA agent sessions
+## 8. Templates in Moca agent sessions
 
-MOCA's own agent sessions (Moca Pi, P6) can name a template too: `mocactl run --option
+Moca's own agent sessions (Moca Pi, P6) can name a template too: `mocactl run --option
 sandboxTemplate=ID`. A worker serves a template when `SANDBOX_TEMPLATE` is set; a session with no
 template never lands on one; the harness runs the seed once, before the agent's first tool call.
 A templated P4 worker is installed beside the main one with `setup-microvm.sh --template ID
 --snapshot DIR`; set-up is in [`P4-ON-P6.md`](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
 Only one worker per host may use guest egress (moca-egress keys VMs by id, which workers share), so
 the installer refuses `--egress` beside another worker that uses it.
-Checked live on a MOCA-VM (P6+P4) on 2026-10-31, with a scripted mock model: a session naming
+Checked live on a Moca-VM (P6+P4) on 2026-10-31, with a scripted mock model: a session naming
 `django-django-11133` ran on the templated worker with the repository seeded, its second turn kept
 the workspace and did not seed again, a session with no template ran on the untemplated worker, and
 an unknown template was refused at creation.
@@ -465,7 +465,7 @@ On a deployment with the template store (the combined control plane, image `87b0
   that `buildId` equals its pin. (`source: "declared"` is a template from `SH_SANDBOX_TEMPLATES`.)
 - **The turn returns the patch.** After each turn on a templated session, the result carries
   `workspace: {baseline, patch, patchSha256, patchBytes}`: the whole workspace's diff from the commit
-  the seed left (`git diff --cached --binary` on a throwaway index, MOCA's own `.moca-*` files left
+  the seed left (`git diff --cached --binary` on a throwaway index, Moca's own `.moca-*` files left
   out), also on the terminal `done` and `error` frames, so `mocactl run --json` prints it. It is
   never truncated: over `SH_TURN_PATCH_MAX_BYTES` (4 MiB by default) `patch` is left out and
   `patchRefused: "too_large"` says so; a patch that is not UTF-8 comes as `patchBase64`; a failed

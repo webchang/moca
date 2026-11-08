@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MOCA template lifecycle automation: an overview deck (design, workflow sequences, validation).
+"""Moca template lifecycle automation: an overview deck (design, workflow sequences, validation).
 
     .venv/bin/python make_template_lifecycle_pptx.py          # .pptx and .pdf beside this file
 
@@ -63,13 +63,13 @@ def self_msg(s, xs, a, y, t, w=2.4, size=11):
 # --------------------------------------------------------------------------- 1. Why and what
 
 def s_motif(d):
-    # MOCA's motif, as autobench-moca's overview deck draws it (its "brain on host, hands apart"):
+    # Moca's motif, as autobench-moca's overview deck draws it (its "brain on host, hands apart"):
     # the brain thinks and holds the model key; the hands only run commands. Here the hands are
     # microVMs from a template's snapshot, and the template is what a client names.
     s = d.slide("The brain thinks, the hands act; a template shapes the hands",
-                "Moca Pi brain, or a stock agent, with MOCA microVM sandbox hands")
+                "Moca Pi brain, or a stock agent, with Moca microVM sandbox hands")
     box(s, 3.1, 1.45, 9.6, 4.6, INFRA, None, [], line_w=1, dash=True)
-    label(s, 3.25, 1.5, 4, 0.3, "MOCA (the cluster and the KVM host)", size=11,
+    label(s, 3.25, 1.5, 4, 0.3, "Moca (the cluster and the KVM host)", size=11,
           align=PP_ALIGN.LEFT)
     brain(s, 0.4, 1.9, 2.3, 1.1, "Stock agent", ["on the client's machine"], size=12)
     brain(s, 0.4, 4.4, 2.3, 1.1, "Client", ["`mocactl`: prompts only"], size=12)
@@ -473,7 +473,7 @@ def s_activation_chart(d):
 
 def s_issues(d):
     s = d.slide("What the windows found, and the fixes",
-                "Every finding has a register entry; MOCA's are fixed and validated")
+                "Every finding has a register entry; Moca's are fixed and validated")
     table(s, 0.6, 1.5, 12.1, [
         ["Id", "Found", "Fixed in", "Validated"],
         ["G26", "commands over 32 KiB hung the worker", "the worker: refused at once", "w2-w4"],
@@ -489,7 +489,7 @@ def s_issues(d):
          "Moca Pi"],
         ["G36", "commands refused at a one-session budget", "client retry; budget sizing",
          "Moca Pi"],
-        ["G30", "~20 s client stalls", "the client's DNS (not MOCA)", "w4: 0 stalls"],
+        ["G30", "~20 s client stalls", "the client's DNS (not Moca)", "w4: 0 stalls"],
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.4, bold_first_col=True)
     note(s, 0.6, 5.8, 12.1, 0.65, "Open",
          ["G34: a declared template's id blocks self-serve creates; G37: mocactl's template "
@@ -521,7 +521,7 @@ def s_next(d):
 
 
 SECTIONS = [
-    ("1", "Why and what", "MOCA's motif, the problem, the design in four ideas",
+    ("1", "Why and what", "Moca's motif, the problem, the design in four ideas",
      [s_motif, s_problem, s_design]),
     ("2", "Architecture", "where each part runs, and a build's states",
      [s_architecture, s_states]),
@@ -535,7 +535,7 @@ SECTIONS = [
 ]
 
 if __name__ == "__main__":
-    d = Deck("MOCA template lifecycle automation", footer="MOCA · template lifecycle", out=OUT,
+    d = Deck("Moca template lifecycle automation", footer="Moca · template lifecycle", out=OUT,
              refuse=[
                  (r"\d{12}", "an account id or similar 12-digit number"),
                  (r"dkr\.ecr|amazonaws", "a registry host"),

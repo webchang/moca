@@ -49,7 +49,7 @@ Redis key prefixes do not collide (`sh:cp:*`, `sbx:*`).
 
 **A third value, `SH_ROUTE_PROFILE=combined`:** the union of both route sets in one process. The
 existing `harness` and `sandbox` profiles stay exactly as they are (SBX0's deployments and the
-MOCA deployments do not change); `combined` is opt-in, for a deployment that runs both brains.
+Moca deployments do not change); `combined` is opt-in, for a deployment that runs both brains.
 
 ### 3.1 Routes
 

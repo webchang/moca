@@ -1,7 +1,7 @@
 # Sandbox templates for agent sessions — Design
 
 Version: 1.0 — October 2026
-Status: Implemented on branch `sbx-template` (webchang/moca), accepted live on a MOCA-VM on 2026-10-31
+Status: Implemented on branch `sbx-template` (webchang/moca), accepted live on a Moca-VM on 2026-10-31
 (§8); not yet proposed upstream
 Builds on (reuse, no redesign): [P6.3](2026-10-04-p6-on-kubernetes-slice3-design.md) (sandbox tiers
 and session-to-sandbox affinity), [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (its
@@ -22,7 +22,7 @@ checked snapshot).
 | What a template is, to selection       | **A second presence label, `moca.dev/template`**, next to `moca.dev/tier`. A worker advertises it from `SANDBOX_TEMPLATE`. The deployment declares its templates (`SH_SANDBOX_TEMPLATES`, the same JSON list SBX0's control plane reads, with an optional `seed`). Rejected: matching on the snapshot name (it carries a digest and changes with every version); matching on `Hello.image` (a container reference, not an id clients choose). |
 | Who picks a session's template         | **The user, at session creation**, fixed for the session's life, like its tier.                                                                                                                                                                                                                                                                                                                                                               |
 | Where a session with no template lands | **Only on untemplated workers** (the user, 2026-10-30). A plain session never gets a benchmark image (often without network, with another toolchain) by accident.                                                                                                                                                                                                                                                                             |
-| Who seeds a templated workspace        | **The harness, once, on the session's first turn that uses the workspace** (the user, 2026-10-30), so a stock agent starts in the template's repository. SBX0 clients run the seed themselves; agents in MOCA sessions do not know to.                                                                                                                                                                                                        |
+| Who seeds a templated workspace        | **The harness, once, on the session's first turn that uses the workspace** (the user, 2026-10-30), so a stock agent starts in the template's repository. SBX0 clients run the seed themselves; agents in Moca sessions do not know to.                                                                                                                                                                                                        |
 | How the template reaches the selector  | **On the exchange response**, beside the tier, as P6.3 does.                                                                                                                                                                                                                                                                                                                                                                                  |
 | Trust                                  | **As the tier.** The label is the worker's word, from its own environment. A workload sandbox's signed attach binding (`AttachBinding`) has no template: workload sandboxes are not templated in this design, and the relay removes a `moca.dev/template` label from any worker attached with a binding.                                                                                                                                      |
 
@@ -42,7 +42,7 @@ A session's sandbox is chosen by tier only. The presence record (`sh:sandbox:rec
 `labels`, `capabilities` and `capacityMax`; `labels` carries `moca.dev/tier` and, for workload
 sandboxes, `moca.dev/workload` and `moca.dev/owner`. A P4 `microvm-worker` serves one snapshot
 (`SH_SNAPSHOT_DIR/SH_SNAPSHOT_IMAGE`), but nothing in its record says which. SBX0 has templates, but
-maps each straight to a worker's `sandbox_id` in its own control-plane profile; MOCA sessions do not
+maps each straight to a worker's `sandbox_id` in its own control-plane profile; Moca sessions do not
 use it.
 
 ## 3. Data model and wire
@@ -212,7 +212,7 @@ An injected sandbox (a leaf's) is its caller's, and a leaf takes its own patch: 
   affinity across a template change (an immediate reset), the seed (runs once, skipped with the marker,
   re-run after a reset, failure).
 - **mocactl, unit:** the option field and request shape.
-- **Acceptance, MOCA-VM on bm1:** one untemplated P4 worker and one templated worker; a session with
+- **Acceptance, Moca-VM on bm1:** one untemplated P4 worker and one templated worker; a session with
   the template lands on the templated worker and finds the repository seeded; a session without
   lands on the untemplated one. **Passed on 2026-10-31** (templated worker installed with `setup-microvm.sh
 --template`, scripted mock model): the templated session ran on the templated worker with the

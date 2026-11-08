@@ -31,9 +31,9 @@ retained workspaces (§6.1); open: TB's egress (O13), a lease's length (O14), wo
 
 ## 1. Goal and scope
 
-**Goal:** SWE-bench, and benchmarks like it, at scale on MOCA templates: many per-instance templates
+**Goal:** SWE-bench, and benchmarks like it, at scale on Moca templates: many per-instance templates
 **onboarded by their clients themselves**, gated automatically, a bounded set of them **active** on a
-host at a time, chosen by the workload through the **MOCA API** (D1, D3, D12), with every deployed
+host at a time, chosen by the workload through the **Moca API** (D1, D3, D12), with every deployed
 image and template traceable through persistent provenance that can be verified offline (D5, D7),
 hosted in the control plane (D8).
 
@@ -44,7 +44,7 @@ hosted in the control plane (D8).
 - template **states** a client can read: onboarding and readiness (D4; gaps S1, S2);
 - **activation by the client**, within a per-subject quota and a per-host active limit, with
   **aging** and **least-recently-used replacement** (A16), and activation on first use (§6.4);
-- **policy**: MOCA's side of the gating rules as machine checks, in profiles an admin chooses (§8);
+- **policy**: Moca's side of the gating rules as machine checks, in profiles an admin chooses (§8);
 - **provenance**: a chain of records from the image to every run, persistent in the control plane and
   verifiable offline (D7, D8; PV1-PV9);
 - **tracing a run** to its exact snapshot (PV7).
@@ -84,25 +84,25 @@ The user asked (2026-11-03) to leverage the good design decisions of E2B's templ
 (docs.e2b.dev, "Template tags & versioning", "Template names", the templates API). Adopted:
 
 - **Self-serve:** any enrolled client creates a template and its builds through the API, as any E2B
-  key holder does (D12). MOCA adds what E2B does not have: policy gating before registration (§8).
+  key holder does (D12). Moca adds what E2B does not have: policy gating before registration (§8).
 - **A build is an immutable artifact with an id.** A build is one snapshot; its id is the snapshot's
   manifest hash, `buildId` (`sha256:…`, §8 PV2-PV3 make that hash cover the whole snapshot). A
   **template** is a name over its builds. Today's rule that a new image is a new snapshot and a new
   worker is unchanged: each is a new build of the same template.
 - **A build is reused when its inputs are the same:** a create whose image digest, spec, profile,
-  gate record (its sha256) and builder (MOCA commit, kernel) match an existing registered build returns that build, not a second snapshot
-  (E2B caches layers; MOCA's unit is the whole snapshot). Disk is the scarce resource (A3).
+  gate record (its sha256) and builder (Moca commit, kernel) match an existing registered build returns that build, not a second snapshot
+  (E2B caches layers; Moca's unit is the whole snapshot). Disk is the scarce resource (A3).
 - **Tags are labels on builds, moved without rebuilding.** A template is referenced as `id[:tag]`,
   `default` when the tag is omitted; **the template's owner** moves tags (`stable`, `v2`, …) between
   its registered builds (§5). Old builds stay addressable while their sandboxes drain.
 - **Pin by build id:** a session or sandbox may name `id@sha256:…` instead of a tag, and is then
   served by exactly that build or refused.
 - **The build is an API resource** with a status and paged logs (§4), as E2B's build status is.
-- **Names:** MOCA keeps its id rule, `^[a-z0-9][a-z0-9-]{0,30}$` (31 characters, the worker-id limit),
+- **Names:** Moca keeps its id rule, `^[a-z0-9][a-z0-9-]{0,30}$` (31 characters, the worker-id limit),
   lowercased on input and refused, never truncated, when longer; `GET /v1/templates/{id}` answering
   404 is the existence check. A tag follows the same rule. **Ids are unique per deployment**: the
   first subject to create an id owns it; another's create of the same id is `409 template_exists`
-  (E2B scopes names to a project; a MOCA deployment is one project, A21).
+  (E2B scopes names to a project; a Moca deployment is one project, A21).
 - **Visibility:** `private` (the owner and admins) or `deployment` (every enrolled client may use and
   activate it; only the owner changes it). Default `deployment`, so per-instance benchmark templates
   are built once and shared (A21).
@@ -225,11 +225,11 @@ Each build carries **its own spec, seed included**: a client that runs the seed 
 | `GET /v1/policy`                                                               | the deployment's policy profiles: each one's rules, size envelope, allowed registries, trusted gate-record sources, and the policy's digest (§8)                                                                                                                                                    |
 
 plus a block per host: `{"hosts": [{"id": "bm1", "active": {"limit": 24, "used": 18}, "idleLimitSeconds": 3600, "disk": {"freeGb": 140, "floorGb": 60}}]}`
-(limits are per host, §6.2). Errors keep MOCA's shape, `{error, message}` with a stable code, and
+(limits are per host, §6.2). Errors keep Moca's shape, `{error, message}` with a stable code, and
 add `step` where a build step failed and `rule` where policy refused; a refusal that may clear
 carries `Retry-After`. `capacity.running` is what the worker's budget admits at once, as the worker
 reports it (its stats, through the host agent's inventory), not a formula in the control plane: the
-rule depends on the MOCA commit (#644 changed standby charging: autobench-moca measured a density of 16
+rule depends on the Moca commit (#644 changed standby charging: autobench-moca measured a density of 16
 at a280cb41 and 36 at c49e6a8e on the same sweep); `inUse` is its running sessions now. `GET /v1/templates/{id}` returns one template with its full provenance chain (§7).
 
 A session or sandbox names `id`, `id:tag` or `id@sha256:…` (§3.2); the reference is resolved to one
@@ -433,7 +433,7 @@ follows) so the chain from the image to a session can be walked and checked. Eve
 | `policy`                       | an admin sets the policy                                                               | the profiles, in full; its digest is what every `check` cites                                                                                                                                                                                                                         | the control plane       |
 | `create`                       | a client creates a template or a build                                                 | the subject, id, image digest, spec, profile, visibility, the gate record's sha256 if given (the record itself stored beside it)                                                                                                                                                      | the control plane       |
 | `gate`                         | a gate record is cited                                                                 | the gate record's digest, its sha256, its source (a trusted source and commit, or `client`) and its gate fields (GATING-RULES §3)                                                                                                                                                     | the image builder       |
-| `build`                        | a snapshot is built and its probe passed                                               | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent/vmstate/memfile digests, probe and its result, the MOCA commit, the host, when                                                                                     | the host agent          |
+| `build`                        | a snapshot is built and its probe passed                                               | the template record T and the manifest S: image digest, `source_record_digest`, manifest hash, kernel/rootfs/agent/vmstate/memfile digests, probe and its result, the Moca commit, the host, when                                                                                     | the host agent          |
 | `check`                        | policy is applied, at create and at registration                                       | the policy's digest, the profile, each rule and its result, the outcome (`admitted`, `registered`, `rejected`); at registration, `build` is the **digest of the `build` record** it judged (not the manifest hash, which that record holds), so a check cites exactly what it checked | the control plane       |
 | `activate` · `deactivate`      | readiness changes                                                                      | host, worker, manifest hash, subject, reason (owner, first use, aging, replacement, admin); each lease stores its `activate` record's digest                                                                                                                                          |
 | `tag` · `visibility` · `owner` | the owner or an admin changes one                                                      | the new value and the one before: `tag` {tag, buildId (null when removed), before}; `visibility` {field (visibility or description), value, before}; `owner` {owner, before}                                                                                                          |
@@ -493,7 +493,7 @@ offers named **profiles**; an admin writes them (§5.2), and each create names o
 
 | Profile     | For                                                   | Requires, beyond the `base` rules                                                                                                                                                                                 |
 | ----------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base`      | any client's own image (a toolchain, a project's env) | MOCA's rules M1-M4, M7-M17; the image from an allowed registry; the size envelope; a probe (the default probe `true` if none) passing in a restored VM (M12)                                                      |
+| `base`      | any client's own image (a toolchain, a project's env) | Moca's rules M1-M4, M7-M17; the image from an allowed registry; the size envelope; a probe (the default probe `true` if none) passing in a restored VM (M12)                                                      |
 | `benchmark` | SWE-bench, TB and the like                            | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
 
 TB-like benchmarks that need packages from the network (a large share of TB2 reps reached PyPI or
@@ -620,7 +620,7 @@ the broken probe rerun, then the Moca Pi arm with the combined control plane.
 Open from window 2: client-side stalls of about 20 s on some Execs (register G30).
 
 **Window 3** (2026-11-05, measurements, the same image and host setup): every build, patch and build check
-as in window 2; G30's cause is the client's DNS (not MOCA's); G31's baseline, about
+as in window 2; G30's cause is the client's DNS (not Moca's); G31's baseline, about
 86-108 s from each activation's request, both of a pair together. **Step 3** passed the same day on
 ykt3 with a second enrolled subject (fssapi): its create of an existing id and its new build of
 another's template `409 template_exists`, its cancel `403`.
@@ -784,7 +784,7 @@ the session is created through the API, then run with `mocactl run --session`.
 | #   | Question                                   | Decision                                                                                                                        | Where      |
 | --- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | O6  | Who may build a template?                  | **any enrolled client**; policy gates it automatically; admins set policy and quotas, and can retire                            | §4, §5, §8 |
-| O7  | Where does a client's image get its gate?  | **MOCA gates it** (the `base` profile); a trusted builder's gate record is extra evidence, **required for benchmark templates** | §8         |
+| O7  | Where does a client's image get its gate?  | **Moca gates it** (the `base` profile); a trusted builder's gate record is extra evidence, **required for benchmark templates** | §8         |
 | O8  | Who activates and deactivates?             | **clients, within quotas**; aging and LRU free slots; admins set quotas and can deactivate any                                  | §5.1, §6   |
 | O9  | Build steps in code (E2B's builder chain)? | **not now**: clients bring a finished image by digest                                                                           | §3.2       |
 

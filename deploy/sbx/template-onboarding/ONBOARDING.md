@@ -1,6 +1,6 @@
 # Onboarding a sandbox template
 
-The walk-through, with two worked examples (MOCA's public image and a SWE-bench instance) and a
+The walk-through, with two worked examples (Moca's public image and a SWE-bench instance) and a
 client choosing between them, is the [Template Onboarding Guide](GUIDE.md)
 ([PDF](GUIDE.pdf)). This page is the short reference.
 

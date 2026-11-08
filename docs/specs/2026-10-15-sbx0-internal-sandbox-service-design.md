@@ -54,9 +54,9 @@ already runs.
 
 | Question                  | Decision                                                                                                                                                                                                                      |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Data-plane API            | **`sandbox/v1` as it is** (`SandboxExec.Exec` / `Abort`). No sandboxd adapter and no new standard: the APIs are still evolving, and the cohort can use what MOCA already runs. Additive changes only, under ADR-0024's rules. |
+| Data-plane API            | **`sandbox/v1` as it is** (`SandboxExec.Exec` / `Abort`). No sandboxd adapter and no new standard: the APIs are still evolving, and the cohort can use what Moca already runs. Additive changes only, under ADR-0024's rules. |
 | First users               | **A small internal cohort, on both paths:** coding agents (Claude Code, OpenCode) through MCP, and developers coding against the gRPC API directly.                                                                           |
-| Where the front door runs | **A dedicated namespace on a shared OpenShift cluster** (configurable; default `moca-sbx`), separate from any MOCA stack. Workers on the KVM host dial out to it, so the host needs no inbound access.                        |
+| Where the front door runs | **A dedicated namespace on a shared OpenShift cluster** (configurable; default `moca-sbx`), separate from any Moca stack. Workers on the KVM host dial out to it, so the host needs no inbound access.                        |
 | Identity                  | **A second control-plane instance** in that namespace, with a `sandbox` route profile: the existing GitHub (github.com) device-flow login, plus a sandbox resource and a new sandbox token. Approach A of three (§12).        |
 | Lifecycle                 | **An explicit sandbox resource:** create, list, get, delete, with a fixed absolute lifetime. A token covers exactly one sandbox's workspace, never a prefix.                                                                  |
 | Egress                    | **None in SBX0.** Curated templates carry the toolchains. Allowlisted egress (experiment E12, then P4.1's vsock transport) is **the next increment** (§11).                                                                   |
@@ -217,7 +217,7 @@ One JSON line per `Exec`, to stdout:
 - `refused`: `UNAUTHENTICATED`, `PERMISSION_DENIED`, `ALREADY_EXISTS` (`reason: "req_id_in_flight"`,
   §3.6) or `INVALID_ARGUMENT`, with a fixed `reason`.
 
-The lines are written only when the relay has sandbox keys configured, so a MOCA relay's output is
+The lines are written only when the relay has sandbox keys configured, so a Moca relay's output is
 unchanged. Harness callers' Execs write no line. Command text and output are never logged, and
 neither is the token. An operator debug flag (`SH_SANDBOX_AUDIT_COMMANDS=1`, exactly `1`) adds the
 command's first 200 bytes as `cmd`, cut at a UTF-8 character boundary, and only for a token that
@@ -438,7 +438,7 @@ persistence follows the existing `base/redis.yaml`.
 
 | Command                                                                               | Does                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbx login`                                                                           | Device flow against the sbx control plane (config key `sbxControlPlaneUrl`, or `--control-plane-url`). Auth is cached per URL, so it coexists with a MOCA login                                                                                                                                                                                                                                                   |
+| `sbx login`                                                                           | Device flow against the sbx control plane (config key `sbxControlPlaneUrl`, or `--control-plane-url`). Auth is cached per URL, so it coexists with a Moca login                                                                                                                                                                                                                                                   |
 | `sbx logout`                                                                          | Revoke and delete the sbx login                                                                                                                                                                                                                                                                                                                                                                                   |
 | `sbx templates`                                                                       | Lists templates                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `sbx create [--template T] [--name N] [--label K=V]…`                                 | Creates a sandbox and prints its id and expiry, with no push and no agent configuration. This is the HTTP-only form of `up` (1b)                                                                                                                                                                                                                                                                                  |
@@ -561,7 +561,7 @@ nothing here changes, and moca does not need Cortex.
   `.sbx/sandbox.json`. It holds the user's login and refreshes the sandbox token in process before
   `exp`.
 - **Tools:** seven, with the **names and input schemas of Pi's** (`bash`, `read`, `write`, `edit`,
-  `grep`, `find`, `ls`), so an agent sees the same tool surface MOCA's harness serves. Each costs one
+  `grep`, `find`, `ls`), so an agent sees the same tool surface Moca's harness serves. Each costs one
   Exec (`edit` two: read, then write), using the command shapes #504's `fewer-execs.ts` measured.
   Plus `sandbox_info`: template, expiry, and the rules from §6.3.
 - **Instructions:** the server's `instructions` are the §6.3 rules, word for word.
@@ -953,7 +953,7 @@ measurements (§10.7) show.
   stores and their wiring, at roughly two to three times the code of a route profile, and it is
   another surface to review. Rejected for SBX0. A route profile can later be split out if the
   products diverge.
-- **Sandboxes as MOCA sessions** (approach C): reuse `/v1/sessions`, with the session as the
+- **Sandboxes as Moca sessions** (approach C): reuse `/v1/sessions`, with the session as the
   sandbox. Almost no new code, but it brings harness semantics along (config bundles, `aud: harness`
   tokens, session quotas), and it makes the relay accept harness-audience tokens. That blurs the
   token separation MI1 depends on. Rejected.

@@ -1,4 +1,4 @@
-# MOCA — Milestone Registry
+# Moca — Milestone Registry
 
 **This document is the source of truth for milestone numbering and status.** It supersedes the
 milestone table in the parent research doc
@@ -221,7 +221,7 @@ technical density work it depends on and packages for shipment.
 
 | ID      | Title                                                                                                                                                                                                                                                                                                                            | Status                                                                                                                                                                                                                                                                                                                                                                                                               | Spec / issue                                                                                                                           |
 | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| **RA1** | **Density cutover & repository re-architecture** — repo rename to **MOCA** (Micro Orchestrator for Cloud Agents), split-out `moca-experiments` repo, P4/P6 made the primary deployment model, then K8s/Knative/KEDA **deprecated in place** (not deleted), elevated sandbox-transport adapter, design-only agent-runtime adapter | **Phases 1–2 executed** (rename PR #365; split 2026-09-25); **Phase 3's substance landed organically** (P6-on-K8s #426 slices 1–3, #348 CredentialStore — the README flip and the sandbox-transport extraction remain); **Phase 4 executing since 2026-10-11** — [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) deprecates the Knative/KEDA path (#338 remains open and is tracked there, not gating) | [`2026-09-24-ra1-density-cutover-and-repo-rearchitecture-design.md`](2026-09-24-ra1-density-cutover-and-repo-rearchitecture-design.md) |
+| **RA1** | **Density cutover & repository re-architecture** — repo rename to **Moca** (Micro Orchestrator for Cloud Agents), split-out `moca-experiments` repo, P4/P6 made the primary deployment model, then K8s/Knative/KEDA **deprecated in place** (not deleted), elevated sandbox-transport adapter, design-only agent-runtime adapter | **Phases 1–2 executed** (rename PR #365; split 2026-09-25); **Phase 3's substance landed organically** (P6-on-K8s #426 slices 1–3, #348 CredentialStore — the README flip and the sandbox-transport extraction remain); **Phase 4 executing since 2026-10-11** — [ADR-0041](../adrs/0041-deprecate-knative-keda-deployment.md) deprecates the Knative/KEDA path (#338 remains open and is tracked there, not gating) | [`2026-09-24-ra1-density-cutover-and-repo-rearchitecture-design.md`](2026-09-24-ra1-density-cutover-and-repo-rearchitecture-design.md) |
 
 ## Multi-user Isolation (`MI`-prefix)
 
@@ -248,7 +248,7 @@ reviewable isolation claim rather than continuing any one of them.
 ## Sandbox Service (`SBX`-prefix)
 
 Offering the P4 microVM tier — a fresh Firecracker VM per command over a persistent workspace — as a
-service that clients other than MOCA's harness use directly: coding agents on developers' laptops
+service that clients other than Moca's harness use directly: coding agents on developers' laptops
 (through MCP) and developers' own code (through `sandbox/v1`). Its own prefix because it packages the
 `P` track's P4 tier as a product with its own identity and lifecycle, rather than continuing the
 density work. The long-term multi-tenant design (SBX1) is exploratory and not in this repository.

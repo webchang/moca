@@ -1,4 +1,4 @@
-# MOCA template onboarding
+# Moca template onboarding
 
 The all-in-one place for **sandbox templates**: what they are, how to create and onboard one from a
 container image, how to check it, and how clients and agents use it. A template is a named image
@@ -20,7 +20,7 @@ what each step records): [`governance/`](governance/README.md).
 | [`template-build.sh`](template-build.sh)                                                           | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record                                          |
 | [`template-register.sh`](template-register.sh)                                                     | **operator machine:** record → `SBX_WORKERS` and the templates file (add, versioned update, `--retire`, `--remove`), then `setup.sh`                            |
 | [`verify-provenance.py`](verify-provenance.py)                                                     | **anywhere, Python 3 only:** verifies a template provenance export offline (digests, chain, heads, cited gate records); `--head` compares a head kept elsewhere |
-| [`examples/default.json`](examples/default.json)                                                   | sample spec 1: MOCA's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                                                  |
+| [`examples/default.json`](examples/default.json)                                                   | sample spec 1: Moca's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                                                  |
 | [`examples/django__django-11133.json`](examples/django__django-11133.json)                         | sample spec 2: a SWE-bench instance (image-factory's spec block, host-free image), template `django-django-11133`                                               |
 | [`examples/django__django-11133.gate-record.json`](examples/django__django-11133.gate-record.json) | sample 2's gate record, image-factory's (commit c3ea3a4), passed with `--gate-record`                                                                           |
 | [`tests/`](tests/)                                                                                 | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                                              |
@@ -47,15 +47,15 @@ These are part of the same flow but live with the code they belong to.
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`../../microvm/build-rootfs.sh`](../../microvm/build-rootfs.sh)     | image → rootfs tree (called by `template-build.sh`)                                                                                          |
 | [`../../microvm/build-snapshot.sh`](../../microvm/build-snapshot.sh) | rootfs → golden snapshot; `--verify-command` runs the probe (called by `template-build.sh`)                                                  |
-| [`../../microvm/P4-ON-P6.md`](../../microvm/P4-ON-P6.md)             | building snapshots by hand, and [a templated P4 worker for MOCA sessions](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates) |
-| [`../../microvm/setup-microvm.sh`](../../microvm/setup-microvm.sh)   | MOCA-VM (P6+P4): `--template ID --snapshot DIR` installs a templated P4 worker for MOCA sessions; `--uninstall-template ID` removes it       |
+| [`../../microvm/P4-ON-P6.md`](../../microvm/P4-ON-P6.md)             | building snapshots by hand, and [a templated P4 worker for Moca sessions](../../microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates) |
+| [`../../microvm/setup-microvm.sh`](../../microvm/setup-microvm.sh)   | Moca-VM (P6+P4): `--template ID --snapshot DIR` installs a templated P4 worker for Moca sessions; `--uninstall-template ID` removes it       |
 
 **Using a template:**
 
 | File                                                                                                                                      | Role in the flow                                                                               |
 | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | [`docs/sbx/user-guide.md`](../../../docs/sbx/user-guide.md)                                                                               | clients: `mocactl sbx templates`, `create --template`, `run`, agents through `mocactl sbx mcp` |
-| [`docs/concepts/sandboxes-and-tiers.md`](../../../docs/concepts/sandboxes-and-tiers.md)                                                   | templates and tiers in MOCA's own agent sessions (`--option sandboxTemplate=ID`)               |
+| [`docs/concepts/sandboxes-and-tiers.md`](../../../docs/concepts/sandboxes-and-tiers.md)                                                   | templates and tiers in Moca's own agent sessions (`--option sandboxTemplate=ID`)               |
 | [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../../docs/specs/2026-10-30-session-sandbox-templates-design.md)         | the design of templates in agent sessions                                                      |
 | [`docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md`](../../../docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md) | the design of SBX0 and its templates                                                           |
 
