@@ -33,6 +33,14 @@ export interface SbxToken {
  * `/v1/discovery` as the sandbox service reads it (SBX0 §4.1). Only `profile` is relied on: a
  * control plane that predates profiles omits it and is a harness (MOCA) one.
  */
+/** A subject as `GET /v1/subjects` lists it (register G38). */
+export interface SbxSubject {
+  subject: string;
+  enrolled: boolean;
+  source: 'env' | 'api';
+  roles: { role: string; source: 'env' | 'api'; until: number | null; by: string | null }[];
+}
+
 export interface SbxDiscovery {
   profile?: string;
 }
@@ -120,6 +128,35 @@ export class SandboxApiClient extends ControlPlaneClient {
     quota: { templates: number; buildsQueued: number; active: number } | null,
   ): Promise<{ target: string; quota: unknown; before: unknown; policy: string; record: string }> {
     return this.json('PUT', `/v1/quota/${encodeURIComponent(target)}`, { body: quota });
+  }
+
+  /** Every enrolled subject, with its roles (enrollment and roles spec §4, register G38; admins). */
+  async listSubjects(): Promise<SbxSubject[]> {
+    return (await this.json<{ subjects: SbxSubject[] }>('GET', '/v1/subjects')).subjects;
+  }
+
+  /** Enroll a subject (G38; admins). */
+  enrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}`, {
+      body: { enrolled: true },
+    });
+  }
+
+  /** Unenroll a subject enrolled through the API (G38; admins). */
+  unenrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}`);
+  }
+
+  /** Grant the admin role, optionally until an epoch second (G38; admins). */
+  grantAdmin(subject: string, until?: number): Promise<SbxSubject & { record: string | null }> {
+    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`, {
+      body: until === undefined ? {} : { until },
+    });
+  }
+
+  /** Revoke an API-granted admin role (G38; admins). */
+  revokeAdmin(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`);
   }
 
   createSandbox(body: {
