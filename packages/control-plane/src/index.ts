@@ -222,6 +222,8 @@ export {
   policyDigest,
   policyProblems,
   registryOf,
+  repositoryOf,
+  repositoryAllowed,
   type CheckResult,
   type Policy,
   type PolicyStore,

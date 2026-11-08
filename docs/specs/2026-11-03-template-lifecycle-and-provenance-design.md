@@ -505,7 +505,9 @@ created under `base`.
 
 M7 (the spec well formed, the id rule), M8, M9 for `benchmark`, X10-X12 and X15 from the spec and the
 gate record, the image pinned by digest (M1) **from an allowed registry** (new; closes G2's
-allowlist part), and the caller's quota (§6.2). A refusal is `422 policy_refused {rule, message}` and
+allowlist part) and, where the policy lists repositories for that registry (`allowedRepositories`), from
+one of them (rule `registry.repository`; whole path segments, `prefix/*` for a prefix), and the caller's
+quota (§6.2). A registry with no list allows every repository it serves. A refusal is `422 policy_refused {rule, message}` and
 a `check` record; nothing is queued.
 
 ### 8.2 At build and registration

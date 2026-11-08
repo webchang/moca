@@ -8,6 +8,19 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.6.0
+
+A per-registry repository allowlist in the template policy, so a registry can be opened to named
+repositories only (the onboarding guide's general-user samples on Docker Hub).
+
+- The policy gains an optional `allowedRepositories: {registry: [repository, …]}`. Each entry is an exact
+  repository path or a `prefix/*`, matched on whole path segments. A registry with no entry allows every
+  repository, as before.
+- A create from a listed registry but an unlisted repository is refused `422 policy_refused`, rule
+  `registry.repository`.
+- `index.docker.io` reads as `docker.io`. A reference with no host stays `<default>`, the build host's
+  own registry, never Docker Hub.
+
 ### 1.5.0
 
 Per-subject trust for gate records ([subject trust spec](../specs/2026-11-08-subject-trust-gate-records-design.md),
