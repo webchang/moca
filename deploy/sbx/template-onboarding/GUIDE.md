@@ -128,19 +128,28 @@ For a template id `ID` and an image digest `sha256:abcdef012345…`:
 A JSON file, schema `moca-sbx-template-spec/1`. Every field is checked before anything runs
 ([`template-build.sh`](template-build.sh)):
 
-| Field                     | Meaning                                                                                                                 |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `id`                      | what clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`; the same across versions                                             |
-| `image`                   | `repository@sha256:<digest>`, never a tag; a repository with no host takes it from `--registry`                         |
-| `guest_ram_mb`, `vcpus`   | the guest's size, fixed in the snapshot                                                                                 |
-| `guest_home`              | optional, a writable `HOME` under `/tmp` (the rootfs is read-only)                                                      |
-| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose                                                               |
-| `guest_home_gitconfig`    | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check`         |
-| `egress`                  | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress                                       |
-| `seed`                    | a bash command that fills a new sandbox's empty `/workspace`, or `""`                                                   |
-| `probe`                   | `{cmd, timeout_s, expect_rc, expect[]}`: run after the seed in the restored VM; passes on the exit code and every regex |
-| `description`, `tools`    | what clients see in `GET /v1/templates`                                                                                 |
-| `etc_hosts_sha256`        | optional: the build stops unless the rootfs's `/etc/hosts` has this hash                                                |
+| Field   | Meaning                                                                                         |
+| ------- | ----------------------------------------------------------------------------------------------- |
+| `id`    | what clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`; the same across versions                     |
+| `image` | `repository@sha256:<digest>`, never a tag; a repository with no host takes it from `--registry` |
+
+**Which images a self-serve create accepts** is the deployment's policy: `allowedRegistries` (by
+registry host; `<default>` is a reference with no host, which the host pulls from its configured
+registry), and, per registry, `allowedRepositories` naming the repositories it admits (exact path
+segments, or `prefix/*`). Docker Hub's key is `docker.io` (`index.docker.io` normalizes to it), so
+write a Docker Hub image with its host, `docker.io/library/python@sha256:…`. Don't work around a
+refusal by writing another host for the same registry (`registry-1.docker.io/…`): that host is its
+own key, refused unless an admin lists it, and listing it would bypass the repository allowlist.
+
+| `guest_ram_mb`, `vcpus` | the guest's size, fixed in the snapshot |
+| `guest_home` | optional, a writable `HOME` under `/tmp` (the rootfs is read-only) |
+| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose |
+| `guest_home_gitconfig` | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check` |
+| `egress` | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress |
+| `seed` | a bash command that fills a new sandbox's empty `/workspace`, or `""` |
+| `probe` | `{cmd, timeout_s, expect_rc, expect[]}`: run after the seed in the restored VM; passes on the exit code and every regex |
+| `description`, `tools` | what clients see in `GET /v1/templates` |
+| `etc_hosts_sha256` | optional: the build stops unless the rootfs's `/etc/hosts` has this hash |
 
 ### The probe must be shareable
 
