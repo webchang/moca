@@ -106,8 +106,9 @@ A subject may submit its own gate record (made with image-factory's general gate
 `selfAttest`. It counts only for that subject's own templates, which stay private and are shown as
 self-attested until an admin adds the record's sha256 to `trustedGateRecords`. The X rules above apply
 unchanged, plus: commits always refused (X12 strict), and egress only where the profile allows it.
-`benchmark-self` keeps X11 (offline, for benchmark integrity); `general-self` allows the KVM host's
-allowlisted egress. Moca's spec: [subject trust for gate records](../../../../docs/specs/2026-11-08-subject-trust-gate-records-design.md).
+`benchmark-self` keeps X11 (offline, for benchmark integrity) and, like `benchmark`, needs a
+general-gate record's floor checked offline (X1.offline: `gate.floor_checked_offline`); `general-self`
+allows the KVM host's allowlisted egress and either floor. Moca's spec: [subject trust for gate records](../../../../docs/specs/2026-11-08-subject-trust-gate-records-design.md).
 
 ## 3. Provenance: what must be kept, where
 
