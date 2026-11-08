@@ -100,6 +100,15 @@ that passed is the evidence. A template built from such an image must carry the 
 | X14 | **The probe's expectation was measured**: in a real VM (`vm`) or the guest emulation (`emulation`), on the same image digest and command; matched against the printed summary, colour codes stripped | vm   | spec `probe_status`, `proved_in_vm`; image-factory's probe record                                                             | enforced: image-factory (tests); M9 refuses an unmeasured one                                                                                                                            |
 | X15 | **The template's size is the gate's envelope**: 4096 MiB, 2 vCPUs, `HOME=/tmp/home`                                                                                                                  | vm   | spec                                                                                                                          | enforced by the spec's values; nothing in Moca checks them                                                                                                                               |
 
+### 2.3 Self-attested gate records (Moca, register G41)
+
+A subject may submit its own gate record (made with image-factory's general gate) on a profile with
+`selfAttest`. It counts only for that subject's own templates, which stay private and are shown as
+self-attested until an admin adds the record's sha256 to `trustedGateRecords`. The X rules above apply
+unchanged, plus: commits always refused (X12 strict), and egress only where the profile allows it.
+`benchmark-self` keeps X11 (offline, for benchmark integrity); `general-self` allows the KVM host's
+allowlisted egress. Moca's spec: [subject trust for gate records](../../../../docs/specs/2026-11-08-subject-trust-gate-records-design.md).
+
 ## 3. Provenance: what must be kept, where
 
 **The chain.** Each link is a digest, and each must be checkable offline from the records alone:

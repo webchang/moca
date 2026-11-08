@@ -8,6 +8,29 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.5.0
+
+Per-subject trust for gate records ([subject trust spec](../specs/2026-11-08-subject-trust-gate-records-design.md),
+register G41 (c)).
+
+- Policy profiles may carry `selfAttest` and `selfAttestEgress`. The default policy gains
+  `benchmark-self` (the benchmark rules, offline) and `general-self` (no X11; the KVM host's
+  allowlisted egress allowed).
+- On a `selfAttest` profile, a gate record the policy does not trust is accepted for the creating
+  subject's own template. New policy rules: `X1.self.scope` (another subject's record),
+  `X12.self` (commits always refused), `X1.self.egress` (egress where the profile forbids it).
+- `attestation` (`deployment | self`) on templates and builds, recomputed from the current policy.
+- `X1.offline`: on a profile that requires X1, a general-gate record (`image-factory/gate/1`) needs
+  `gate.floor_checked_offline: true` (fail closed); a curated family record predates the field and
+  passes. A profile with `requireOfflineGate: false` (`general-self`) accepts either. Builds show
+  `gateFloorCheckedOffline`, and `gateFloorMetOffline` for a gate from a `network_needed` contract.
+- New error code `self_attested` (409): deployment visibility for a template with a self-attested
+  build, at create or by PATCH.
+- PUT /v1/policy answers `narrowed`, the builds a trust removal makes private; the `policy` record
+  names them too. A template's `visibility` is the one in effect.
+- The `gate` provenance record's body: `source` `trusted | self | client`, `scope` for `self`, and
+  `policy` (the policy record at create).
+
 ### 1.4.0
 
 Enrollment and roles through the API ([enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md),
