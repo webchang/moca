@@ -8,6 +8,24 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.4.0
+
+Enrollment and roles through the API ([enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md),
+register G38). On both route profiles, when the deployment keeps a template store (`SH_PROVENANCE_DIR`); admin only.
+
+- New GET /v1/subjects: every enrolled subject with its roles, each with `source: env | api`, and
+  an admin grant's `until`.
+- New PUT and DELETE /v1/subjects/{subject} (enroll, unenroll), and PUT and DELETE
+  /v1/subjects/{subject}/roles/admin (grant, with an optional `until` in epoch seconds; revoke).
+- The settings stay the bootstrap: `SH_ALLOWED_SUBJECTS` and `SH_ADMIN_SUBJECTS` can't be changed
+  here (`409 bootstrap_subject`), and an admin can't revoke its own role (`409 self_revoke`).
+- **Behaviour change:** with a template store, roles and enrollment are evaluated per request. A
+  token's `roles` claim reports what held when it was minted; a grant, revoke or lapsed `until`
+  takes effect at the subject's next request.
+- New provenance stream `members`, with record kinds `member` and `role`. An older
+  `verify-provenance.py` refuses a store holding them.
+- New `Subject` schema; new error codes `bootstrap_subject` (409) and `self_revoke` (409).
+
 ### 1.3.0
 
 Templates as a store with a lifecycle, self-serve and gated by policy, built and run by host agents,

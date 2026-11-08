@@ -289,3 +289,17 @@ describe('per-request evaluation through the router (spec §3)', () => {
     expect((await get(tokenFor(CAROL, []))).status).toBe(200);
   });
 });
+
+describe('the wiring (main.ts)', () => {
+  it('builds a members store with the settings as its bootstrap, only with SH_PROVENANCE_DIR', async () => {
+    const { templateCatalogFromEnv } = await import('../src/main.js');
+    const dir = mkdtempSync(join(tmpdir(), 'cp-members-main-'));
+    const config = { sandbox: { allowedSubjects: [ALLOWED] } } as never;
+    const built = templateCatalogFromEnv(
+      { SH_PROVENANCE_DIR: dir, SH_ADMIN_SUBJECTS: ENV_ADMIN } as NodeJS.ProcessEnv,
+      config,
+    );
+    expect(built.members?.bootstrap).toEqual({ allowed: [ALLOWED], admins: [ENV_ADMIN] });
+    expect(templateCatalogFromEnv({} as NodeJS.ProcessEnv, config).members).toBeUndefined();
+  });
+});

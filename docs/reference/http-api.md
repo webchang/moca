@@ -186,6 +186,7 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Internal       | `POST /internal/credentials`: data plane only, authenticated with `SH_EXCHANGE_TOKEN`                                                                                                                                                                                                                                             |
 | Templates      | `GET /v1/templates[/{id}]`, `…/builds[/{build}]`, `…/tags`; `POST /v1/templates`, `…/builds`, `…/builds/{build}/cancel`; `POST …/activate`, `…/deactivate`; `POST`/`DELETE …/tags[/{tag}]`; `PATCH /v1/templates/{id}`; `PUT …/owner` (admin); `POST …/builds/{build}/reject` (admin); `POST …/retire`, `DELETE …/builds/{build}` |
 | Policy, quota  | `GET`, `PUT /v1/policy` (admin); `GET /v1/quota`, `PUT /v1/quota/{subject\|default}` (admin)                                                                                                                                                                                                                                      |
+| Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}` (enroll, unenroll); `PUT`, `DELETE /v1/subjects/{subject}/roles/admin` (grant with an optional `until`, revoke); admin only, API 1.4.0                                                                                                                                 |
 | Host agents    | `POST /v1/hosts/{host}/inventory`, `…/builds/claim`, `…/builds/{build}/log`, `…/builds/{build}/report`, `…/workers/report`; `GET …/wanted`, `…/blobs/{digest}`; the `hostToken` scheme                                                                                                                                            |
 | Sandboxes      | `POST`, `GET /v1/sandboxes`, `GET`, `DELETE /v1/sandboxes/{id}`, `POST /v1/sandboxes/{id}/token`; `GET /v1/janitor/sandboxes` (janitor); the `sandbox` profile only                                                                                                                                                               |
 
@@ -203,12 +204,19 @@ with Retry-After, and its lease is taken, so the retry succeeds once the host ha
 [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) and the
 [changelog](../api/CHANGELOG.md).
 
+Who is enrolled and who is an admin (API 1.4.0, with a template store): the deployment's settings
+(`SH_ALLOWED_SUBJECTS`, `SH_ADMIN_SUBJECTS`) are the bootstrap, and admins add to them through `/v1/subjects`. Roles
+and enrollment are evaluated per request, so a grant, a revoke or a lapsed `until` takes effect at the subject's next
+request; a token's `roles` claim reports what held when it was minted. See the
+[enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md).
+
 Another user's session returns 404, not 403. Control-plane error codes and statuses: 400
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`, `unknown_template`,
 `digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`, `model_unavailable`), 401 (`token_required`,
 `token_invalid`, `token_expired`, `unauthorized`), 403 (`forbidden`, `not_enrolled`), 404 (`session_not_found`, `config_bundle_not_found`,
 `credential_not_found`, `template_not_found`, `sandbox_not_found`), 409 (`template_exists`, `template_not_active`,
-`template_unavailable`, `no_active_slot`, `build_in_use`, `name_conflict`, `sandbox_terminated`), 410 (`device_code_expired`,
+`template_unavailable`, `no_active_slot`, `build_in_use`, `name_conflict`, `sandbox_terminated`, `bootstrap_subject`,
+`self_revoke`), 410 (`device_code_expired`,
 `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429 (`quota_exceeded`,
 `bundle_quota_exceeded`), 500 `internal_error`, 502 `identity_provider_misconfigured`, 503
 (`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in

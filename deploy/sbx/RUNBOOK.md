@@ -164,6 +164,21 @@ Edit the list and re-run `setup.sh`. The control plane rolls with the new list:
 Admins (`SBX_ADMIN_SUBJECTS`) may list, read and delete every sandbox, but never mint a token for
 another user's: they cannot run commands in another user's code.
 
+**Enrollment and admins through the API** (register G38, on a deployment with a template store,
+`SBX_TEMPLATE_STORE`). The settings above stay the bootstrap; an admin adds to them without a
+`setup.sh` run, each change a record on the `members` provenance stream:
+
+```bash
+mocactl sbx admin subjects                                   # who is enrolled, and how
+mocactl sbx admin subjects enroll github:<id>                # or unenroll
+mocactl sbx admin subjects grant github:<id> --until 1h      # a temporary admin: lapses by itself
+mocactl sbx admin subjects revoke github:<id>
+```
+
+It takes effect at the subject's next request. A subject in `SBX_ALLOWED_SUBJECTS` or
+`SBX_ADMIN_SUBJECTS` can't be unenrolled or revoked this way (`409 bootstrap_subject`): change the
+settings for those. An admin can't revoke its own role.
+
 **A test login without GitHub.** A deployment whose `SBX_GITHUB_CLIENT_ID` is a placeholder (no OAuth
 app) has no device flow. To test it, an operator mints a login for an enrolled subject with the
 deployment's own signing key:
