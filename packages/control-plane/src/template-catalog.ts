@@ -58,6 +58,12 @@ export interface TemplateBuild {
   provenance?: string;
   /** What a host agent needs to build it (§6.1): the image and the spec as the client sent them. */
   request?: { image: string; spec: Record<string, unknown>; gateRecordSha256?: string };
+  /**
+   * Created on a selfAttest profile with a gate record the policy did not trust (G41 (c)): a fact
+   * of its create. Whether it is self-attested NOW is recomputed from the current policy
+   * (attestationOf): an admin's promotion or removal of the record needs no rewrite.
+   */
+  selfAttested?: boolean;
   /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */
   queuedAtMs?: number;
   /** The host that claimed it, and when (epoch seconds). */

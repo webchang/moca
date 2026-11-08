@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.4.0
+  version: 1.5.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -161,6 +161,20 @@ components:
             required: [requires, envelope]
             properties:
               requires: { type: array, items: { type: string }, description: gating rule ids }
+              selfAttest:
+                type: boolean
+                description: |
+                  register G41 (c): a gate record the policy does not trust still passes X1.trusted
+                  when the creating subject submitted it, for that subject's own templates only. The
+                  build is self-attested: private, its commits always refused (X12 strict), never
+                  deployment-visible until an admin adds the record's sha256 to trustedGateRecords.
+                  Absent: false. The default policy holds `benchmark-self` and `general-self`
+              selfAttestEgress:
+                type: boolean
+                description: |
+                  on a self-attested record only, whether spec.egress may be true (the KVM host's
+                  allowlisted egress, never unrestricted). Absent: false. `benchmark-self` keeps it
+                  false (benchmark integrity); `general-self` sets it
               envelope:
                 type: object
                 required: [maxGuestMb, maxVcpus, maxWorkspaceMb]
@@ -215,7 +229,16 @@ components:
         owner:
           type: [string, 'null']
           description: the owning subject; null for a template the deployment declared
-        visibility: { type: string, enum: [private, deployment] }
+        visibility:
+          type: string
+          enum: [private, deployment]
+          description: |
+            in effect: `private` while any registered build is self-attested now (register G41,
+            a trust removal narrows a template on the next read), else as set
+        attestation:
+          type: string
+          enum: [deployment, self]
+          description: '`self` when any registered build is self-attested now (G41)'
         onboarding:
           type: [string, 'null']
           description: "`registered` once any build is; else the newest build's status"
@@ -295,6 +318,13 @@ components:
           description: |
             epoch seconds of the newest sandbox created on it (retained records included); null
             when it has none, and on the harness profile
+        attestation:
+          type: string
+          enum: [deployment, self]
+          description: |
+            register G41 (c), recomputed on every read from the current policy: `self` when the build
+            was created on a selfAttest profile with a gate record trustedGateRecords does not list;
+            `deployment` otherwise (a promotion or removal of the record changes it, nothing rewritten)
         heldBy:
           type: [array, 'null']
           items: { type: string }
@@ -376,6 +406,7 @@ components:
             - template_not_active
             - template_retired
             - build_in_use
+            - self_attested
             - bootstrap_subject
             - self_revoke
             - digest_mismatch
@@ -1585,7 +1616,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: '`template_exists`'
+          description: |
+            `template_exists`; or `self_attested` (G41): a self-attested create asking for
+            `deployment` visibility, or adding a self-attested build to a deployment-visible template
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1657,6 +1690,13 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: '`template_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `self_attested` (G41): `visibility: deployment` for a template with a self-attested build,
+            until an admin adds its gate record's sha256 to trustedGateRecords
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2238,6 +2278,11 @@ paths:
     put:
       operationId: putPolicy
       summary: Set the template policy (admin); recorded
+      description: |
+        The policy is stored as sent. When it removes a gate record's sha256 from trustedGateRecords
+        (register G41 (c), the user's decision Q4 (i)), the builds that become self-attested on a
+        deployment-visible template make that template private on read; they are named as
+        `narrowed` in the answer and in the `policy` record, so the narrowing is never silent.
       security: [{ sessionToken: [] }]
       requestBody:
         required: true
@@ -2246,10 +2291,22 @@ paths:
             schema: { $ref: '#/components/schemas/Policy' }
       responses:
         '200':
-          description: the policy as set
+          description: the policy as set, and `narrowed` when a trust removal narrowed templates
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/PolicyView' }
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/PolicyView' }
+                  - type: object
+                    properties:
+                      narrowed:
+                        type: array
+                        items:
+                          type: object
+                          required: [template, buildId]
+                          properties:
+                            template: { type: string }
+                            buildId: { type: string }
         '400':
           description: '`invalid_request`: the policy is malformed (each problem named)'
           content:

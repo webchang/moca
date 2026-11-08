@@ -10,7 +10,7 @@ import {
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { isEnrolledForSandbox, type SandboxConfig } from './sandbox-config.js';
-import { buildRecordOf, canonicalJson, type ProvenanceStore } from './provenance.js';
+import { buildRecordOf, canonicalJson, sha256Hex, type ProvenanceStore } from './provenance.js';
 import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
 import {
   checkCreate,
@@ -162,17 +162,53 @@ function catalog(deps: CpDeps): TemplateCatalog {
   );
 }
 
-const canSee = (d: TemplateDoc, p: TokenClaims): boolean =>
-  d.visibility === 'deployment' || d.owner === p.sub || isAdmin(p);
+/**
+ * The trust a build's gate record has NOW (G41 (c)): `deployment` when its sha256 is in the
+ * current policy's trustedGateRecords, or the build names no gate record; `self` when it was
+ * created on a selfAttest profile with a record the policy does not (or no longer) trust.
+ * Recomputed on every read, never stored, so an admin's promotion or removal needs no rewrite.
+ */
+export function attestationOf(
+  b: TemplateBuild,
+  trusted: ReadonlySet<string>,
+): 'deployment' | 'self' {
+  const g = b.request?.gateRecordSha256;
+  return b.selfAttested === true && g !== undefined && !trusted.has(g) ? 'self' : 'deployment';
+}
+
+/**
+ * A template's visibility in effect (G41 (c), the user's Q4 (i)): `private` whenever any of its
+ * registered builds is self-attested now, whatever is stored, so a record whose trust an admin
+ * removed narrows its templates on the next read. Otherwise the stored visibility.
+ */
+export function effectiveVisibility(
+  d: TemplateDoc,
+  trusted: ReadonlySet<string>,
+): 'private' | 'deployment' {
+  return d.visibility === 'deployment' &&
+    d.builds.some((b) => b.status === 'registered' && attestationOf(b, trusted) === 'self')
+    ? 'private'
+    : d.visibility;
+}
+
+/** The current policy's trusted gate records, or none on a deployment without a policy store. */
+async function trustedSet(deps: CpDeps): Promise<ReadonlySet<string>> {
+  return new Set(deps.policy ? (await deps.policy.current()).policy.trustedGateRecords : []);
+}
+
+const canSee = (d: TemplateDoc, p: TokenClaims, trusted: ReadonlySet<string>): boolean =>
+  effectiveVisibility(d, trusted) === 'deployment' || d.owner === p.sub || isAdmin(p);
 
 async function visibleTemplates(deps: CpDeps, p: TokenClaims): Promise<TemplateDoc[]> {
-  return (await catalog(deps).list()).filter((d) => canSee(d, p));
+  const trusted = await trustedSet(deps);
+  return (await catalog(deps).list()).filter((d) => canSee(d, p, trusted));
 }
 
 /** 404 for a template the caller cannot see, as for one that does not exist (no existence oracle). */
 async function visibleTemplate(deps: CpDeps, p: TokenClaims, id: string): Promise<TemplateDoc> {
   const d = await catalog(deps).get(id);
-  if (!d || !canSee(d, p)) throw new CpError('template_not_found', 'no such template');
+  if (!d || !canSee(d, p, await trustedSet(deps)))
+    throw new CpError('template_not_found', 'no such template');
   return d;
 }
 
@@ -192,6 +228,8 @@ interface ReadinessFacts {
   placement: Placement | null;
   /** The hosts as last reported, for each build's `heldBy` (null without host agents). */
   hosts: HostView[] | null;
+  /** The current policy's trusted gate records (G41 (c): attestation and visibility in effect). */
+  trusted: ReadonlySet<string>;
   nowS: number;
 }
 
@@ -206,6 +244,7 @@ function hostViews(deps: CpDeps): HostView[] {
 
 async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<ReadinessFacts> {
   const nowS = seconds(deps);
+  const trusted = await trustedSet(deps);
   const hosts = hostViews(deps);
   const placement =
     hosts.length > 0 ? place(docs ?? (await catalog(deps).list()), hosts, nowS) : null;
@@ -225,6 +264,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       lastUsed: null,
       placement,
       hosts: viewsOrNull(deps, hosts),
+      trusted,
       nowS,
     };
   }
@@ -235,7 +275,15 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
     lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
   }
-  return { attached, inUse, lastUsed, placement, hosts: viewsOrNull(deps, hosts), nowS };
+  return {
+    attached,
+    inUse,
+    lastUsed,
+    placement,
+    hosts: viewsOrNull(deps, hosts),
+    trusted,
+    nowS,
+  };
 }
 
 /** The host views, or null on a deployment without host agents (no `heldBy` to report). */
@@ -281,6 +329,8 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     handle: b.handle ?? b.buildId,
     // On failed or rejected: why, and the step or the rule (§4).
     reason: b.reason ?? null,
+    // G41 (c): whether its gate record is trusted deployment-wide now, or only by its submitter.
+    attestation: attestationOf(b, f.trusted),
     ...(full ? { spec: b.spec } : {}),
   };
 }
@@ -292,7 +342,14 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
     description: d.description,
     tools: def?.spec.tools ?? [],
     owner: d.owner,
-    visibility: d.visibility,
+    // In effect (G41 (c), Q4 (i)): private while any registered build is self-attested.
+    visibility: effectiveVisibility(d, f.trusted),
+    // G41 (c): `self` when any registered build is self-attested now.
+    attestation: d.builds.some(
+      (b) => b.status === 'registered' && attestationOf(b, f.trusted) === 'self',
+    )
+      ? 'self'
+      : 'deployment',
     onboarding: d.builds.some((b) => b.status === 'registered')
       ? 'registered'
       : (d.builds[0]?.status ?? null),
@@ -368,6 +425,27 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
   }
   const { policy: pol, record: policyRecord } = await policy.current();
+  // G41 (c): who already self-attested this record (keyed by subject and sha256), from the catalog:
+  // a build's create names its gate record's sha256 and the template its owner.
+  const gateSha = gateRecordBytes ? `sha256:${sha256Hex(gateRecordBytes)}` : undefined;
+  const gateSelfSubmitters =
+    gateSha && !pol.trustedGateRecords.includes(gateSha)
+      ? [
+          ...new Set(
+            (await cat.list())
+              .filter(
+                (d) =>
+                  d.owner !== null &&
+                  d.builds.some(
+                    (x) =>
+                      x.request?.gateRecordSha256 === gateSha &&
+                      pol.profiles[x.profile]?.selfAttest === true,
+                  ),
+              )
+              .map((d) => d.owner as string),
+          ),
+        ]
+      : [];
   const result = checkCreate(
     {
       id,
@@ -375,6 +453,8 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
       spec,
       ...(typeof b.profile === 'string' ? { profile: b.profile } : {}),
       ...(gateRecordBytes ? { gateRecordBytes } : {}),
+      subject: p.sub,
+      gateSelfSubmitters,
     },
     pol,
   );
@@ -394,6 +474,14 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     const f = result.failed!;
     throw new CpError('policy_refused', f.message ?? f.rule, undefined, { rule: f.rule });
   }
+  // A self-attested create (G41 (c)) never makes its template deployment-visible.
+  const selfAttestedCreate =
+    result.gateTrust === 'self' && pol.profiles[result.profile]?.selfAttest === true;
+  if (selfAttestedCreate && b.visibility === 'deployment')
+    throw new CpError(
+      'self_attested',
+      'a self-attested template is private until an admin trusts its gate record (trustedGateRecords)',
+    );
   const now = seconds(deps);
   const handle = buildHandle(deps.newId());
   const quota = quotaFor(pol, p.sub);
@@ -410,6 +498,13 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     // §3.2: the same inputs are the same build. One registered, or still on its way there, is
     // answered instead of a second build (register G21: a duplicate create queued one, and both
     // registered under one manifest hash).
+    // A self-attested build on a template others can see would reach them on its owner's own gate
+    // (G41 (c)): refused; the owner makes the template private first, or an admin trusts the record.
+    if (selfAttestedCreate && cur && cur.visibility === 'deployment')
+      throw new CpError(
+        'self_attested',
+        `template '${id}' is deployment-visible: make it private before adding a self-attested build`,
+      );
     reused = cur?.builds.find(
       (x) => REUSABLE.has(x.status) && buildReuseKey(x) === want && stillHeld(deps, x),
     );
@@ -452,7 +547,19 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         subject: p.sub,
         body: {
           record_sha256: result.gateRecordSha256,
-          source: pol.trustedGateRecords.includes(result.gateRecordSha256) ? 'trusted' : 'client',
+          // `trusted`: in trustedGateRecords. `self` (G41 (c)): trusted only for its submitter, on a
+          // selfAttest profile. `client`: any other (a profile that does not require X1). The policy
+          // record in force names what the trust was at create, after any later change.
+          source:
+            result.gateTrust === 'trusted'
+              ? 'trusted'
+              : pol.profiles[result.profile]?.selfAttest === true
+                ? 'self'
+                : 'client',
+          ...(result.gateTrust !== 'trusted' && pol.profiles[result.profile]?.selfAttest === true
+            ? { scope: p.sub }
+            : {}),
+          policy: policyRecord,
         },
       });
     }
@@ -472,12 +579,15 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         spec: JSON.parse(JSON.stringify(spec)) as Record<string, unknown>,
         ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
       },
+      ...(selfAttestedCreate ? { selfAttested: true } : {}),
     };
     const base: TemplateDoc = cur ?? {
       schema: TEMPLATE_DOC_SCHEMA,
       id,
       owner: p.sub,
-      visibility: (b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment',
+      visibility: selfAttestedCreate
+        ? 'private'
+        : ((b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment'),
       description: String(spec.description ?? ''),
       tags: {},
       builds: [],
@@ -1090,6 +1200,15 @@ async function updateTemplate(ctx: RequestCtx, deps: CpDeps) {
   if (b.visibility !== undefined) {
     if (b.visibility !== 'private' && b.visibility !== 'deployment')
       throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
+    // G41 (c): a self-attested template reaches no one else on its owner's own gate.
+    if (b.visibility === 'deployment') {
+      const trusted = await trustedSet(deps);
+      if (d0.builds.some((x) => x.status !== 'retired' && attestationOf(x, trusted) === 'self'))
+        throw new CpError(
+          'self_attested',
+          'a self-attested build stays private until an admin trusts its gate record (trustedGateRecords)',
+        );
+    }
     if (b.visibility !== d0.visibility)
       changes.push({ field: 'visibility', value: b.visibility, before: d0.visibility });
   }
@@ -1268,11 +1387,13 @@ export async function resolveForUse(
   const r =
     at >= 0 ? { build: ref.slice(at + 1) } : colon >= 0 ? { tag: ref.slice(colon + 1) } : {};
   const d = await catalog(deps).get(id);
-  const b = d && canSee(d, p) ? resolveBuild(d, r) : null;
+  const trusted = await trustedSet(deps);
+  const seen = !!d && canSee(d, p, trusted);
+  const b = d && seen ? resolveBuild(d, r) : null;
   // A retired build, or a template whose every build is retired, is gone, not unknown (§5.1).
   if (
     d &&
-    canSee(d, p) &&
+    seen &&
     (b?.status === 'retired' ||
       (!b && d.builds.length > 0 && d.builds.every((x) => x.status === 'retired')))
   ) {
@@ -1419,9 +1540,37 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       );
     const bad = policyProblems(ctx.body);
     if (bad.length) throw new CpError('invalid_request', bad.join('; '));
-    const { policy, record } = await deps.policy.set(ctx.body as Policy, p.sub);
+    // G41 (c), the user's Q4 (i): a record whose trust this removes narrows its deployment-visible
+    // templates to private on read. Name each narrowed build in the policy record, so nothing is
+    // silent. The policy itself is what the admin sent, every field kept as sent.
+    const before = new Set((await deps.policy.current()).policy.trustedGateRecords);
+    const after = new Set((ctx.body as Policy).trustedGateRecords);
+    const narrowed: { template: string; buildId: string }[] = [];
+    if ([...before].some((g) => !after.has(g)) && deps.templates)
+      for (const d of await deps.templates.list())
+        if (effectiveVisibility(d, before) === 'deployment')
+          for (const x of d.builds)
+            if (
+              x.status === 'registered' &&
+              attestationOf(x, before) === 'deployment' &&
+              attestationOf(x, after) === 'self'
+            )
+              narrowed.push({ template: d.id, buildId: x.buildId });
+    const { policy, record } = await deps.policy.set(
+      ctx.body as Policy,
+      p.sub,
+      narrowed.length ? { narrowed } : undefined,
+    );
     await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
-    return { status: 200, body: { policy, digest: policyDigest(policy), record } };
+    return {
+      status: 200,
+      body: {
+        policy,
+        digest: policyDigest(policy),
+        record,
+        ...(narrowed.length ? { narrowed } : {}),
+      },
+    };
   },
 
   getQuota: async (ctx, deps) => {
