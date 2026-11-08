@@ -1,5 +1,6 @@
 import { ProvenanceStore } from './provenance.js';
 import { FilePolicyStore } from './template-policy-store.js';
+import { MembersStore } from './members.js';
 import { HostRegistry } from './host-handlers.js';
 import { templateHostsFromEnv } from './host-config.js';
 import type { PolicyStore } from './template-policy.js';
@@ -455,7 +456,12 @@ export function redisClientOptions(url: string) {
 export function templateCatalogFromEnv(
   env: NodeJS.ProcessEnv,
   config: CpConfig,
-): { templates?: TemplateCatalog; policy?: PolicyStore; provenance?: ProvenanceStore } {
+): {
+  templates?: TemplateCatalog;
+  policy?: PolicyStore;
+  provenance?: ProvenanceStore;
+  members?: MembersStore;
+} {
   const dir = env.SH_PROVENANCE_DIR;
   if (!dir) return {};
   if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
@@ -465,6 +471,16 @@ export function templateCatalogFromEnv(
     templates: new FileTemplateCatalog({ dir, declared, provenance }),
     policy: new FilePolicyStore({ dir, provenance }),
     provenance,
+    // Enrollment and roles through the API (register G38), beside the policy; the settings' lists
+    // are its bootstrap, never edited by it.
+    members: new MembersStore({
+      dir,
+      provenance,
+      bootstrap: {
+        allowed: config.sandbox?.allowedSubjects ?? [],
+        admins: adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS),
+      },
+    }),
   };
 }
 

@@ -9,7 +9,7 @@ import { sanitizeRemote } from '../core/sanitize.js';
 import { saveConfig, storedLoginUrl } from '../config.js';
 import { deviceLoginEnd, devicePrompt, type Io, type LoginHelpers } from '../headless.js';
 import { setAuth, type RefreshFailure, type Runtime } from '../runtime.js';
-import type { SandboxApiClient, SbxDiscovery, SbxSandbox } from './api.js';
+import type { SandboxApiClient, SbxDiscovery, SbxSandbox, SbxSubject } from './api.js';
 
 /** `mocactl sbx`'s exit codes (SBX0 §6.1), as `mocactl auth token`'s beyond 0 and 2. */
 export const SBX_EXIT = { ok: 0, failed: 1, usage: 2, loginRequired: 3, unreachable: 4 } as const;
@@ -295,6 +295,55 @@ export async function cmdSetQuota(
           ? `${sanitizeRemote(r.target)}: back to the default quota\n`
           : `${sanitizeRemote(r.target)}: templates ${quota.templates}, builds queued ${quota.buildsQueued}, active ${quota.active}\n`,
       );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** One subject, for a person: `github:9  enrolled (api)  admin (api, until 2026-11-08T12:00:00Z)`. */
+function subjectLine(s: SbxSubject): string {
+  const roles = s.roles.map(
+    (r) =>
+      `${sanitizeRemote(r.role)} (${r.source}${r.until !== null ? `, until ${new Date(r.until * 1000).toISOString().replace('.000Z', 'Z')}` : ''})`,
+  );
+  return [
+    sanitizeRemote(s.subject),
+    `${s.enrolled ? 'enrolled' : 'not enrolled'} (${s.source})`,
+    ...roles,
+  ].join('  ');
+}
+
+/** `sbx admin subjects`: every enrolled subject and its roles (register G38; admins). */
+export async function cmdSubjects(c: SbxCtx): Promise<number> {
+  try {
+    const subjects = await c.api.listSubjects();
+    if (c.json) c.io.out(JSON.stringify(subjects) + '\n');
+    else for (const s of subjects) c.io.out(subjectLine(s) + '\n');
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** `sbx admin subjects enroll|unenroll|grant|revoke SUBJECT` (register G38; admins). */
+export async function cmdSubjectChange(
+  c: SbxCtx,
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  subject: string,
+  until?: number,
+): Promise<number> {
+  try {
+    const r =
+      action === 'enroll'
+        ? await c.api.enrollSubject(subject)
+        : action === 'unenroll'
+          ? await c.api.unenrollSubject(subject)
+          : action === 'grant'
+            ? await c.api.grantAdmin(subject, until)
+            : await c.api.revokeAdmin(subject);
+    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    else c.io.out(`${subjectLine(r)}${r.record ? '' : '  (unchanged)'}\n`);
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);

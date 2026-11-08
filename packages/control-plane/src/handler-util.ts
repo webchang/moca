@@ -4,6 +4,7 @@ import type { OwnershipIndex } from './ownership.js';
 import { CpError } from './errors.js';
 import { isEnrolledForSandbox, notEnrolled } from './sandbox-config.js';
 import type { CpConfig } from './handlers.js';
+import type { MembersStore } from './members.js';
 import type { TokenClaims } from './token.js';
 
 /**
@@ -21,8 +22,29 @@ export const asRecord = (body: unknown): Record<string, unknown> =>
 /** The injectable clock (CpDeps.now, epoch ms) in epoch seconds. */
 export const seconds = (deps: { now(): number }): number => Math.floor(deps.now() / 1000);
 
-/** Whether the caller holds the admin role (SH_ADMIN_SUBJECTS). */
+/**
+ * Whether the caller holds the admin role: SH_ADMIN_SUBJECTS, or an API grant (register G38). With a
+ * members store the router replaces a token's `roles` with the subject's roles now, so this reads a
+ * per-request answer, not one fixed when the token was minted.
+ */
 export const isAdmin = (p: TokenClaims): boolean => (p.roles ?? []).includes('admin');
+
+/**
+ * A subject's roles and store enrollment NOW (register G38). Without a members store (no
+ * SH_PROVENANCE_DIR) it is `fallbackRoles` and not enrolled by a store, as before G38.
+ */
+export async function membershipNow(
+  deps: { members?: MembersStore; now(): number },
+  subject: string,
+  fallbackRoles: string[],
+): Promise<{ roles: string[]; enrolled: boolean }> {
+  if (!deps.members) return { roles: fallbackRoles, enrolled: false };
+  const nowS = seconds(deps);
+  return {
+    roles: await deps.members.rolesNow(subject, nowS),
+    enrolled: await deps.members.storeEnrolled(subject),
+  };
+}
 
 /**
  * Audit a route whose write has ALREADY happened, without letting the audit's own failure change the
@@ -73,7 +95,8 @@ export function requireEnrolledPrincipal(
 ): TokenClaims {
   const p = ctx.principal;
   if (!p) throw new CpError('token_required', 'this route requires a token');
-  if (!isEnrolledForSandbox(p.sub, p.roles ?? [], config)) throw notEnrolled(p.sub);
+  if (!isEnrolledForSandbox(p.sub, p.roles ?? [], config, p.enrolled === true))
+    throw notEnrolled(p.sub);
   return p;
 }
 

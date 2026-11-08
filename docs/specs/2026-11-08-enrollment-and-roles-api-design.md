@@ -1,6 +1,6 @@
 # Enrollment and roles through the API
 
-- **Status:** design accepted (the user, 2026-11-08: all four proposals in §6); not implemented (register G38).
+- **Status:** design accepted (the user, 2026-11-08: all four proposals in §6); **implemented** (0b88a829 control plane, 49c98a85 mocactl), not deployed (register G38).
 - **Date:** 2026-11-08
 - **Builds on:** [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) §4.2 (enrollment),
   [template lifecycle](2026-11-03-template-lifecycle-and-provenance-design.md) §5 (D10: authorization
@@ -103,3 +103,22 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
   and their chain.
 - **On a deployment:** a G34-style handover with an API-granted admin (with `until`) and no `setup.sh`,
   then the offline verify of the `members` stream.
+
+## 8. As built (0b88a829, 49c98a85)
+
+- **The store:** `members.json` beside `policy.json` (`packages/control-plane/src/members.ts`), read
+  through an in-memory copy refreshed when the file's mtime changes.
+- **Per request:** the router (`server.ts`) replaces a verified token's `roles` with
+  `MembersStore.rolesNow` and sets `enrolled` from the store. The device login, the test-user login,
+  the refresh, the egress owner check and the owner transfer use the same evaluation
+  (`membershipNow`, `handler-util.ts`). Without a store (no `SH_PROVENANCE_DIR`), the token's claims
+  stand, as before.
+- **Routes** (`member-handlers.ts`), on both route profiles like the other admin routes. With no
+  store they answer `400 invalid_request`.
+- **Records:** on stream `members`. `member` is `{subject, enrolled, before}`; `role` is
+  `{subject, role, state: granted | revoked | expired, until, before}`. Their `subject` is the acting
+  admin, or `control-plane` for an `expired`, which is written once, by the first request that sees
+  the lapse.
+- **Decided here (the spec left it open):** a grant to a subject not yet enrolled is allowed: the
+  admin role enrolls it, as a bootstrap admin is. Re-granting an unexpired grant with the same `until`
+  writes nothing; with another `until` it writes a new `granted` record.
