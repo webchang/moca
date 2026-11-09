@@ -21,6 +21,16 @@
 # a failed post changes nothing on the host's egress, it only leaves the journal cursor where it was.
 #   - Off when `systemctl is-enabled moca-egress.service` does not say enabled (a --no-egress host, or
 #     none installed): then no journal read, no post, no cursor file.
+#   - Only this host's sandboxes' events leave it: the wanted state's `egressSids` (the workspace keys
+#     of the sandboxes on its workers, live or just ended) is the list, and an event whose sid is not in
+#     it (a Moca P6 session's, served by the same proxy) is not sent, only counted (egressNotOurs).
+#     An audit_dropped report (a count, no sid) is sent. A control plane whose wanted state has no
+#     egressSids (older than openapi 1.7.0) gets nothing: an error line, no journal read, the cursor kept.
+#     The list comes from activation()'s read of the wanted state, never a second request; a run whose
+#     activation was skipped for the lock reads it once itself.
+#   - A time budget: no new batch is started 120 s (EGRESS_BUDGET_S) after the step began, so slow
+#     posts never hold the wanted unit (TimeoutStartSec 5 min) and its activations; the cursor stays at
+#     the last batch taken, and the next run goes on from there.
 #   - The cursor is $SBX_SRV/egress.cursor (0600), the journal position after the last event the
 #     control plane took. With none, the step starts at this boot's first entry.
 #   - Batches of up to 1000 journal entries, at most 10 per run; a non-event line (the proxy's own log)
@@ -68,7 +78,7 @@
 # or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
 # summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
 # --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
-# "egressSkipped","egressRejected".
+# "egressSkipped","egressRejected","egressNotOurs".
 # A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
@@ -84,8 +94,8 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
 CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
-EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_CODE=''
-EGRESS_BATCH=1000 EGRESS_BATCHES=10
+EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NOT_OURS=0 EG_CODE=''
+EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
@@ -264,6 +274,8 @@ activation() {
     return 0
   fi
   wanted="$(api GET "/v1/hosts/$SBX_HOST_ID/wanted")" || { error 'wanted state unreadable'; return; }
+  # Kept for egress(), which takes its egressSids from this read rather than asking again.
+  (umask 077 && printf '%s' "$wanted" >"$WORK/wanted.json")
   jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted" || { error 'wanted state malformed'; return; }
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a wanted worker id is malformed'; continue; }
@@ -377,12 +389,27 @@ egress() {
   command -v journalctl >/dev/null || { error 'egress: no journalctl on PATH'; return; }
   exec 8>"$SBX_SRV/.egress.lock"
   flock -n 8 || { say '{"agent":"skipped","why":"another run is shipping egress events"}'; return 0; }
-  local pending="$SBX_SRV/egress.pending.json" n i pos entries
+  local pending="$SBX_SRV/egress.pending.json" n i pos entries started=$SECONDS sids="$WORK/egress.sids"
+  # This host's sandboxes' workspace keys (see the header). activation() kept the wanted state; a run
+  # whose activation skipped for the lock reads it here, once.
+  if [[ ! -s "$WORK/wanted.json" ]]; then
+    (umask 077 && api GET "/v1/hosts/$SBX_HOST_ID/wanted" >"$WORK/wanted.json") || { error 'egress: wanted state unreadable; nothing sent'; exec 8>&-; return; }
+  fi
+  if ! jq -e '.egressSids | type == "array" and all(type == "string")' "$WORK/wanted.json" >/dev/null 2>&1; then
+    error 'egress: the wanted state has no egressSids (a control plane older than openapi 1.7.0); nothing sent, the cursor kept'
+    exec 8>&-
+    return
+  fi
+  (umask 077 && jq -c '.egressSids' "$WORK/wanted.json" >"$sids")
   if [[ -f "$pending" ]]; then
     egress_post || { error "egress post failed: the cursor stays, the next run retries (HTTP $EG_CODE)"; exec 8>&-; return; }
   fi
   local rc mb mm skipped
   for ((i = 0; i < EGRESS_BATCHES; i++)); do
+    if ((SECONDS - started >= EGRESS_BUDGET_S)); then
+      say "{\"agent\":\"skipped\",\"why\":\"egress: the ${EGRESS_BUDGET_S} s budget is spent; the next run goes on\"}"
+      break
+    fi
     pos=(-b)
     [[ ! -s "$SBX_SRV/egress.cursor" ]] || pos=(--after-cursor "$(<"$SBX_SRV/egress.cursor")")
     entries="$WORK/egress.entries"
@@ -416,12 +443,19 @@ egress() {
     # Each entry's MESSAGE is a proxy event when it is a JSON object from moca-egress; others are skipped.
     # An event over 8 KiB (a guest's long path) is not sent; its sid is, as `oversized`, and the
     # control plane counts it as dropped in that sandbox's log. Nothing in an event is changed.
-    (umask 077 && jq -cs --arg b "$mb" --argjson m "$mm" '(last | .__CURSOR) as $c
+    # Only this host's sandboxes' events, and the proxy's audit_dropped reports (no sid); `notOurs`
+    # counts the others, which stay on the host (it is read aside, and never posted).
+    (umask 077 && jq -cs --arg b "$mb" --argjson m "$mm" --slurpfile s "$sids" '(last | .__CURSOR) as $c
         | [.[] | select(._BOOT_ID != $b or ((.__MONOTONIC_TIMESTAMP // "0") | tonumber) > $m)]
-        | [.[] | .MESSAGE | strings | (try fromjson catch null) | objects | select(.via == "moca-egress")] as $all
-        | {cursor: $c, events: [$all[] | select((tojson | utf8bytelength) <= 8192)],
+        | [.[] | .MESSAGE | strings | (try fromjson catch null) | objects | select(.via == "moca-egress")] as $every
+        | [$every[] | select((.decision == "audit_dropped" and ((.sid // "") == "")) or (.sid as $x | $s[0] | index([$x]) != null))] as $all
+        | {cursor: $c, notOurs: (($every | length) - ($all | length)),
+           events: [$all[] | select((tojson | utf8bytelength) <= 8192)],
            oversized: [$all[] | select((tojson | utf8bytelength) > 8192) | (.sid // "" | tostring | .[0:128])]}' \
-      "$entries" >"$pending") || { rm -f "$pending"; error 'egress: the journal batch did not parse'; break; }
+      "$entries" >"$pending.all" && jq -c 'del(.notOurs)' "$pending.all" >"$pending") ||
+      { rm -f "$pending" "$pending.all"; error 'egress: the journal batch did not parse'; break; }
+    EG_NOT_OURS=$((EG_NOT_OURS + $(jq .notOurs "$pending.all")))
+    rm -f "$pending.all"
     # The skipped count, and the mark after this batch (never moved back within a boot).
     # '|'-joined: with tabs, read would collapse an empty boot id and shift the fields.
     IFS='|' read -r skipped mb mm < <(jq -rs --arg b "$mb" --argjson m "$mm" '
@@ -461,7 +495,7 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS}"
     return 0
   fi
   local free

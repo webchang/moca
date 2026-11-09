@@ -48,6 +48,7 @@ case "$method $path" in
   # egress-status: answer with that status (400 with invalid_request, 404 not_found, else an error).
   [[ -n "$outf" && -n "$wfmt" && " $* " != *" -fsS "* ]] || { echo 'curl: egress posted without -o/-w' >&2; exit 2; }
   [[ ! -f "$MOCK_STATE/egress-fail" ]] || { echo 'curl: (7) Failed to connect' >&2; printf 000; exit 7; }
+  [[ ! -f "$MOCK_STATE/egress-sleep" ]] || sleep "$(<"$MOCK_STATE/egress-sleep")"
   if [[ -f "$MOCK_STATE/egress-status" ]]; then
     st="$(<"$MOCK_STATE/egress-status")"
     case "$st" in
@@ -88,10 +89,10 @@ stop) rm -f "$MOCK_STATE/active-$2" ;;
 esac
 MOCK
 # flock: util-linux on the hosts, absent on a developer's Mac. `flock -n FD` fails while
-# $MOCK_STATE/locked exists, as a lock another run holds.
+# $MOCK_STATE/locked exists, as a lock another run holds (or $MOCK_STATE/locked-FD, that fd's only).
 cat >"$TMP/bin/flock" <<'MOCK'
 #!/usr/bin/env bash
-[[ ! -e "$MOCK_STATE/locked" ]]
+[[ ! -e "$MOCK_STATE/locked" && ! -e "$MOCK_STATE/locked-${!#}" ]]
 MOCK
 # install-host.sh: logs its argv; --uninstall removes the worker's env file, as the real one does.
 cat >"$TMP/bin/install-host" <<'MOCK'
@@ -362,7 +363,8 @@ pass 'removes a retired build only when named and matched by its own record, nev
 #     journal read, no post, no cursor file); on, it posts the proxy's events exactly as written, in
 #     batches of up to 1000, the token from the 0600 header file; a failed post keeps the cursor and
 #     re-sends the same batch; a non-event line is skipped and never posted. example.com hosts only.
-printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+SID=sbx-0123456789abcdef0123456789
+printf '{"run":[],"stop":[],"egressSids":["%s"]}' "$SID" >"$TMP/state/wanted-answer"
 EV='{"time":"2026-11-08T12:00:00.5Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"pypi.example.com","dial_addr":"192.0.2.10:443","method":"CONNECT","status":200,"bytes_up":10,"bytes_down":20,"decision":"tunnel"}'
 EV2='{"time":"2026-11-08T12:00:01Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"files.example.com","method":"GET","path":"/x/","status":403,"bytes_up":0,"bytes_down":0,"credential":"mirror","decision":"destination_denied","coalesced":2}'
 # entry CURSOR MESSAGE [MONOTONIC]: a journal entry of boot b1; the monotonic time defaults to the
@@ -376,7 +378,7 @@ egress_run || fail 'the egress-off run failed'
 grep -q '^journalctl' "$MOCK_LOG" && fail 'read the journal with moca-egress not enabled'
 grep -q '/egress' "$MOCK_LOG" && fail 'posted with moca-egress not enabled'
 [[ ! -e "$TMP/srv/egress.cursor" && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'wrote a cursor or batch with egress off'
-grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0,"egressSkipped":0,"egressRejected":0' "$TMP/out" || fail 'the off summary'
+grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0,"egressSkipped":0,"egressRejected":0,"egressNotOurs":0' "$TMP/out" || fail 'the off summary'
 # On: both events posted as written, the proxy's own log line skipped, the cursor at the last entry.
 touch "$TMP/state/enabled-moca-egress.service"
 egress_run || fail 'the egress run failed'
@@ -391,7 +393,7 @@ jq -e '[.events[] | keys[]] - ["time","via","vm_id","sid","sub","host","dial_add
 grep -q 'curl .*-H @.*/v1/hosts/bm1/egress' "$MOCK_LOG" || fail 'the post did not use the header file'
 grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
 grep -q 'pypi.example.com' "$TMP/out" && fail 'an egress event was printed'
-grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0,"egressSkipped":0,"egressRejected":0' "$TMP/out" || fail 'the on summary'
+grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0,"egressSkipped":0,"egressRejected":0,"egressNotOurs":0' "$TMP/out" || fail 'the on summary'
 grep -qE 'systemctl (start|stop|restart|reload|kill)[^@]*moca-egress' "$MOCK_LOG" && fail 'acted on moca-egress'
 # Nothing new: nothing posted, the cursor unchanged.
 egress_run || fail 'the idle egress run failed'
@@ -482,7 +484,58 @@ egress_run || fail 'the no-mark run failed'
 grep -q 'no position mark: entries of this boot already sent are sent again, and the control plane stores them twice' "$TMP/out" ||
   fail 'a re-send without a mark is silent'
 jq -s -e '(map(.events | length) | add) == 4' "$TMP/state/egress-posts" >/dev/null || fail 'the no-mark restart did not re-send'
-rm -f "$TMP/state/enabled-moca-egress.service"
 pass 'a rotated-away cursor is an error, kept as egress.cursor.stale, restarted from this boot without re-sending; no mark is said (G42)'
+
+# 16. Only this host's sandboxes' events leave it: egressSids from the wanted state (one request, the
+#     one activation made); another sid (a Moca P6 session's) is counted as egressNotOurs and never
+#     posted; an audit_dropped report is sent. An older control plane (no egressSids): nothing sent.
+rm -f "$TMP/srv/egress.pending.json" "$TMP/srv/egress.cursor" "$TMP/srv/egress.mark" "$TMP/srv/egress.catchup"
+P6="$(jq -c '.sid = "p6-session-0001" | .host = "api.example.com"' <<<"$EV")"
+DROP='{"time":"2026-11-08T12:00:02Z","via":"moca-egress","vm_id":"","sid":"","host":"","method":"","status":0,"bytes_up":0,"bytes_down":0,"decision":"audit_dropped","dropped":5}'
+{ entry c1 "$EV"; entry c2 "$P6"; entry c3 "$DROP"; entry c4 "$P6"; } >"$TMP/state/journal"
+egress_run || fail 'the filtered run failed'
+jq -e --argjson a "$EV" --argjson d "$DROP" '.events == [$a, $d] and .cursor == "c4"' "$TMP/state/egress-posts" >/dev/null ||
+  fail 'the post is not exactly our event and the drop report'
+grep -q 'p6-session-0001\|api.example.com' "$TMP/state/egress-posts" "$TMP/out" && fail "another client's event left the host"
+grep -q '"egressRead":4,"egressAccepted":2,.*"egressNotOurs":2' "$TMP/out" || fail 'egressNotOurs is not counted'
+[[ "$(grep -c 'GET.*/v1/hosts/bm1/wanted\|/v1/hosts/bm1/wanted$' "$MOCK_LOG")" == 1 ]] || fail 'the wanted state was read twice'
+[[ "$(<"$TMP/srv/egress.cursor")" == c4 ]] || fail 'the cursor after a filtered batch'
+# A run whose activation is skipped for the lock reads the wanted state once, for egress.
+entry c5 "$EV" >>"$TMP/state/journal"
+touch "$TMP/state/locked-9" # the activation lock only
+egress_run || fail 'the locked egress run failed'
+rm -f "$TMP/state/locked-9"
+[[ "$(grep -c '/v1/hosts/bm1/wanted' "$MOCK_LOG")" == 1 ]] || fail 'a lock-skipped run did not read the wanted state once'
+jq -e '.cursor == "c5"' "$TMP/state/egress-posts" >/dev/null || fail 'a lock-skipped run did not ship'
+# An older control plane: no egressSids, nothing sent, the cursor kept, an error line.
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+entry c6 "$EV" >>"$TMP/state/journal"
+egress_run || fail 'the no-egressSids run failed'
+[[ ! -e "$TMP/state/egress-posts" ]] && ! grep -q '^journalctl' "$MOCK_LOG" || fail 'sent or read without egressSids'
+grep -q 'the wanted state has no egressSids (a control plane older than openapi 1.7.0); nothing sent, the cursor kept' "$TMP/out" ||
+  fail 'no error line for a missing egressSids'
+[[ "$(<"$TMP/srv/egress.cursor")" == c5 ]] || fail 'the cursor moved without egressSids'
+printf '{"run":[],"stop":[],"egressSids":["%s"]}' "$SID" >"$TMP/state/wanted-answer"
+pass 'ships only the wanted state egressSids events and drop reports, counts the rest egressNotOurs; nothing without egressSids (G42)'
+
+# 17. The time budget: no new batch after EGRESS_BUDGET_S (120 s; 5 s here, by the test copy below,
+#     with 3 s posts: SECONDS counts whole seconds, so the margins are wide),
+#     the cursor at the last batch taken; the next run goes on.
+sed 's/EGRESS_BUDGET_S=120$/EGRESS_BUDGET_S=5/' "$A" >"$TMP/host-agent-budget.sh"
+grep -q 'EGRESS_BUDGET_S=5$' "$TMP/host-agent-budget.sh" || fail 'the budget constant is not EGRESS_BUDGET_S=120'
+for i in $(seq 7 3006); do entry "c$i" "$EV"; done >"$TMP/state/journal"
+printf 3 >"$TMP/state/egress-sleep"
+: >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts"; printf c7 >"$TMP/srv/egress.cursor"
+bash "$TMP/host-agent-budget.sh" --wanted-only >"$TMP/out" 2>&1 || fail 'the budget run failed'
+rm -f "$TMP/state/egress-sleep"
+[[ "$(jq -s length "$TMP/state/egress-posts")" == 2 ]] || fail "the budget did not stop the loop after 2 posts ($(jq -s length "$TMP/state/egress-posts"))"
+grep -q 'egress: the 5 s budget is spent; the next run goes on' "$TMP/out" || fail 'the budget stop is not said'
+[[ "$(<"$TMP/srv/egress.cursor")" == c2007 && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'the cursor is not at the last batch taken'
+grep -q '"errors":0' "$TMP/out" || fail 'the budget stop counted an error'
+egress_run || fail 'the run after the budget failed'
+jq -e '.cursor == "c3006" and (.events | length) == 999' "$TMP/state/egress-posts" >/dev/null || fail 'the next run did not go on'
+grep -q 'EGRESS_BUDGET_S=120$' "$A" || fail 'the shipped budget is not 120 s'
+rm -f "$TMP/state/enabled-moca-egress.service"
+pass 'stops starting batches after the time budget, the cursor at the last batch taken; the next run goes on (G42)'
 
 echo 'all host-agent tests passed'

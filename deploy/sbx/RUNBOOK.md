@@ -481,6 +481,15 @@ SANDBOX`, or `GET /v1/sandboxes/{id}/egress`. Nothing to install: no new unit, t
 - **On or off:** on when `systemctl is-enabled moca-egress.service` says enabled, off otherwise (a
   `--no-egress` host). Off, the agent reads no journal, posts nothing and writes no cursor; its summary
   says `"egress":"off"`.
+- **Only this host's sandboxes' events leave it.** The wanted state names them (`egressSids`: the
+  workspace keys of the sandboxes on this host's workers, live or ended within 600 s); an event with
+  any other `sid`, such as a Moca P6 session's on the same proxy, stays in the journal and is only
+  counted (`egressNotOurs`). The proxy's `audit_dropped` reports are sent. Against a control plane
+  whose wanted state has no `egressSids` (older than openapi 1.7.0), the agent sends nothing and says
+  so in an error line, keeping its cursor.
+- **A time budget:** a run starts no new batch 120 s after its egress step began, so slow posts never
+  hold the wanted unit (`TimeoutStartSec` 5 min) and its activations. The cursor stays at the last
+  batch taken; the next run goes on.
 - **It only reads.** The agent reads `journalctl -u moca-egress.service` and never starts, stops or
   configures `moca-egress`, so a failed post never blocks or changes a guest's egress.
 - **Where it is:** the journal cursor after the last event the control plane took is
