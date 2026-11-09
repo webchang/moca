@@ -14,7 +14,8 @@ with one kept elsewhere, which is what catches an export that dropped its latest
 --egress (register G42, optional) checks a sandbox's egress log, as `GET /v1/sandboxes/{id}/egress
 ?format=ndjson` returned it, against the export: the sha256 of FILE's bytes and its line count must
 be the `egress` of the newest `sandbox` record of that sandbox naming one (its end record, or a later
-`state: egress` record). It prints the log's `dropped` and `complete` as recorded; whether an
+`state: egress` record). It prints the log's `dropped` and `complete` as recorded, with the reasons
+(`droppedBy`: proxy, cap, budget, invalid) when the record names them; whether an
 incomplete log still counts is the reader's call. Without --egress nothing about egress is checked.
 
 The rules are the ones packages/control-plane/src/provenance.ts (verifyExport) applies; its test
@@ -197,6 +198,10 @@ def main(argv):
         print(f"ok {h['stream']}: {h['count']} records, head {h['head']}")
     for sandbox_id, n in named.items():
         state = "complete" if n.get("complete") else f"INCOMPLETE, {n.get('dropped')} dropped"
+        by = n.get("droppedBy")
+        if not n.get("complete") and isinstance(by, dict):
+            why = ", ".join(f"{k} {v}" for k, v in sorted(by.items()) if isinstance(v, int) and v > 0)
+            state += f" ({why})" if why else ""
         print(f"ok egress {sandbox_id}: {n.get('events')} events, {n.get('sha256')}, {state}")
     return 0
 

@@ -514,11 +514,14 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   agent says so in an error line (`no position mark`). Entries of an earlier boot that the old cursor
   had not reached are not read.
 - **What is kept:** each event exactly as the proxy wrote it, for as long as the sandbox record
-  (`SBX_RETENTION_DAYS`). A log holds at most 50,000 events.
+  (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`, about 3 MB), and all
+  logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
+  most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
+  back.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
-  those, events past the cap, and the proxy's own `audit_dropped` reports, charged to every sandbox on
+  those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
-  record (`sandbox`, `state: terminated`) names `egress: {events, sha256, dropped, complete}`; if events
+  record (`sandbox`, `state: terminated`) names `egress: {events, sha256, dropped, droppedBy, complete}`; if events
   arrive in the 600 s after the end, a later `sandbox` record with `state: egress` names the final
   log. The grader decides whether an incomplete log still counts.
 - **To turn it off** on a host without disabling egress: there is no switch but the unit's state, by
