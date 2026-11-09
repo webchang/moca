@@ -196,6 +196,10 @@ The id is checked against the credential's catalog (400 `model_unavailable` when
 cannot list its models, the id is accepted unverified and the answer has `modelVerified: false`. Only the two list routes
 answer 503 `model_catalog_unavailable`. These routes came with API 1.1.0; see the [changelog](../api/CHANGELOG.md).
 
+A sandbox's egress log (`GET /v1/sandboxes/{id}/egress`, API 1.7.0, register G42) holds the KVM host's
+egress proxy events for it. Paths are logged without query, fragment or userinfo, and an injected
+credential appears by name only, but a secret a guest puts in a URL path segment is logged as sent.
+
 Templates, policy and host agents came with API 1.3.0, on both route profiles, when the deployment keeps a template
 store (`SH_PROVENANCE_DIR`); sandboxes came with 1.2.0 on the `sandbox` profile. A template is referenced as `id`,
 `id:tag` or `id@sha256:…`, by a sandbox create and by `POST /v1/sessions`'s `sandbox.template` alike; a session records

@@ -3343,6 +3343,9 @@ paths:
         dropped, coalesced), in arrival order. The caller's own sandbox; admins may read any, as
         `GET /v1/sandboxes/{id}`. Kept as long as the sandbox record (SH_SANDBOX_RETENTION_SECONDS).
 
+        Paths are logged without query, fragment or userinfo, and an injected credential appears by
+        name only, but a secret a guest puts in a URL path segment is logged as sent.
+
         `format=ndjson` returns the whole log, one canonical JSON event per line, each ended by
         `\n`. Its sha256 is `summary.sha256`, and the sandbox's end record's `egress.sha256` (or a
         later `sandbox` record with `state: egress`, when events arrived after the end).

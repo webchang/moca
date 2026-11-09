@@ -478,6 +478,8 @@ The host agent's wanted-state run (`sbx-host-agent-wanted`, every 15 s) also shi
 events to the control plane, where each lands in its sandbox's egress log: `mocactl sbx egress
 SANDBOX`, or `GET /v1/sandboxes/{id}/egress`. Nothing to install: no new unit, timer or setting.
 
+Paths are logged without query, fragment or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL path segment is logged as sent.
+
 - **On or off:** on when `systemctl is-enabled moca-egress.service` says enabled, off otherwise (a
   `--no-egress` host). Off, the agent reads no journal, posts nothing and writes no cursor; its summary
   says `"egress":"off"`.
