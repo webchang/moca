@@ -315,7 +315,7 @@ mkdir -p "$BUILD"
 log "building the rootfs of $NAME"
 # The tools this template's image must carry (GATING-RULES.md M3): its spec's `tools` plus what the
 # guest agent itself runs (bash for every command; base64, cat, ls and file for the harness's file
-# operations). Not MOCA's whole sandbox toolchain, which benchmark images do not carry.
+# operations). Not Moca's whole sandbox toolchain, which benchmark images do not carry.
 required="$(jq -r '[.tools[]] + ["bash","ls","cat","base64","file"] | unique | join(" ")' "$SPEC")"
 "$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$PULL" --require "$required"
 if [[ -n "$HOSTS_SHA" ]]; then

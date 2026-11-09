@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a MOCA template provenance export offline (template lifecycle spec §7.2).
+"""Verify a Moca template provenance export offline (template lifecycle spec §7.2).
 
     python3 deploy/sbx/template-onboarding/verify-provenance.py EXPORT.json [--head STREAM=sha256:HEX ...]
         [--egress SANDBOX_ID=FILE ...]
