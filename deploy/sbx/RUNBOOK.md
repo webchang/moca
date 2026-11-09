@@ -121,6 +121,16 @@ Before any Redis image change, take a copy of `/data` (`BGSAVE`, then `dump.rdb`
 revision is never replaced, so `setup.sh`'s rollout wait times out. Then delete the pod
 (`kubectl -n <ns> delete pod redis-0`; its PVC stays) and re-run `setup.sh`.
 
+**Redis's memory limit (register G45).** `setup.sh`'s `redis.conf` sets `maxmemory 200mb` with
+`maxmemory-policy noeviction`, under the container's 256 MiB: a full Redis refuses writes (the
+control plane answers `503 redis_unavailable`) and evicts nothing, instead of being killed with
+every session and sandbox record. **A new namespace gets it at Redis's first start** with nothing
+extra. **An existing one doesn't:** the Secret's change doesn't restart `redis-0` (the StatefulSet
+has no settings hash), so apply it live, `kubectl -n <ns> exec redis-0 -c redis -- redis-cli CONFIG
+SET maxmemory 209715200` and `… CONFIG SET maxmemory-policy noeviction` (`REDISCLI_AUTH` is set in
+the container), or let the next restart read the file. Check with `CONFIG GET maxmemory`. Redis 7
+and Valkey 9 both accept it.
+
 **A host bundle change.** Re-run `install-host.sh` with the new worker bundle whenever `setup.sh`
 says so, and `install-host.sh --janitor` with the new janitor bundle after a change to
 `SBX_JANITOR_WAIT_MINUTES`, `SBX_TOKEN_TTL_MINUTES` (its default wait follows the lifetime),
@@ -540,8 +550,8 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
   most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
   back. Each post reads the length of every retained log, so its cost grows with the number of
-  sandboxes retained with a log: small at SBX0's scale. Redis itself has no `maxmemory` today
-  (register G45).
+  sandboxes retained with a log: small at SBX0's scale. Redis refuses writes past its 200 MB
+  `maxmemory` (register G45, above), well clear of these.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
