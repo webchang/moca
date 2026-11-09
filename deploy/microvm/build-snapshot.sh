@@ -1120,9 +1120,16 @@ check_git_identity() {
     log "skipping the git identity check (--skip-git-identity-check): this image refuses agent commits on purpose"
     return 0
   fi
+  # An image with no git at all has no commit to fail, so the check passes (register G47): the
+  # guest prints `no-git` and exits 0. An image whose template needs git is refused earlier, by
+  # build-rootfs.sh --require (template-build.sh passes the spec's tools there).
   out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
-    -command 'git init -q /tmp/id-check && cd /tmp/id-check && git -c user.useConfigOnly=true commit --allow-empty -m x 2>&1; rc=$?; cd / && rm -rf /tmp/id-check; exit $rc' \
+    -command 'command -v git >/dev/null 2>&1 || { echo no-git; exit 0; }; git init -q /tmp/id-check && cd /tmp/id-check && git -c user.useConfigOnly=true commit --allow-empty -m x 2>&1; rc=$?; cd / && rm -rf /tmp/id-check; exit $rc' \
     2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$out" | tr -d '[:space:]')" = "no-git" ]; then
+    log "the guest has no git: no commit to fail, so no identity is needed (register G47)"
+    return 0
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "build-snapshot.sh: the guest git has no usable identity (exit $rc). An agent's" >&2
     echo "  first \`git commit\` in this sandbox will fail with exit 128 until it configures" >&2

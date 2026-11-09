@@ -28,6 +28,7 @@ import {
   seedCredential,
   type TestDeps,
 } from './helpers/deps.js';
+import { buildJobSpec } from '../src/host-handlers.js';
 
 const EX = resolve(__dirname, '../../../deploy/sbx/template-onboarding/examples');
 const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf8')) as Record<
@@ -2212,3 +2213,49 @@ describe('cold-start pacing: the start limit (register G43)', () => {
 });
 
 void sha256Hex;
+
+describe('the build job names the guest size template-build.sh reads (guest_mb)', () => {
+  it('maps guest_mb to guest_ram_mb, keeps guest_ram_mb, and prefers guest_mb as the policy does', () => {
+    expect(buildJobSpec('t', 'i@sha256:x', { guest_mb: 4096, vcpus: 2 })).toEqual({
+      id: 't',
+      image: 'i@sha256:x',
+      vcpus: 2,
+      guest_ram_mb: 4096,
+    });
+    expect(buildJobSpec('t', 'i', { guest_ram_mb: 2048 })).toEqual({
+      id: 't',
+      image: 'i',
+      guest_ram_mb: 2048,
+    });
+    expect(buildJobSpec('t', 'i', { guest_mb: 1024, guest_ram_mb: 2048 })).toEqual({
+      id: 't',
+      image: 'i',
+      guest_ram_mb: 1024,
+    });
+    expect(buildJobSpec('t', 'i', { vcpus: 1 })).toEqual({ id: 't', image: 'i', vcpus: 1 });
+    // A spec's own id or image never renames the build or swaps its image.
+    expect(
+      buildJobSpec('t', 'i@sha256:x', { id: 'other', image: 'evil@sha256:y', vcpus: 1 }),
+    ).toEqual({
+      id: 't',
+      image: 'i@sha256:x',
+      vcpus: 1,
+    });
+  });
+
+  it("a create that names guest_mb is claimed with guest_ram_mb (the guide window's failure)", async () => {
+    const d = await setup();
+    const { guest_ram_mb: g, ...noRam } = BASE_SPEC as Body;
+    const r = await HANDLERS.createTemplate!(
+      ctx({
+        principal: alice,
+        body: { id: 'gmb', image: IMAGE, spec: { ...noRam, guest_mb: g }, profile: 'base' },
+      }),
+      d,
+    );
+    expect(r.status).toBe(202);
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    expect(c.builds[0].spec.guest_ram_mb).toBe(g);
+    expect(c.builds[0].spec.guest_mb).toBeUndefined();
+  });
+});

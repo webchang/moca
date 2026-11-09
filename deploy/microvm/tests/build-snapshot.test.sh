@@ -1615,6 +1615,13 @@ check "host-side guest_client stderr is captured, not discarded" \
   "$(printf '%s' "$gitid_body" | grep -cF '2>/dev/null')" "0"
 check "the identity check names #415 for the reader who hits the failure" \
   "$([ "$(printf '%s' "$gitid_body" | grep -c '#415')" -ge 1 ] && echo yes || echo no)" "yes"
+# G47: a guest with no git passes (no commit to fail): the guest command tests for git first and
+# prints no-git, and the host takes exactly that as a pass; anything else still goes through the
+# real commit.
+check "the identity check passes a guest with no git (G47)" \
+  "$(printf '%s' "$gitid_body" | grep -cF 'command -v git >/dev/null 2>&1 || { echo no-git; exit 0; }')" "1"
+check "only the exact no-git answer, with exit 0, skips the commit" \
+  "$(printf '%s' "$gitid_body" | grep -cF '[ "$rc" -eq 0 ] && [ "$(printf '"'"'%s'"'"' "$out" | tr -d '"'"'[:space:]'"'"')" = "no-git" ]')" "1"
 
 echo "== egress (P4.1): proxy env + inert placeholder baked into init, build-time listener probe, no NIC"
 # The parked bash inherits the agent's env, which is init's env, so every Exec sees these.

@@ -54,6 +54,27 @@ const CLAIM_MAX = 4;
 /** The host agent's journal cursor, opaque here: printable ASCII, bounded. */
 const CURSOR_RE = /^[\x21-\x7e]{1,512}$/;
 
+/**
+ * The spec a host agent hands template-build.sh for a claimed build. The API takes the guest's size as
+ * `guest_mb` or `guest_ram_mb` (policy M7.guest reads either), but template-build.sh reads only
+ * `guest_ram_mb`, so a create that named `guest_mb` passed the policy and then failed the build's own
+ * spec check (the guide window, 2026-11-09). The job always names `guest_ram_mb`, with the value the
+ * policy checked (`guest_mb ?? guest_ram_mb`, as M7 and the build's S.guest_ram_mb check read it);
+ * `guest_mb` is dropped from it. The job's `id` and `image` are always the template's and the
+ * create's, whatever the spec carries.
+ */
+export function buildJobSpec(
+  id: string,
+  image: string,
+  spec: Record<string, unknown>,
+): Record<string, unknown> {
+  const { guest_mb, ...rest } = spec;
+  const guest = guest_mb ?? rest.guest_ram_mb;
+  // The template's own id and the create's image come last, so a spec key of the same name (which
+  // the create does not refuse) can't rename the build or swap its image in the job.
+  return { ...rest, ...(guest !== undefined ? { guest_ram_mb: guest } : {}), id, image };
+}
+
 /** The workers of the builds a host holds (its last inventory): whose sandboxes it may report. */
 async function hostWorkers(deps: CpDeps, host: string): Promise<Set<string>> {
   const holds = deps.hosts?.get(host)?.holds ?? {};
@@ -584,7 +605,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         template: d.id,
         build: x.handle,
         image: x.request!.image,
-        spec: { id: d.id, image: x.request!.image, ...x.request!.spec },
+        spec: buildJobSpec(d.id, x.request!.image, x.request!.spec),
         ...(x.request!.gateRecordSha256
           ? { gateRecord: `/v1/hosts/${host}/blobs/${x.request!.gateRecordSha256}` }
           : {}),
