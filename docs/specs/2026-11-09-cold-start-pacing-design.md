@@ -1,8 +1,10 @@
 # Pacing and placing template workers' cold starts
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
-  by autobench-moca, autobench, image-factory and autobench-sandbox). Not implemented; built after G39 (G40
-  deployed 2026-11-09; G39 merged), the start limit first, then the grace (register G43).
+  by autobench-moca, autobench, image-factory and autobench-sandbox). **The start limit is
+  implemented** (merged 64bb34fe): its control plane deployed on both namespaces (2026-11-09,
+  ccac7696), its host agent part pending a KVM-host window. The idle grace is not built yet
+  (register G43). §4a records where the build differs from §4.
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
   and many activations waited minutes for their workers. The user kept the host's disk as it was
@@ -126,6 +128,27 @@ grace keeps a template's **worker** attached after its last one ends. Upstream's
 (ADR-0048, SBX0.3) is a different thing: it keeps one sandbox's **VM** warm between its commands,
 inside a worker. The two can coexist: a graced worker can hold lease VMs only while their sandboxes
 live, and a sandbox keeps its worker wanted.
+
+## 4a. As built: the start limit (64bb34fe), and why
+
+- **`SBX_START_WINDOW_S`** (default **300 s**, not ten minutes): with a control plane that sends no
+  `starting`, the agent counts as starting the workers it started less than that long ago, still
+  running and wanted. A wave of four 4 GiB cold starts on a ~125 MB/s volume (3-4 minutes) fits
+  inside it; a slower disk raises it. It is validated like `SBX_START_CONCURRENCY` (a whole number, at
+  least 1).
+- **`startSeconds` is measured to within the 15 s poll:** the agent sees a start end when its build
+  leaves the wanted answer's `starting` while still in `run`, not from the worker's journal. Kept in
+  `$SBX_SRV/start-seconds` (0600, the last 10), with the starts themselves in `start-times`.
+- **`run` comes in the wanted order** (oldest lease first), so the agent starts in that order.
+- **"Attached" is the relay's presence,** the source readiness uses; the agent's own `attached`
+  reports only mean "started".
+- **Retry-After** is `max(1, ceil(ceil(position / startConcurrency) × startSeconds))`, else 30 s as
+  before; on first use the readiness facts are re-read after the lease is taken, so the request's own
+  build has its place in the line.
+- **Placement prefers a host already running the build's worker** for every host, with or without
+  memory figures (G39's `runningWorkers`).
+- **The hosts block** shows `start: {concurrency, seconds, starting, queued}`; builds gain optional
+  `queued` and `queuePosition`; openapi 1.9.0.
 
 ## 5. Effects
 

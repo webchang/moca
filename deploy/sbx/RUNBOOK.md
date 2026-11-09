@@ -943,6 +943,10 @@ workers at once (default 4).
   the cache and looks much faster than a cold one.
 - **Placement prefers a host already running the build's worker** (no start at all), whether or
   not that host reports its memory.
+- **The first window after the agent swap is not a regression:** with at most four starts per run, a
+  wide activation (say 28 templates at once) takes several 15 s runs to start everything, and a
+  client's first Retry-After is the old 30 s until the host has measured a start. Each start's wait is
+  bounded; the total is the disk's, as before.
 - **The one change on upgrade:** a host whose agent is upgraded, with no new settings and whatever
   its control plane, now starts at most 4 workers per run instead of every wanted one at once.
   A control plane older than 1.9.0 ignores the new inventory fields; an older agent sends none, and

@@ -1,6 +1,6 @@
 # Moca — Template Onboarding Guide
 
-**Last modified:** 2026-11-09T04:35:53Z
+**Last modified:** 2026-11-09T19:37:26Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -269,8 +269,10 @@ host and registers it by policy; nobody approves it. Sections 4 and 5 are the op
 same result.
 
 The commands that go through the API are as recorded in the validation runs, cited by run and request
-(answers abridged; their ids replaced by placeholders). The self-serve steps for **your own** image
-are _(unverified)_: they haven't yet been run end to end on a KVM host from a user's image.
+(answers abridged; their ids replaced by placeholders). **Both paths below ran end to end on a KVM host
+from a user's own images on 2026-11-09**, from create to retire (the guide window: Path A in run
+guide-4b-3, Path B in guide-4b-2, and their first attempts' failures in guide-4b-1). Only a template
+with `egress: true` on a host that ships its egress is still _(unverified)_: those runs had egress off.
 
 ### 4b.1 What you need, and what you get
 
@@ -350,10 +352,11 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
      "image": "<your registry>/python-moca-min@sha256:<your layered image's digest>",
      "profile": "base",
      "spec": {
-       "guest_mb": 4096,
+       "guest_ram_mb": 4096,
        "vcpus": 2,
-       "egress": true,
+       "egress": false,
        "seed": "",
+       "skip_git_identity_check": true,
        "tools": ["bash", "python3"],
        "probe": {
          "cmd": "python3 -c 'import sys; print(sys.version_info[:2])'",
@@ -366,8 +369,18 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
    }
    ```
 
-   `POST /v1/templates` with that body and your API token _(unverified for this image)_. A create is
-   answered `202` with the build to follow (as recorded, run lc-1, request 0003):
+   - **`egress: false`** is how it ran; `true` gives the sandbox the host's allowlisted egress
+     (§4b.3's `ca-certificates`, and §4b.6's egress records).
+   - **`skip_git_identity_check: true`** because this image has no git: until register G47's fix
+     reaches the build hosts, the snapshot build's git identity check fails a git-less image. A host
+     with the fix passes it by itself; then leave the field out. (An image that has git should never
+     set it on `base`.)
+   - The guest size can also be written `guest_mb`; on a control plane before ccac7696 that passed
+     the policy and then failed the build's spec check (the guide window's first attempt,
+     guide-4b-1/0009), so write `guest_ram_mb`.
+
+   `POST /v1/templates` with that body and your API token. A create is answered `202` with the build
+   to follow (as recorded, guide-4b-3/0001; also lc-1/0003):
 
    ```json
    {
@@ -379,7 +392,9 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
    ```
 
 3. **Follow the build** with `mocactl sbx templates --json` or `GET /v1/templates/<id>/builds/<build>`:
-   `queued`, `building`, `probing`, `built`, then `registered` (lc-1/0007 queued, lc-1/0103 registered).
+   `queued`, `building`, `probing`, `built`, then `registered` (guide-4b-3/0014: registered,
+   its build's `attestation` `deployment`, since `base` needs no gate record; the template itself was
+   created `visibility: private`; also lc-1/0007 and lc-1/0103).
    `heldBy` names a host once one holds the snapshot.
 
 4. **If it's refused or fails:**
@@ -388,17 +403,22 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
      id's stream.
    - **A failed build** has a `reason` with a `step` and a `code` you can branch on, e.g.
      `{"step": "probe", "code": "probe_failed"}` (lc-1/0185: the probe didn't print what the spec
-     expected). Section 10 lists the usual causes.
+     expected). The guide window's first attempts show two more: `{"step": "spec", "code":
+"spec_refused"}` (guide-4b-1/0009: `guest_mb`, above) and `{"step": "build", "code":
+"build_failed"}` (guide-4b-2/0013, Path A's second build: no git, above). Section 10 lists the usual causes.
 
-5. **Use it:** `mocactl sbx create --template my-python`. Its first use may answer
+5. **Use it:** activate it (`POST /v1/templates/<id>/activate`, guide-4b-3/0018), then
+   `mocactl sbx create --template my-python` (guide-4b-3/0032: `201`). A first use may answer
    `409 template_not_active` with `Retry-After` (lc-1/0188) while a host starts its worker; the retry
-   succeeds once it's attached. A Moca agent session names it with `--option sandboxTemplate=<id>@<build>`
+   succeeds once it's attached. Behind a host's start limit the build reads `activating` with
+   `queued` and its `queuePosition`, and Retry-After estimates the wait; poll with a timeout sized
+   for the queue. A Moca agent session names it with `--option sandboxTemplate=<id>@<build>`
    (section 8).
 
 6. **Update and retire:** a new build of the same id (`POST /v1/templates/<id>/builds`), then
    `mocactl sbx templates tag <id> default --build <new build>`; retire with
-   `mocactl sbx templates retire <id>` (lc-1/0260). A create after that answers `410 template_retired`
-   (lc-1/0262). A retire is refused while a sandbox or session still uses the build
+   `mocactl sbx templates retire <id>` (guide-4b-3/0039; also lc-1/0260). A create after that answers
+   `410 template_retired` (guide-4b-3/0041; also lc-1/0262). A retire is refused while a sandbox or session still uses the build
    (`409 build_in_use`) _(not yet recorded)_.
 
 ### 4b.5 Path B: your own gate record (`general-self`, `benchmark-self`)
@@ -531,11 +551,14 @@ Add `"passed_at_least"` to `floor` with a count you have measured yourself, if y
 hold the image to it.
 
 _Source: image-factory's `docs/examples/general-gate/` and `docs/GENERAL_GATE.md` (8d4b96e). Gated on
-image-factory's machine; not yet built as a template on a KVM host._
+image-factory's machine, and on the KVM host in the guide window, where it was built and registered as
+`benchmark-self` (§4b.5.5)._
 
 #### 5. Create with your gate record
 
-Send the record's bytes, unchanged, as `gateRecord` with a self-attested profile _(unverified)_:
+Send the record's bytes, unchanged, as `gateRecord` with a self-attested profile (as recorded:
+guide-4b-2/0001, a `benchmark-self` create from the layered django-11133 image with image-factory's
+gate record):
 
 ```json
 {
@@ -551,7 +574,10 @@ Send the record's bytes, unchanged, as `gateRecord` with a self-attested profile
   `gate.floor_checked_offline` must be `true`), or `general-self` for one with the host's allowlisted
   egress.
 - The build shows `attestation: self`, and your template stays private: making it
-  `deployment`-visible answers `409 self_attested`.
+  `deployment`-visible answers `409 self_attested`. As recorded: guide-4b-2/0027 registered with
+  `attestation: self`; then an activation (0031), a sandbox (0048) seeded from the image's `/testbed`
+  with its checks passing, and a retire (0055) after which a create answers `410` (0057). On the
+  provenance chain its `gate` record says `source: self`.
 - The refusals you may meet: `X1.self.scope` (a record someone else submitted), `X1.offline` (a
   `network_needed` record on an offline profile), `X12.self` (the record shows commits allowed), and
   `X1.self.egress` (egress on a profile that forbids it).
@@ -573,7 +599,10 @@ names the builds it narrowed.
   `GET /v1/sandboxes/<id>/egress`) shows which hosts the sandbox reached, and the sandbox's end
   record names the log's digest and whether it's complete. Paths are logged without query, fragment
   or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL
-  path segment is logged as sent.
+  path segment is logged as sent. With egress off (both recorded paths), the log is empty, complete,
+  and its digest is the sha256 of no bytes (guide-4b-3/0037 for Path A, guide-4b-2/0053 for Path B);
+  a log with events is _(unverified)_ on
+  a host until one ships them.
 
 ### 4b.7 When something's refused (what users hit)
 
