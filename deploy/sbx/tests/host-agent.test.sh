@@ -745,4 +745,59 @@ rm -f "$TMP/state/active-"*
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 pass 'refuses SBX_START_CONCURRENCY 0 or anything but a whole number from 1, and a bad SBX_START_WINDOW_S, before calling anything (G43)'
 
+# 26. The idle grace (register G43): SBX_IDLE_GRACE_S, default 0, reported as limits.idleGraceSeconds;
+#     a graced build (the wanted answer's `graced`) is kept running and never started, counted in the
+#     summary ("graced":<n>, only when > 0); its stop is logged as ending a grace; a retired build in
+#     `stop` beside `remove` is stopped, then removed, in one run.
+rm -f "$TMP/state/active-"* "$TMP/srv/start-times" "$TMP/srv/start-seconds" "$TMP/srv/graced"
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+st_run || fail 'the default-grace run failed'
+jq -e '.limits.idleGraceSeconds == 0' "$INV" >/dev/null || fail "the default grace: $(jq -c .limits "$INV")"
+! grep -q '"graced"' "$TMP/out" || fail 'the summary says graced with none'
+SBX_IDLE_GRACE_S=900 st_run || fail 'the set-grace run failed'
+jq -e '.limits.idleGraceSeconds == 900' "$INV" >/dev/null || fail "a set grace: $(jq -c .limits "$INV")"
+# s1 wanted, s2 and s3 graced (s2's unit running, s3's not): s1 starts, s2 is counted, s3 never started.
+touch "$TMP/state/active-sbx-worker@sbx_s2.service"
+jq -n '{run: [range(1; 4) | tostring | {template: ("s" + .), buildId: ("sha256:s" + .), worker: ("sbx_s" + .)}],
+  stop: [], starting: ["sha256:s1"], graced: ["sha256:s2", "sha256:s3"], egressSids: []}' >"$TMP/state/wanted-answer"
+SBX_IDLE_GRACE_S=900 st_run || fail 'the graced run failed'
+[[ "$(started)" == 's1 ' ]] || fail "a graced build was started: $(started)"
+grep -q '"agent":"summary".*"graced":1}' "$TMP/out" || fail 'the summary does not count the graced worker'
+[[ "$(stat -c %a "$TMP/srv/graced" 2>/dev/null || stat -f %Lp "$TMP/srv/graced")" == 600 ]] || fail 'the graced list is not 0600'
+! grep -q 'sbx_s2\|sbx_s3' "$TMP/srv/start-times" || fail 'a graced build entered the start book'
+# s2's grace ends (displaced or over): in `stop`, stopped, and said to end a grace.
+jq -n '{run: [{template: "s1", buildId: "sha256:s1", worker: "sbx_s1"}],
+  stop: [{template: "s2", buildId: "sha256:s2", worker: "sbx_s2"}], starting: [], graced: [], egressSids: []}' >"$TMP/state/wanted-answer"
+SBX_IDLE_GRACE_S=900 st_run || fail 'the grace-end run failed'
+grep -q '"agent":"stopped","worker":"sbx_s2","was":"graced"}' "$TMP/out" || fail 'the end of a grace is not logged'
+! grep -q '"graced":' "$TMP/out" || fail 'the summary counts a grace that ended'
+[[ ! -e "$TMP/state/active-sbx-worker@sbx_s2.service" ]] || fail 'the worker whose grace ended still runs'
+# A control plane without `graced` (older than 1.10.0): nothing graced, as before.
+touch "$TMP/state/active-sbx-worker@sbx_s3.service"
+jq -n '{run: [], stop: [{template: "s3", buildId: "sha256:s3", worker: "sbx_s3"}], egressSids: []}' >"$TMP/state/wanted-answer"
+st_run || fail 'the no-graced run failed'
+grep -q '"agent":"stopped","worker":"sbx_s3"}' "$TMP/out" || fail 'a plain stop is logged as a grace'
+# A retired build in `stop` beside `remove`: stopped first, then removed in the same run.
+H="sha256:$(printf 'a%.0s' {1..64})" W=sbx_ret_2
+mkdir -p "$TMP/srv/snapshots/ret-2"; snapfiles "$TMP/srv/snapshots/ret-2" 1
+jq -n --arg h "$H" --arg w "$W" '{schema: "moca-sbx-template/1", id: "ret2", worker: $w, snapshot: "ret-2", manifest_hash: $h}' >"$TMP/srv/templates/ret-2.json"
+: >"$TMP/workers/$W.env"; touch "$TMP/state/active-sbx-worker@$W.service"
+jq -n --arg h "$H" --arg w "$W" '{run: [], stop: [{template: "ret2", buildId: $h, worker: $w}],
+  remove: [{template: "ret2", buildId: $h, worker: $w}], graced: [], egressSids: []}' >"$TMP/state/wanted-answer"
+SBX_IDLE_GRACE_S=900 st_run || fail 'the retire run failed'
+grep -q "\"agent\":\"stopped\",\"worker\":\"$W\"" "$TMP/out" && grep -q "\"agent\":\"removed\",\"worker\":\"$W\"" "$TMP/out" ||
+  fail 'a retired graced worker was not stopped and removed in one run'
+[[ ! -e "$TMP/srv/snapshots/ret-2" ]] || fail 'the retired snapshot is still there'
+# Its settings, refused (exit 2) before any call.
+for bad in 'SBX_IDLE_GRACE_S=-1' 'SBX_IDLE_GRACE_S=01' 'SBX_IDLE_GRACE_S=x' 'SBX_IDLE_GRACE_S=1.5' 'SBX_IDLE_GRACE_S=86401'; do
+  : >"$MOCK_LOG"
+  rc=0; env "$bad" bash "$A" --once >"$TMP/out" 2>&1 || rc=$?
+  [[ "$rc" == 2 ]] || fail "accepted $bad (rc $rc)"
+  [[ ! -s "$MOCK_LOG" ]] || fail "called the control plane before refusing $bad"
+done
+grep -q 'SBX_IDLE_GRACE_S must be' "$TMP/out" || fail 'the grace refusal does not say why'
+rm -f "$TMP/state/active-"*
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+pass 'reports SBX_IDLE_GRACE_S (default 0), keeps graced workers running without starting any, counts them, logs a grace that ends, refuses a bad value (G43)'
+
 echo 'all host-agent tests passed'

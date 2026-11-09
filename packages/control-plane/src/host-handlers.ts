@@ -3,6 +3,7 @@ import { asRecord, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
+import { activationLock } from './activation-lock.js';
 import {
   liveLeases,
   place,
@@ -41,6 +42,7 @@ import {
  *                                            leased first), those it holds that it should stop (no
  *                                            lease left), and, of `run`, those not attached yet
  *                                            (`starting`, register G43: the agent's start limit)
+ *                                            and those kept in its idle grace (`graced`, G43)
  *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
  *   POST /v1/hosts/{host}/egress             {events, cursor}: the egress proxy's audit events, as it
  *                                            wrote them, into each sandbox's egress log (register G42)
@@ -125,6 +127,11 @@ export interface HostState {
   /** The agent's start limit and measured start time (register G43); absent from an older agent. */
   start?: HostStart;
   /**
+   * SBX_IDLE_GRACE_S as its agent reports it (register G43, the idle grace); absent from an older
+   * agent, which is a grace of 0 (off).
+   */
+  idleGraceSeconds?: number;
+  /**
    * The inventory's `memory` (register G39), as far as it is well-formed; absent from an older
    * agent, and then its host is placed by activeLimit alone.
    */
@@ -190,7 +197,33 @@ export function hostViewsOf(deps: CpDeps): HostView[] {
     at: h.at,
     ...(h.memory ? { memory: h.memory } : {}),
     ...(h.start ? { start: h.start } : {}),
+    ...(h.idleGraceSeconds ? { idleGraceSeconds: h.idleGraceSeconds } : {}),
   }));
+}
+
+/**
+ * The workers with a live sandbox, for placement's idle grace (register G43: a draining worker is
+ * never graced, so never displaced). Read only when a host reports a grace; else undefined, and
+ * placement reads exactly as before.
+ */
+export async function graceBusy(
+  deps: CpDeps,
+  hosts: HostView[],
+  nowS: number,
+): Promise<Set<string> | undefined> {
+  if (!deps.sandboxes || !hosts.some((h) => (h.idleGraceSeconds ?? 0) > 0)) return undefined;
+  const busy = new Set<string>();
+  for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+  return busy;
+}
+
+/** The most an idle grace is taken at: a day (a malformed or larger figure is dropped). */
+const GRACE_MAX = 86_400;
+
+/** The inventory limits' idleGraceSeconds (register G43): a whole number 0..GRACE_MAX, else none. */
+export function parseIdleGrace(l: Record<string, unknown>): number | undefined {
+  const g = nonNeg(l.idleGraceSeconds);
+  return g !== undefined && g <= GRACE_MAX ? g : undefined;
 }
 
 /** The most a start limit or a start time is taken at (a malformed figure is dropped, not capped). */
@@ -422,64 +455,10 @@ export const HOST_HANDLERS: Record<string, Handler> = {
 
   hostWanted: async (ctx, deps) => {
     const host = hostOf(ctx);
-    const { cat } = catalogOf(deps);
     const nowS = seconds(deps);
-    const docs = await cat.list();
-    // Read-only: the same placement takeLease judges by (hostViewsOf), for the wanted answer.
-    const p = place(docs, hostViewsOf(deps), nowS);
-    const mine = deps.hosts?.get(host);
-    // A worker is never stopped under a live sandbox (§6.3): it drains first.
-    const busy = new Set<string>();
-    if (deps.sandboxes) {
-      for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
-    }
-    const run: Record<string, unknown>[] = [];
-    const stop: Record<string, unknown>[] = [];
-    // Retired builds this host still holds, with no live sandbox on their worker (§6.1 step 7): the
-    // agent stops and uninstalls the worker and removes the snapshot. Never one with a live sandbox.
-    const remove: Record<string, unknown>[] = [];
-    for (const d of docs) {
-      for (const b of d.builds) {
-        if (!mine || mine.holds[b.buildId] === undefined) continue;
-        const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
-        // Rejected after the fact by an admin (§5.2) ends a build's use as a retire does.
-        if (b.status === 'retired' || (b.status === 'rejected' && b.reason?.rule === 'admin')) {
-          if (b.worker && !busy.has(b.worker)) remove.push(entry);
-          continue;
-        }
-        if (b.status !== 'registered') continue;
-        if (p.placed.get(b.buildId) === host) run.push(entry);
-        else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) stop.push(entry);
-      }
-    }
-    // The agent starts `run` in order, as many as its start limit allows (register G43): first
-    // leased first, the order placement uses, so the oldest activations start first.
-    const order = new Map(wantedBuilds(docs, nowS).map((w, i) => [w.build.buildId, i]));
-    run.sort((a, b) => order.get(a.buildId as string)! - order.get(b.buildId as string)!);
-    // Register G43: of `run`, the builds whose worker is not attached to the relay (its presence, as
-    // readiness reads it); the agent counts those whose unit it runs as starting. Absent when the
-    // presence cannot be read: the agent then counts its own recent starts.
-    let starting: string[] | undefined;
-    if (deps.presence) {
-      try {
-        const attached = new Map(
-          (await deps.presence.list()).map((r) => [r.sandboxId, r.capacityMax]),
-        );
-        starting = unattachedPlaced(docs, p, attached, nowS)
-          .filter((x) => x.host === host)
-          .map((x) => x.buildId);
-      } catch {
-        starting = undefined;
-      }
-    }
-    // Register G42: the workspace keys whose egress events the agent ships, and no others.
-    const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
-      .map((r) => r.wsk)
-      .sort();
-    return {
-      status: 200,
-      body: { run, stop, remove, ...(starting ? { starting } : {}), egressSids },
-    };
+    const views = hostViewsOf(deps);
+    const grace = (deps.hosts?.get(host)?.idleGraceSeconds ?? 0) > 0;
+    return wantedAnswer(deps, host, nowS, views, grace);
   },
 
   hostWorkerReport: async (ctx, deps) => {
@@ -496,12 +475,21 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', 'event must be attached, refused, detached or removed');
     }
     const buildId = typeof b.buildId === 'string' ? b.buildId : '';
-    // `removed` is reported for a retired build (§6.1 step 7); the others for a registered one.
-    const want = event === 'removed' ? 'retired or rejected' : 'registered';
+    // `removed` is reported for a retired build (§6.1 step 7); the others for a registered one, and
+    // `detached` for a retired one too: on a host with an idle grace (register G43), a retired
+    // build's running worker is stopped before its removal.
+    const want =
+      event === 'removed'
+        ? 'retired or rejected'
+        : event === 'detached'
+          ? 'registered, retired or rejected'
+          : 'registered';
     const ok = (x: { status: string }) =>
       event === 'removed'
         ? x.status === 'retired' || x.status === 'rejected'
-        : x.status === 'registered';
+        : event === 'detached'
+          ? x.status === 'registered' || x.status === 'retired' || x.status === 'rejected'
+          : x.status === 'registered';
     const doc = (await cat.list()).find((d) =>
       d.builds.some((x) => x.buildId === buildId && ok(x)),
     );
@@ -548,12 +536,14 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     };
     const memory = parseHostMemory(b.memory);
     const start = parseHostStart(l);
+    const grace = parseIdleGrace(l);
     deps.hosts?.set(host, {
       at: seconds(deps),
       holds,
       limits,
       ...(memory ? { memory } : {}),
       ...(start ? { start } : {}),
+      ...(grace !== undefined ? { idleGraceSeconds: grace } : {}),
     });
     return { status: 200, body: { host, holds: Object.keys(holds).length } };
   },
@@ -770,3 +760,121 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     };
   },
 };
+
+/**
+ * The wanted answer (§6.3), for GET /v1/hosts/{host}/wanted. `grace`: the host has an idle grace
+ * (register G43): its graced builds stay in `run` and are listed in `graced`; a graced worker
+ * displaced for a wanted build is re-checked for a lease at stop time, under the activation lock
+ * (so a lease being taken is written, or not yet begun); and a retired build is listed in `stop`
+ * beside `remove`, so a graced worker's removal is not held for its grace.
+ */
+async function wantedAnswer(
+  deps: CpDeps,
+  host: string,
+  nowS: number,
+  views: HostView[],
+  grace: boolean,
+) {
+  const { cat } = catalogOf(deps);
+  const docs = await cat.list();
+  const mine = deps.hosts?.get(host);
+  // A worker is never stopped under a live sandbox (§6.3): it drains first.
+  const busy = new Set<string>();
+  if (deps.sandboxes) {
+    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+  }
+  // Read-only: the same placement takeLease judges by (hostViewsOf), for the wanted answer. With a
+  // grace on any host (G43) it also says which unleased builds keep their running worker there
+  // (`graced`); `busy` is passed for every host's answer, so they all agree on it.
+  const p = place(docs, views, nowS, { busy });
+  const run: Record<string, unknown>[] = [];
+  const stop: Record<string, unknown>[] = [];
+  // Retired builds this host still holds, with no live sandbox on their worker (§6.1 step 7): the
+  // agent stops and uninstalls the worker and removes the snapshot. Never one with a live sandbox.
+  const remove: Record<string, unknown>[] = [];
+  // Register G43: the unleased builds this host keeps running in its idle grace, after `run`'s
+  // wanted ones (the agent starts nothing for them: their units run).
+  const keep: Record<string, unknown>[] = [];
+  const displaced: Record<string, unknown>[] = [];
+  for (const d of docs) {
+    for (const b of d.builds) {
+      if (!mine || mine.holds[b.buildId] === undefined) continue;
+      const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
+      // Rejected after the fact by an admin (§5.2) ends a build's use as a retire does.
+      if (b.status === 'retired' || (b.status === 'rejected' && b.reason?.rule === 'admin')) {
+        if (b.worker && !busy.has(b.worker)) {
+          remove.push(entry);
+          // A retire ends the grace at once (G43): on a host with a grace, its worker is listed in
+          // `stop` too (the agent stops it only if its unit runs, before the removal, in the same
+          // run), so a graced worker's removal is never held for the grace.
+          if (grace) stop.push(entry);
+        }
+        continue;
+      }
+      if (b.status !== 'registered') continue;
+      if (p.placed.get(b.buildId) === host) run.push(entry);
+      else if (grace && p.graced.get(b.buildId)?.host === host) keep.push(entry);
+      else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) {
+        if (p.displaced.get(b.buildId) === host) displaced.push(entry);
+        else stop.push(entry);
+      }
+    }
+  }
+  // A graced worker displaced for a wanted build (G43) is the one stop nobody asked for: at stop
+  // time, the catalog is read again under the activation lock (no lease half-written), and a build
+  // leased since keeps its worker running.
+  if (displaced.length > 0) {
+    await activationLock(cat).run('activation', async () => {
+      const t = seconds(deps);
+      for (const e of displaced) {
+        const now = (await cat.get(e.template as string))?.builds.find(
+          (x) => x.buildId === e.buildId,
+        );
+        if (now && now.status === 'registered' && liveLeases(now, t).length === 0) stop.push(e);
+      }
+    });
+  }
+  // The agent starts `run` in order, as many as its start limit allows (register G43): first
+  // leased first, the order placement uses, so the oldest activations start first.
+  const order = new Map(wantedBuilds(docs, nowS).map((w, i) => [w.build.buildId, i]));
+  run.sort((a, b) => order.get(a.buildId as string)! - order.get(b.buildId as string)!);
+  // The graced builds stay in `run` (their units keep running), soonest grace end first, and are
+  // listed in `graced` so the agent counts them without guessing.
+  keep.sort(
+    (a, b) =>
+      p.graced.get(a.buildId as string)!.until - p.graced.get(b.buildId as string)!.until ||
+      ((a.buildId as string) < (b.buildId as string) ? -1 : 1),
+  );
+  run.push(...keep);
+  // Register G43: of `run`, the builds whose worker is not attached to the relay (its presence, as
+  // readiness reads it); the agent counts those whose unit it runs as starting. Absent when the
+  // presence cannot be read: the agent then counts its own recent starts.
+  let starting: string[] | undefined;
+  if (deps.presence) {
+    try {
+      const attached = new Map(
+        (await deps.presence.list()).map((r) => [r.sandboxId, r.capacityMax]),
+      );
+      starting = unattachedPlaced(docs, p, attached, nowS)
+        .filter((x) => x.host === host)
+        .map((x) => x.buildId);
+    } catch {
+      starting = undefined;
+    }
+  }
+  // Register G42: the workspace keys whose egress events the agent ships, and no others.
+  const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
+    .map((r) => r.wsk)
+    .sort();
+  return {
+    status: 200,
+    body: {
+      run,
+      stop,
+      remove,
+      ...(starting ? { starting } : {}),
+      ...(grace ? { graced: keep.map((x) => x.buildId as string) } : {}),
+      egressSids,
+    },
+  };
+}

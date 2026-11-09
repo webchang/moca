@@ -13,7 +13,11 @@ import type { TemplateBuild, TemplateDoc } from './template-catalog.js';
  *     and the activation that cannot be placed is refused with no_active_slot (§6.3, O11);
  *   - a subject holds at most quota.active builds at once;
  *   - a host starts at most its startConcurrency workers at once (cold-start pacing spec §4,
- *     register G43): a placed build beyond it waits in the host's start line, `activating`, queued.
+ *     register G43): a placed build beyond it waits in the host's start line, `activating`, queued;
+ *   - on a host with an idle grace (SBX_IDLE_GRACE_S > 0, register G43), a build whose last lease
+ *     has ended keeps its running worker for that long (GRACED), in a slot no wanted build needs: a
+ *     wanted build that needs the slot (or the memory) displaces it, the only stop of a worker
+ *     nobody asked to stop, and only of one with no lease.
  */
 
 /**
@@ -52,6 +56,11 @@ export interface HostView {
    * agent, and then its builds' readiness carries no queue position.
    */
   start?: HostStart;
+  /**
+   * SBX_IDLE_GRACE_S (register G43): how long a released build's running worker is kept, in
+   * seconds; absent or 0 (off, and from an older agent): stopped as soon as it is not wanted.
+   */
+  idleGraceSeconds?: number;
 }
 
 /** What a host's agent reports of its starts (cold-start pacing spec §4, register G43). */
@@ -87,6 +96,32 @@ export interface Placement {
   unplaced: Map<string, Unplaced>;
   /** Per host that reports its memory figures: its use after this placement. */
   memory: Map<string, HostMemoryUse>;
+  /**
+   * Builds in their host's idle grace (register G43): no live lease, their worker running there,
+   * kept until `until` (epoch seconds) in a slot no wanted build needs. Empty without a grace.
+   */
+  graced: Map<string, Graced>;
+  /**
+   * Builds that were in their host's idle grace and gave it up (buildId -> host): a wanted build
+   * needed the slot or the memory, or the host is over its memory with them. Stopped.
+   */
+  displaced: Map<string, string>;
+}
+
+/** A build kept in its host's idle grace (register G43). */
+export interface Graced {
+  host: string;
+  /** Epoch seconds: its last lease's end plus the host's idleGraceSeconds. */
+  until: number;
+}
+
+/** What placement needs beside the catalog and the hosts. */
+export interface PlaceOptions {
+  /**
+   * The workers with a live sandbox (drained, never stopped): never in a grace, so never displaced.
+   * Read only where a host has a grace; absent, none.
+   */
+  busy?: ReadonlySet<string>;
 }
 
 /** A worker's fixed overhead beside its guest's RAM: the VMM and the worker itself (spec §4). */
@@ -114,6 +149,31 @@ export function costMib(b: TemplateBuild): number {
 
 export const liveLeases = (b: TemplateBuild, nowS: number) =>
   (b.leases ?? []).filter((l) => l.until > nowS);
+
+/**
+ * When a build's last lease ended (register G43), epoch seconds: the latest of its recorded
+ * `lastLeaseEnd` (a deactivate's time, or an expired lease's end it cleared) and the ends of its
+ * expired leases still stored. Undefined when it has none (never leased, or released before G43).
+ */
+export function lastLeaseEnd(b: TemplateBuild, nowS: number): number | undefined {
+  let end = b.lastLeaseEnd;
+  for (const l of b.leases ?? [])
+    if (l.until <= nowS && (end === undefined || l.until > end)) end = l.until;
+  return end;
+}
+
+/**
+ * Until when a build would be in an idle grace of `graceS` seconds (register G43): its last lease's
+ * end plus the grace, or undefined when none applies (a live lease, no recorded end, a grace of 0,
+ * or a release with stopNow since that end). Whether it is graced also needs its worker running on
+ * a host with room: place() decides that.
+ */
+export function graceUntil(b: TemplateBuild, graceS: number, nowS: number): number | undefined {
+  if (graceS <= 0 || b.status !== 'registered' || liveLeases(b, nowS).length > 0) return undefined;
+  const end = lastLeaseEnd(b, nowS);
+  if (end === undefined || (b.stopNowAt !== undefined && end <= b.stopNowAt)) return undefined;
+  return end + graceS;
+}
 
 /** The wanted builds, their leases' earliest start breaking ties: first leased, first placed. */
 export function wantedBuilds(
@@ -152,11 +212,24 @@ export function wantedBuilds(
  *
  * "Running" is the agent's own report (`runningWorkers`: the sbx-worker units active on that
  * host), not the relay's presence: a worker pins its memfile from its start, before it attaches,
- * and presence does not say which host a worker is on. A worker in G43's idle grace (not built yet)
- * still runs its unit, so it is counted as running here with no change; if grace ever stops the
- * unit while keeping the pin, add those workers to `running` in the agent.
+ * and presence does not say which host a worker is on. A worker in G43's idle grace still runs its
+ * unit, so it is counted as running here (its memory is in `used`) with no change.
+ *
+ * The idle grace (register G43): on a host with idleGraceSeconds > 0, a registered build with no
+ * live lease and no live sandbox (opts.busy), whose worker runs there, is a grace candidate until
+ * graceUntil(). Each candidate takes a slot of the host's activeLimit; a wanted build that would
+ * otherwise not fit a holder (no slot, or no memory) displaces the candidates that end soonest
+ * there, as few as fit it: a host that fits without displacing comes first. A host still over its
+ * memory with its candidates (headroom below 0), or with more of them than free slots, drops the
+ * soonest-ending. The rest are `graced`; the dropped ones `displaced`. With no grace anywhere,
+ * placement is exactly as before.
  */
-export function place(docs: TemplateDoc[], hosts: HostView[], nowS: number): Placement {
+export function place(
+  docs: TemplateDoc[],
+  hosts: HostView[],
+  nowS: number,
+  opts: PlaceOptions = {},
+): Placement {
   const placed = new Map<string, string>();
   const unplaced = new Map<string, Unplaced>();
   const count = new Map(hosts.map((h) => [h.id, 0]));
@@ -186,13 +259,50 @@ export function place(docs: TemplateDoc[], hosts: HostView[], nowS: number): Pla
           : null;
     memUse.set(h.id, { usedMib: used, pendingMib: 0, headroomMib: 0, brake });
   }
+  // The memory displaced grace candidates free once stopped: not in MemAvailable yet (G43).
+  const freedMib = new Map<string, number>();
   const headroom = (h: HostView): number => {
     const m = h.memory!;
     const u = memUse.get(h.id)!;
     return Math.min(
       m.totalMib! - m.floorMib! - u.usedMib,
-      m.availableMib! - m.floorMib! - u.pendingMib,
+      m.availableMib! - m.floorMib! - u.pendingMib + (freedMib.get(h.id) ?? 0),
     );
+  };
+  // Register G43: each host's grace candidates, soonest-ending first (the first displaced).
+  const candidates = new Map<string, { buildId: string; cost: number; until: number }[]>();
+  const taken = new Set<string>();
+  for (const h of [...hosts].sort((a, b) => (a.id < b.id ? -1 : 1))) {
+    const g = h.idleGraceSeconds ?? 0;
+    if (g <= 0) continue;
+    const list: { buildId: string; cost: number; until: number }[] = [];
+    for (const d of docs) {
+      for (const b of d.builds) {
+        if (taken.has(b.buildId) || h.holds[b.buildId] === undefined) continue;
+        if (b.worker === '' || !running.get(h.id)!.has(b.worker) || opts.busy?.has(b.worker))
+          continue;
+        const until = graceUntil(b, g, nowS);
+        if (until === undefined || nowS >= until) continue;
+        list.push({ buildId: b.buildId, cost: costMib(b), until });
+        taken.add(b.buildId);
+      }
+    }
+    list.sort((a, b) => a.until - b.until || (a.buildId < b.buildId ? -1 : 1));
+    if (list.length) candidates.set(h.id, list);
+  }
+  const displaced = new Map<string, string>();
+  const displace = (h: HostView, k: number) => {
+    const list = candidates.get(h.id) ?? [];
+    let freed = 0;
+    for (const c of list.splice(0, k)) {
+      displaced.set(c.buildId, h.id);
+      freed += c.cost;
+    }
+    const u = memUse.get(h.id);
+    if (u && freed > 0) {
+      u.usedMib -= freed;
+      freedMib.set(h.id, (freedMib.get(h.id) ?? 0) + freed);
+    }
   };
   for (const { build } of wantedBuilds(docs, nowS)) {
     const holders = hosts.filter((h) => h.holds[build.buildId] !== undefined);
@@ -210,24 +320,38 @@ export function place(docs: TemplateDoc[], hosts: HostView[], nowS: number): Pla
     const isRunning = (h: HostView) => build.worker !== '' && running.get(h.id)!.has(build.worker);
     const underLimit = sound.filter((h) => count.get(h.id)! < h.activeLimit);
     const cost = costMib(build);
-    const fits = (h: HostView) => {
+    // How many of the host's grace candidates must give way for this build (0: none), or null
+    // when it does not fit even with all of them gone. A grace candidate holds a slot, and its
+    // memory is in `used` (its worker runs); displacing k frees both.
+    const need = (h: HostView): number | null => {
+      const list = candidates.get(h.id) ?? [];
       const u = memUse.get(h.id);
-      if (!u || isRunning(h)) return true;
-      return u.brake === null && cost <= headroom(h);
+      let freed = 0;
+      for (let k = 0; k <= list.length; k++) {
+        if (k > 0) freed += list[k - 1]!.cost;
+        if (count.get(h.id)! + list.length - k >= h.activeLimit) continue;
+        if (!u || isRunning(h)) return k;
+        if (u.brake !== null) return null;
+        if (cost <= headroom(h) + freed) return k;
+      }
+      return null;
     };
     const free = underLimit
-      .filter(fits)
+      .map((h) => ({ h, k: need(h) }))
+      .filter((x): x is { h: HostView; k: number } => x.k !== null)
       .sort(
         (a, b) =>
-          Number(isRunning(b)) - Number(isRunning(a)) ||
-          count.get(a.id)! - count.get(b.id)! ||
-          (a.id < b.id ? -1 : 1),
+          Number(isRunning(b.h)) - Number(isRunning(a.h)) ||
+          a.k - b.k ||
+          count.get(a.h.id)! - count.get(b.h.id)! ||
+          (a.h.id < b.h.id ? -1 : 1),
       );
     if (free.length === 0) {
       unplaced.set(build.buildId, underLimit.length > 0 ? 'memory' : 'no_slot');
       continue;
     }
-    const to = free[0]!;
+    const to = free[0]!.h;
+    if (free[0]!.k > 0) displace(to, free[0]!.k);
     placed.set(build.buildId, to.id);
     count.set(to.id, count.get(to.id)! + 1);
     const u = memUse.get(to.id);
@@ -236,12 +360,24 @@ export function place(docs: TemplateDoc[], hosts: HostView[], nowS: number): Pla
       u.pendingMib += cost;
     }
   }
+  // The grace keeps only what the host has room for (G43): free slots, and memory at or above the
+  // floor with its graced workers counted; the soonest-ending give way first.
+  const graced = new Map<string, Graced>();
+  for (const h of hosts) {
+    const list = candidates.get(h.id);
+    if (!list) continue;
+    const over = count.get(h.id)! + list.length - h.activeLimit;
+    if (over > 0) displace(h, over);
+    const u = memUse.get(h.id);
+    while (u && list.length > 0 && headroom(h) < 0) displace(h, 1);
+    for (const c of list) graced.set(c.buildId, { host: h.id, until: c.until });
+  }
   for (const h of hosts) {
     const u = memUse.get(h.id);
     // A braked host has none for a new start, whatever the figures (the brake says why).
     if (u) u.headroomMib = u.brake === null ? Math.max(0, headroom(h)) : 0;
   }
-  return { placed, unplaced, memory: memUse };
+  return { placed, unplaced, memory: memUse, graced, displaced };
 }
 
 /** Readiness of a registered build (§3.3), from what is wanted, placed and attached. */
