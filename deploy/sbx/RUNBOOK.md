@@ -532,7 +532,9 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`, about 3 MB), and all
   logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
   most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
-  back.
+  back. Each post reads the length of every retained log, so its cost grows with the number of
+  sandboxes retained with a log: small at SBX0's scale. Redis itself has no `maxmemory` today
+  (register G45).
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
