@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.9.0
+  version: 1.10.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -352,6 +352,17 @@ components:
             1.9.0 (register G43), with `queued`: the build's 1-based place among its host's placed,
             wanted builds not attached yet, first leased first; the first startConcurrency are
             starting
+        graced:
+          type: boolean
+          enum: [true]
+          description: |
+            1.10.0 (cold-start pacing spec §4, register G43), present only while the build is in its
+            host's idle grace: no lease left, and its worker kept running (readiness `deactivating`)
+            until `gracedUntil`, unless a wanted build needs its slot, a retire or reject ends it, or
+            a release with `stopNow` does. A use within the grace finds it active, with no cold start
+        gracedUntil:
+          type: integer
+          description: 1.10.0 (register G43), with `graced`, epoch seconds the grace ends (its last lease's end plus the host's idleGraceSeconds)
         capacity:
           type: [object, 'null']
           description: for an active build
@@ -1749,6 +1760,19 @@ paths:
                               description: build ids never placed there (their memory file is not the guest's size)
                             reportedAt:
                               { type: integer, description: epoch seconds of its last inventory }
+                        idleGraceSeconds:
+                          type: integer
+                          minimum: 1
+                          description: |
+                            1.10.0 (register G43), only from an agent that sets one (SBX_IDLE_GRACE_S
+                            above 0): how long a released build's worker is kept running there
+                        graced:
+                          type: integer
+                          description: |
+                            1.10.0 (register G43), beside idleGraceSeconds: the builds in the host's
+                            idle grace now (no lease, worker kept running). Each still holds its
+                            whole pinned memory file, counted in `memory.usedMib`, and a slot of
+                            `active.limit` until a wanted build needs it
                         start:
                           type: object
                           description: |
@@ -2834,6 +2858,10 @@ paths:
         cold starts, start to attach, in seconds (absent before one is done; used only beside
         startConcurrency). Without startConcurrency (an older agent) its builds have no place in a
         start line, and Retry-After is as before.
+
+        `limits.idleGraceSeconds` (1.10.0, register G43) is optional: SBX_IDLE_GRACE_S, a whole
+        number of seconds, 0 (off) to 86400. Absent (an older agent), malformed or 0: no grace, as
+        before.
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
@@ -2859,6 +2887,11 @@ paths:
                     startSeconds:
                       type: number
                       description: the mean of the last (up to 10) cold starts, start to attach, seconds (1.9.0)
+                    idleGraceSeconds:
+                      type: integer
+                      minimum: 0
+                      maximum: 86400
+                      description: SBX_IDLE_GRACE_S (default 0, off), how long a released build's worker is kept running (1.10.0)
                 memory:
                   type: object
                   description: what the host agent reads of its memory (memory-aware placement spec §4)
@@ -3115,6 +3148,13 @@ paths:
     post:
       operationId: deactivateTemplate
       summary: 'Release your lease (an admin with `all: true`, every lease); the build drains if none is left'
+      description: |
+        With no lease left, the build is no longer wanted. On a host with an idle grace
+        (SBX_IDLE_GRACE_S, 1.10.0, register G43) its running worker is kept for that long after the
+        release, so a use soon after is warm. `stopNow: true` skips the grace: once no lease is left
+        (after this release), the worker is stopped at the host's next poll, as on a host with no
+        grace; a build already in its grace has it ended (`released: 0`). The `deactivate` record
+        carries `stopNow: true`. A stopNow while others hold leases changes nothing for them.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -3122,7 +3162,13 @@ paths:
         required: false
         content:
           application/json:
-            schema: { type: object, properties: { all: { type: boolean } } }
+            schema:
+              type: object
+              properties:
+                all: { type: boolean }
+                stopNow:
+                  type: boolean
+                  description: 1.10.0 (register G43), skip the host's idle grace (force a cold start next time); not a boolean is `400 invalid_request`
       responses:
         '200':
           description: released
@@ -3152,7 +3198,12 @@ paths:
       summary: The workers a host agent should run (placed on it), stop (no lease, no live sandbox) and remove (retired)
       description: |
         `run` is in the wanted order, first leased first (1.9.0: the order the agent starts them in,
-        at most its start limit at once).
+        at most its start limit at once). On a host with an idle grace (1.10.0, register G43) the
+        graced builds follow the wanted ones in `run`, soonest grace end first, and are listed in
+        `graced`; a retired or rejected build is listed in `stop` as well as `remove`, so its worker
+        is stopped and removed in one poll, never held for a grace. A graced worker displaced for a
+        wanted build is re-checked for a lease when the answer is made: a build leased since stays
+        in `run`.
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
@@ -3194,6 +3245,15 @@ paths:
                       starts at most SBX_START_CONCURRENCY less those. Absent from a control plane
                       before 1.9.0, or when the presence cannot be read: the agent then counts its own
                       recent starts (SBX_START_WINDOW_S).
+                  graced:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      1.10.0 (cold-start pacing spec §4, register G43), only for a host whose agent
+                      reports an idle grace: the build ids of `run` with no lease, kept running in
+                      the grace. The agent never starts one (a grace keeps a running worker) and
+                      counts those it runs in its summary. Absent from a control plane before
+                      1.10.0, or for a host with no grace.
         '400':
           description: '`invalid_request`: this deployment stores no templates'
           content:

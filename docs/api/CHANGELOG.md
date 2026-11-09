@@ -8,6 +8,29 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.10.0
+
+The idle grace of template workers ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md)
+§4, register G43): on a KVM host with `SBX_IDLE_GRACE_S` set (default 0, off), a released build's
+worker is kept running for that long after its last lease ends, so a use soon after is warm. Off,
+nothing changes.
+
+- `POST /v1/hosts/{host}/inventory`'s `limits` take an optional `idleGraceSeconds` (0-86400). Absent
+  (an older agent), malformed or 0: no grace; an older control plane ignores it.
+- The grace runs from the build's last lease end (a release's time, or an expired lease's `until`),
+  for a worker the agent reports running (`runningWorkers`) with no live sandbox, while the host has
+  room under `activeLimit` and its memory headroom (a graced worker counts as running there). A
+  wanted build that needs the slot or the memory displaces the graced worker that ends soonest; the
+  stop is re-checked for a lease when the wanted answer is made.
+- `GET /v1/hosts/{host}/wanted` gains `graced: [buildId]` for a host with a grace: the graced builds,
+  kept in `run` after the wanted ones (the agent starts none of them). A retired or rejected build is
+  then also listed in `stop` beside `remove`, so its removal is not held for a grace.
+- `POST /v1/templates/{id}/deactivate` takes an optional `stopNow: true`: with no lease left, the
+  build skips the grace (stopped at the next poll); the `deactivate` record carries `stopNow: true`.
+- Builds gain `graced: true` and `gracedUntil` (epoch seconds) while in a grace. `GET /v1/templates`'
+  hosts gain `idleGraceSeconds` and `graced` (a count) for a host whose agent sets a grace.
+- `POST /v1/hosts/{host}/workers/report` takes `detached` for a retired or rejected build too.
+
 ### 1.9.0
 
 Pacing template workers' cold starts ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md),

@@ -2212,6 +2212,330 @@ describe('cold-start pacing: the start limit (register G43)', () => {
   });
 });
 
+describe('cold-start pacing: the idle grace (register G43)', () => {
+  const GRACE = 600;
+  const nowS = () => Math.floor(now / 1000);
+  /**
+   * An inventory with the agent's idle grace (null: an agent that reports none) and the workers it
+   * runs (runningWorkers); memory figures only when given.
+   */
+  const inventoryGrace = (
+    d: TestDeps,
+    holds: Record<string, string>,
+    grace: unknown,
+    running: string[],
+    activeLimit = 8,
+    figures: Record<string, unknown> = {},
+  ) =>
+    HANDLERS.hostInventory!(
+      asHost(
+        'bm1',
+        {},
+        {
+          holds: Object.entries(holds).map(([manifestHash, template]) => ({
+            manifestHash,
+            template,
+          })),
+          limits: {
+            activeLimit,
+            idleLimitSeconds: 3600,
+            ...(grace === null ? {} : { idleGraceSeconds: grace }),
+          },
+          memory: { runningWorkers: running, ...figures },
+        },
+      ),
+      d,
+    );
+  const wanted = async (d: TestDeps) => (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+  const ids = (xs: Body[]) => xs.map((x) => x.template);
+  const build = async (d: TestDeps, id: string) =>
+    ((await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id } }), d)).body as Body)
+      .builds[0] as Body;
+  const deactivate = (d: TestDeps, id: string, body: unknown = {}, principal = alice) =>
+    HANDLERS.deactivateTemplate!(ctx({ principal, params: { id }, body }), d);
+  const hostsBlock = async (d: TestDeps) =>
+    ((await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body).hosts[0] as Body;
+  const one = { [hash('1')]: 't1' };
+  const two = { [hash('1')]: 't1', [hash('2')]: 't2' };
+  /** t1 registered, leased, running and attached on bm1, then released by alice at `released`. */
+  const released = async (grace: unknown = GRACE, holds = one, activeLimit = 8) => {
+    const d = await setup();
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    if (holds !== one) await registered(d, 't2', hash('2'), 'sbx_t2');
+    await inventoryGrace(d, holds, grace, [], activeLimit);
+    await activate(d, 't1');
+    attachedNow = ['sbx_t1'];
+    await inventoryGrace(d, holds, grace, ['sbx_t1'], activeLimit);
+    now += 10_000;
+    await deactivate(d, 't1');
+    return d;
+  };
+
+  it('with no grace (0, or an agent that reports none), a released build is stopped as today', async () => {
+    for (const g of [0, null, -1, 1.5, '600', 86_401]) {
+      const d = await released(g);
+      const w = await wanted(d);
+      expect(ids(w.stop)).toEqual(['t1']);
+      expect(w.run).toEqual([]);
+      expect(w).not.toHaveProperty('graced');
+      expect(await build(d, 't1')).not.toHaveProperty('graced');
+      const h = await hostsBlock(d);
+      expect(h).not.toHaveProperty('graced');
+      expect(h).not.toHaveProperty('idleGraceSeconds');
+      expect(d.hosts!.get('bm1')!.idleGraceSeconds ?? 0).toBe(0);
+    }
+  });
+
+  it('keeps a released build in run, graced, until its last lease end + the grace; then stop', async () => {
+    const d = await released();
+    const end = nowS();
+    let w = await wanted(d);
+    expect(ids(w.run)).toEqual(['t1']);
+    expect(w.graced).toEqual([hash('1')]);
+    expect(w.stop).toEqual([]);
+    expect(w.starting).toEqual([]);
+    const b = await build(d, 't1');
+    expect(b).toMatchObject({ readiness: 'deactivating', graced: true, gracedUntil: end + GRACE });
+    expect(await hostsBlock(d)).toMatchObject({
+      idleGraceSeconds: GRACE,
+      graced: 1,
+      active: { limit: 8, used: 0 },
+    });
+    // The record of the release, as today (no stopNow).
+    const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(rec).toMatchObject({ kind: 'deactivate', body: { leases: 1, all: false } });
+    expect(rec.body).not.toHaveProperty('stopNow');
+    // The grace ends: stopped.
+    now += (GRACE - 1) * 1000;
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    now += 1000;
+    await inventoryGrace(d, one, GRACE, ['sbx_t1']);
+    w = await wanted(d);
+    expect(ids(w.stop)).toEqual(['t1']);
+    expect(w.run).toEqual([]);
+    expect(w.graced).toEqual([]);
+    expect(await build(d, 't1')).not.toHaveProperty('graced');
+    expect((await hostsBlock(d)).graced).toBe(0);
+  });
+
+  it('graces from the end of a lease that ran out, not only a deactivate', async () => {
+    const d = await setup();
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventoryGrace(d, one, GRACE, []);
+    await activate(d, 't1', alice, { leaseSeconds: 120 });
+    const until = nowS() + 120;
+    attachedNow = ['sbx_t1'];
+    now += 200_000;
+    await inventoryGrace(d, one, GRACE, ['sbx_t1']);
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    expect((await build(d, 't1')).gracedUntil).toBe(until + GRACE);
+    // A worker the agent does not report running is never graced (nothing to keep).
+    await inventoryGrace(d, one, GRACE, []);
+    expect(ids((await wanted(d)).stop)).toEqual(['t1']);
+  });
+
+  it('a lease taken during the grace keeps the worker running, un-graced; first use serves at once', async () => {
+    const d = await released();
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    // First use on the graced, attached worker: a lease, and the create succeeds with no wait.
+    const sb = await HANDLERS.createSandbox!(ctx({ principal: bob, body: { template: 't1' } }), d);
+    expect(sb.status).toBe(201);
+    const w = await wanted(d);
+    expect(ids(w.run)).toEqual(['t1']);
+    expect(w.graced).toEqual([]);
+    expect(w.stop).toEqual([]);
+    const b = await build(d, 't1');
+    expect(b.readiness).toBe('active');
+    expect(b).not.toHaveProperty('graced');
+  });
+
+  it('a wanted build that needs the slot displaces the graced worker (activeLimit)', async () => {
+    const d = await released(GRACE, two, 1);
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    // t2 fits only in t1's slot: placed, not refused, and t1 is stopped.
+    const r = (await activate(d, 't2')).body as Body;
+    expect(r.host).toBe('bm1');
+    const w = await wanted(d);
+    expect(ids(w.run)).toEqual(['t2']);
+    expect(ids(w.stop)).toEqual(['t1']);
+    expect(w.graced).toEqual([]);
+    expect(await build(d, 't1')).not.toHaveProperty('graced');
+    expect(await hostsBlock(d)).toMatchObject({ graced: 0, active: { limit: 1, used: 1 } });
+    // Without a grace, as today: t1 (no lease) holds no slot, t2 is placed and t1 stopped.
+    const plain = await released(0, two, 1);
+    expect(((await activate(plain, 't2')).body as Body).host).toBe('bm1');
+    expect(ids((await wanted(plain)).stop)).toEqual(['t1']);
+  });
+
+  it('a wanted build that needs the memory displaces the graced worker (G39 headroom)', async () => {
+    const d = await setup();
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    // Room for one 4096 + 128 worker above the floor, not two.
+    const mem = (running: string[], avail: number) => ({
+      memTotalMib: 12_288 + 4096,
+      memAvailableMib: avail,
+      memFloorMib: 12_288 - 4224,
+      memPressureLimit: 10,
+      runningWorkers: running,
+    });
+    const inv = (running: string[], avail: number) =>
+      HANDLERS.hostInventory!(
+        asHost(
+          'bm1',
+          {},
+          {
+            holds: Object.entries(two).map(([manifestHash, template]) => ({
+              manifestHash,
+              template,
+            })),
+            limits: { activeLimit: 8, idleLimitSeconds: 3600, idleGraceSeconds: GRACE },
+            memory: mem(running, avail),
+          },
+        ),
+        d,
+      );
+    await inv([], 12_288 + 4096);
+    await activate(d, 't1');
+    attachedNow = ['sbx_t1'];
+    await inv(['sbx_t1'], 12_288);
+    now += 10_000;
+    await deactivate(d, 't1');
+    await inv(['sbx_t1'], 12_288);
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    expect((await hostsBlock(d)).memory.usedMib).toBe(4224);
+    await activate(d, 't2');
+    const w = await wanted(d);
+    expect(ids(w.run)).toEqual(['t2']);
+    expect(ids(w.stop)).toEqual(['t1']);
+    expect(w.graced).toEqual([]);
+  });
+
+  it('re-checks for a lease at stop time: one taken between the decisions keeps the worker', async () => {
+    const d = await released(GRACE, two, 1);
+    await activate(d, 't2');
+    // A lease on t1 lands after the wanted answer read the catalog, before its stop is decided.
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    cat.get = async (id: string) => {
+      const doc = await get(id);
+      if (!doc || id !== 't1') return doc;
+      return {
+        ...doc,
+        builds: doc.builds.map((b) => ({
+          ...b,
+          leases: [{ subject: bob.sub, until: nowS() + 600, since: nowS() }],
+        })),
+      };
+    };
+    const w = await wanted(d);
+    expect(ids(w.run)).toEqual(['t2']);
+    expect(w.stop).toEqual([]);
+    cat.get = get;
+    expect(ids((await wanted(d)).stop)).toEqual(['t1']);
+  });
+
+  it('a retire or a reject ends the grace at once: stop and remove in the same answer', async () => {
+    for (const how of ['retire', 'reject'] as const) {
+      const d = await released();
+      expect((await wanted(d)).graced).toEqual([hash('1')]);
+      if (how === 'retire') {
+        await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' } }), d);
+      } else {
+        await HANDLERS.rejectTemplateBuild!(
+          ctx({
+            principal: { ...bob, roles: ['admin'] },
+            params: { id: 't1', build: hash('1') },
+            body: { reason: 'X12' },
+          }),
+          d,
+        );
+      }
+      const w = await wanted(d);
+      expect(w.run).toEqual([]);
+      expect(w.graced).toEqual([]);
+      expect(ids(w.stop)).toEqual(['t1']);
+      expect(ids(w.remove)).toEqual(['t1']);
+      // The agent's stop of the retired worker is recorded, then its removal.
+      for (const event of ['detached', 'removed']) {
+        const r = await HANDLERS.hostWorkerReport!(
+          asHost('bm1', {}, { buildId: hash('1'), event }),
+          d,
+        );
+        expect((r.body as Body).recorded).toBe(event);
+      }
+    }
+  });
+
+  it('stopNow ends the grace: the build is stopped at the next answer, and the record says so', async () => {
+    const d = await setup();
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventoryGrace(d, one, GRACE, []);
+    await activate(d, 't1');
+    await activate(d, 't1', bob);
+    attachedNow = ['sbx_t1'];
+    await inventoryGrace(d, one, GRACE, ['sbx_t1']);
+    expect(
+      await deactivate(d, 't1', { stopNow: 'yes' }).then(
+        () => 'none',
+        (e: { code: string }) => e.code,
+      ),
+    ).toBe('invalid_request');
+    // Alice's stopNow while bob holds a lease: it stays wanted, and bob's later release is graced.
+    await deactivate(d, 't1', { stopNow: true });
+    expect(ids((await wanted(d)).run)).toEqual(['t1']);
+    now += 5000;
+    await deactivate(d, 't1', {}, bob);
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+    // A stopNow on a graced build ends its grace (no lease to drop: still recorded).
+    now += 5000;
+    const r = (await deactivate(d, 't1', { stopNow: true })).body as Body;
+    expect(r.released).toBe(0);
+    const w = await wanted(d);
+    expect(ids(w.stop)).toEqual(['t1']);
+    expect(w.graced).toEqual([]);
+    const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
+    expect(rec).toMatchObject({
+      kind: 'deactivate',
+      subject: alice.sub,
+      body: { leases: 0, all: false, stopNow: true },
+    });
+    // Again: nothing left to end, no second record.
+    const n = (await d.provenance!.chain('template/t1')).length;
+    await deactivate(d, 't1', { stopNow: true });
+    expect((await d.provenance!.chain('template/t1')).length).toBe(n);
+    // A release with stopNow that drops the last lease: no grace, the record carries it.
+    await activate(d, 't1');
+    now += 5000;
+    await deactivate(d, 't1', { stopNow: true });
+    expect(ids((await wanted(d)).stop)).toEqual(['t1']);
+    expect((await d.provenance!.chain('template/t1')).at(-1)).toMatchObject({
+      kind: 'deactivate',
+      body: { leases: 1, stopNow: true },
+    });
+    // A later lease and plain release is graced again.
+    await activate(d, 't1');
+    now += 5000;
+    await deactivate(d, 't1');
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+  });
+
+  it('never graces a worker with a live sandbox (it drains, as today), nor counts it', async () => {
+    const d = await released();
+    const sb = (
+      await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d)
+    ).body as Body;
+    now += 5000;
+    await deactivate(d, 't1');
+    const w = await wanted(d);
+    expect(w.graced).toEqual([]);
+    expect(w.stop).toEqual([]);
+    expect(w.run).toEqual([]);
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id } }), d);
+    expect((await wanted(d)).graced).toEqual([hash('1')]);
+  });
+});
+
 void sha256Hex;
 
 describe('the build job names the guest size template-build.sh reads (guest_mb)', () => {
