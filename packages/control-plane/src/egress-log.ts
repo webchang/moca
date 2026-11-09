@@ -41,8 +41,20 @@ export const EVENT_INT_FIELDS = [
 ] as const;
 export const EVENT_FIELDS: readonly string[] = [...EVENT_STRING_FIELDS, ...EVENT_INT_FIELDS];
 
-/** A sandbox's log holds at most this many events; later ones are counted as dropped (`cap`). */
-export const EGRESS_LOG_CAP = 50_000;
+/**
+ * A sandbox's log holds at most this many events; later ones are counted as dropped (`cap`). About
+ * 317 B each in Redis (measured, a typical CONNECT event), so about 3 MB per log at the cap.
+ */
+export const EGRESS_LOG_CAP = 10_000;
+/**
+ * All sandboxes' logs together hold at most this many events, about 64 MB: the bound on Redis
+ * memory, which SBX0 gives 256 MiB in all (deploy/k8s/base/redis.yaml) for sessions, sandboxes and
+ * templates too. An event over it is not stored and is counted as dropped (`budget`) in its
+ * sandbox's log. The total is derived, never kept: the Lua append sums the lengths of the logs that
+ * still exist, so a log that expired (14 days after its sandbox ended) gives its share back with no
+ * reconciliation and no counter to drift.
+ */
+export const EGRESS_TOTAL_BUDGET = 200_000;
 /** At most this many events in one host post (the host agent sends batches of up to 1000). */
 export const EGRESS_POST_MAX = 1000;
 /**
@@ -114,6 +126,8 @@ export interface EgressAnswer {
   refused: number;
   /** Events over a log's cap, counted as dropped in that log. */
   capped: number;
+  /** Events over the deployment's total budget, counted as dropped in their logs. */
+  overBudget: number;
   /** Events naming a sandbox of this host's that were not a proxy Event (dropped in that log). */
   invalid: number;
   /** The events the proxy reported lost (`audit_dropped`), summed, in this post. */
@@ -126,6 +140,8 @@ export interface EgressMeta {
   proxy: number;
   /** Over the length cap. */
   cap: number;
+  /** Over the total budget (EGRESS_TOTAL_BUDGET). */
+  budget: number;
   /** Named this sandbox but were not a proxy Event. */
   invalid: number;
   /** Past its grace: takes no more events. */
@@ -168,7 +184,7 @@ export interface EgressSummary {
   >;
   total: number;
   dropped: number;
-  droppedBy: { proxy: number; cap: number; invalid: number };
+  droppedBy: { proxy: number; cap: number; budget: number; invalid: number };
   complete: boolean;
   sealed: boolean;
   sha256: string;
@@ -192,12 +208,12 @@ export async function summarize(store: EgressStore, sandboxId: string): Promise<
     s.bytesDown += Number(e.bytes_down ?? 0);
   }
   const m = await store.meta(sandboxId);
-  const dropped = m.proxy + m.cap + m.invalid;
+  const dropped = m.proxy + m.cap + m.budget + m.invalid;
   return {
     byHost,
     total,
     dropped,
-    droppedBy: { proxy: m.proxy, cap: m.cap, invalid: m.invalid },
+    droppedBy: { proxy: m.proxy, cap: m.cap, budget: m.budget, invalid: m.invalid },
     complete: dropped === 0,
     sealed: m.sealed,
     sha256: `sha256:${h.digest('hex')}`,
@@ -224,10 +240,24 @@ export class MemoryEgressStore implements EgressStore {
   private readonly hosts = new Map<string, { cursor: string; answer: EgressAnswer }>();
   private seq = 0;
 
+  constructor(
+    private readonly cap: number = EGRESS_LOG_CAP,
+    private readonly budget: number = EGRESS_TOTAL_BUDGET,
+  ) {}
+
+  /** Forgets a log, as its keys' expiry does in Redis (for tests). */
+  expire(id: string): void {
+    this.logs.delete(id);
+  }
+
   private log(id: string) {
     let l = this.logs.get(id);
     if (!l) {
-      l = { entries: [], meta: { proxy: 0, cap: 0, invalid: 0, sealed: false }, expireAtS: 0 };
+      l = {
+        entries: [],
+        meta: { proxy: 0, cap: 0, budget: 0, invalid: 0, sealed: false },
+        expireAtS: 0,
+      };
       this.logs.set(id, l);
     }
     return l;
@@ -247,7 +277,17 @@ export class MemoryEgressStore implements EgressStore {
   ) {
     const last = this.hosts.get(host);
     if (last && last.cursor === cursor) return last.answer;
-    const a: EgressAnswer = { accepted: 0, refused, capped: 0, invalid: 0, dropped, cursor };
+    const a: EgressAnswer = {
+      accepted: 0,
+      refused,
+      capped: 0,
+      overBudget: 0,
+      invalid: 0,
+      dropped,
+      cursor,
+    };
+    let total = 0;
+    for (const l of this.logs.values()) total += l.entries.length;
     for (const g of groups) {
       const l = this.log(g.sandboxId);
       if (l.meta.sealed) {
@@ -257,13 +297,17 @@ export class MemoryEgressStore implements EgressStore {
       l.meta.invalid += g.invalid;
       a.invalid += g.invalid;
       for (const line of g.lines) {
-        if (l.entries.length < EGRESS_LOG_CAP) {
+        if (l.entries.length >= this.cap) {
+          l.meta.cap += 1;
+          a.capped += 1;
+        } else if (total >= this.budget) {
+          l.meta.budget += 1;
+          a.overBudget += 1;
+        } else {
           this.seq += 1;
           l.entries.push({ id: `${this.seq}-0`, line });
           a.accepted += 1;
-        } else {
-          l.meta.cap += 1;
-          a.capped += 1;
+          total += 1;
         }
       }
       l.meta.proxy += g.proxyDropped;
@@ -280,7 +324,9 @@ export class MemoryEgressStore implements EgressStore {
   }
 
   async meta(id: string) {
-    return { ...(this.logs.get(id)?.meta ?? { proxy: 0, cap: 0, invalid: 0, sealed: false }) };
+    return {
+      ...(this.logs.get(id)?.meta ?? { proxy: 0, cap: 0, budget: 0, invalid: 0, sealed: false }),
+    };
   }
 
   async seal(id: string, expireAtS: number) {
@@ -311,39 +357,58 @@ export interface EgressRedisLike {
 
 export const EGRESS_KEY_PREFIX = 'sh:sbx:egress:';
 
-// KEYS: the host key, then per sandbox its stream and its meta hash.
-// ARGV: cursor, cap, host TTL seconds, refused, dropped, groups G; per group (count, proxyDropped,
-// invalid, expireAt); then every line, the groups' in order. One script, so a post is appended whole or not at
-// all, and its replay check and the sealed check are atomic with the append.
+// KEYS: the host key, the index (the set of sandbox ids with a log), then per sandbox its stream and
+// its meta hash.
+// ARGV: cursor, cap, host TTL seconds, refused, dropped, groups G, budget, the stream key prefix; per
+// group (count, proxyDropped, invalid, expireAt); then every line, the groups' in order. One script,
+// so a post is appended whole or not at all, and its replay check, the sealed check and the budget
+// check are atomic with the append: two hosts posting at once cannot pass the budget together.
+//
+// The total is derived from the index: the sum of the lengths of the logs that still exist (an
+// expired stream is gone, and XLEN of it is 0, so it is dropped from the index here). Nothing is
+// kept that could drift, and an expired log gives its budget back at the next append. The index's
+// members are read by name, outside KEYS, which a standalone Redis allows (SBX0 runs one, not a
+// cluster). Its size is the sandboxes retained with a log, one XLEN each per post.
 const APPEND = `
 local last = redis.call('HGET', KEYS[1], 'cursor')
 if last and last == ARGV[1] then return redis.call('HGET', KEYS[1], 'answer') end
-local cap = tonumber(ARGV[2]); local g = tonumber(ARGV[6])
-local accepted, refused, capped, invalid = 0, tonumber(ARGV[4]), 0, 0
-local li = 7 + 4 * g
+local cap = tonumber(ARGV[2]); local g = tonumber(ARGV[6]); local budget = tonumber(ARGV[7])
+local prefix = ARGV[8]
+local total = 0
+for _, id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  local n = redis.call('XLEN', prefix .. id)
+  if n == 0 then redis.call('SREM', KEYS[2], id) else total = total + n end
+end
+local accepted, refused, capped, over, invalid = 0, tonumber(ARGV[4]), 0, 0, 0
+local li = 9 + 4 * g
 for i = 1, g do
-  local b = 3 + 4 * i
+  local b = 5 + 4 * i
   local n = tonumber(ARGV[b]); local pd = tonumber(ARGV[b + 1]); local inv = tonumber(ARGV[b + 2])
   local exp = ARGV[b + 3]
-  local s, m = KEYS[2 * i], KEYS[2 * i + 1]
+  local s, m = KEYS[2 * i + 1], KEYS[2 * i + 2]
   if redis.call('HGET', m, 'sealed') == '1' then
     refused = refused + n + inv
   else
     if inv > 0 then redis.call('HINCRBY', m, 'invalid', inv); invalid = invalid + inv end
-    local len = redis.call('XLEN', s); local over = 0
+    local len = redis.call('XLEN', s); local c, o = 0, 0
     for j = 0, n - 1 do
-      if len < cap then
-        redis.call('XADD', s, '*', 'e', ARGV[li + j]); len = len + 1; accepted = accepted + 1
-      else over = over + 1 end
+      if len >= cap then c = c + 1
+      elseif total >= budget then o = o + 1
+      else
+        redis.call('XADD', s, '*', 'e', ARGV[li + j]); len = len + 1; total = total + 1
+        accepted = accepted + 1
+      end
     end
-    if over > 0 then redis.call('HINCRBY', m, 'cap', over); capped = capped + over end
+    if c > 0 then redis.call('HINCRBY', m, 'cap', c); capped = capped + c end
+    if o > 0 then redis.call('HINCRBY', m, 'budget', o); over = over + o end
     if pd > 0 then redis.call('HINCRBY', m, 'proxy', pd) end
+    if len > 0 then redis.call('SADD', KEYS[2], string.sub(s, #prefix + 1)) end
     redis.call('EXPIREAT', s, exp); redis.call('EXPIREAT', m, exp)
   end
   li = li + n
 end
-local answer = cjson.encode({accepted = accepted, refused = refused, capped = capped, invalid = invalid,
-  dropped = tonumber(ARGV[5]), cursor = ARGV[1]})
+local answer = cjson.encode({accepted = accepted, refused = refused, capped = capped,
+  overBudget = over, invalid = invalid, dropped = tonumber(ARGV[5]), cursor = ARGV[1]})
 redis.call('HSET', KEYS[1], 'cursor', ARGV[1], 'answer', answer)
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 return answer
@@ -366,19 +431,27 @@ return 1
 /**
  * The production store. A sandbox's log is the stream `sh:sbx:egress:<sandboxId>` (one field, `e`,
  * the canonical line) and its counters the hash `sh:sbx:egress:<sandboxId>:meta` (`proxy`, `cap`,
- * `invalid`, `sealed`); both expire when the sandbox record does (EXPIREAT, set on every append and moved on
+ * `budget`, `invalid`, `sealed`); both expire when the sandbox record does (EXPIREAT, set on every append and moved on
  * deletion). A host's last post is `sh:sbx:egress:host:<host>` (`cursor`, `answer`), for replays.
+ * `sh:sbx:egress:index` is the set of sandbox ids with a log, which the total budget is summed over.
  */
 export class RedisEgressStore implements EgressStore {
   constructor(
     private readonly redis: EgressRedisLike,
     private readonly hostTtlS: number,
     private readonly prefix: string = EGRESS_KEY_PREFIX,
+    private readonly limits: { cap: number; budget: number } = {
+      cap: EGRESS_LOG_CAP,
+      budget: EGRESS_TOTAL_BUDGET,
+    },
   ) {}
 
   private stream = (id: string) => `${this.prefix}${id}`;
   private metaKey = (id: string) => `${this.prefix}${id}:meta`;
   private hostKey = (host: string) => `${this.prefix}host:${host}`;
+  private get indexKey() {
+    return `${this.prefix}index`;
+  }
 
   private async guard<T>(op: () => Promise<T>): Promise<T> {
     try {
@@ -394,15 +467,18 @@ export class RedisEgressStore implements EgressStore {
     return this.guard(async () => {
       const keys = [
         this.hostKey(host),
+        this.indexKey,
         ...groups.flatMap((g) => [this.stream(g.sandboxId), this.metaKey(g.sandboxId)]),
       ];
       const args = [
         cursor,
-        String(EGRESS_LOG_CAP),
+        String(this.limits.cap),
         String(this.hostTtlS),
         String(refused),
         String(dropped),
         String(groups.length),
+        String(this.limits.budget),
+        this.prefix,
         ...groups.flatMap((g) => [
           String(g.lines.length),
           String(g.proxyDropped),
@@ -433,6 +509,7 @@ export class RedisEgressStore implements EgressStore {
       return {
         proxy: Number(h.proxy ?? 0),
         cap: Number(h.cap ?? 0),
+        budget: Number(h.budget ?? 0),
         invalid: Number(h.invalid ?? 0),
         sealed: h.sealed === '1',
       };

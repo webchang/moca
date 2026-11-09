@@ -10,6 +10,7 @@ import { FileTemplateCatalog } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
 import { DEFAULT_POLICY } from '../src/template-policy.js';
 import {
+  EGRESS_TOTAL_BUDGET,
   EGRESS_DROP_WINDOW_S,
   EGRESS_GRACE_S,
   EGRESS_LOG_CAP,
@@ -380,7 +381,13 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     expect(end!.body).toMatchObject({
       state: 'terminated',
       reason: 'deleted',
-      egress: { events: 2, sha256: sha(nd1), dropped: 0, complete: true },
+      egress: {
+        events: 2,
+        sha256: sha(nd1),
+        dropped: 0,
+        droppedBy: { proxy: 0, cap: 0, budget: 0, invalid: 0 },
+        complete: true,
+      },
     });
     // A late event, inside the grace, is still taken.
     now += 30_000;
@@ -435,7 +442,32 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     expect(e).toHaveLength(1);
     expect(e[0]!.body).toMatchObject({
       reason: 'expired',
-      egress: { events: 1, dropped: 3, complete: false },
+      egress: { events: 1, dropped: 3, droppedBy: { proxy: 3, budget: 0 }, complete: false },
+    });
+  });
+
+  it('a log over the total budget: the end record and the late egress record name droppedBy.budget', async () => {
+    expect(EGRESS_TOTAL_BUDGET).toBe(200_000);
+    expect(EGRESS_LOG_CAP).toBe(10_000);
+    const d = await setup({ egress: new MemoryEgressStore(10, 3) });
+    const a = await create(d, 't1');
+    expect(await post(d, 'bm1', [ev(a.id), ev(a.id), ev(a.id), ev(a.id)])).toMatchObject({
+      accepted: 3,
+      overBudget: 1,
+    });
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: a.id } }), d);
+    const [end] = await ends(d, a.id);
+    expect(end!.body).toMatchObject({
+      egress: { events: 3, dropped: 1, droppedBy: { budget: 1 }, complete: false },
+    });
+    now += 30_000;
+    await post(d, 'bm1', [ev(a.id)]); // late, in the grace, and still over the budget
+    now += EGRESS_GRACE_S * 1000;
+    await HANDLERS.janitorSandboxes!({ ...ctx({}), janitorAuthorized: true } as never, d);
+    const after = await ends(d, a.id);
+    expect(after[1]!.body).toMatchObject({
+      state: 'egress',
+      egress: { events: 3, dropped: 2, droppedBy: { budget: 2 }, complete: false },
     });
   });
 

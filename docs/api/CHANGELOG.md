@@ -16,7 +16,7 @@ proxy, readable through the API and named in the sandbox's provenance.
 - `GET /v1/sandboxes/{id}/egress?after=&limit=` (the owner or an admin, as `GET /v1/sandboxes/{id}`)
   gives `{events, next, summary}`. The events are the proxy's audit events exactly as it wrote them
   (`EgressEvent`), in arrival order. `summary` is `{byHost: {host: {count, decisions, bytesUp,
-bytesDown}}, total, dropped, droppedBy: {proxy, cap, invalid}, complete, sealed, sha256}`.
+bytesDown}}, total, dropped, droppedBy: {proxy, cap, budget, invalid}, complete, sealed, sha256}`.
 - `?format=ndjson` gives the whole log as `application/x-ndjson`: each event's canonical JSON, each
   followed by `\n`. Its sha256 is `summary.sha256`.
 - `POST /v1/hosts/{host}/egress` (`hostToken`): the host agent's batches of up to 1000 events and its
@@ -24,7 +24,7 @@ bytesDown}}, total, dropped, droppedBy: {proxy, cap, invalid}, complete, sealed,
 - `GET /v1/hosts/{host}/wanted` gains `egressSids`, the workspace keys whose events the host ships (the
   set the egress route accepts); the agent sends no other sandbox's or session's events.
 - The `sandbox` provenance record that ends a sandbox (`state: terminated`) gains
-  `egress: {events, sha256, dropped, complete}`. Events that arrive in the 600 s after the end are
+  `egress: {events, sha256, dropped, droppedBy, complete}`. Events that arrive in the 600 s after the end are
   still taken; if any did, one more `sandbox` record with `state: egress` names the final log. No
   record kind is added.
 

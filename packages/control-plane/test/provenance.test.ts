@@ -437,6 +437,20 @@ describe.skipIf(!havePython)('verify-provenance.py --egress (G42)', () => {
     );
     expect(inc.status).toBe(0);
     expect(inc.out).toContain('INCOMPLETE, 3 dropped');
+    // With the record's droppedBy, the line names the reasons.
+    const why = runVerifier(
+      await ended(
+        egressOf(NDJSON, {
+          dropped: 5,
+          complete: false,
+          droppedBy: { proxy: 0, cap: 0, budget: 4, invalid: 1 },
+        }),
+      ),
+      '--egress',
+      `${SBX}=${file(NDJSON)}`,
+    );
+    expect(why.status).toBe(0);
+    expect(why.out).toContain('INCOMPLETE, 5 dropped (budget 4, invalid 1)');
   });
 
   it('takes the newest record naming egress: a later state: egress record wins over the end record', async () => {

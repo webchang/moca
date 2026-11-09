@@ -1344,10 +1344,19 @@ async function sandboxEnded(
   });
 }
 
-/** What a `sandbox` record names of the egress log (register G42): its digest and completeness. */
+/**
+ * What a `sandbox` record names of the egress log (register G42): its digest, and its completeness
+ * with the reasons (`droppedBy`: proxy, cap, budget, invalid).
+ */
 async function egressDigest(store: EgressStore, id: string) {
   const s = await summarize(store, id);
-  return { events: s.total, sha256: s.sha256, dropped: s.dropped, complete: s.complete };
+  return {
+    events: s.total,
+    sha256: s.sha256,
+    dropped: s.dropped,
+    droppedBy: s.droppedBy,
+    complete: s.complete,
+  };
 }
 
 /**

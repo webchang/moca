@@ -78,7 +78,7 @@ export interface SbxEgressSummary {
   >;
   total: number;
   dropped: number;
-  droppedBy?: { proxy: number; cap: number; invalid: number };
+  droppedBy?: { proxy: number; cap: number; budget?: number; invalid: number };
   complete: boolean;
   sealed?: boolean;
   sha256: string;

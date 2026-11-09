@@ -290,7 +290,15 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     if (!deps.egress) {
       return {
         status: 200,
-        body: { accepted: 0, refused, capped: 0, invalid: 0, dropped, cursor: b.cursor },
+        body: {
+          accepted: 0,
+          refused,
+          capped: 0,
+          overBudget: 0,
+          invalid: 0,
+          dropped,
+          cursor: b.cursor,
+        },
       };
     }
     const answer = await deps.egress.append(host, b.cursor, [...groups.values()], refused, dropped);

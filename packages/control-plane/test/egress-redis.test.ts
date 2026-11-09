@@ -3,6 +3,7 @@ import { createClient } from 'redis';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   EGRESS_LOG_CAP,
+  EGRESS_TOTAL_BUDGET,
   MemoryEgressStore,
   RedisEgressStore,
   summarize,
@@ -62,7 +63,15 @@ describe.each([
     const { store, done } = make();
     const exp = Math.floor(Date.now() / 1000) + 3600;
     const a = await store.append('bm1', 'c1', [group('sbx-a', 3, exp)], 2, 0);
-    expect(a).toEqual({ accepted: 3, refused: 2, capped: 0, invalid: 0, dropped: 0, cursor: 'c1' });
+    expect(a).toEqual({
+      accepted: 3,
+      refused: 2,
+      capped: 0,
+      overBudget: 0,
+      invalid: 0,
+      dropped: 0,
+      cursor: 'c1',
+    });
     expect(await store.append('bm1', 'c1', [group('sbx-a', 3, exp)], 2, 0)).toEqual(a);
     await store.append(
       'bm1',
@@ -77,7 +86,11 @@ describe.each([
     const s = await summarize(store, 'sbx-a');
     const want = [0, 1, 2, 3, 4].map((i) => `${line(i)}\n`).join('');
     expect(s.sha256).toBe(`sha256:${createHash('sha256').update(want).digest('hex')}`);
-    expect(s).toMatchObject({ total: 5, dropped: 5, droppedBy: { proxy: 4, cap: 0, invalid: 1 } });
+    expect(s).toMatchObject({
+      total: 5,
+      dropped: 5,
+      droppedBy: { proxy: 4, cap: 0, budget: 0, invalid: 1 },
+    });
     expect(await store.seal('sbx-a', exp)).toBe(true);
     expect(await store.seal('sbx-a', exp)).toBe(false);
     const late = await store.append('bm1', 'c3', [group('sbx-a', 2, exp)], 0, 0);
@@ -85,7 +98,110 @@ describe.each([
     await done();
   });
 
+  it('holds all logs together to the budget; an expired log gives its share back', async () => {
+    // A budget of 10 and a cap of 6 on a fresh store of each kind, so the numbers stay readable.
+    const small =
+      name === 'memory'
+        ? { store: new MemoryEgressStore(6, 10), prefix: '', done: async () => {} }
+        : (() => {
+            const p = `test:egress:${process.pid}:${randomUUID()}:`;
+            return {
+              store: new RedisEgressStore(redis, 3600, p, { cap: 6, budget: 10 }),
+              prefix: p,
+              done: async () => {
+                const keys = await client.keys(`${p}*`);
+                if (keys.length) await client.del(keys);
+              },
+            };
+          })();
+    const { store, prefix, done } = small;
+    const exp = Math.floor(Date.now() / 1000) + 3600;
+    expect(await store.append('bm1', 'c1', [group('sbx-a', 8, exp)], 0, 0)).toMatchObject({
+      accepted: 6,
+      capped: 2,
+      overBudget: 0,
+    });
+    expect(
+      await store.append('bm2', 'c1', [group('sbx-b', 3, exp), group('sbx-c', 2, exp)], 0, 0),
+    ).toMatchObject({ accepted: 4, overBudget: 1 });
+    // The over-budget event is dropped in its own log, which is then incomplete.
+    expect(await summarize(store, 'sbx-c')).toMatchObject({
+      total: 1,
+      droppedBy: { budget: 1 },
+      complete: false,
+    });
+    expect(await store.append('bm1', 'c2', [group('sbx-d', 1, exp)], 0, 0)).toMatchObject({
+      accepted: 0,
+      overBudget: 1,
+    });
+    // sbx-a's log expires (passively, in Redis: its keys are gone); its 6 come back, no sweep needed.
+    if (name === 'memory') (store as MemoryEgressStore).expire('sbx-a');
+    else await client.del([`${prefix}sbx-a`, `${prefix}sbx-a:meta`]);
+    // 10 - (3 + 1) = 6 free: sbx-d takes 6, and its 7th is over its own cap of 6, not the budget.
+    expect(await store.append('bm1', 'c3', [group('sbx-d', 7, exp)], 0, 0)).toMatchObject({
+      accepted: 6,
+      capped: 1,
+      overBudget: 0,
+    });
+    await done();
+  });
+
   if (name === 'redis') {
+    it('cannot pass the budget with two hosts posting at once (one Lua script per post)', async () => {
+      const p = `test:egress:${process.pid}:${randomUUID()}:`;
+      const store = new RedisEgressStore(redis, 3600, p, { cap: 1000, budget: 1500 });
+      // A second connection, so the two posts really race on the server.
+      const other = createClient({ url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379' });
+      await other.connect();
+      const store2 = new RedisEgressStore(other as unknown as EgressRedisLike, 3600, p, {
+        cap: 1000,
+        budget: 1500,
+      });
+      const exp = Math.floor(Date.now() / 1000) + 3600;
+      const posts = [];
+      for (let i = 0; i < 10; i++) {
+        posts.push(store.append('bm1', `a${i}`, [group(`sbx-a${i}`, 200, exp)], 0, 0));
+        posts.push(store2.append('bm2', `b${i}`, [group(`sbx-b${i}`, 200, exp)], 0, 0));
+      }
+      const answers = await Promise.all(posts);
+      const accepted = answers.reduce((n, a) => n + a.accepted, 0);
+      const over = answers.reduce((n, a) => n + a.overBudget, 0);
+      expect(accepted).toBe(1500);
+      expect(over).toBe(4000 - 1500);
+      let stored = 0;
+      for (let i = 0; i < 10; i++)
+        stored += (await client.xLen(`${p}sbx-a${i}`)) + (await client.xLen(`${p}sbx-b${i}`));
+      expect(stored).toBe(1500);
+      other.destroy();
+      const keys = await client.keys(`${p}*`);
+      if (keys.length) await client.del(keys);
+    });
+
+    it('takes back the budget of a log whose keys expired passively (EXPIREAT in the past)', async () => {
+      const p = `test:egress:${process.pid}:${randomUUID()}:`;
+      const store = new RedisEgressStore(redis, 3600, p, { cap: 100, budget: 5 });
+      const now = Math.floor(Date.now() / 1000);
+      await store.append('bm1', 'c1', [group('sbx-old', 5, now + 3600)], 0, 0);
+      expect(
+        await store.append('bm1', 'c2', [group('sbx-new', 1, now + 3600)], 0, 0),
+      ).toMatchObject({
+        accepted: 0,
+        overBudget: 1,
+      });
+      // As retention ends: the log's expiry moves to now (deleteSandbox's expireAt), Redis drops it.
+      await store.expireAt('sbx-old', now - 1);
+      expect(await client.exists(`${p}sbx-old`)).toBe(0);
+      expect(
+        await store.append('bm1', 'c3', [group('sbx-new', 5, now + 3600)], 0, 0),
+      ).toMatchObject({
+        accepted: 5,
+        overBudget: 0,
+      });
+      expect(await client.sMembers(`${p}index`)).toEqual(['sbx-new']);
+      const keys = await client.keys(`${p}*`);
+      if (keys.length) await client.del(keys);
+    });
+
     it('names its keys sh:sbx:egress:<id> and :meta, both expiring with the sandbox record', async () => {
       const { store, prefix, done } = isolated();
       const exp = Math.floor(Date.now() / 1000) + 1800;
