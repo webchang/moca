@@ -23,12 +23,14 @@ mkdir -p "$TMP/bin" "$TMP/srv/templates" "$TMP/srv/snapshots" "$TMP/state"
 cat >"$TMP/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$MOCK_LOG"
-args=("$@") hdr='' url='' data='' method=GET
+args=("$@") hdr='' url='' data='' method=GET outf='' wfmt=''
 for ((i = 0; i < ${#args[@]}; i++)); do
   [[ "${args[$i]}" == -H && "${args[$((i + 1))]:-}" == @* ]] && hdr="${args[$((i + 1))]#@}"
   [[ "${args[$i]}" == --data-binary ]] && data="${args[$((i + 1))]#@}"
   [[ "${args[$i]}" == -X ]] && method="${args[$((i + 1))]}"
   [[ "${args[$i]}" == https://* ]] && url="${args[$i]}"
+  [[ "${args[$i]}" == -o ]] && outf="${args[$((i + 1))]}"
+  [[ "${args[$i]}" == -w ]] && wfmt=1
 done
 [[ -n "$hdr" && "$(cat "$hdr")" == "Authorization: Bearer $(cat "$MOCK_TOKEN_FILE")" ]] || { echo 'curl: (22) 401' >&2; exit 22; }
 path="${url#https://cp.example.invalid}"
@@ -42,10 +44,23 @@ case "$method $path" in
 "GET /v1/hosts/bm1/wanted") cat "$MOCK_STATE/wanted-answer" ;;
 "POST /v1/hosts/bm1/workers/report") echo '{"recorded":"x"}' ;;
 "POST /v1/hosts/bm1/egress")
-  [[ ! -f "$MOCK_STATE/egress-fail" ]] || { echo 'curl: (7) Failed to connect' >&2; exit 7; }
+  # As the agent calls it: -o ANSWER -w '%{http_code}', no -f. egress-fail: no answer at all;
+  # egress-status: answer with that status (400 with invalid_request, 404 not_found, else an error).
+  [[ -n "$outf" && -n "$wfmt" && " $* " != *" -fsS "* ]] || { echo 'curl: egress posted without -o/-w' >&2; exit 2; }
+  [[ ! -f "$MOCK_STATE/egress-fail" ]] || { echo 'curl: (7) Failed to connect' >&2; printf 000; exit 7; }
+  if [[ -f "$MOCK_STATE/egress-status" ]]; then
+    st="$(<"$MOCK_STATE/egress-status")"
+    case "$st" in
+    400) echo '{"error":"invalid_request","message":"events and oversized must be arrays"}' >"$outf" ;;
+    404) echo '{"error":"not_found"}' >"$outf" ;;
+    *) echo '{"error":"redis_unavailable"}' >"$outf" ;;
+    esac
+    printf '%s' "$st"; exit 0
+  fi
   cat "$data" >>"$MOCK_STATE/egress-posts"
   printf '{"accepted":%d,"refused":0,"capped":0,"invalid":0,"dropped":0,"cursor":%s}' \
-    "$(jq '.events | length' "$data")" "$(jq .cursor "$data")" ;;
+    "$(jq '.events | length' "$data")" "$(jq .cursor "$data")" >"$outf"
+  printf 200 ;;
 *) echo "curl: (22) 404 $method $path" >&2; exit 22 ;;
 esac
 MOCK
@@ -85,7 +100,8 @@ printf 'install-host %s\n' "$*" >>"$MOCK_LOG"
 [[ "$1" == --uninstall ]] && rm -f "$SBX_ENV_DIR/workers/$2.env"
 MOCK
 # journalctl: logs its argv; answers -o json entries from $MOCK_STATE/journal (one JSON entry a line,
-# each with __CURSOR), after --after-cursor when given. Exits 1 if anything else is asked of it.
+# each with __CURSOR), after --after-cursor when given; a cursor no entry has is journalctl's
+# "Failed to seek to cursor" and exit 1, as a rotated-away cursor is. Exits 1 if anything else is asked.
 cat >"$TMP/bin/journalctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'journalctl %s\n' "$*" >>"$MOCK_LOG"
@@ -97,6 +113,7 @@ done
 [[ " $* " == *" -u moca-egress.service -o json --no-pager "* ]] || exit 1
 [[ -f "$MOCK_STATE/journal" ]] || exit 0
 if [[ -z "$after" ]]; then cat "$MOCK_STATE/journal"; else
+  grep -qF "\"__CURSOR\":\"$after\"" "$MOCK_STATE/journal" || { echo 'Failed to seek to cursor: Invalid argument' >&2; exit 1; }
   awk -v c="$after" 'seen { print } index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 }' "$MOCK_STATE/journal"
 fi
 MOCK
@@ -348,7 +365,9 @@ pass 'removes a retired build only when named and matched by its own record, nev
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 EV='{"time":"2026-11-08T12:00:00.5Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"pypi.example.com","dial_addr":"192.0.2.10:443","method":"CONNECT","status":200,"bytes_up":10,"bytes_down":20,"decision":"tunnel"}'
 EV2='{"time":"2026-11-08T12:00:01Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"files.example.com","method":"GET","path":"/x/","status":403,"bytes_up":0,"bytes_down":0,"credential":"mirror","decision":"destination_denied","coalesced":2}'
-entry() { jq -cn --arg c "$1" --arg m "$2" '{__CURSOR: $c, MESSAGE: $m, _SYSTEMD_UNIT: "moca-egress.service"}'; }
+# entry CURSOR MESSAGE [MONOTONIC]: a journal entry of boot b1; the monotonic time defaults to the
+# cursor's number (c12 -> 12), so entries are in journal order.
+entry() { jq -cn --arg c "$1" --arg m "$2" --arg t "${3:-${1#c}}" '{__CURSOR: $c, __MONOTONIC_TIMESTAMP: $t, _BOOT_ID: "b1", MESSAGE: $m, _SYSTEMD_UNIT: "moca-egress.service"}'; }
 { entry c1 "$EV"; entry c2 'moca-egress: serving 3 allowlist entries'; entry c3 "$EV2"; } >"$TMP/state/journal"
 egress_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts"; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
 # Off: the unit is not enabled.
@@ -357,7 +376,7 @@ egress_run || fail 'the egress-off run failed'
 grep -q '^journalctl' "$MOCK_LOG" && fail 'read the journal with moca-egress not enabled'
 grep -q '/egress' "$MOCK_LOG" && fail 'posted with moca-egress not enabled'
 [[ ! -e "$TMP/srv/egress.cursor" && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'wrote a cursor or batch with egress off'
-grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0' "$TMP/out" || fail 'the off summary'
+grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0,"egressSkipped":0,"egressRejected":0' "$TMP/out" || fail 'the off summary'
 # On: both events posted as written, the proxy's own log line skipped, the cursor at the last entry.
 touch "$TMP/state/enabled-moca-egress.service"
 egress_run || fail 'the egress run failed'
@@ -372,7 +391,7 @@ jq -e '[.events[] | keys[]] - ["time","via","vm_id","sid","sub","host","dial_add
 grep -q 'curl .*-H @.*/v1/hosts/bm1/egress' "$MOCK_LOG" || fail 'the post did not use the header file'
 grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
 grep -q 'pypi.example.com' "$TMP/out" && fail 'an egress event was printed'
-grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0' "$TMP/out" || fail 'the on summary'
+grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0,"egressSkipped":0,"egressRejected":0' "$TMP/out" || fail 'the on summary'
 grep -qE 'systemctl (start|stop|restart|reload|kill)[^@]*moca-egress' "$MOCK_LOG" && fail 'acted on moca-egress'
 # Nothing new: nothing posted, the cursor unchanged.
 egress_run || fail 'the idle egress run failed'
@@ -402,7 +421,68 @@ BIG="$(jq -cn --argjson e "$EV" '$e + {path: ("/" + ("a" * 9000))}')"
 entry c1007 "$BIG" >>"$TMP/state/journal"
 egress_run || fail 'the oversized run failed'
 jq -e '.events == [] and .oversized == ["sbx-0123456789abcdef0123456789"]' "$TMP/state/egress-posts" >/dev/null || fail 'an oversized event'
-rm -f "$TMP/state/enabled-moca-egress.service"
 pass 'ships egress events as written, only with moca-egress enabled; batches of 1000; a failed post keeps the cursor and retries the same batch (G42)'
+
+# 14. A 400 invalid_request (a batch the control plane will never take) is set aside, never retried
+#     forever: kept 0600 in egress.rejected/, the cursor past it, an error naming it; shipping goes on.
+#     A 404 (an older control plane) and a 503 keep the batch and the cursor, and retry.
+rm -f "$TMP/srv/egress.pending.json" "$TMP/srv/egress.mark" "$TMP/srv/egress.catchup"
+{ entry c1 "$EV"; entry c2 "$EV2"; } >"$TMP/state/journal"
+printf c1 >"$TMP/srv/egress.cursor"
+for st in 404 503; do
+  printf '%s' "$st" >"$TMP/state/egress-status"
+  egress_run || fail "the $st run failed"
+  [[ "$(<"$TMP/srv/egress.cursor")" == c1 ]] || fail "the cursor moved on a $st"
+  [[ -f "$TMP/srv/egress.pending.json" ]] || fail "the batch was dropped on a $st"
+  [[ ! -d "$TMP/srv/egress.rejected" ]] || fail "a $st batch was set aside as rejected"
+  grep -q "egress post failed: the cursor stays, the next run retries (HTTP $st)" "$TMP/out" || fail "the $st error"
+  grep -q '"egressRejected":0' "$TMP/out" || fail "the $st summary"
+done
+printf 400 >"$TMP/state/egress-status"
+egress_run || fail 'the 400 run failed'
+REJ="$(ls "$TMP/srv/egress.rejected/"*.json 2>/dev/null | head -1)"
+[[ -n "$REJ" && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'the refused batch was not set aside'
+jq -e --argjson b "$EV2" '.events == [$b] and .cursor == "c2"' "$REJ" >/dev/null || fail 'the rejected file is not the batch'
+[[ "$(stat -c %a "$REJ" 2>/dev/null || stat -f %Lp "$REJ")" == 600 ]] || fail 'the rejected file is not 0600'
+[[ "$(<"$TMP/srv/egress.cursor")" == c2 ]] || fail 'the cursor did not move past the refused batch'
+grep -q "refused a batch as malformed (400 invalid_request); kept in $REJ" "$TMP/out" || fail 'the 400 error does not name the file'
+grep -q '"errors":1,.*"egressRejected":1' "$TMP/out" || fail 'the 400 summary'
+grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
+grep -q 'events and oversized' "$TMP/out" && fail "the control plane's answer was printed"
+rm -f "$TMP/state/egress-status"
+entry c3 "$EV" >>"$TMP/state/journal"
+egress_run || fail 'the run after a rejection failed'
+jq -e '.cursor == "c3"' "$TMP/state/egress-posts" >/dev/null || fail 'shipping did not go on after a rejection'
+pass 'a 400 batch is kept in egress.rejected/ (0600) and passed; a 404 or 503 keeps it and retries (G42)'
+
+# 15. A rotated-away cursor: an error, the old cursor kept as egress.cursor.stale, a restart from this
+#     boot, and shipping goes on; entries already sent (at or before egress.mark) are not sent again.
+#     Without a mark, the restart re-sends, and says so.
+rm -f "$TMP/srv/egress.pending.json" "$TMP/srv/egress.cursor.stale" "$TMP/srv/egress.catchup" "$TMP/srv/egress.mark"
+{ entry c10 "$EV"; entry c11 "$EV2"; } >"$TMP/state/journal"
+egress_run || fail 'the first run of 15 failed'
+[[ "$(<"$TMP/srv/egress.mark")" == 'b1 11' ]] || fail 'the position mark is not the last sent entry'
+# The journal rotates: c10 and c11 are now under other cursors, and the agent's c11 is gone.
+{ entry r10 "$EV" 10; entry r11 "$EV2" 11; entry r12 "$EV" 12; } >"$TMP/state/journal"
+egress_run || fail 'the rotated run failed'
+grep -q 'egress: the journal cursor is no longer valid; restarting from this boot' "$TMP/out" || fail 'no error for a rotated cursor'
+[[ "$(<"$TMP/srv/egress.cursor.stale")" == c11 ]] || fail 'the old cursor was not kept'
+grep -q 'journalctl -u moca-egress.service -o json --no-pager -b' "$MOCK_LOG" || fail 'no restart from this boot'
+jq -s -e --argjson a "$EV" '(map(.events) | add) == [$a] and .[-1].cursor == "r12"' "$TMP/state/egress-posts" >/dev/null ||
+  fail 'the restart re-sent entries already sent, or did not ship the new one'
+grep -q '"egressSkipped":2' "$TMP/out" || fail 'the skipped entries are not counted'
+[[ "$(<"$TMP/srv/egress.cursor")" == r12 && ! -e "$TMP/srv/egress.catchup" ]] || fail 'not caught up after the restart'
+entry r13 "$EV2" 13 >>"$TMP/state/journal"
+egress_run || fail 'the run after the restart failed'
+jq -e '.cursor == "r13" and (.events | length) == 1' "$TMP/state/egress-posts" >/dev/null || fail 'shipping did not go on after the restart'
+grep -q '"errors":0' "$TMP/out" || fail 'an error after the restart'
+# No mark: the restart says the control plane will store the re-sent entries twice.
+rm -f "$TMP/srv/egress.mark"; printf gone >"$TMP/srv/egress.cursor"
+egress_run || fail 'the no-mark run failed'
+grep -q 'no position mark: entries of this boot already sent are sent again, and the control plane stores them twice' "$TMP/out" ||
+  fail 'a re-send without a mark is silent'
+jq -s -e '(map(.events | length) | add) == 4' "$TMP/state/egress-posts" >/dev/null || fail 'the no-mark restart did not re-send'
+rm -f "$TMP/state/enabled-moca-egress.service"
+pass 'a rotated-away cursor is an error, kept as egress.cursor.stale, restarted from this boot without re-sending; no mark is said (G42)'
 
 echo 'all host-agent tests passed'

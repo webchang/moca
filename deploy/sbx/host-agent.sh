@@ -27,8 +27,20 @@
 #     is skipped. A batch is saved to $SBX_SRV/egress.pending.json (0600) before it is posted and re-sent
 #     unchanged until it is taken, so a retry repeats its cursor and the control plane, idempotent by
 #     (host, cursor), never stores it twice.
-#   - A post that fails (the control plane down, or one without the route) is an error in the summary;
-#     the cursor stays, and the next run retries.
+#   - A post that fails (the control plane down, a 5xx, or a 404 from one without the route) is an error
+#     in the summary; the cursor stays, and the next run retries.
+#   - A batch the control plane refuses as malformed (400 invalid_request or invalid_json) would fail
+#     every retry, so it is moved to $SBX_SRV/egress.rejected/<UTC time>-<pid>.json (0600), the cursor
+#     moves past it, and the error names the file: nothing is lost silently, and shipping goes on.
+#   - A cursor journalctl can no longer seek to (rotated away, or another machine's) is an error; it is
+#     kept as $SBX_SRV/egress.cursor.stale and the step restarts from this boot. Entries it already
+#     sent are not sent again: beside the cursor, $SBX_SRV/egress.mark (0600) keeps the last sent
+#     entry's _BOOT_ID and __MONOTONIC_TIMESTAMP. From the restart ($SBX_SRV/egress.catchup) until the
+#     first entry past the mark, an entry of that boot at or before it is skipped (egressSkipped).
+#     Without a mark, a restart re-sends this boot's entries, which the control plane would store twice
+#     (its replay check is by cursor, and re-read entries come with new batch cursors): that is an
+#     error line of its own, never silent. Entries of an earlier boot after the stale cursor that are
+#     still in the journal are not read (-b is this boot only).
 #
 # Run it through the unit (systemctl start sbx-host-agent.service): the unit loads host-agent.env; a
 # bare run sees none of it and refuses (SBX_API_URL). Installed outside the tree, it needs
@@ -55,7 +67,8 @@
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
 # summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
-# --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused".
+# --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
+# "egressSkipped","egressRejected".
 # A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
@@ -71,7 +84,7 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
 CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
-EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0
+EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_CODE=''
 EGRESS_BATCH=1000 EGRESS_BATCHES=10
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
@@ -313,15 +326,48 @@ removal() {
   done < <(jq -r '.remove[] | [.worker, .buildId] | @tsv' <<<"$1")
 }
 
-# Posts the pending batch; on success records its cursor and drops it. Fails, keeping both, otherwise.
+# The egress post, with curl's status rather than -f's failure, so a 400 can be told from a 503: the
+# HTTP status on stdout (000: no answer), the answer's body in ANSWER_FILE. The token is in the header
+# file, as for api(); neither the body nor the token is printed.
+egress_api() { # egress_api BODY_FILE ANSWER_FILE
+  local ca=()
+  [[ -z "${SBX_API_CA_FILE:-}" ]] || ca=(--cacert "$SBX_API_CA_FILE")
+  curl -sS --max-time 60 --proto =https ${ca[@]+"${ca[@]}"} -H "@$HDR" -H 'Content-Type: application/json' \
+    -X POST --data-binary "@$1" -o "$2" -w '%{http_code}' "$SBX_API_URL/v1/hosts/$SBX_HOST_ID/egress"
+}
+
+# Moves the cursor (and the position mark) past the batch in FILE.
+egress_advance() { # egress_advance BATCH_FILE
+  (umask 077 && jq -j .cursor "$1" >"$SBX_SRV/egress.cursor.tmp") && mv -f "$SBX_SRV/egress.cursor.tmp" "$SBX_SRV/egress.cursor"
+  [[ ! -f "$SBX_SRV/egress.pending.mark" ]] || mv -f "$SBX_SRV/egress.pending.mark" "$SBX_SRV/egress.mark"
+}
+
+# Posts the pending batch; on success records its cursor and drops it. A 400 invalid_request or
+# invalid_json moves it to egress.rejected/ and records its cursor (see the header). Fails, keeping
+# both, otherwise (EG_CODE says how).
 egress_post() {
-  local pending="$SBX_SRV/egress.pending.json" out
-  out="$(api POST "/v1/hosts/$SBX_HOST_ID/egress" "$pending")" || return 1
-  jq -e '(.accepted | type) == "number"' >/dev/null 2>&1 <<<"$out" || return 1
-  EG_ACCEPTED=$((EG_ACCEPTED + $(jq -r .accepted <<<"$out")))
-  EG_REFUSED=$((EG_REFUSED + $(jq -r '.refused // 0' <<<"$out")))
-  (umask 077 && jq -j .cursor "$pending" >"$SBX_SRV/egress.cursor.tmp") && mv -f "$SBX_SRV/egress.cursor.tmp" "$SBX_SRV/egress.cursor"
-  rm -f "$pending"
+  local pending="$SBX_SRV/egress.pending.json" out="$WORK/egress.answer" rej
+  : >"$out"
+  EG_CODE="$(egress_api "$pending" "$out" 2>/dev/null)" || EG_CODE=000
+  case "$EG_CODE" in
+  2??)
+    jq -e '(.accepted | type) == "number"' "$out" >/dev/null 2>&1 || return 1
+    EG_ACCEPTED=$((EG_ACCEPTED + $(jq -r .accepted "$out")))
+    EG_REFUSED=$((EG_REFUSED + $(jq -r '.refused // 0' "$out")))
+    egress_advance "$pending"
+    rm -f "$pending"
+    ;;
+  400)
+    jq -e '.error == "invalid_request" or .error == "invalid_json"' "$out" >/dev/null 2>&1 || return 1
+    (umask 077 && mkdir -p "$SBX_SRV/egress.rejected") && chmod 0700 "$SBX_SRV/egress.rejected"
+    rej="$SBX_SRV/egress.rejected/$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+    mv -f "$pending" "$rej" && chmod 0600 "$rej"
+    egress_advance "$rej"
+    EG_REJECTED=$((EG_REJECTED + 1))
+    error "egress: the control plane refused a batch as malformed (400 $(jq -r .error "$out")); kept in $rej, the cursor moved past it"
+    ;;
+  *) return 1 ;;
+  esac
 }
 
 # The egress step (see the header). Reads the journal only; never acts on moca-egress.
@@ -333,29 +379,64 @@ egress() {
   flock -n 8 || { say '{"agent":"skipped","why":"another run is shipping egress events"}'; return 0; }
   local pending="$SBX_SRV/egress.pending.json" n i pos entries
   if [[ -f "$pending" ]]; then
-    egress_post || { error 'egress post failed: the cursor stays, the next run retries'; exec 8>&-; return; }
+    egress_post || { error "egress post failed: the cursor stays, the next run retries (HTTP $EG_CODE)"; exec 8>&-; return; }
   fi
+  local rc mb mm skipped
   for ((i = 0; i < EGRESS_BATCHES; i++)); do
     pos=(-b)
     [[ ! -s "$SBX_SRV/egress.cursor" ]] || pos=(--after-cursor "$(<"$SBX_SRV/egress.cursor")")
     entries="$WORK/egress.entries"
-    { journalctl -u moca-egress.service -o json --no-pager "${pos[@]}" 2>/dev/null || true; } | head -n "$EGRESS_BATCH" >"$entries" || true
+    # journalctl's own exit status, written aside: the pipe's is head's, and head stopping early is a
+    # SIGPIPE (141) for a full batch, not a failure. (A && B || C keeps set -e out of the subshell.)
+    { journalctl -u moca-egress.service -o json --no-pager "${pos[@]}" 2>"$WORK/egress.jerr" && echo 0 >"$WORK/egress.jrc" ||
+      echo "$?" >"$WORK/egress.jrc"; } | head -n "$EGRESS_BATCH" >"$entries" || true
+    rc="$(<"$WORK/egress.jrc")"
     n="$(wc -l <"$entries" | tr -d ' ')"
+    if ((n == 0)) && [[ "$rc" != 0 && "$rc" != 141 ]]; then
+      if [[ "${pos[0]}" == --after-cursor ]]; then
+        mv -f "$SBX_SRV/egress.cursor" "$SBX_SRV/egress.cursor.stale"
+        error 'egress: the journal cursor is no longer valid; restarting from this boot (the old one is in egress.cursor.stale)'
+        if [[ -s "$SBX_SRV/egress.mark" ]]; then
+          (umask 077 && : >"$SBX_SRV/egress.catchup")
+        else
+          error 'egress: no position mark: entries of this boot already sent are sent again, and the control plane stores them twice'
+        fi
+        continue
+      fi
+      error "egress: journalctl exited $rc"
+      break
+    fi
     ((n > 0)) || break
     EG_READ=$((EG_READ + n))
+    # The position mark: the last sent entry's boot and monotonic time. An entry of that boot at or
+    # before it was sent already (a restart from this boot re-reads it), so it is skipped.
+    mb='' mm=-1
+    if [[ -f "$SBX_SRV/egress.catchup" && -s "$SBX_SRV/egress.mark" ]]; then read -r mb mm <"$SBX_SRV/egress.mark" || true; fi
+    [[ "$mm" =~ ^[0-9]+$ ]] || { mb='' mm=-1; }
     # Each entry's MESSAGE is a proxy event when it is a JSON object from moca-egress; others are skipped.
     # An event over 8 KiB (a guest's long path) is not sent; its sid is, as `oversized`, and the
     # control plane counts it as dropped in that sandbox's log. Nothing in an event is changed.
-    (umask 077 && jq -cs '(last | .__CURSOR) as $c
+    (umask 077 && jq -cs --arg b "$mb" --argjson m "$mm" '(last | .__CURSOR) as $c
+        | [.[] | select(._BOOT_ID != $b or ((.__MONOTONIC_TIMESTAMP // "0") | tonumber) > $m)]
         | [.[] | .MESSAGE | strings | (try fromjson catch null) | objects | select(.via == "moca-egress")] as $all
         | {cursor: $c, events: [$all[] | select((tojson | utf8bytelength) <= 8192)],
            oversized: [$all[] | select((tojson | utf8bytelength) > 8192) | (.sid // "" | tostring | .[0:128])]}' \
       "$entries" >"$pending") || { rm -f "$pending"; error 'egress: the journal batch did not parse'; break; }
+    # The skipped count, and the mark after this batch (never moved back within a boot).
+    # '|'-joined: with tabs, read would collapse an empty boot id and shift the fields.
+    IFS='|' read -r skipped mb mm < <(jq -rs --arg b "$mb" --argjson m "$mm" '
+        ([.[] | select(._BOOT_ID == $b and ((.__MONOTONIC_TIMESTAMP // "0") | tonumber) <= $m)] | length) as $s
+        | (last | [._BOOT_ID // "", ((.__MONOTONIC_TIMESTAMP // "0") | tonumber)]) as $l
+        | [$s] + (if $l[0] == $b and $l[1] <= $m then [$b, $m] else $l end) | map(tostring) | join("|")' "$entries")
+    EG_SKIPPED=$((EG_SKIPPED + skipped))
+    # Caught up once the batch holds an entry past the mark.
+    ((skipped == n)) || rm -f "$SBX_SRV/egress.catchup"
+    [[ -z "$mb" ]] || (umask 077 && printf '%s %s\n' "$mb" "$mm" >"$SBX_SRV/egress.pending.mark")
     if [[ "$(jq '(.events | length) + (.oversized | length)' "$pending")" == 0 ]]; then
-      (umask 077 && jq -j .cursor "$pending" >"$SBX_SRV/egress.cursor.tmp") && mv -f "$SBX_SRV/egress.cursor.tmp" "$SBX_SRV/egress.cursor"
+      egress_advance "$pending"
       rm -f "$pending"
     else
-      egress_post || { error 'egress post failed: the cursor stays, the next run retries'; break; }
+      egress_post || { error "egress post failed: the cursor stays, the next run retries (HTTP $EG_CODE)"; break; }
     fi
     ((n == EGRESS_BATCH)) || break
   done
@@ -380,7 +461,7 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED}"
     return 0
   fi
   local free

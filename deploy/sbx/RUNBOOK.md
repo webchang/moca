@@ -486,10 +486,22 @@ SANDBOX`, or `GET /v1/sandboxes/{id}/egress`. Nothing to install: no new unit, t
 - **Where it is:** the journal cursor after the last event the control plane took is
   `/srv/sbx/egress.cursor`; a batch being sent is `/srv/sbx/egress.pending.json` (both 0600). Without a
   cursor, the first run starts at this boot.
-- **If a post fails** (the control plane down, or one older than this): the summary counts an error
-  (`egress post failed: the cursor stays, the next run retries`), the cursor stays, and the next run
-  re-sends the same batch first. The control plane takes a repeated batch once (idempotent by host
-  and cursor). Up to 10 batches of 1000 entries per run.
+- **If a post fails** (the control plane down, a 5xx, or a 404 from one older than this): the summary
+  counts an error (`egress post failed: the cursor stays, the next run retries (HTTP <code>)`), the
+  cursor stays, and the next run re-sends the same batch first. The control plane takes a repeated
+  batch once (idempotent by host and cursor). Up to 10 batches of 1000 entries per run.
+- **A batch refused as malformed** (400 `invalid_request` or `invalid_json`) would fail every retry, so
+  it is moved to `/srv/sbx/egress.rejected/<UTC time>-<pid>.json` (0600), the cursor moves past it, and
+  the error names the file (`egressRejected` in the summary). Its events are not in any sandbox's log:
+  look at the file, and fix the agent or the control plane.
+- **A cursor the journal no longer has** (rotated away, or from another machine) is an error
+  (`the journal cursor is no longer valid; restarting from this boot`). The old cursor is kept as
+  `/srv/sbx/egress.cursor.stale`, and shipping restarts from this boot's first entry. Entries already
+  sent are skipped (`egressSkipped`), by `/srv/sbx/egress.mark` (the last sent entry's boot id and
+  monotonic time): the control plane's replay check is by cursor, so it could not tell them apart.
+  Without a mark, the restart re-sends this boot's entries, which the control plane stores twice; the
+  agent says so in an error line (`no position mark`). Entries of an earlier boot that the old cursor
+  had not reached are not read.
 - **What is kept:** each event exactly as the proxy wrote it, for as long as the sandbox record
   (`SBX_RETENTION_DAYS`). A log holds at most 50,000 events.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
