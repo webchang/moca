@@ -395,6 +395,12 @@ Build claims take subjects in turn, so one subject's batch of 50 does not hold e
   `lastUsedAt` aging and the replacement of idle unleased builds above moot: no build stays active
   without a lease to be replaced. Over the subject's `active` quota the activation is refused
   (`429 quota_exceeded`, `quota: active`); replacing the subject's own oldest is **not built**.
+- **As built (register G40, 2026-11-09):** an activation's quota and placement check, its `activate`
+  record and its lease write run one activation at a time across the deployment (owner activation
+  and first use alike), so concurrent activations of different templates can't together pass a
+  subject's quota or a host's `activeLimit`. A lease taken in the same second as a placed build waits
+  (`409 no_active_slot`) rather than displacing it. One control plane process per template store is
+  what makes that lock enough (RUNBOOK).
 - **Live sessions:** a build is never stopped under a live session; `deactivating` drains (no new
   sessions, existing ones finish or expire). If every active build on every holding host has live
   sessions, the activation waits (`activating`, `Retry-After`) or is refused with `409 no_active_slot`.

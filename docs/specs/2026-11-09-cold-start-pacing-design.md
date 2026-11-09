@@ -1,8 +1,8 @@
 # Pacing and placing template workers' cold starts
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
-  by autobench-moca, autobench, image-factory and autobench-sandbox). Not implemented; built after G40
-  and G39, the start limit first, then the grace (register G43).
+  by autobench-moca, autobench, image-factory and autobench-sandbox). Not implemented; built after G39 (G40
+  deployed 2026-11-09), the start limit first, then the grace (register G43).
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
   and many activations waited minutes for their workers. The user kept the host's disk as it was

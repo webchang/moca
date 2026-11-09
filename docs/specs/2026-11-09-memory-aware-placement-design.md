@@ -1,8 +1,8 @@
 # Memory-aware placement of template workers
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
-  by autobench-moca, autobench, image-factory and autobench-sandbox). Not implemented; built after G40
-  (register G39).
+  by autobench-moca, autobench, image-factory and autobench-sandbox). Being built (G40, its prerequisite, deployed
+  2026-11-09) (register G39).
 - **Date:** 2026-11-09
 - **Asked by:** autobench-moca, 2026-11-08, for the user ("per host resource availability"). The
   user's answer: "yes, run the test first". The Lite-28 batch window (2026-11-08) was that test.
