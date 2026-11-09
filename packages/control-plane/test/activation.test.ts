@@ -219,6 +219,20 @@ describe('activation (§6.2-§6.4)', () => {
     expect((await activate(d, 't2', bob)).status).toBe(200);
   });
 
+  it('never evicts for a lease taken in the same second: the tie on since does not reorder placement', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2', bob);
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    expect((await activate(d, 't2', bob)).status).toBe(200);
+    const e = await activate(d, 't1', alice).catch((x) => x);
+    expect(e.code).toBe('no_active_slot');
+    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+      run: [{ template: 't2' }],
+    });
+  });
+
   it('refuses a build no host holds as template_unavailable, and a draft build too', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');

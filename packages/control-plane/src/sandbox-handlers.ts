@@ -810,12 +810,19 @@ async function takeLease(
       : { ...d, builds: d.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)) },
   );
   const pl = place(trial, hosts, nowS);
+  // A held build is never evicted to make room (§6.3): placement breaks a tie of equal `since` (whole
+  // seconds) by buildId, so a lease taken in the same second as a placed one could otherwise sort
+  // ahead of it and push it off its host. Such a lease waits, as one that does not fit.
+  const before = place(docs, hosts, nowS);
+  const displaces = [...before.placed.keys()].some(
+    (b) => b !== target.buildId && !pl.placed.has(b),
+  );
   if (hosts.length > 0 && pl.unplaced.get(target.buildId) === 'not_held') {
     throw new CpError('template_unavailable', "no host holds this build's snapshot", undefined, {
       readiness: 'unavailable',
     });
   }
-  if (pl.unplaced.get(target.buildId) === 'no_slot') {
+  if (pl.unplaced.get(target.buildId) === 'no_slot' || displaces) {
     const free = Math.min(
       ...trial
         .flatMap((d) => d.builds)
