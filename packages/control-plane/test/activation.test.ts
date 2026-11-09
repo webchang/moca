@@ -219,6 +219,20 @@ describe('activation (§6.2-§6.4)', () => {
     expect((await activate(d, 't2', bob)).status).toBe(200);
   });
 
+  it('never evicts for a lease taken in the same second: the tie on since does not reorder placement', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2', bob);
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    expect((await activate(d, 't2', bob)).status).toBe(200);
+    const e = await activate(d, 't1', alice).catch((x) => x);
+    expect(e.code).toBe('no_active_slot');
+    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+      run: [{ template: 't2' }],
+    });
+  });
+
   it('refuses a build no host holds as template_unavailable, and a draft build too', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
@@ -1342,6 +1356,136 @@ describe('every link of a sandbox is a record digest (§7.1)', () => {
       subject: 'janitor',
       body: { sandboxId: sb.id, reason: 'expired', expiresAt: sb.expiresAt },
     });
+  });
+});
+
+describe('activation is one check-and-write at a time across templates (G40)', () => {
+  /**
+   * Holds every `activate` record's append until `release()`: each activation, once past its
+   * checks, waits inside its critical section, so without the lock a second activation reads the
+   * catalog before the first one's lease is written: a real race, not a sequence.
+   */
+  function gateActivateRecords(d: TestDeps) {
+    const prov = d.provenance!;
+    const orig = prov.append.bind(prov);
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    let entered = 0;
+    prov.append = (async (rec: Parameters<typeof orig>[0]) => {
+      if (rec.kind === 'activate') {
+        entered++;
+        await gate;
+      }
+      return orig(rec);
+    }) as typeof prov.append;
+    return {
+      release: () => open(),
+      entered: () => entered,
+    };
+  }
+  /**
+   * Starts every op at once, waits until all are held at the gate (or 250 ms: under the lock only
+   * one can get there), releases it, and answers each op's outcome: 'ok' or its error code.
+   */
+  async function race(g: ReturnType<typeof gateActivateRecords>, ops: (() => Promise<unknown>)[]) {
+    const all = Promise.allSettled(ops.map((f) => f()));
+    for (let i = 0; i < 50 && g.entered() < ops.length; i++)
+      await new Promise((r) => setTimeout(r, 5));
+    g.release();
+    return (await all).map((r) =>
+      r.status === 'fulfilled' ? 'ok' : String((r.reason as { code?: string }).code ?? r.reason),
+    );
+  }
+  const liveLeasesOf = async (d: TestDeps) =>
+    (await d.templates!.list())
+      .flatMap((x) => x.builds)
+      .flatMap((b) => (b.leases ?? []).filter((l) => l.until > Math.floor(now / 1000)));
+
+  it("two concurrent activations of different templates never pass one subject's active quota", async () => {
+    const d = await setup(2);
+    attachedNow = [];
+    await registered(d, 't0', hash('0'), 'sbx_t0');
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await registered(d, 't3', hash('3'), 'sbx_t3');
+    await inventory(
+      d,
+      'bm1',
+      { [hash('0')]: 't0', [hash('1')]: 't1', [hash('2')]: 't2', [hash('3')]: 't3' },
+      8,
+    );
+    await activate(d, 't0'); // one of alice's two held already: room for exactly one more
+    const g = gateActivateRecords(d);
+    const out = await race(g, [
+      () => activate(d, 't1'),
+      () => activate(d, 't2'),
+      () => activate(d, 't3'),
+    ]);
+    expect(out.filter((x) => x === 'ok')).toHaveLength(1);
+    expect(out.filter((x) => x === 'quota_exceeded')).toHaveLength(2);
+    expect((await liveLeasesOf(d)).filter((l) => l.subject === alice.sub)).toHaveLength(2);
+    // Every kept lease names its record, and no refused one left a record.
+    const recs = (
+      await Promise.all(['t0', 't1', 't2', 't3'].map((id) => d.provenance!.chain(`template/${id}`)))
+    )
+      .flat()
+      .filter((r) => r.kind === 'activate');
+    expect(recs).toHaveLength(2);
+    for (const l of await liveLeasesOf(d))
+      expect(recs.map((r) => recordDigestOf(r))).toContain(l.record);
+  });
+
+  it("two concurrent activations of different templates never pass a host's activeLimit", async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2', bob);
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    const g = gateActivateRecords(d);
+    const out = await race(g, [() => activate(d, 't1', alice), () => activate(d, 't2', bob)]);
+    expect([...out].sort()).toEqual(['no_active_slot', 'ok']);
+    expect(await liveLeasesOf(d)).toHaveLength(1);
+    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+      run: [{ template: out[0] === 'ok' ? 't1' : 't2' }],
+    });
+  });
+
+  it('activation on first use takes the same lock as an owner activation', async () => {
+    const d = await setup(1);
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
+    const g = gateActivateRecords(d);
+    const out = await race(g, [
+      () => activate(d, 't1'),
+      () => HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't2' } }), d),
+    ]);
+    // The first-use create answers template_not_active when it took the lease, quota_exceeded when not.
+    expect(
+      (out[0] === 'ok' && out[1] === 'quota_exceeded') ||
+        (out[0] === 'quota_exceeded' && out[1] === 'template_not_active'),
+    ).toBe(true);
+    expect((await liveLeasesOf(d)).filter((l) => l.subject === alice.sub)).toHaveLength(1);
+  });
+
+  it('a renewal does not count against itself, also beside a concurrent activation', async () => {
+    const d = await setup(1);
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    const first = (await activate(d, 't1', alice, { leaseSeconds: 600 })).body as Body;
+    now += 60_000;
+    const g = gateActivateRecords(d);
+    const out = await race(g, [
+      () => activate(d, 't1', alice, { leaseSeconds: 600 }),
+      () => activate(d, 't2', alice),
+    ]);
+    expect(out).toEqual(['ok', 'quota_exceeded']);
+    const ls = await liveLeasesOf(d);
+    expect(ls).toHaveLength(1);
+    expect(ls[0]).toMatchObject({ subject: alice.sub, until: first.leaseUntil + 60 });
   });
 });
 

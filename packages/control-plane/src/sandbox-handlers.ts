@@ -44,6 +44,7 @@ import {
   summarize,
   type EgressStore,
 } from './egress-log.js';
+import { SubjectQueue } from './subject-document.js';
 import type { TokenClaims } from './token.js';
 
 /**
@@ -760,6 +761,46 @@ async function takeLease(
   leaseSeconds: unknown,
   reason: 'owner' | 'first_use',
 ): Promise<{ until: number; host: string | null }> {
+  const { cat } = writable(deps);
+  return activationLock(cat).run('activation', () =>
+    takeLeaseLocked(deps, p, d0, target, leaseSeconds, reason),
+  );
+}
+
+/**
+ * The deployment-wide activation lock (register G40). takeLease checks the subject's active quota
+ * and the hosts' activeLimit against EVERY template's leases, then writes one template's lease;
+ * the catalog serializes writes per template id only, so two activations of different templates
+ * (by one subject, or placed on one host) could each pass the check before either lease was
+ * written, and together overshoot. One lease-taking check-and-write at a time, per catalog, closes
+ * that: each activation sees every earlier one's lease. It covers the policy read, the catalog
+ * read, placement, the `activate` record and the lease write (record first, so no lease is stored
+ * without its record), and nothing that calls a host. Paths that only DROP leases (deactivate,
+ * retire, reject) do not take it: a drop can only free quota or a slot, so an activation that read
+ * the leases before a drop judged against more leases than remain, never fewer.
+ *
+ * It is process-local, which suffices because one control plane process owns the store: the
+ * Deployment runs one replica (deploy/k8s/base/control-plane.yaml), and the file catalog's volume is
+ * ReadWriteOnce with the Recreate strategy (deploy/k8s/overlays/ocp-sbx/template-store), so no
+ * second pod writes it, even during a rollout. A control plane with more than one replica on a
+ * shared store would need a store-level lock (or a check-and-set on the whole catalog) instead.
+ */
+const ACTIVATION_LOCKS = new WeakMap<TemplateCatalog, SubjectQueue>();
+function activationLock(cat: TemplateCatalog): SubjectQueue {
+  let q = ACTIVATION_LOCKS.get(cat);
+  if (!q) ACTIVATION_LOCKS.set(cat, (q = new SubjectQueue()));
+  return q;
+}
+
+/** takeLease's body: run only under activationLock. */
+async function takeLeaseLocked(
+  deps: CpDeps,
+  p: TokenClaims,
+  d0: TemplateDoc,
+  target: TemplateBuild,
+  leaseSeconds: unknown,
+  reason: 'owner' | 'first_use',
+): Promise<{ until: number; host: string | null }> {
   const { cat, policy, prov } = writable(deps);
   const nowS = seconds(deps);
   const DAY = 86_400;
@@ -810,12 +851,19 @@ async function takeLease(
       : { ...d, builds: d.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)) },
   );
   const pl = place(trial, hosts, nowS);
+  // A held build is never evicted to make room (§6.3): placement breaks a tie of equal `since` (whole
+  // seconds) by buildId, so a lease taken in the same second as a placed one could otherwise sort
+  // ahead of it and push it off its host. Such a lease waits, as one that does not fit.
+  const before = place(docs, hosts, nowS);
+  const displaces = [...before.placed.keys()].some(
+    (b) => b !== target.buildId && !pl.placed.has(b),
+  );
   if (hosts.length > 0 && pl.unplaced.get(target.buildId) === 'not_held') {
     throw new CpError('template_unavailable', "no host holds this build's snapshot", undefined, {
       readiness: 'unavailable',
     });
   }
-  if (pl.unplaced.get(target.buildId) === 'no_slot') {
+  if (pl.unplaced.get(target.buildId) === 'no_slot' || displaces) {
     const free = Math.min(
       ...trial
         .flatMap((d) => d.builds)
