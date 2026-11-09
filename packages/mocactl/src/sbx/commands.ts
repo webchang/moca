@@ -456,6 +456,53 @@ export async function cmdRm(c: SbxCtx, id: string, o: { goneOk?: boolean } = {})
   }
 }
 
+/**
+ * `sbx egress` (register G42): a sandbox's egress, as its KVM host's proxy logged it. Text: the
+ * summary per host, then whether the log is complete and its digest. `--json`: every event and the
+ * summary, read page by page. `--ndjson`: the log exactly as served, whose sha256 the summary and the
+ * sandbox's end record name (verify-provenance.py --egress checks a saved copy).
+ */
+export async function cmdEgress(c: SbxCtx, id: string, ndjson: boolean): Promise<number> {
+  try {
+    if (ndjson) {
+      const body = await c.api.sandboxEgressNdjson(id);
+      if (c.io.outBytes) c.io.outBytes(Buffer.from(body, 'utf8'));
+      else c.io.out(body);
+      return SBX_EXIT.ok;
+    }
+    let page = await c.api.sandboxEgress(id, { limit: 1000 });
+    const summary = page.summary;
+    if (c.json) {
+      const events = [...page.events];
+      while (page.next !== null) {
+        page = await c.api.sandboxEgress(id, { after: page.next, limit: 1000 });
+        events.push(...page.events);
+      }
+      c.io.out(JSON.stringify({ events, summary }) + '\n');
+      return SBX_EXIT.ok;
+    }
+    const hosts = Object.entries(summary.byHost).sort(([a], [b]) => (a < b ? -1 : 1));
+    for (const [host, h] of hosts) {
+      const decisions = Object.entries(h.decisions)
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([d, n]) => `${sanitizeRemote(d)} ${n}`)
+        .join(', ');
+      c.io.out(
+        `${sanitizeRemote(host || '-').padEnd(40)} ${String(h.count).padStart(6)}  ` +
+          `up ${h.bytesUp} B, down ${h.bytesDown} B  (${decisions})\n`,
+      );
+    }
+    c.io.out(
+      `${summary.total} events; ` +
+        (summary.complete ? 'complete' : `INCOMPLETE: ${summary.dropped} dropped`) +
+        `; ${sanitizeRemote(summary.sha256)}\n`,
+    );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
 export async function cmdToken(c: SbxCtx, id: string): Promise<number> {
   try {
     const t = await c.api.mintSandboxToken(id);

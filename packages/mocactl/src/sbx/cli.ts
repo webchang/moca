@@ -25,6 +25,7 @@ import {
   cmdSubjects,
   cmdSubjectChange,
   cmdToken,
+  cmdEgress,
   failRefresh,
   SBX_EXIT,
   type SbxCtx,
@@ -95,6 +96,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  or when that cannot be checked)
   mocactl sbx token [ID] [--json]                print a fresh sandbox token (15 minutes by default)
   mocactl sbx env [ID]                           shell exports for a direct sandbox/v1 client
+  mocactl sbx egress [ID] [--json | --ndjson]    what the sandbox reached through its host's egress
+                                                 proxy: per host, and whether the log is complete;
+                                                 --ndjson prints the log whose sha256 its end record names
   mocactl sbx run [--sandbox ID] [--timeout S] [-- CMD ...]   run CMD (or the script on stdin) in /workspace
                                                  (CMD's words are quoted, so they run exactly as typed:
                                                  for pipes, $VARS or globs use stdin or -- sh -c '...';
@@ -314,7 +318,7 @@ const NO_JSON = new Set([
 /** The commands that open without the login check: they log in, out, or check it themselves (R7). */
 const OWN_LOGIN = new Set(['login', 'logout', 'doctor']);
 /** The commands that act on one sandbox: `[ID]` as an argument (or `--sandbox ID`). */
-const TAKES_ID_ARG = new Set(['rm', 'token', 'env']);
+const TAKES_ID_ARG = new Set(['rm', 'token', 'env', 'egress']);
 /** The commands that act on one sandbox through `--sandbox ID` only. */
 const TAKES_SANDBOX_FLAG = new Set([
   'run',
@@ -391,6 +395,7 @@ export async function sbxMain(
         label: { type: 'string', multiple: true },
         all: { type: 'boolean' },
         json: { type: 'boolean' },
+        ndjson: { type: 'boolean' },
         sandbox: { type: 'string' },
         timeout: { type: 'string' },
         force: { type: 'boolean' },
@@ -451,6 +456,7 @@ export async function sbxMain(
     'doctor',
     'credentials',
     'admin',
+    'egress',
   ];
   if (!known.includes(command)) {
     io.err(`sbx: unknown command '${command}'\n${SBX_USAGE}`);
@@ -464,6 +470,14 @@ export async function sbxMain(
   }
   if (values.sandbox !== undefined && !TAKES_SANDBOX_FLAG.has(command)) {
     io.err(`sbx: --sandbox does not apply to ${command}\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (values.ndjson && command !== 'egress') {
+    io.err(`sbx: --ndjson only applies to egress\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (values.ndjson && values.json) {
+    io.err(`sbx: egress takes --json or --ndjson, not both\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
   if (values.timeout !== undefined && command !== 'run') {
@@ -841,6 +855,8 @@ export async function sbxMain(
       return cmdDoctor(ctx, root, id, deps.execFactory, deps.claudeVersion, deps.agentop);
     case 'token':
       return cmdToken(ctx, id!);
+    case 'egress':
+      return cmdEgress(ctx, id!, values.ndjson === true);
     case 'run':
       return cmdRun(ctx, id!, script!, timeout, deps.execFactory, runRetry(env, deps, ctx));
     case 'put':
