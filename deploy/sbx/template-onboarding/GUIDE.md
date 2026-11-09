@@ -1,6 +1,6 @@
 # Moca — Template Onboarding Guide
 
-**Last modified:** 2026-11-07T15:16:38Z
+**Last modified:** 2026-11-09T01:37:04Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -128,10 +128,19 @@ For a template id `ID` and an image digest `sha256:abcdef012345…`:
 A JSON file, schema `moca-sbx-template-spec/1`. Every field is checked before anything runs
 ([`template-build.sh`](template-build.sh)):
 
-| Field   | Meaning                                                                                         |
-| ------- | ----------------------------------------------------------------------------------------------- |
-| `id`    | what clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`; the same across versions                     |
-| `image` | `repository@sha256:<digest>`, never a tag; a repository with no host takes it from `--registry` |
+| Field                     | Meaning                                                                                                                 |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `id`                      | what clients ask for: `^[a-z0-9][a-z0-9-]{0,30}$`; the same across versions                                             |
+| `image`                   | `repository@sha256:<digest>`, never a tag; a repository with no host takes it from `--registry`                         |
+| `guest_ram_mb`, `vcpus`   | the guest's size, fixed in the snapshot                                                                                 |
+| `guest_home`              | optional, a writable `HOME` under `/tmp` (the rootfs is read-only)                                                      |
+| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose                                                               |
+| `guest_home_gitconfig`    | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check`         |
+| `egress`                  | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress                                       |
+| `seed`                    | a bash command that fills a new sandbox's empty `/workspace`, or `""`                                                   |
+| `probe`                   | `{cmd, timeout_s, expect_rc, expect[]}`: run after the seed in the restored VM; passes on the exit code and every regex |
+| `description`, `tools`    | what clients see in `GET /v1/templates`                                                                                 |
+| `etc_hosts_sha256`        | optional: the build stops unless the rootfs's `/etc/hosts` has this hash                                                |
 
 **Which images a self-serve create accepts** is the deployment's policy: `allowedRegistries` (by
 registry host; `<default>` is a reference with no host, which the host pulls from its configured
@@ -141,15 +150,14 @@ write a Docker Hub image with its host, `docker.io/library/python@sha256:…`. D
 refusal by writing another host for the same registry (`registry-1.docker.io/…`): that host is its
 own key, refused unless an admin lists it, and listing it would bypass the repository allowlist.
 
-| `guest_ram_mb`, `vcpus` | the guest's size, fixed in the snapshot |
-| `guest_home` | optional, a writable `HOME` under `/tmp` (the rootfs is read-only) |
-| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose |
-| `guest_home_gitconfig` | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check` |
-| `egress` | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress |
-| `seed` | a bash command that fills a new sandbox's empty `/workspace`, or `""` |
-| `probe` | `{cmd, timeout_s, expect_rc, expect[]}`: run after the seed in the restored VM; passes on the exit code and every regex |
-| `description`, `tools` | what clients see in `GET /v1/templates` |
-| `etc_hosts_sha256` | optional: the build stops unless the rootfs's `/etc/hosts` has this hash |
+**Which profile a create names** is its gate: the policy's profiles, listed by `GET /v1/policy`.
+`base` needs no gate record. `benchmark` needs a gate record that passed and that an admin trusts
+(`trustedGateRecords`). Two self-attested profiles (register G41) accept the creating subject's own
+gate record, for that subject's templates only, which stay private until an admin trusts the record:
+`benchmark-self` (the benchmark rules, offline) and `general-self` (no X11, so the KVM host's
+allowlisted egress). A build shows `attestation: deployment | self`. A profile exists on a deployment
+only once its stored policy lists it, so check `GET /v1/policy` first. See the
+[subject trust spec](../../../docs/specs/2026-11-08-subject-trust-gate-records-design.md).
 
 ### The probe must be shareable
 
@@ -441,8 +449,9 @@ without the janitor they stay on disk: about a few hundred MB to a GB per templa
 run of retires fills `/srv/sbx` unless the janitor is installed or the workspaces are removed.
 
 A template the deployment declares (`SH_SANDBOX_TEMPLATES`) has no owner, so a subject cannot create
-a self-serve template under the same id (`409 template_exists`), and no admin can hand it over yet
-(register G34): use another id.
+a self-serve template under the same id (`409 template_exists`). An admin hands it to a subject
+(`mocactl sbx templates transfer ID github:<id>`, register G34); that subject then builds, tags and
+retires it.
 
 ## 8. Templates in Moca agent sessions
 

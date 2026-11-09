@@ -1,6 +1,6 @@
 # Enrollment and roles through the API
 
-- **Status:** design accepted (the user, 2026-11-08: all four proposals in §6); **implemented** (0b88a829 control plane, 49c98a85 mocactl), not deployed (register G38).
+- **Status:** design accepted (the user, 2026-11-08: all four proposals in §6); **implemented** (0b88a829 control plane, 49c98a85 mocactl; decision 1 narrowed: only an admin named in the settings changes access); **deployed** on `moca-sbx-template` 2026-11-08, `moca-combined` with its next image (register G38).
 - **Date:** 2026-11-08
 - **Builds on:** [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) §4.2 (enrollment),
   [template lifecycle](2026-11-03-template-lifecycle-and-provenance-design.md) §5 (D10: authorization

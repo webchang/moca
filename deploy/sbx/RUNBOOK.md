@@ -271,6 +271,21 @@ Every template change re-runs `setup.sh`, which rolls the control plane but not 
 running `Exec`s on every template carry on. A worker added or retired at the same time is a token
 change, which the relay reads on each attach without a restart.
 
+**Self-serve templates and the policy** (a deployment with a template store, §15): clients create
+their own templates with `POST /v1/templates`, gated by the stored policy (`GET /v1/policy`), which
+only an admin changes (`PUT /v1/policy`, a `policy` record). What an operator sets there:
+
+- **Profiles**, the gate a create names: `base` (no gate record), `benchmark` (a gate record an admin
+  trusts in `trustedGateRecords`), and the self-attested `benchmark-self` (offline) and
+  `general-self` (the KVM host's allowlisted egress), which trust a subject's own gate record for its
+  own templates only (register G41). A new image's default policy gains new profiles, but a stored
+  policy does not: add them with one `PUT /v1/policy`, the whole policy as read plus the change.
+- **Images:** `allowedRegistries` (`<default>` is the KVM host's own `SBX_REGISTRY`) and, per
+  registry, `allowedRepositories`. Docker Hub is `docker.io`. **On a rollback to an image older than
+  the repository allowlist, take `docker.io` out of `allowedRegistries` first:** an older image
+  ignores `allowedRepositories`, so it would admit every Docker Hub repository.
+- **Quotas:** `quota`, and `quotaBySubject` for an override.
+
 ## 6. Rotating the signing key
 
 The control plane signs sandbox tokens with one Ed25519 key, `SH_SESSION_TOKEN_PRIVATE_KEY` in the

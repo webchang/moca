@@ -1,7 +1,7 @@
 # HTTP API guide
 
 > **Preview.** Describes the P6 runtime on `main` as of 2026-10-12, with the template, sandbox and host routes of
-> control-plane API 1.3.0 and the templated-session fields of data-plane API 1.1.0 (2026-11-07). The machine-readable contracts are
+> control-plane API 1.6.0 and the templated-session fields of data-plane API 1.1.0 (2026-11-08). The machine-readable contracts are
 > [`docs/api/openapi.yaml`](../api/openapi.yaml) (control plane) and
 > [`docs/api/harness-openapi.yaml`](../api/harness-openapi.yaml) (data plane); this page explains how
 > they fit together and records behaviour the specs do not. Workload routes are covered in
@@ -209,6 +209,12 @@ Who is enrolled and who is an admin (API 1.4.0, with a template store): the depl
 and enrollment are evaluated per request, so a grant, a revoke or a lapsed `until` takes effect at the subject's next
 request; a token's `roles` claim reports what held when it was minted. See the
 [enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md).
+
+Self-attested gate records (API 1.5.0): a policy profile with `selfAttest` (`benchmark-self`, `general-self`) accepts
+the creating subject's own gate record for its own template; templates and builds show `attestation`
+(`deployment | self`), and deployment visibility for a self-attested build is refused `409 self_attested`. Which
+images a create accepts (API 1.6.0): `allowedRegistries`, and per registry `allowedRepositories` (rule
+`registry.repository`). See the [subject trust spec](../specs/2026-11-08-subject-trust-gate-records-design.md).
 
 Another user's session returns 404, not 403. Control-plane error codes and statuses: 400
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`, `unknown_template`,

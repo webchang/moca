@@ -1,6 +1,8 @@
 # Subject trust for gate records: general-user self-serve for gated profiles
 
-- **Status:** implemented, not deployed (register G41 (c)).
+- **Status:** implemented; **deployed** on `moca-sbx-template` 2026-11-09 (image 733eac0d, its stored policy
+  gaining `benchmark-self` and `general-self`); `moca-combined` with its next image, its policy unchanged
+  (register G41 (c)).
 - **Date:** 2026-11-08
 - **Decisions:** the user, 2026-11-08, in sbx-template's and autobench-moca's sessions, with
   image-factory's review.

@@ -1,6 +1,6 @@
-# Per-sandbox egress records through the API (DRAFT)
+# Per-sandbox egress records through the API
 
-- **Status:** draft for review (register G42). Not implemented.
+- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); being built (register G42).
 - **Date:** 2026-11-08
 - **Asked by:** the user, 2026-11-08: "per-sandbox egress records available through Moca API
   operations … a key requirement for Moca". A benchmark grader voids a rep for a download its rules
@@ -97,13 +97,14 @@ other sandbox routes.
 - **Graders:** read `…/egress` for each rep's sandbox, or check the exported log against the end
   record.
 
-## 6. Open questions (for the user)
+## 6. Decisions (the user, 2026-11-08)
 
-1. **Who may read a sandbox's egress:** the owner and admins (proposed), or also a named grader role?
-2. **Retention:** the sandbox record's (14 days today, proposed), or longer for benchmark windows?
-3. **A loss budget:** if the proxy dropped events for a sandbox (`audit_dropped`), should its end
-   record mark the log incomplete, and should a grader treat that rep as unverifiable? Proposed: mark
-   it incomplete, and let the grader decide.
+1. **Who may read a sandbox's egress:** the sandbox's owner and admins, the same as the other
+   sandbox routes. No separate grader role.
+2. **Retention:** the sandbox record's (`SBX_RETENTION_DAYS`, 14 days today).
+3. **A loss budget:** if the proxy dropped events for a sandbox (`audit_dropped`), the sandbox's end
+   record marks its egress log incomplete, with the drop count, and the grader decides whether that
+   rep is still valid.
 
 ## 7. Later
 

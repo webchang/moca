@@ -7,7 +7,7 @@ Sources, in the order they win (a slide restates them; change the source first):
   1. docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md (states §3.3, API §4,
      host agent §6.1, first use §6.4, provenance §7, policy §8, validation §10.1)
   2. docs/specs/2026-11-05-combined-control-plane-design.md (one control plane, turns by build)
-  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G37)
+  3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G43)
   4. deploy/sbx/RUNBOOK.md §15 (the host agent, its units)
   5. the run record of windows 1-4 (on the user's machine; its numbers are copied below with the
      window they come from); spec §10.1's Lite-28 and Moca Pi window entries (words, no counts)
@@ -491,21 +491,21 @@ def s_issues(d):
          "Moca Pi"],
         ["G30", "~20 s client stalls", "the client's DNS (not Moca)", "w4: 0 stalls"],
     ], [1.4, 4.6, 3.8, 1.8], right_from=-1, size=12, row_h=0.4, bold_first_col=True)
-    note(s, 0.6, 5.8, 12.1, 0.65, "Open",
-         ["G34: a declared template's id blocks self-serve creates; G37: mocactl's template "
-          "option takes only declared ids, not `id@build`"], size=12)
+    box(s, 0.6, 5.8, 12.1, 0.65, INFRA, "Since fixed",
+         ["G34: an admin hands a declared template to a subject; G37: mocactl's template option "
+          "takes `id@build`"], size=12, align=PP_ALIGN.LEFT)
 
 
 # --------------------------------------------------------------------------- 6. Next
 
 def s_next(d):
-    s = d.slide("Next: the two open gaps, then upstream",
+    s = d.slide("Next: egress records, then capacity, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "Both brains on one control plane: done", "the Moca Pi window (2026-11-07): a stock "
-         "agent and Moca Pi on the same builds, every provenance link exact"),
-        ("2", "Close G34 and G37", "hand a declared template to a subject; let mocactl take "
-         "`id@build` for a session"),
+        ("1", "Egress records through the API (G42)", "a sandbox's owner reads which hosts it "
+         "reached; its end record names the log's digest"),
+        ("2", "Capacity by host resources (G39, G43)", "placement weighs memory and paces cold "
+         "starts, from the batch window's measurements"),
         ("3", "Propose upstream", "as reviewable PRs, from what the windows proved; upstream has "
          "no session templates today"),
     ]
@@ -515,9 +515,9 @@ def s_next(d):
         text(s, 1.55, y + 0.05, 4.4, 0.9, [f"**{t}**"], size=16)
         text(s, 6.0, y + 0.05, 6.7, 0.95, [b], size=14, color=MUTED)
         y += 1.35
-    note(s, 0.6, 5.8, 12.1, 0.6, "Deployed and validated with a model",
-         ["the combined control plane runs on the cluster; both kinds of client shared one build"],
-         size=12)
+    box(s, 0.6, 5.8, 12.1, 0.6, INFRA, "Done since",
+         ["users and roles through the API (G38); general-user self-serve with its own gate "
+          "records (G41); a Docker Hub repository allowlist"], size=12, align=PP_ALIGN.LEFT)
 
 
 SECTIONS = [
@@ -547,4 +547,4 @@ if __name__ == "__main__":
              ])
     d.build(SECTIONS, lambda d: d.title_slide(
         "Self-serve sandbox templates, gated by policy, with provenance",
-        "sbx-template · 2026-11-07"))
+        "sbx-template · 2026-11-09"))
