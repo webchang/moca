@@ -8,6 +8,31 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.9.0
+
+Pacing template workers' cold starts ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md),
+register G43): a KVM host starts at most `SBX_START_CONCURRENCY` (default 4) workers at once, and an
+activation waiting for a start slot says so. The start limit is the host agent's, so it holds with an
+older control plane too. Nothing running is stopped.
+
+- `GET /v1/hosts/{host}/wanted` gains `starting: [buildId]`: the builds of `run` whose worker is not
+  attached to the relay (its presence, as readiness reads it), in `run`'s order. `run` is now in the
+  wanted order, first leased first. Without `starting` (an older control plane, or the presence
+  unreadable) the agent counts its own starts of the last `SBX_START_WINDOW_S` (default 300).
+- `POST /v1/hosts/{host}/inventory`'s `limits` take optional `startConcurrency` and `startSeconds`
+  (the mean of the agent's last cold starts, start to attach). Without them (an older agent) nothing
+  changes; an older control plane ignores them.
+- A build `activating` on such a host gains `queued` and `queuePosition` (1-based, among its host's
+  placed, wanted builds not attached yet, first leased first); `queued` is true beyond the host's
+  `startConcurrency`.
+- `409 template_not_active`'s Retry-After is `ceil(ceil(queuePosition / startConcurrency) ×
+startSeconds)` when the host reports both; else 30 s, as before. A queued activation stays
+  `activating` longer than before: a client polls with a timeout sized for the host's whole start line.
+- `GET /v1/templates`' hosts gain `start: {concurrency, seconds, starting, queued}`, only for a host
+  whose agent reports it.
+- Placement prefers a holder whose agent reports the build's worker running (`runningWorkers`),
+  whether or not it reports memory figures (in 1.8.0, only one that did).
+
 ### 1.8.0
 
 Memory-aware placement of template workers ([memory-aware placement spec](../specs/2026-11-09-memory-aware-placement-design.md),

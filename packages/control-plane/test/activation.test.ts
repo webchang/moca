@@ -7,13 +7,14 @@ import {
   defaultCostMib,
   place,
   readinessOf,
+  startRetryAfterS,
   workerOverheadMib,
   type HostView,
 } from '../src/activation.js';
 import { writeError } from '../src/errors.js';
 import { exchangeCredential } from '../src/exchange.js';
 import { HANDLERS } from '../src/handlers.js';
-import { HostRegistry, parseHostMemory } from '../src/host-handlers.js';
+import { HostRegistry, parseHostMemory, parseHostStart } from '../src/host-handlers.js';
 import { ProvenanceStore, recordDigest as recordDigestOf, sha256Hex } from '../src/provenance.js';
 import { FileTemplateCatalog, type TemplateDoc } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
@@ -1943,6 +1944,270 @@ describe('memory-aware placement through the routes (register G39)', () => {
       .flatMap((x) => x.builds)
       .flatMap((b) => (b.leases ?? []).filter((l) => l.until > Math.floor(now / 1000)));
     expect(leases).toHaveLength(1);
+  });
+});
+
+describe('cold-start pacing: the start limit (register G43)', () => {
+  const createSandbox = (d: TestDeps, body: Record<string, unknown>, principal = alice) =>
+    HANDLERS.createSandbox!(ctx({ principal, body }), d);
+  const retryOf = async (f: () => Promise<unknown>) => {
+    try {
+      await f();
+    } catch (e) {
+      const x = e as { code: string; retryAfterS?: number };
+      return { code: x.code, retryAfterS: x.retryAfterS };
+    }
+    return { code: 'none' };
+  };
+  /** An inventory whose limits carry the agent's start figures (G43), or none (an older agent). */
+  const inventoryStart = (
+    d: TestDeps,
+    host: string,
+    holds: Record<string, string>,
+    start: Record<string, unknown> | null,
+    extra: Record<string, unknown> = {},
+  ) =>
+    HANDLERS.hostInventory!(
+      asHost(
+        host,
+        {},
+        {
+          holds: Object.entries(holds).map(([manifestHash, template]) => ({
+            manifestHash,
+            template,
+          })),
+          limits: { activeLimit: 8, idleLimitSeconds: 3600, ...(start ?? {}) },
+          ...extra,
+        },
+      ),
+      d,
+    );
+  const build = async (d: TestDeps, id: string) =>
+    ((await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id } }), d)).body as Body)
+      .builds[0] as Body;
+  const holds3 = { [hash('1')]: 't1', [hash('2')]: 't2', [hash('3')]: 't3' };
+  const three = async (d: TestDeps) => {
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await registered(d, 't3', hash('3'), 'sbx_t3');
+  };
+
+  it('the wanted answer lists, of run, the builds not attached (starting), in the wanted order', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await three(d);
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2 });
+    // Leased t3, then t1, then t2: run and starting follow the leases, first leased first.
+    await activate(d, 't3');
+    now += 1000;
+    await activate(d, 't1');
+    now += 1000;
+    await activate(d, 't2');
+    let w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.run.map((x: Body) => x.template)).toEqual(['t3', 't1', 't2']);
+    expect(w.starting).toEqual([hash('3'), hash('1'), hash('2')]);
+    // t3 attaches: it is no longer starting, and still in run.
+    attachedNow = ['sbx_t3'];
+    w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.run.map((x: Body) => x.template)).toEqual(['t3', 't1', 't2']);
+    expect(w.starting).toEqual([hash('1'), hash('2')]);
+    // Another host's builds are never in this host's starting.
+    expect(((await HANDLERS.hostWanted!(asHost('bm2'), d)).body as Body).starting).toEqual([]);
+  });
+
+  it('leaves starting out when the presence cannot be read (the agent counts its own starts)', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventoryStart(d, 'bm1', { [hash('1')]: 't1' }, { startConcurrency: 4 });
+    await activate(d, 't1');
+    d.presence = {
+      list: async () => {
+        throw new Error('relay down');
+      },
+    };
+    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    expect(w.run).toHaveLength(1);
+    expect(w).not.toHaveProperty('starting');
+  });
+
+  it('reads a build beyond its host start limit as activating, queued, with its 1-based position', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await three(d);
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    for (const id of ['t1', 't2', 't3']) {
+      await activate(d, id);
+      now += 1000;
+    }
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    expect(await build(d, 't1')).toMatchObject({
+      readiness: 'activating',
+      queued: false,
+      queuePosition: 1,
+    });
+    expect(await build(d, 't2')).toMatchObject({ queued: false, queuePosition: 2 });
+    expect(await build(d, 't3')).toMatchObject({
+      readiness: 'activating',
+      queued: true,
+      queuePosition: 3,
+    });
+    // t1 attaches: it leaves the line (active, no queue fields), and t3 moves up into a slot.
+    attachedNow = ['sbx_t1'];
+    const b1 = await build(d, 't1');
+    expect(b1.readiness).toBe('active');
+    expect(b1).not.toHaveProperty('queued');
+    expect(await build(d, 't3')).toMatchObject({ queued: false, queuePosition: 2 });
+    // The hosts block shows the host's start figures and its line.
+    const list = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
+    expect(list.hosts[0].start).toEqual({ concurrency: 2, seconds: 40, starting: 2, queued: 0 });
+    attachedNow = [];
+    const list2 = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
+    expect(list2.hosts[0].start).toEqual({ concurrency: 2, seconds: 40, starting: 2, queued: 1 });
+  });
+
+  it("answers template_not_active with Retry-After from the build's position: ceil(position / concurrency) x startSeconds", async () => {
+    const d = await setup();
+    attachedNow = [];
+    await three(d);
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    await activate(d, 't1');
+    now += 1000;
+    await activate(d, 't2');
+    now += 1000;
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    // First use of t3 takes its lease: third in line, the second wave, 2 x 40 s.
+    expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
+      code: 'template_not_active',
+      retryAfterS: 80,
+    });
+    // t1 is first in line: the first wave.
+    expect(await retryOf(() => createSandbox(d, { template: 't1' }))).toEqual({
+      code: 'template_not_active',
+      retryAfterS: 40,
+    });
+    // One start at a time: the third waits three waves (3 x 37.4 s, rounded up).
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 1, startSeconds: 37.4 });
+    expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
+      code: 'template_not_active',
+      retryAfterS: 113,
+    });
+    // No start measured yet: the line is shown, and Retry-After is as before.
+    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2 });
+    expect(await build(d, 't3')).toMatchObject({ queued: true, queuePosition: 3 });
+    expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
+      code: 'template_not_active',
+      retryAfterS: 30,
+    });
+    const list = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
+    expect(list.hosts[0].start).toEqual({ concurrency: 2, seconds: null, starting: 2, queued: 1 });
+  });
+
+  it('changes nothing for an agent that reports no startConcurrency (version skew)', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await three(d);
+    await inventoryStart(d, 'bm1', holds3, null);
+    for (const id of ['t1', 't2', 't3']) {
+      await activate(d, id);
+      now += 1000;
+    }
+    await inventoryStart(d, 'bm1', holds3, null);
+    const b3 = await build(d, 't3');
+    expect(b3.readiness).toBe('activating');
+    expect(b3).not.toHaveProperty('queued');
+    expect(b3).not.toHaveProperty('queuePosition');
+    expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
+      code: 'template_not_active',
+      retryAfterS: 30,
+    });
+    const list = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
+    expect(list.hosts[0]).not.toHaveProperty('start');
+    // A malformed figure is dropped, never guessed: no start line either.
+    for (const bad of [
+      { startConcurrency: 0 },
+      { startConcurrency: -1 },
+      { startConcurrency: 1.5 },
+    ]) {
+      await inventoryStart(d, 'bm1', holds3, { ...bad, startSeconds: 40 });
+      expect(await build(d, 't3')).not.toHaveProperty('queued');
+    }
+    expect(parseHostStart({ startConcurrency: 4, startSeconds: -3 })).toEqual({ concurrency: 4 });
+    expect(parseHostStart({ startSeconds: 40 })).toBeUndefined();
+  });
+
+  it('places a build on a host already running its worker, with or without memory figures', () => {
+    const doc = (id: string, h: string): TemplateDoc => ({
+      schema: 'moca-template/1',
+      id,
+      owner: 'github:1',
+      visibility: 'deployment',
+      description: '',
+      tags: { default: h },
+      builds: [
+        {
+          buildId: h,
+          status: 'registered',
+          profile: 'base',
+          worker: `w_${id}`,
+          spec: { tools: [] },
+          createdAt: 0,
+          leases: [{ subject: 'github:1', until: 10_000, since: 1 }],
+        },
+      ],
+      createdAt: 0,
+    });
+    const docs = [doc('a', hash('a'))];
+    const holds = { [hash('a')]: 'a' };
+    // Without memory figures: h1 first by id, unless h2 runs w_a.
+    const bare = (running?: string[]): HostView[] => [
+      { id: 'h1', holds, activeLimit: 4, at: 100 },
+      {
+        id: 'h2',
+        holds,
+        activeLimit: 4,
+        at: 100,
+        ...(running ? { memory: { running } } : {}),
+      },
+    ];
+    expect(place(docs, bare(), 100).placed.get(hash('a'))).toBe('h1');
+    expect(place(docs, bare([]), 100).placed.get(hash('a'))).toBe('h1');
+    expect(place(docs, bare(['w_a']), 100).placed.get(hash('a'))).toBe('h2');
+    // With memory figures, as G39 already did.
+    const mem = { totalMib: 65536, availableMib: 60000, floorMib: 4096, pressureLimit: 10 };
+    const fig: HostView[] = [
+      { id: 'h1', holds, activeLimit: 4, at: 100, memory: { ...mem, running: [] } },
+      { id: 'h2', holds, activeLimit: 4, at: 100, memory: { ...mem, running: ['w_a'] } },
+    ];
+    expect(place(docs, fig, 100).placed.get(hash('a'))).toBe('h2');
+    // A running worker on a host without figures is not charged memory anywhere.
+    const p = place(
+      docs,
+      [fig[0]!, { id: 'h2', holds, activeLimit: 4, memory: { running: ['w_a'] } }],
+      100,
+    );
+    expect(p.placed.get(hash('a'))).toBe('h2');
+    expect(p.memory.get('h1')!.pendingMib).toBe(0);
+  });
+
+  it('computes the start line and its estimate purely', () => {
+    expect(startRetryAfterS({ host: 'h', position: 5, queued: true }, undefined)).toBeNull();
+    const h: HostView = {
+      id: 'h',
+      holds: {},
+      activeLimit: 8,
+      start: { concurrency: 4, seconds: 37 },
+    };
+    expect(startRetryAfterS({ host: 'h', position: 1, queued: false }, h)).toBe(37);
+    expect(startRetryAfterS({ host: 'h', position: 4, queued: false }, h)).toBe(37);
+    expect(startRetryAfterS({ host: 'h', position: 5, queued: true }, h)).toBe(74);
+    expect(startRetryAfterS({ host: 'h', position: 28, queued: true }, h)).toBe(7 * 37);
+    expect(
+      startRetryAfterS(
+        { host: 'h', position: 1, queued: false },
+        { ...h, start: { concurrency: 4 } },
+      ),
+    ).toBeNull();
   });
 });
 

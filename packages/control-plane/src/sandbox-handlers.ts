@@ -16,8 +16,11 @@ import {
   place,
   readinessOf,
   readinessReasonOf,
+  startQueue,
+  startRetryAfterS,
   type HostView,
   type Placement,
+  type StartQueue,
 } from './activation.js';
 import { hostViewsOf } from './host-handlers.js';
 import {
@@ -242,6 +245,11 @@ interface ReadinessFacts {
   lastUsed: Map<string, number> | null;
   /** Where wanted builds are placed (§6.2), when any host agent has reported; else null. */
   placement: Placement | null;
+  /**
+   * The hosts' start lines (register G43): placed, wanted builds not attached, per host that reports
+   * its startConcurrency; null without placement or presence.
+   */
+  queue: StartQueue | null;
   /** The hosts as last reported, for each build's `heldBy` (null without host agents). */
   hosts: HostView[] | null;
   /** The current policy's trusted gate records (G41 (c): attestation and visibility in effect). */
@@ -267,12 +275,17 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       attached = null;
     }
   }
+  const queue =
+    placement && attached
+      ? startQueue(docs ?? (await catalog(deps).list()), hosts, placement, attached, nowS)
+      : null;
   if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
     return {
       attached,
       inUse: null,
       lastUsed: null,
       placement,
+      queue,
       hosts: viewsOrNull(deps, hosts),
       trusted,
       nowS,
@@ -290,6 +303,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     inUse,
     lastUsed,
     placement,
+    queue,
     hosts: viewsOrNull(deps, hosts),
     trusted,
     nowS,
@@ -308,6 +322,8 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
         ? null
         : readinessOf(b, f.nowS, f.placement, f.attached);
   const readinessReason = readinessReasonOf(b, readiness, f.placement);
+  // Waiting for a start slot on its host (register G43): present only on an `activating` build.
+  const line = readiness === 'activating' ? f.queue?.byBuild.get(b.buildId) : undefined;
   return {
     buildId: b.buildId,
     status: b.status,
@@ -315,6 +331,7 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     readiness,
     // Why an `unavailable` build is not placed (register G39): present only then.
     ...(readinessReason ? { readinessReason } : {}),
+    ...(line ? { queued: line.queued, queuePosition: line.position } : {}),
     capacity:
       readiness === 'active'
         ? {
@@ -719,6 +736,16 @@ function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
   const used = new Map<string, number>();
   for (const h of f.placement?.placed.values() ?? []) used.set(h, (used.get(h) ?? 0) + 1);
   return (deps.hosts?.all() ?? []).map(([id, h]) => {
+    const q = f.queue?.byHost.get(id);
+    // Register G43: its start limit, measured start time, and start line, from an agent that reports it.
+    const start = h.start
+      ? {
+          concurrency: h.start.concurrency,
+          seconds: h.start.seconds ?? null,
+          starting: q?.starting ?? null,
+          queued: q?.queued ?? null,
+        }
+      : undefined;
     const m = h.memory;
     const u = f.placement?.memory.get(id);
     const memory =
@@ -743,6 +770,7 @@ function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
       idleLimitSeconds: h.limits.idleLimitSeconds,
       disk: { freeGb: h.limits.diskFreeGb, floorGb: h.limits.diskFloorGb },
       ...(memory ? { memory } : {}),
+      ...(start ? { start } : {}),
     };
   });
 }
@@ -1596,7 +1624,7 @@ export async function requireActive(
   activate: boolean,
 ): Promise<void> {
   if (hostViews(deps).length === 0 && !deps.config.templateHosts?.length) return;
-  const facts = await readinessFacts(deps);
+  let facts = await readinessFacts(deps);
   const readiness = readinessOf(t.build, facts.nowS, facts.placement, facts.attached);
   if (readiness === 'active') return;
   let now = readiness;
@@ -1607,7 +1635,18 @@ export async function requireActive(
     // Refusals (no_active_slot, quota_exceeded, template_unavailable) answer as they would to activate.
     await takeLease(deps, p, t.doc, t.build, undefined, 'first_use');
     now = 'activating';
+    // The lease may have placed it just now: its start line is read after it (register G43).
+    if (readiness !== 'activating') facts = await readinessFacts(deps);
   }
+  // Register G43: on a host whose agent reports its start limit and time, the wait its place in the
+  // host's start line implies; else FIRST_USE_RETRY_S, as before.
+  const line = now === 'activating' ? facts.queue?.byBuild.get(t.build.buildId) : undefined;
+  const estimate = line
+    ? startRetryAfterS(
+        line,
+        facts.hosts?.find((h) => h.id === line.host),
+      )
+    : null;
   throw new CpError(
     'template_not_active',
     activate
@@ -1620,7 +1659,7 @@ export async function requireActive(
         ? { reason: facts.placement.unplaced.get(t.build.buildId)! }
         : {}),
     },
-    FIRST_USE_RETRY_S,
+    estimate ?? FIRST_USE_RETRY_S,
   );
 }
 

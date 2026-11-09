@@ -11,7 +11,9 @@ import type { TemplateBuild, TemplateDoc } from './template-catalog.js';
  *     G39): the holding host with the fewest wanted builds, then by id;
  *   - over a host's limit, the newest leases wait: a held build is never evicted to make room,
  *     and the activation that cannot be placed is refused with no_active_slot (§6.3, O11);
- *   - a subject holds at most quota.active builds at once.
+ *   - a subject holds at most quota.active builds at once;
+ *   - a host starts at most its startConcurrency workers at once (cold-start pacing spec §4,
+ *     register G43): a placed build beyond it waits in the host's start line, `activating`, queued.
  */
 
 /**
@@ -45,6 +47,19 @@ export interface HostView {
    */
   at?: number;
   memory?: HostMemory;
+  /**
+   * Its agent's start limit and measured cold-start time (register G43): absent from an older
+   * agent, and then its builds' readiness carries no queue position.
+   */
+  start?: HostStart;
+}
+
+/** What a host's agent reports of its starts (cold-start pacing spec §4, register G43). */
+export interface HostStart {
+  /** SBX_START_CONCURRENCY: at most this many workers starting (started, not attached) at once. */
+  concurrency: number;
+  /** The mean of its last cold starts, start to attach, in seconds; absent before one is done. */
+  seconds?: number;
 }
 
 export type Unplaced = 'not_held' | 'no_slot' | 'memory' | 'memfile_mismatch';
@@ -120,8 +135,9 @@ export function wantedBuilds(
 /**
  * Placement (§6.2, and memory-aware placement spec §4). In the wanted order (first leased, first
  * placed), each build goes to a host that holds it and is under its activeLimit, the one with the
- * fewest builds placed this pass, then by id; a memory-reporting host already running the build's
- * worker comes first.
+ * fewest builds placed this pass, then by id; a host already running the build's worker comes first
+ * (no start at all: cold-start pacing spec §4, register G43), whether or not it reports its memory
+ * figures, from its agent's `runningWorkers`.
  *
  * A host that reports its memory figures must also have room for the build, unless it already runs
  * the build's worker (that is paid for, and a running worker is never evicted):
@@ -189,9 +205,9 @@ export function place(docs: TemplateDoc[], hosts: HostView[], nowS: number): Pla
       unplaced.set(build.buildId, 'memfile_mismatch');
       continue;
     }
-    // Only on a host with memory figures: without them placement is exactly as before G39.
-    const isRunning = (h: HostView) =>
-      memUse.has(h.id) && build.worker !== '' && running.get(h.id)!.has(build.worker);
+    // The agent's runningWorkers, with or without memory figures (G43): a running worker needs no
+    // start. With no runningWorkers (an older agent) no host runs it, and the order is as before.
+    const isRunning = (h: HostView) => build.worker !== '' && running.get(h.id)!.has(build.worker);
     const underLimit = sound.filter((h) => count.get(h.id)! < h.activeLimit);
     const cost = costMib(build);
     const fits = (h: HostView) => {
@@ -253,4 +269,84 @@ export function readinessReasonOf(
   p: Placement | null,
 ): Unplaced | null {
   return readiness === 'unavailable' ? (p?.unplaced.get(build.buildId) ?? null) : null;
+}
+
+/** A build's place in its host's start line (register G43). */
+export interface StartLine {
+  host: string;
+  /** 1-based, among the host's placed, wanted builds not attached yet, in the wanted order. */
+  position: number;
+  /** Beyond the host's startConcurrency: waiting for a start slot, not started yet. */
+  queued: boolean;
+}
+
+export interface StartQueue {
+  /** buildId -> its line, for builds on hosts that report a startConcurrency. */
+  byBuild: Map<string, StartLine>;
+  /** host -> its starting (within the limit) and queued (beyond it) builds. */
+  byHost: Map<string, { starting: number; queued: number }>;
+}
+
+/**
+ * The builds placed and wanted whose worker is not attached to the relay (register G43), in the
+ * wanted order (first leased first, the order the agent starts them in), with their host. This is
+ * the wanted answer's `starting`: the agent counts those whose unit it runs as starting. Attachment
+ * is the relay's presence, as readiness reads it.
+ */
+export function unattachedPlaced(
+  docs: TemplateDoc[],
+  p: Placement,
+  attached: Map<string, number>,
+  nowS: number,
+): { buildId: string; host: string }[] {
+  const out: { buildId: string; host: string }[] = [];
+  for (const { build } of wantedBuilds(docs, nowS)) {
+    const host = p.placed.get(build.buildId);
+    if (host === undefined) continue;
+    if (build.worker !== '' && attached.has(build.worker)) continue;
+    out.push({ buildId: build.buildId, host });
+  }
+  return out;
+}
+
+/**
+ * Each host's start line (cold-start pacing spec §4, register G43): of its placed, wanted builds not
+ * attached, in the wanted order, the first startConcurrency are starting and the rest queued. Only
+ * for hosts whose agent reports its startConcurrency (an older agent's builds have no line). The
+ * agent applies the limit; this is the control plane's view of it, for readiness and Retry-After.
+ */
+export function startQueue(
+  docs: TemplateDoc[],
+  hosts: HostView[],
+  p: Placement,
+  attached: Map<string, number>,
+  nowS: number,
+): StartQueue {
+  const limit = new Map<string, number>();
+  for (const h of hosts) if (h.start) limit.set(h.id, h.start.concurrency);
+  const byBuild = new Map<string, StartLine>();
+  const byHost = new Map<string, { starting: number; queued: number }>();
+  for (const h of limit.keys()) byHost.set(h, { starting: 0, queued: 0 });
+  for (const { buildId, host } of unattachedPlaced(docs, p, attached, nowS)) {
+    const n = limit.get(host);
+    if (n === undefined) continue;
+    const c = byHost.get(host)!;
+    const position = c.starting + c.queued + 1;
+    const queued = position > n;
+    if (queued) c.queued += 1;
+    else c.starting += 1;
+    byBuild.set(buildId, { host, position, queued });
+  }
+  return { byBuild, byHost };
+}
+
+/**
+ * Retry-After for a build in a start line (register G43): the waves before its start ends,
+ * ceil(ceil(position / startConcurrency) x the host's measured start seconds), at least 1; null when the host has
+ * measured none (the caller then answers as before).
+ */
+export function startRetryAfterS(line: StartLine, host: HostView | undefined): number | null {
+  const s = host?.start;
+  if (!s || s.seconds === undefined || s.concurrency < 1) return null;
+  return Math.max(1, Math.ceil(Math.ceil(line.position / s.concurrency) * s.seconds));
 }

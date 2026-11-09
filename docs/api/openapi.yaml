@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.8.0
+  version: 1.9.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -337,6 +337,21 @@ components:
             for a retired build; null for any other build that is not registered
         readinessReason:
           $ref: '#/components/schemas/ReadinessReason'
+        queued:
+          type: boolean
+          description: |
+            1.9.0 (cold-start pacing spec §4, register G43), present only with readiness
+            `activating` on a host whose agent reports its start limit: true while the build waits
+            for a start slot (its place in the host's start line is beyond the host's
+            startConcurrency), false once its worker is starting. A queued build stays `activating`
+            longer than before: poll with a timeout sized for the host's whole start line
+        queuePosition:
+          type: integer
+          minimum: 1
+          description: |
+            1.9.0 (register G43), with `queued`: the build's 1-based place among its host's placed,
+            wanted builds not attached yet, first leased first; the first startConcurrency are
+            starting
         capacity:
           type: [object, 'null']
           description: for an active build
@@ -1734,6 +1749,21 @@ paths:
                               description: build ids never placed there (their memory file is not the guest's size)
                             reportedAt:
                               { type: integer, description: epoch seconds of its last inventory }
+                        start:
+                          type: object
+                          description: |
+                            1.9.0 (cold-start pacing spec §4, register G43), only from an agent that
+                            reports its start limit: at most `concurrency` workers start at once
+                            there (SBX_START_CONCURRENCY); `seconds` its measured mean cold start,
+                            start to attach (null before one is done); `starting` and `queued` its
+                            start line now (placed, wanted builds not attached: within the limit,
+                            and beyond it), null when the relay's presence cannot be read
+                          required: [concurrency, seconds, starting, queued]
+                          properties:
+                            concurrency: { type: integer, minimum: 1 }
+                            seconds: { type: [number, 'null'] }
+                            starting: { type: [integer, 'null'] }
+                            queued: { type: [integer, 'null'] }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotEnrolled' }
     post:
@@ -2798,6 +2828,12 @@ paths:
         placed by `activeLimit` alone, as before; a control plane before it ignores it. Each field
         is optional and a malformed one is dropped. `memTotalMib`, `memAvailableMib` and
         `memFloorMib` are used only all three together.
+
+        `limits.startConcurrency` and `limits.startSeconds` (1.9.0, register G43) are optional: the
+        agent's start limit (SBX_START_CONCURRENCY, a whole number from 1) and the mean of its last
+        cold starts, start to attach, in seconds (absent before one is done; used only beside
+        startConcurrency). Without startConcurrency (an older agent) its builds have no place in a
+        start line, and Retry-After is as before.
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
@@ -2808,6 +2844,21 @@ paths:
             schema:
               type: object
               properties:
+                limits:
+                  type: object
+                  properties:
+                    activeLimit: { type: integer }
+                    idleLimitSeconds: { type: integer }
+                    buildConcurrency: { type: integer }
+                    diskFreeGb: { type: integer }
+                    diskFloorGb: { type: integer }
+                    startConcurrency:
+                      type: integer
+                      minimum: 1
+                      description: SBX_START_CONCURRENCY (default 4), at most this many workers starting at once (1.9.0)
+                    startSeconds:
+                      type: number
+                      description: the mean of the last (up to 10) cold starts, start to attach, seconds (1.9.0)
                 memory:
                   type: object
                   description: what the host agent reads of its memory (memory-aware placement spec §4)
@@ -3099,6 +3150,9 @@ paths:
     get:
       operationId: hostWanted
       summary: The workers a host agent should run (placed on it), stop (no lease, no live sandbox) and remove (retired)
+      description: |
+        `run` is in the wanted order, first leased first (1.9.0: the order the agent starts them in,
+        at most its start limit at once).
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
@@ -3130,6 +3184,16 @@ paths:
                       sandboxes' events (and `audit_dropped` reports), so the proxy's other clients'
                       events never leave the host. Absent from a control plane before 1.7.0: the agent
                       then sends nothing.
+                  starting:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      1.9.0 (cold-start pacing spec §4, register G43): the build ids of `run` whose
+                      worker is not attached to the relay (its presence, which readiness reads), in
+                      `run`'s order. The agent counts those whose unit is active as starting, and
+                      starts at most SBX_START_CONCURRENCY less those. Absent from a control plane
+                      before 1.9.0, or when the presence cannot be read: the agent then counts its own
+                      recent starts (SBX_START_WINDOW_S).
         '400':
           description: '`invalid_request`: this deployment stores no templates'
           content:
@@ -3266,6 +3330,9 @@ paths:
         the create takes the caller's activation lease (as POST /v1/templates/{id}/activate, with
         its refusals: `409 no_active_slot`, `409 template_unavailable`, `429 quota_exceeded`) and
         answers `409 template_not_active` with `readiness` and `Retry-After`; retry after the wait.
+        Retry-After (1.9.0, register G43) is the build's place in its host's start line, when the
+        host's agent reports its start limit and a measured start time:
+        `ceil(ceil(queuePosition / startConcurrency) × startSeconds)`; else 30 s, as before.
         With `activate: false` nothing is started. No sandbox is kept while waiting, so a wait
         never uses the live-sandbox cap. Without host agents the create succeeds as before.
       security: [{ sessionToken: [] }]
