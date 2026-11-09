@@ -11,7 +11,15 @@ import {
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { isEnrolledForSandbox, type SandboxConfig } from './sandbox-config.js';
 import { buildRecordOf, canonicalJson, sha256Hex, type ProvenanceStore } from './provenance.js';
-import { liveLeases, place, readinessOf, type HostView, type Placement } from './activation.js';
+import {
+  liveLeases,
+  place,
+  readinessOf,
+  readinessReasonOf,
+  type HostView,
+  type Placement,
+} from './activation.js';
+import { hostViewsOf } from './host-handlers.js';
 import {
   checkCreate,
   policyDigest,
@@ -242,13 +250,7 @@ interface ReadinessFacts {
 }
 
 /** The hosts as their agents last reported (§6.1), for placement and the hosts block. */
-function hostViews(deps: CpDeps): HostView[] {
-  return (deps.hosts?.all() ?? []).map(([id, h]) => ({
-    id,
-    holds: h.holds,
-    activeLimit: h.limits.activeLimit,
-  }));
-}
+const hostViews = (deps: CpDeps): HostView[] => hostViewsOf(deps);
 
 async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<ReadinessFacts> {
   const nowS = seconds(deps);
@@ -305,11 +307,14 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
       : b.status !== 'registered'
         ? null
         : readinessOf(b, f.nowS, f.placement, f.attached);
+  const readinessReason = readinessReasonOf(b, readiness, f.placement);
   return {
     buildId: b.buildId,
     status: b.status,
     profile: b.profile,
     readiness,
+    // Why an `unavailable` build is not placed (register G39): present only then.
+    ...(readinessReason ? { readinessReason } : {}),
     capacity:
       readiness === 'active'
         ? {
@@ -353,6 +358,7 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
 
 function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
   const def = resolveBuild(d, {});
+  const defBody = def ? buildBody(d, def, f, false) : null;
   return {
     id: d.id,
     description: d.description,
@@ -369,7 +375,8 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
     onboarding: d.builds.some((b) => b.status === 'registered')
       ? 'registered'
       : (d.builds[0]?.status ?? null),
-    readiness: def ? buildBody(d, def, f, false).readiness : null,
+    readiness: defBody?.readiness ?? null,
+    ...(defBody?.readinessReason ? { readinessReason: defBody.readinessReason } : {}),
     tags: { ...d.tags },
     builds: d.builds.map((b) => buildBody(d, b, f, full)),
   };
@@ -703,16 +710,41 @@ function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
   };
 }
 
-/** Per host: its limits, its use (builds placed on it now) and its disk (§4, §6.2). */
+/**
+ * Per host: its limits, its use (builds placed on it now) and its disk (§4, §6.2), and, from an agent
+ * that reports it (register G39), its memory: the figures, the effective floor, the use and headroom
+ * placement counts, and the brake (pressure or a stale inventory) that stops new starts.
+ */
 function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
   const used = new Map<string, number>();
   for (const h of f.placement?.placed.values() ?? []) used.set(h, (used.get(h) ?? 0) + 1);
-  return (deps.hosts?.all() ?? []).map(([id, h]) => ({
-    id,
-    active: { limit: h.limits.activeLimit, used: used.get(id) ?? 0 },
-    idleLimitSeconds: h.limits.idleLimitSeconds,
-    disk: { freeGb: h.limits.diskFreeGb, floorGb: h.limits.diskFloorGb },
-  }));
+  return (deps.hosts?.all() ?? []).map(([id, h]) => {
+    const m = h.memory;
+    const u = f.placement?.memory.get(id);
+    const memory =
+      m && m.totalMib !== undefined && u
+        ? {
+            totalMib: m.totalMib,
+            availableMib: m.availableMib!,
+            floorMib: m.floorMib!,
+            usedMib: u.usedMib,
+            headroomMib: u.headroomMib,
+            pressureFull10: m.pressureFull10 ?? null,
+            pressureLimit: m.pressureLimit ?? null,
+            brake: u.brake,
+            runningWorkers: (m.running ?? []).length,
+            memfileMismatch: [...(m.memfileMismatch ?? [])].sort(),
+            reportedAt: h.at,
+          }
+        : undefined;
+    return {
+      id,
+      active: { limit: h.limits.activeLimit, used: used.get(id) ?? 0 },
+      idleLimitSeconds: h.limits.idleLimitSeconds,
+      disk: { freeGb: h.limits.diskFreeGb, floorGb: h.limits.diskFloorGb },
+      ...(memory ? { memory } : {}),
+    };
+  });
 }
 
 /**
@@ -855,27 +887,43 @@ async function takeLeaseLocked(
   // seconds) by buildId, so a lease taken in the same second as a placed one could otherwise sort
   // ahead of it and push it off its host. Such a lease waits, as one that does not fit.
   const before = place(docs, hosts, nowS);
-  const displaces = [...before.placed.keys()].some(
+  const displaced = [...before.placed.keys()].find(
     (b) => b !== target.buildId && !pl.placed.has(b),
   );
-  if (hosts.length > 0 && pl.unplaced.get(target.buildId) === 'not_held') {
+  const displaces = displaced !== undefined;
+  // Displacing, the refusal's reason is the displaced build's: what would push it off (G39).
+  const why =
+    displaced !== undefined ? pl.unplaced.get(displaced) : pl.unplaced.get(target.buildId);
+  if (hosts.length > 0 && why === 'not_held') {
     throw new CpError('template_unavailable', "no host holds this build's snapshot", undefined, {
       readiness: 'unavailable',
     });
   }
-  if (pl.unplaced.get(target.buildId) === 'no_slot' || displaces) {
+  // Every holder reports this build's memory file wrong (G39): no wait clears it, a rebuild does.
+  if (!displaces && why === 'memfile_mismatch') {
+    throw new CpError(
+      'template_unavailable',
+      "every host holding this build reports its memory file is not the guest's size",
+      undefined,
+      { readiness: 'unavailable', reason: 'memfile_mismatch' },
+    );
+  }
+  if (why === 'no_slot' || why === 'memory' || displaces) {
     const free = Math.min(
       ...trial
         .flatMap((d) => d.builds)
         .flatMap((x) => liveLeases(x, nowS).map((l) => l.until - nowS)),
     );
+    // A memory refusal says so (G39); one at the active limit answers exactly as before.
     throw new CpError(
       'no_active_slot',
-      'every host holding this build is at its active limit with leased builds',
+      why === 'memory'
+        ? 'no host holding this build has the memory for its worker now (memory-aware placement)'
+        : 'every host holding this build is at its active limit with leased builds',
       undefined,
-      {
-        readiness: 'unavailable',
-      },
+      why === 'memory'
+        ? { readiness: 'unavailable', reason: 'memory' }
+        : { readiness: 'unavailable' },
       Number.isFinite(free) ? Math.max(1, free) : 60,
     );
   }
@@ -1566,7 +1614,12 @@ export async function requireActive(
       ? `template '${t.doc.id}' is ${now}; its activation has started: retry after the wait`
       : `template '${t.doc.id}' is ${now}; activate it (POST /v1/templates/${t.doc.id}/activate) or retry without activate: false`,
     undefined,
-    { readiness: now },
+    {
+      readiness: now,
+      ...(now === 'unavailable' && facts.placement?.unplaced.get(t.build.buildId)
+        ? { reason: facts.placement.unplaced.get(t.build.buildId)! }
+        : {}),
+    },
     FIRST_USE_RETRY_S,
   );
 }
