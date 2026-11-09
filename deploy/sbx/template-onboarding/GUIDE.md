@@ -394,7 +394,7 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 3. **Follow the build** with `mocactl sbx templates --json` or `GET /v1/templates/<id>/builds/<build>`:
    `queued`, `building`, `probing`, `built`, then `registered` (guide-4b-3/0014: registered,
    its build's `attestation` `deployment`, since `base` needs no gate record; the template itself was
-   created `visibility: private`; also lc-1/0007 and lc-1/0103).
+   created `visibility: private`; also lc-1/0007 (queued) to lc-1/0103 (registered)).
    `heldBy` names a host once one holds the snapshot.
 
 4. **If it's refused or fails:**
