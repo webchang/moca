@@ -1,6 +1,7 @@
 # Per-sandbox egress records through the API
 
-- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); being built (register G42).
+- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); built on branch `sbx-g42`,
+  under review, not deployed (register G42). §3-§5 describe the build.
 - **Date:** 2026-11-08
 - **Asked by:** the user, 2026-11-08: "per-sandbox egress records available through Moca API
   operations … a key requirement for Moca". A benchmark grader voids a rep for a download its rules
@@ -38,7 +39,9 @@ provenance.
   for its retention afterwards.
 - A sandbox's end record names a **digest of its egress log**, so the egress is part of what the
   provenance chain proves, and a copy can be checked offline.
-- No secret is ever exposed. Paths are already redacted at the proxy, and credentials are names only.
+- No credential Moca injects is exposed: credentials are names only, and paths are logged without
+  query, fragment or userinfo. **The limit (the user, 2026-11-09, register G44):** a secret a guest
+  puts in a URL path segment is logged as sent; the proxy is unchanged.
 - The proxy's hot path is untouched. Shipping is off the proxy, and losing events is counted, never
   silent.
 
@@ -50,52 +53,75 @@ provenance.
 
 ## 3. The model
 
-- **Collection, on the host:** the host agent tails the proxy's journal (`journalctl -u moca-egress
--o cat --after-cursor …`, keeping its cursor in `$SBX_SRV`). It groups events by `sid`, and posts
-  them in batches to the control plane:
-  - `POST /v1/hosts/{host}/egress` `{events:[…], cursor}`, behind the existing `hostToken` scheme;
-  - every post is idempotent by (host, cursor range).
+- **Collection, on the host:** in its `--wanted-only` runs (the 15 s wanted-state timer), the host
+  agent reads the proxy's journal (`journalctl -u moca-egress.service -o json`, after its cursor in
+  `$SBX_SRV/egress.cursor`) and posts the events unchanged, in batches of up to 1000 and within a
+  time budget per run. It never acts on the proxy, and is off unless `moca-egress.service` is
+  enabled.
+  - **Only this host's sandboxes' events leave the host:** the wanted answer lists `egressSids`, the
+    workspace keys of the sandboxes on its workers' builds, and the agent sends only those, plus the
+    proxy's `audit_dropped` counts. One proxy may also serve other workloads' VMs (Moca's own P6
+    sessions), whose events stay on the host.
+  - `POST /v1/hosts/{host}/egress` `{events, cursor, oversized?}`, behind the host token; idempotent
+    by (host, cursor). An event over 8 KiB is not sent; only its `sid`, as `oversized`.
+  - A failed post keeps the batch and the cursor for the next run. A batch refused as malformed
+    (400) is kept on the host in `egress.rejected/` and the cursor moves past it. A cursor the
+    journal no longer holds restarts the read from this boot, skipping entries already sent by a
+    position mark (`egress.mark`).
 
-  The proxy itself is unchanged. Its JSON is the wire format.
+  The proxy itself is unchanged. Its JSON is the wire format: an event naming any field the proxy
+  does not write is not stored.
 
 - **Store, in the control plane:**
-  - **Where:** an append-only log per sandbox, in Redis (where the sandbox records live), as a
-    Redis stream `sh:sbx:egress:<sandboxId>` with a length cap. It's kept as long as the sandbox
-    record (`SBX_RETENTION_DAYS`).
-  - **Who:** events whose `sid` names no sandbox this host serves are refused, and counted.
-  - **Integrity:** each sandbox keeps a running sha256 over its accepted events' canonical JSON, in
-    arrival order.
+  - **Where:** Redis (where the sandbox records live): a stream `sh:sbx:egress:<sandboxId>` (one
+    canonical line per event, capped at 50,000), a hash `…:meta` (drop counts, sealed), and a key
+    per host (`sh:sbx:egress:host:<host>`, its last cursor, for replays). Kept as long as the
+    sandbox record: its end plus the sandbox retention (`SH_SANDBOX_RETENTION_SECONDS`, 14 days).
+  - **Who:** an event is stored only when its `sid` is the workspace key of a sandbox on a worker of
+    a build this host holds, ended at most 600 s ago; every other event is refused and counted.
 - **Read:**
-  - `GET /v1/sandboxes/{id}/egress?after=<cursor>&limit=N`, for the owner or an admin, gives
-    `{events:[…], next, summary}`;
-  - `summary` is per host: count, decisions, and bytes up and down.
+  - `GET /v1/sandboxes/{id}/egress?after=<next>&limit=N` (1-1000, default 100), for whoever may read
+    the sandbox (its owner or an admin), gives `{events, next, summary}`;
+  - `summary`: `byHost` (count, decisions, bytes up and down per destination host), `total`,
+    `dropped`, `droppedBy` (`proxy`, `cap`, `invalid`), `complete`, `sealed`, `sha256`.
+- **The digest:** `sha256:` and the hex sha256 of the NDJSON export: each stored event's canonical
+  JSON (the provenance canonicalization) followed by one newline, in arrival order.
 - **Provenance:** the sandbox's `terminated` record (deleted or expired) gains
-  `egress: {events: N, sha256, dropped}`. The digest is over the log up to the end, and dropped is
-  what the host agent saw reported. Late events after the end are still accepted for a grace period,
-  and named in a second `egress` record if any arrive.
-- **Export:** `GET /v1/sandboxes/{id}/egress?format=ndjson` returns the whole log as JSON lines. Its
-  sha256 equals the end record's, so a grader can check a copy offline (verify-provenance.py gains
-  an optional `--egress FILE` check).
+  `egress: {events, sha256, dropped, complete}`. Late events are accepted for 600 s after the end;
+  the janitor's sweep then seals the log and, if it changed since the end record, appends one more
+  `sandbox` record with `state: 'egress'` naming the final log. The newest `sandbox` record that
+  names `egress` is the log's digest. Record kinds are unchanged.
+- **Drops:** a proxy `audit_dropped` report (no VM) is charged to every sandbox on that host's workers
+  that existed within 60 s before it: a sandbox may be marked incomplete when it lost nothing, never
+  complete when it did. `complete` means `dropped == 0`.
+- **Export:** `GET /v1/sandboxes/{id}/egress?format=ndjson` returns the whole log
+  (`application/x-ndjson`). Its sha256 equals the end record's, so a grader checks a copy offline:
+  `verify-provenance.py EXPORT --egress <sandbox id>=<file>`.
 
 ## 4. The API
 
-| Route                                         | Who                 | Answer                        |
-| --------------------------------------------- | ------------------- | ----------------------------- |
-| `POST /v1/hosts/{host}/egress`                | a host agent        | `{accepted, refused, cursor}` |
-| `GET /v1/sandboxes/{id}/egress`               | the owner, an admin | `{events, next, summary}`     |
-| `GET /v1/sandboxes/{id}/egress?format=ndjson` | the owner, an admin | the log, NDJSON               |
+| Route                                         | Who                                | Answer                                                  |
+| --------------------------------------------- | ---------------------------------- | ------------------------------------------------------- |
+| `POST /v1/hosts/{host}/egress`                | a host agent, as itself            | `{accepted, refused, capped, invalid, dropped, cursor}` |
+| `GET /v1/sandboxes/{id}/egress`               | the owner, an admin                | `{events, next, summary}`                               |
+| `GET /v1/sandboxes/{id}/egress?format=ndjson` | the owner, an admin                | the log, NDJSON                                         |
+| `GET /v1/hosts/{host}/wanted`                 | a host agent, as itself (existing) | gains `egressSids`                                      |
 
-Errors: 404 for an unknown or invisible sandbox, and 403 for another subject's sandbox, as for the
-other sandbox routes.
+Errors: 404 `sandbox_not_found` for an unknown sandbox or another subject's, as for the other sandbox
+routes. CLI: `mocactl sbx egress <sandbox> [--json | --ndjson]`.
 
 ## 5. Effects on what exists
 
-- **The host agent:** a new tail-and-post step, on the build poll or its own timer (every 15 s, like
-  the wanted state). Its env gains nothing; the journal is local.
-- **The janitor:** unchanged. A workspace's removal doesn't touch its egress log, which follows the
-  sandbox record's retention.
+- **The host agent:** the egress step in `--wanted-only` runs; no new unit, timer or setting. New
+  0600 files under `$SBX_SRV` (cursor, mark, pending batch, `egress.rejected/`); `rm -rf /srv/sbx`
+  removes them.
+- **The janitor's sweep** also seals ended logs (above). A workspace's removal doesn't touch its
+  egress log.
+- **Rollback:** deploy the control plane first. An older one answers 404 on the egress route, and the
+  agent keeps its batch and retries; an older control plane ignores the egress keys (they expire),
+  and reads the new `sandbox` records as before.
 - **Graders:** read `…/egress` for each rep's sandbox, or check the exported log against the end
-  record.
+  record. A log marked incomplete is the grader's call (§6).
 
 ## 6. Decisions (the user, 2026-11-08)
 
