@@ -2,7 +2,7 @@
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
   by autobench-moca, autobench, image-factory and autobench-sandbox). Not implemented; built after G39 (G40
-  deployed 2026-11-09), the start limit first, then the grace (register G43).
+  deployed 2026-11-09; G39 merged), the start limit first, then the grace (register G43).
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
   and many activations waited minutes for their workers. The user kept the host's disk as it was
@@ -120,6 +120,12 @@ The client-side counterpart exists: autobench-moca's runner can hold its leases 
     "graced, not stuck" both have an answer;
   - it's a host setting, not a client's. On a host with the grace off, `KEEP_WARM` stays the client's
     option.
+
+**Words:** a "lease" here is a template activation lease (`POST /v1/templates/{id}/activate`), and the
+grace keeps a template's **worker** attached after its last one ends. Upstream's proposed lease mode
+(ADR-0048, SBX0.3) is a different thing: it keeps one sandbox's **VM** warm between its commands,
+inside a worker. The two can coexist: a graced worker can hold lease VMs only while their sandboxes
+live, and a sandbox keeps its worker wanted.
 
 ## 5. Effects
 

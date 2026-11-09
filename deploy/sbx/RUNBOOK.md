@@ -856,7 +856,8 @@ stopped: the rule only holds back new starts.
   `/proc/pressure/memory` (a percentage: the share of the last 10 s in which every non-idle task
   was stalled on memory); the workers of held builds whose `sbx-worker@<id>` runs; per running
   worker, `vmCommittedMib`, its slice's `memory.current` (`sbx.slice/sbx-<id>.slice`) less its
-  pinned memory file; and `memFloorMib`, **the effective floor**, so the number placement uses is in
+  pinned memory file (a lower bound while a worker starts: its file's pages may not be charged to
+  its slice yet, and MemAvailable then bounds placement); and `memFloorMib`, **the effective floor**, so the number placement uses is in
   the inventory and in `GET /v1/templates`' hosts block (`memory.floorMib`), with no arithmetic.
 - **`SBX_MEM_FLOOR_MIB`**: the memory never placed into, a whole number of MiB. Unset, it is 10% of
   MemTotal, at least 4096 (a host of 188.5 GiB: 19302 MiB). Set a fixed amount on a host shared with

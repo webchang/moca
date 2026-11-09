@@ -1,8 +1,10 @@
 # Memory-aware placement of template workers
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
-  by autobench-moca, autobench, image-factory and autobench-sandbox). Being built (G40, its prerequisite, deployed
-  2026-11-09) (register G39).
+  by autobench-moca, autobench, image-factory and autobench-sandbox). **Implemented** (merged 6230e2cc,
+  reviewed by autobench and autobench-sandbox), not deployed: the control plane with an image and a
+  rollout, the host agent's part at a KVM-host window (register G39). §4a records where the build
+  differs from §4.
 - **Date:** 2026-11-09
 - **Asked by:** autobench-moca, 2026-11-08, for the user ("per host resource availability"). The
   user's answer: "yes, run the test first". The Lite-28 batch window (2026-11-08) was that test.
@@ -97,6 +99,48 @@ other work (Moca's own P6 sessions), need a lower limit than the operator's numb
   the activation's `409 no_active_slot` names it. The client's retry (Retry-After) is unchanged.
 - **Serialized:** the check and the lease's write run under G40's activation lock, so two
   activations can't each see the same headroom.
+
+## 4a. As built (6230e2cc), and why
+
+- **The inventory's `memory` object** (not new fields in `limits`): `memTotalMib`, `memAvailableMib`,
+  `memFloorMib` (effective), `memPressureFull10` (absent with no PSI), `memPressureLimit`,
+  `runningWorkers`, `vmCommittedMib` (per worker), `memfileMismatch`. The slice is
+  `sbx.slice/sbx-<id>.slice` (install-host.sh's `SH_PARENT_CGROUP`). If `/proc/meminfo` gives no
+  MemTotal or MemAvailable, no figures are sent (an error line), and the host is placed by
+  `activeLimit` alone.
+- **"Running" is the agent's own report** (`runningWorkers`: the `sbx-worker@<id>` units active on
+  that host), not the relay's presence: a worker pins its memory file from its start, before it
+  attaches, and presence doesn't say which host a worker is on. Every build's worker counts, wanted
+  or not, so a draining worker still uses memory. A host that already runs the build's worker keeps
+  it, even when stale, braked or short of headroom (never evict), and is preferred for it.
+- **The headroom:** `min(total − floor − used, available − floor − pending)`, where
+  `used = Σ cost(running workers) + Σ vmCommittedMib + pending`, and `pending` is the cost of builds
+  placed in this pass whose workers aren't running yet. MemAvailable already reflects what runs, so
+  only the pending starts come off it, and two builds placed in one pass both count.
+- **The terms count different memory:**
+  - A worker's **cost**, its guest's RAM + 128 MiB, is its pinned memory file (the guest's whole RAM
+    image, locked once) plus the worker and its VMM.
+  - Its running VMs are separate processes restored from that file. Each maps it privately:
+    unmodified pages are the same page-cache pages, already in the cost, and the pages a VM writes are
+    private copies. **`vmCommittedMib`**, the slice's `memory.current` minus the file's size, is
+    those private pages plus the VMM processes.
+  - The only overlap is the 128 MiB overhead with the VMM processes, a few hundred MiB per worker in
+    the safe direction.
+  - The batch window agrees: about 3.7 GiB per attached idle 4 GiB worker against a cost of 4.1 GiB
+    (the cost over-reserves by about 0.4 GiB), and about 0.5 GiB per running rep on top.
+  - **The `min()` covers an under-count:** while a worker starts, or if its file's pages are still
+    charged to another cgroup (a snapshot just built on that host), `memory.current` minus the file
+    floors at 0, and `vmCommittedMib` reads low. MemAvailable sees every locked and dirty page,
+    whoever is charged, so the second term still binds.
+- **A memory-file mismatch** on every holder is its own reason, `memfile_mismatch`, answered
+  `409 template_unavailable` (waiting can't clear it; a rebuild does). The agent also refuses to
+  start a mismatched build itself (`refused`), so an older control plane can't start one.
+- **Readiness and refusals carry the reason:** `no_active_slot` with `reason: memory` (at the active
+  limit it answers as before, with no reason); `readinessReason` on builds and templates.
+- **Lease mode** (upstream's proposed SBX0.3, ADR-0048), if built: a lease VM lives in its worker's
+  slice, so `vmCommittedMib` counts it with no change. Its reclaim target for idle lease VMs and this
+  floor act on different things (VMs and workers). On one host, set this floor at or above lease
+  mode's reclaim target, so a worker start can't push running sandboxes' leases into reclaim.
 
 ## 5. Effects
 
