@@ -1,6 +1,6 @@
 # Moca — Template Onboarding Guide
 
-**Last modified:** 2026-11-09T01:37:04Z
+**Last modified:** 2026-11-09T04:26:40Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -47,6 +47,14 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
   - [4.3 Register (operator machine)](#43-register-operator-machine)
   - [4.4 Install the worker](#44-install-the-worker)
   - [4.5 Use it](#45-use-it)
+- [4b. From an OCI image to a Moca template (self-serve)](#4b-from-an-oci-image-to-a-moca-template-self-serve)
+  - [4b.1 What you need, and what you get](#4b1-what-you-need-and-what-you-get)
+  - [4b.2 Pick your path: the profile](#4b2-pick-your-path-the-profile)
+  - [4b.3 Make your image Moca-ready: the Moca minimum](#4b3-make-your-image-moca-ready-the-moca-minimum)
+  - [4b.4 Path A: `base`, worked with `python:3.12-slim`](#4b4-path-a-base-worked-with-python312-slim)
+  - [4b.5 Path B: your own gate record (`general-self`, `benchmark-self`)](#4b5-path-b-your-own-gate-record-general-self-benchmark-self)
+  - [4b.6 What Moca records, and your sandboxes' network](#4b6-what-moca-records-and-your-sandboxes-network)
+  - [4b.7 When something's refused (what users hit)](#4b7-when-somethings-refused-what-users-hit)
 - [5. Example 2: a SWE-bench instance (django\_\_django-11133)](#5-example-2-a-swe-bench-instance-django__django-11133)
   - [5.1 The spec comes from image-factory](#51-the-spec-comes-from-image-factory)
   - [5.2 Build, register, install](#52-build-register-install)
@@ -252,6 +260,332 @@ mocactl sbx templates
 mocactl sbx create --template default --name try-default
 mocactl sbx run -- python3 -c 'print(6*7)'
 ```
+
+## 4b. From an OCI image to a Moca template (self-serve)
+
+For a **general user**: you have a Moca login and an image, and no operator access. Every step goes
+through the API (`POST /v1/templates`) and `mocactl sbx`. Moca builds and probes the template on a KVM
+host and registers it by policy; nobody approves it. Sections 4 and 5 are the operator's path for the
+same result.
+
+The commands that go through the API are as recorded in the validation runs, cited by run and request
+(answers abridged; their ids replaced by placeholders). The self-serve steps for **your own** image
+are _(unverified)_: they haven't yet been run end to end on a KVM host from a user's image.
+
+### 4b.1 What you need, and what you get
+
+- **An image, pinned by digest** (`repository@sha256:<64 hex>`), from a registry the deployment's
+  policy allows. Read it first: `GET /v1/policy` lists `allowedRegistries` and, per registry,
+  `allowedRepositories` (§3). Docker Hub is written with its host: `docker.io/library/python@sha256:…`.
+- **A Moca login** (`mocactl sbx login`) and room in your quota (`GET /v1/quota`).
+- **You get** a template only you can see, built and probed by Moca, which you activate, use from
+  sandboxes or Moca agent sessions, update and retire. Others see it only if you make it
+  `deployment`-visible, which a self-attested template can't be until an admin trusts its gate
+  record (§4b.5).
+
+### 4b.2 Pick your path: the profile
+
+The profile you name in the create is the gate your template must pass (`GET /v1/policy` lists the
+deployment's profiles; a profile exists only once its stored policy lists it):
+
+| Profile          | Gate record                                        | Network                       | Visible to others                         | Use it for                                     |
+| ---------------- | -------------------------------------------------- | ----------------------------- | ----------------------------------------- | ---------------------------------------------- |
+| `base`           | none                                               | the host's allowlisted egress | if you make it so                         | most templates: a toolchain, an app            |
+| `general-self`   | **your own**, passed                               | the host's allowlisted egress | only after an admin trusts the record     | a tested image you want proved, with network   |
+| `benchmark-self` | **your own**, passed, its floor proved offline     | none (X11)                    | only after an admin trusts the record     | a benchmark task environment you gate yourself |
+| `benchmark`      | one an admin already trusts (`trustedGateRecords`) | none (X11)                    | as the deployment's curated templates are | the curated benchmark images                   |
+
+Most users start with `base` (§4b.4). If you want Moca to hold your template to a test result, gate
+it yourself and use a self-attested profile (§4b.5).
+
+### 4b.3 Make your image Moca-ready: the Moca minimum
+
+A stranger's image usually fails as published, for reasons most images share:
+
+- **`/etc/hosts` is empty.** A container runtime writes one when a container starts; a microVM guest
+  boots with none, so `localhost` doesn't resolve.
+- **The guest agent's minimum is missing**, most often `file`, and any tool your spec's `tools` lists
+  (`git`, `rg`, …).
+- **`ca-certificates`** is missing. A template with `egress: true` needs it on a host whose egress
+  intercepts TLS (egress credentials): Moca bakes that host's CA into the system trust store at build,
+  and refuses the build without one. Add it whenever you use egress: it costs little and keeps the
+  template portable across hosts.
+
+The fix is a small layer on top of your image: a localhost `/etc/hosts`, the guest minimum, and
+`ca-certificates` when the template uses egress. Each path below shows its own. Build it for
+`linux/amd64`, push it to an allowed registry, and use the digest the registry gives it.
+
+### 4b.4 Path A: `base`, worked with `python:3.12-slim`
+
+1. **The layer** (a `Containerfile` beside a `hosts` file):
+
+   ```dockerfile
+   # The Moca minimum on python:3.12-slim, for a `base` (or `general-self`) template whose tools are bash and
+   # python3: a localhost /etc/hosts (a microVM guest boots with none), `file` (the guest agent's minimum),
+   # and `ca-certificates` (the system trust store, so Moca can bake a TLS-intercepting host's egress CA in
+   # with update-ca-certificates; on such a host a template with egress true is refused at build without it).
+   FROM docker.io/library/python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+   RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends file ca-certificates >/dev/null \
+    && rm -rf /var/lib/apt/lists/*
+   COPY hosts /etc/hosts
+   ```
+
+   `hosts`, exactly these two lines (tab-separated; copy them from the rendered guide or the PDF,
+   since the indentation here is the list's):
+
+   ```text
+   127.0.0.1	localhost
+   ::1	localhost ip6-localhost ip6-loopback
+   ```
+
+   _Source: image-factory's `docs/examples/base-python/` (7e5c86b), measured there: a read-only root,
+   no network, every guest-minimum tool present, the probe below printing `(3, 12)`._
+
+2. **The create.** The spec's size must fit the profile's envelope (`base`: up to 16 GiB and 8
+   vCPUs):
+
+   ```json
+   {
+     "id": "my-python",
+     "image": "<your registry>/python-moca-min@sha256:<your layered image's digest>",
+     "profile": "base",
+     "spec": {
+       "guest_mb": 4096,
+       "vcpus": 2,
+       "egress": true,
+       "seed": "",
+       "tools": ["bash", "python3"],
+       "probe": {
+         "cmd": "python3 -c 'import sys; print(sys.version_info[:2])'",
+         "timeout_s": 60,
+         "expect_rc": 0,
+         "expect": ["^\\(3, 12\\)$"]
+       },
+       "description": "Python 3.12"
+     }
+   }
+   ```
+
+   `POST /v1/templates` with that body and your API token _(unverified for this image)_. A create is
+   answered `202` with the build to follow (as recorded, run lc-1, request 0003):
+
+   ```json
+   {
+     "templateId": "<id>",
+     "buildId": null,
+     "build": "/v1/templates/<id>/builds/b-<handle>",
+     "status": "queued"
+   }
+   ```
+
+3. **Follow the build** with `mocactl sbx templates --json` or `GET /v1/templates/<id>/builds/<build>`:
+   `queued`, `building`, `probing`, `built`, then `registered` (lc-1/0007 queued, lc-1/0103 registered).
+   `heldBy` names a host once one holds the snapshot.
+
+4. **If it's refused or fails:**
+   - **A policy refusal** is `422 policy_refused` naming the rule, before anything is built (lc-1/0001,
+     rule X10). A refused create stores no template, but a `check` record of the refusal stays on the
+     id's stream.
+   - **A failed build** has a `reason` with a `step` and a `code` you can branch on, e.g.
+     `{"step": "probe", "code": "probe_failed"}` (lc-1/0185: the probe didn't print what the spec
+     expected). Section 10 lists the usual causes.
+
+5. **Use it:** `mocactl sbx create --template my-python`. Its first use may answer
+   `409 template_not_active` with `Retry-After` (lc-1/0188) while a host starts its worker; the retry
+   succeeds once it's attached. A Moca agent session names it with `--option sandboxTemplate=<id>@<build>`
+   (section 8).
+
+6. **Update and retire:** a new build of the same id (`POST /v1/templates/<id>/builds`), then
+   `mocactl sbx templates tag <id> default --build <new build>`; retire with
+   `mocactl sbx templates retire <id>` (lc-1/0260). A create after that answers `410 template_retired`
+   (lc-1/0262). A retire is refused while a sandbox or session still uses the build
+   (`409 build_in_use`) _(not yet recorded)_.
+
+### 4b.5 Path B: your own gate record (`general-self`, `benchmark-self`)
+
+A gate record is image-factory's file that says your image's environment works. Sections 4b.5.1-4
+are written by image-factory, which owns the tool; 4b.5.5-6 are Moca's side.
+
+#### 1. What a gate checks: the environment, not the answer
+
+A gate record says that your image's **environment works**. The gate runs your image's own test
+command once, unmodified, as a Moca microVM guest would run it, and asks that the result meet a floor
+you state. It applies no change, no fix and no patch, and it never sees a task's answer. Whether an
+agent's work is right is **grading's** question, asked later and elsewhere. A gate cannot answer it, and
+does not try.
+
+The gate runs your image in an emulation of the guest: a read-only root file system, no network, root,
+an empty `/workspace` that it seeds from your work tree, and a clean environment (`env -i`, the guest's
+`PATH`, `HOME=/tmp/home`). In that guest it checks:
+
+| Check           | Passes when                                                                                                           |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `/etc/hosts`    | your image's own file resolves `localhost`. A guest boots with no runtime-written file, so an empty one fails         |
+| tools           | the guest agent's minimum (`bash ls cat base64 file`) and every tool your `tools` list names are present              |
+| no credentials  | no credential-shaped variable is in the guest's environment                                                           |
+| commits refused | git has no identity, so an agent cannot commit, and a clean tree after the seed if your work tree is a git repository |
+| the floor       | your test command's exit code, and its passed count (pytest's or unittest's summary), meet `floor`                    |
+| absent files    | with `absent_sha256`: no file in the image has one of those sha256s (only a count of matches is kept)                 |
+| the probe       | with `probe`: it runs on a fresh seed, and what it prints becomes your template's expectation                         |
+
+#### 2. The input contract (`image-factory/gate-input/1`)
+
+You describe your image in a small JSON file:
+
+| Field            | Required | Meaning                                                                                                                            |
+| ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `schema`         | yes      | `image-factory/gate-input/1`                                                                                                       |
+| `image`          | yes      | your image, pinned: `repository@sha256:<64 hex>`. A public registry is written with its host (`docker.io/library/python@sha256:…`) |
+| `workdir`        | yes      | your work tree, an absolute path. The gate copies it into the guest's empty `/workspace`, where the test runs                      |
+| `test_cmd`       | yes      | a bash command, run in the work tree                                                                                               |
+| `floor`          | yes      | `{"rc": N}`, `{"passed_at_least": N}`, or both. `{"rc": 0}` alone is a valid floor                                                 |
+| `absent_sha256`  | no       | sha256s no file in your image may have, such as a task's own tests or its solution                                                 |
+| `probe`          | no       | `{"cmd": "…", "public": true}`: a shareable check, never a grading command                                                         |
+| `tools`          | no       | the tools your template will list (default `bash git python3 rg`)                                                                  |
+| `network_needed` | no       | `true` or absent: your test command cannot pass offline. **`general-self` only**                                                   |
+
+Any other field is refused, and so is `network_needed` with any value but `true`.
+
+#### 3. Running the gate, and the record it writes
+
+```bash
+python scripts/gate-image.py contract.json --out gate.json \
+    --template-id my-app --spec-out spec.json
+```
+
+> **Where the tool is.** `gate-image.py` is image-factory's, and today it lives in a repository a
+> general reader can't open. It moves into Moca later. Until then, ask your Moca admin for a copy, or have
+> image-factory gate your image. Everything below is what it does, so you can prepare your image and
+> contract now.
+
+It pulls your image by digest (linux/amd64, as Moca's guests run), and refuses if the digest it got is
+not the contract's. It writes the record whether or not the gate passed, prints the record's sha256,
+and exits 0 only on a pass. On a pass, `--template-id` also writes a template spec for the
+self-attested profiles. Its probe expectation is built from what your probe printed (colour codes
+stripped), never from a count.
+
+The record, `image-factory/gate/1`, is what you send as `gateRecord` with your create (§4b.5.5). Moca
+reads these fields:
+
+| Field                                                              | Moca's rule                                                                                                                                                                                      |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `gate.passed`                                                      | X1: the gate passed                                                                                                                                                                              |
+| `image.digest`                                                     | X1.image: the record is for your template's image                                                                                                                                                |
+| `observed.testbed.agent_can_commit`, `observed.guest.git_identity` | X12: commits refused (`no` and `none`)                                                                                                                                                           |
+| `gate.floor_checked_offline`                                       | X1.offline: `true` means the floor was proved with no network. **`benchmark` and `benchmark-self` require it.** It is `false` only for a `network_needed` contract, which `general-self` accepts |
+| `gate.floor_met_offline`                                           | present only with `network_needed`: whether the offline run met the floor anyway. `general-self` shows it on your build                                                                          |
+
+The record is unsigned bytes, and **its sha256 is its identity**. It names no person or key. Who
+submitted it is what Moca records, and trust follows from that (§4b.5.6). A record never carries a
+private registry host, a credential, your test command (only its sha256) or its output (only counts).
+
+#### 4. A worked sample: SWE-bench's django-11133 image, as a stranger would bring it
+
+SWE-bench's own image for django-11133 (`swebench/sweb.eval.x86_64.django_1776_django-11133`, the
+image behind §5's template), gated as any user's image, outside the benchmark. The contract names its
+work tree `/testbed`, its own test runner on the public `basic` label, and a floor of rc 0 with the
+passed count measured. The probe is the same command.
+
+- **As published, the gate refuses it**, correctly, and for reasons most images share: its
+  `/etc/hosts` is empty, and it lacks `file` and `rg`. Its tests themselves pass in the guest, commits
+  are refused, and it holds no credentials.
+- **With the Moca minimum on top (§4b.3), it passes.** Here that's a localhost `/etc/hosts`, plus
+  `file` and `ripgrep` from the image's own Ubuntu packages. The gate wrote a spec whose probe expects
+  what the runner printed: `^Ran 53 tests?\b` and `^OK\b`, rc 0. django counts skipped tests in
+  `Ran N`, so an expectation rebuilt from the passed count would never have matched.
+
+The layer, a `Containerfile` beside a `hosts` file:
+
+```dockerfile
+# The Moca minimum, on a stranger's image: a localhost /etc/hosts (a microVM guest boots with none)
+# and the tools a template needs that the image lacks.
+FROM docker.io/swebench/sweb.eval.x86_64.django_1776_django-11133@sha256:914093363dbe12def92c5d36e9bdc5270cce5ed0aa6f3daad8bc4ef0389c29bf
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends file ripgrep >/dev/null && rm -rf /var/lib/apt/lists/*
+COPY hosts /etc/hosts
+```
+
+`hosts`, exactly these two lines (tab-separated):
+
+```text
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+```
+
+The contract, with your layered image's digest in `image`:
+
+```json
+{
+  "schema": "image-factory/gate-input/1",
+  "image": "<your registry>/django-moca-min@sha256:<the digest of your layered image>",
+  "workdir": "/testbed",
+  "test_cmd": "source /opt/miniconda3/bin/activate && conda activate testbed && export LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 basic",
+  "floor": { "rc": 0 },
+  "probe": {
+    "cmd": "source /opt/miniconda3/bin/activate && conda activate testbed && export LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 && ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 basic",
+    "public": true
+  }
+}
+```
+
+Add `"passed_at_least"` to `floor` with a count you have measured yourself, if you want the gate to
+hold the image to it.
+
+_Source: image-factory's `docs/examples/general-gate/` and `docs/GENERAL_GATE.md` (8d4b96e). Gated on
+image-factory's machine; not yet built as a template on a KVM host._
+
+#### 5. Create with your gate record
+
+Send the record's bytes, unchanged, as `gateRecord` with a self-attested profile _(unverified)_:
+
+```json
+{
+  "id": "my-app",
+  "image": "<your layered image>@sha256:<digest>",
+  "profile": "benchmark-self",
+  "gateRecord": "<the contents of gate.json, byte for byte>",
+  "spec": { "...": "the spec gate-image.py wrote (spec.json)" }
+}
+```
+
+- Use `benchmark-self` for a task environment that must stay offline (its record's
+  `gate.floor_checked_offline` must be `true`), or `general-self` for one with the host's allowlisted
+  egress.
+- The build shows `attestation: self`, and your template stays private: making it
+  `deployment`-visible answers `409 self_attested`.
+- The refusals you may meet: `X1.self.scope` (a record someone else submitted), `X1.offline` (a
+  `network_needed` record on an offline profile), `X12.self` (the record shows commits allowed), and
+  `X1.self.egress` (egress on a profile that forbids it).
+
+#### 6. Sharing it: trust
+
+To let others use it, ask an admin to trust the record: its sha256 goes into the policy's
+`trustedGateRecords` (`PUT /v1/policy`, a `policy` record names who did it). Its builds then read
+as `attestation: deployment`, and you can make the template `deployment`-visible. If the admin later
+removes that trust, the builds read as `self` again and fall back to private; the `policy` record
+names the builds it narrowed.
+
+### 4b.6 What Moca records, and your sandboxes' network
+
+- **Provenance:** your create, its gate record, every policy check, the build, each activation, each
+  sandbox or session on it, and its retire are records on the template's stream, chained by digest.
+  Anyone with an export can check them offline (`verify-provenance.py`).
+- **Egress records:** for a template with `egress: true`, `mocactl sbx egress <sandbox>` (or
+  `GET /v1/sandboxes/<id>/egress`) shows which hosts the sandbox reached, and the sandbox's end
+  record names the log's digest and whether it's complete. Paths are logged without query, fragment
+  or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL
+  path segment is logged as sent.
+
+### 4b.7 When something's refused (what users hit)
+
+| You see                                              | Why                                                                     | Do                                                                        |
+| ---------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `422 policy_refused`, rule `registry`                | the image's registry isn't in `allowedRegistries`                       | use an allowed registry; never another host name for the same registry    |
+| `422 policy_refused`, rule `registry.repository`     | that registry allows only listed repositories                           | ask an admin to list yours                                                |
+| `422 policy_refused`, rule `M7.guest`, `M7.vcpus`, … | the spec is outside the profile's envelope                              | fit the spec to the profile (`GET /v1/policy`)                            |
+| `429 quota_exceeded`                                 | your templates, queued builds or active templates are at your quota     | retire or wait (`GET /v1/quota`)                                          |
+| `409 template_exists`                                | the id is someone else's, or one the deployment declares (l28g1-1/0006) | another id; an admin can hand a declared id to you (`templates transfer`) |
+| a build failed at `probe`                            | the probe printed something else, or `localhost` doesn't resolve        | the Moca minimum (§4b.3); match what the probe prints exactly             |
+| a build refused for egress                           | `egress: true` without `ca-certificates`                                | add it to the layer                                                       |
 
 ## 5. Example 2: a SWE-bench instance (django\_\_django-11133)
 
