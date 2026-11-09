@@ -69,16 +69,45 @@
 #                            (template-build.sh's own refusal; retained workspaces count, W8)
 #   SBX_BUILD_CONCURRENCY    default 1: builds claimed per poll
 #   SBX_ACTIVE_LIMIT, SBX_IDLE_LIMIT_S   reported to the control plane (§6.2); default 0 (none set)
+#   SBX_MEM_FLOOR_MIB        optional; the memory the control plane never places workers into
+#                            (memory-aware placement spec §4, register G39): a whole number of MiB,
+#                            at least 1. Unset: 10% of MemTotal, at least 4096. The inventory reports
+#                            the effective floor (memFloorMib)
+#   SBX_MEM_PRESSURE_LIMIT   default 10: while memory PSI `full avg10` (a percentage) is above it, the
+#                            host takes no new start (what it runs is kept); a number, more than 0,
+#                            at most 100, up to two decimals
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
 #   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs it
 #                            (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
 #   SBX_REGISTRY             optional; template-build.sh --registry
+#   SBX_SYS_ROOT             default /: where /proc and /sys/fs/cgroup are read from (a test seam)
+#
+# The inventory's memory (register G39), sent on every run, so the control plane places workers by
+# memory as well as by SBX_ACTIVE_LIMIT: `memory: {memTotalMib, memAvailableMib, memPressureFull10,
+# memFloorMib, memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
+#   - memTotalMib, memAvailableMib: /proc/meminfo; memFloorMib the effective floor. Without the two,
+#     none of the three is sent (an error line): the control plane then places by SBX_ACTIVE_LIMIT
+#     alone, as with an older agent.
+#   - memPressureFull10: /proc/pressure/memory's `full avg10`. With no /proc/pressure (an older kernel,
+#     or psi=0 at boot) it is left out, which is no brake, never "no starts"; the summary says
+#     "psi":"absent", once per run.
+#   - runningWorkers: the workers of the held builds whose sbx-worker@<id> unit is active (a worker
+#     pins its snapshot's memory file whole at start, attached to the relay or not).
+#   - vmCommittedMib: per running worker, its slice's memory.current (cgroup v2,
+#     sbx.slice/sbx-<id>.slice) less its pinned memory file, at least 0: what its VMs hold. A slice
+#     whose memory.current cannot be read is left out, never guessed; the summary lists it
+#     ("sliceUnread").
+#   - memfileMismatch: the held builds whose memory file (snapshots/<snapshot>/memfile) is not exactly
+#     the manifest's guest_ram_mb x 1 MiB (or is missing): each is an error line, the summary counts
+#     them ("memfileMismatch"), the control plane never places one here, and this agent refuses to
+#     start one (reported `refused`) whatever a control plane asks.
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
 # summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
 # --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
-# "egressSkipped","egressRejected","egressNotOurs".
+# "egressSkipped","egressRejected","egressNotOurs"; then, when there is something to say about memory,
+# "psi":"absent", "sliceUnread":[<worker id>...] and "memfileMismatch":<n>.
 # A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
@@ -97,6 +126,8 @@ CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
 EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NOT_OURS=0 EG_CODE=''
 EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
+: "${SBX_SYS_ROOT:=/}"                                            # a test seam: /proc, /sys
+MEM_SUMMARY=''
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
 check_settings() {
@@ -119,6 +150,13 @@ check_settings() {
   done
   : "${SBX_DISK_FLOOR_GB:=60}" "${SBX_BUILD_CONCURRENCY:=1}" "${SBX_ACTIVE_LIMIT:=0}" "${SBX_IDLE_LIMIT_S:=0}"
   ((SBX_BUILD_CONCURRENCY >= 1 && SBX_BUILD_CONCURRENCY <= 4)) || refuse 'SBX_BUILD_CONCURRENCY must be 1-4'
+  [[ -z "${SBX_MEM_FLOOR_MIB:-}" || "$SBX_MEM_FLOOR_MIB" =~ ^[1-9][0-9]{0,8}$ ]] ||
+    refuse 'SBX_MEM_FLOOR_MIB must be a whole number of MiB, at least 1, without a leading zero'
+  : "${SBX_MEM_PRESSURE_LIMIT:=10}"
+  [[ "$SBX_MEM_PRESSURE_LIMIT" =~ ^(0|[1-9][0-9]{0,2})(\.[0-9]{1,2})?$ ]] &&
+    awk -v v="$SBX_MEM_PRESSURE_LIMIT" 'BEGIN { exit !(v > 0 && v <= 100) }' ||
+    refuse 'SBX_MEM_PRESSURE_LIMIT must be a number more than 0 and at most 100 (PSI full avg10, a percentage)'
+  [[ "$SBX_SYS_ROOT" == /* ]] || refuse 'SBX_SYS_ROOT must be an absolute path'
 }
 
 HDR=''
@@ -138,21 +176,105 @@ registry_logged_in() {
 
 free_gb() { df -Pk "$SBX_SRV" 2>/dev/null | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
 
-# The snapshots this host holds, by manifest hash, as template-build.sh's records name them.
+# A file's size in bytes (GNU stat, then BSD's); empty when it is not there.
+file_size() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || true; }
+
+# The records of the snapshots this host holds, as template-build.sh writes them.
+held_records() {
+  local f
+  for f in "$SBX_SRV"/templates/*.json; do
+    [[ -f "$f" ]] || continue
+    jq -e '.schema == "moca-sbx-template/1" and (.manifest_hash | test("^sha256:[0-9a-f]{64}$"))' "$f" >/dev/null 2>&1 || continue
+    printf '%s\n' "$f"
+  done
+}
+
+# The inventory's memory object (see the header) into $WORK/memory.json, without the figures (and an
+# error line) when /proc/meminfo gives no MemTotal or MemAvailable. Notes for the summary go into
+# MEM_SUMMARY, and the builds whose memory file does not match into $WORK/memfile-mismatch (one
+# manifest hash a line), which activation() refuses to start.
+memory_report() {
+  local root="${SBX_SYS_ROOT%/}" total avail psi='' floor rec hash snap w guest size cur mm=0
+  local running="$WORK/mem.running" committed="$WORK/mem.committed" unread="$WORK/mem.unread"
+  : >"$running"; : >"$committed"; : >"$unread"; : >"$WORK/memfile-mismatch"
+  MEM_SUMMARY=''
+  total="$(awk '$1 == "MemTotal:" { printf "%d", $2 / 1024 }' "$root/proc/meminfo" 2>/dev/null || true)"
+  avail="$(awk '$1 == "MemAvailable:" { printf "%d", $2 / 1024 }' "$root/proc/meminfo" 2>/dev/null || true)"
+  # PSI's `full avg10`: absent with no /proc/pressure (no brake), said once in the summary.
+  if [[ -r "$root/proc/pressure/memory" ]]; then
+    psi="$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i } }' "$root/proc/pressure/memory" 2>/dev/null || true)"
+  fi
+  [[ "$psi" =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]] || { psi=''; MEM_SUMMARY+=',"psi":"absent"'; }
+  while IFS= read -r rec; do
+    hash="$(jq -r .manifest_hash "$rec")" snap="$(jq -r '.snapshot // empty' "$rec")" w="$(jq -r '.worker // empty' "$rec")"
+    # The memory file a worker pins is the guest's whole RAM (a Full snapshot): its size must be
+    # guest_ram_mb x 1 MiB exactly, or the build's cost is not what the control plane counts.
+    guest='' size=''
+    if [[ "$snap" =~ ^[A-Za-z0-9._-]+$ && "$snap" != . && "$snap" != .. ]]; then
+      guest="$(jq -r '.guest_ram_mb // empty' "$SBX_SRV/snapshots/$snap/manifest.json" 2>/dev/null || true)"
+      size="$(file_size "$SBX_SRV/snapshots/$snap/memfile")"
+    fi
+    if ! [[ "$guest" =~ ^[1-9][0-9]*$ && "$size" =~ ^[0-9]+$ ]] || ((size != guest * 1048576)); then
+      mm=$((mm + 1))
+      printf '%s\n' "$hash" >>"$WORK/memfile-mismatch"
+      error "memfile mismatch: build $hash (snapshot ${snap:-?}): its memory file is ${size:-missing}${size:+ bytes}, not guest_ram_mb ${guest:-?} x 1 MiB; it is not placed or started on this host"
+    fi
+    [[ "$w" =~ $WORKER_RE ]] || continue
+    grep -qxF -- "$w" "$running" && continue
+    systemctl is-active --quiet "sbx-worker@$w.service" || continue
+    printf '%s\n' "$w" >>"$running"
+    cur="$(cat "$root/sys/fs/cgroup/sbx.slice/sbx-$w.slice/memory.current" 2>/dev/null || true)"
+    if [[ "$cur" =~ ^[0-9]+$ ]]; then
+      [[ "$size" =~ ^[0-9]+$ ]] || size=0
+      cur=$(((cur - size) / 1048576))
+      ((cur >= 0)) || cur=0
+      printf '%s\t%s\n' "$w" "$cur" >>"$committed"
+    else
+      printf '%s\n' "$w" >>"$unread"
+      say "{\"agent\":\"note\",\"worker\":\"$w\",\"why\":\"its slice's memory.current is unreadable: its VMs' memory is not reported\"}"
+    fi
+  done < <(held_records)
+  [[ ! -s "$unread" ]] || MEM_SUMMARY+=",\"sliceUnread\":$(jq -Rsc 'split("\n") | map(select(length > 0))' "$unread")"
+  ((mm == 0)) || MEM_SUMMARY+=",\"memfileMismatch\":$mm"
+  # Without MemTotal and MemAvailable, the object carries no memory figures (the control plane then
+  # places by SBX_ACTIVE_LIMIT alone), but still the workers and the mismatches.
+  if [[ "$total" =~ ^[0-9]+$ && "$avail" =~ ^[0-9]+$ ]] && ((total > 0)); then
+    if [[ -n "${SBX_MEM_FLOOR_MIB:-}" ]]; then
+      floor="$SBX_MEM_FLOOR_MIB"
+    else
+      floor=$((total / 10))
+      ((floor >= 4096)) || floor=4096
+    fi
+  else
+    total='' avail='' floor=''
+    error 'no MemTotal or MemAvailable in /proc/meminfo: no memory figures reported, so placement here is by SBX_ACTIVE_LIMIT alone'
+  fi
+  jq -n --arg total "$total" --arg avail "$avail" --arg psi "$psi" --arg floor "$floor" \
+    --argjson limit "$SBX_MEM_PRESSURE_LIMIT" --rawfile r "$running" --rawfile c "$committed" --rawfile m "$WORK/memfile-mismatch" \
+    '(if $total == "" then {} else
+        {memTotalMib: ($total | tonumber), memAvailableMib: ($avail | tonumber), memFloorMib: ($floor | tonumber)} end)
+     + (if $psi == "" then {} else {memPressureFull10: ($psi | tonumber)} end)
+     + {memPressureLimit: $limit,
+        runningWorkers: ($r | split("\n") | map(select(length > 0))),
+        vmCommittedMib: ($c | split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries),
+        memfileMismatch: ($m | split("\n") | map(select(length > 0)) | unique)}' >"$WORK/memory.json"
+}
+
+# The snapshots this host holds, by manifest hash, as template-build.sh's records name them; its
+# limits; and its memory (register G39).
 inventory() {
-  local f out="$WORK/inventory.json"
+  local f out="$WORK/inventory.json" mem='{}'
+  if memory_report; then mem="$(jq -c '{memory: .}' "$WORK/memory.json")" || mem='{}'; fi
   {
     printf '{"holds":['
     local sep=''
-    for f in "$SBX_SRV"/templates/*.json; do
-      [[ -f "$f" ]] || continue
-      jq -e '.schema == "moca-sbx-template/1" and (.manifest_hash | test("^sha256:[0-9a-f]{64}$"))' "$f" >/dev/null 2>&1 || continue
+    while IFS= read -r f; do
       printf '%s%s' "$sep" "$(jq -c '{template: .id, manifestHash: .manifest_hash}' "$f")"
       sep=','
-    done
+    done < <(held_records)
     printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d}}' \
       "$SBX_ACTIVE_LIMIT" "$SBX_IDLE_LIMIT_S" "$SBX_BUILD_CONCURRENCY" "$(free_gb)" "$SBX_DISK_FLOOR_GB"
-  } >"$out"
+  } | jq -c --argjson m "$mem" '. + $m' >"$out"
   api POST "/v1/hosts/$SBX_HOST_ID/inventory" "$out" >/dev/null
 }
 
@@ -286,6 +408,13 @@ activation() {
       continue
     fi
     systemctl is-active --quiet "$unit" && continue
+    # A build whose memory file does not match its guest size (memory_report) is never started here,
+    # whatever the control plane asks (one older than openapi 1.8.0 does not read memfileMismatch).
+    if [[ -s "$WORK/memfile-mismatch" ]] && grep -qxF -- "$b" "$WORK/memfile-mismatch"; then
+      worker_report "$b" refused 'memfile mismatch: its memory file is not guest_ram_mb x 1 MiB on this host'
+      say "{\"agent\":\"refused\",\"worker\":\"$w\",\"why\":\"memfile mismatch\"}"
+      continue
+    fi
     if systemctl start "$unit"; then
       STARTED=$((STARTED + 1)); worker_report "$b" attached; say "{\"agent\":\"started\",\"worker\":\"$w\"}"
     else
@@ -495,7 +624,7 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY}"
     return 0
   fi
   local free
@@ -505,7 +634,7 @@ main() {
   if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
     say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY}"
     return 0
   fi
   if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
@@ -520,7 +649,7 @@ main() {
     fi
   fi
   activation
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY}"
 }
 
 main "$@"
