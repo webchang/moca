@@ -502,10 +502,10 @@ def s_next(d):
     s = d.slide("Next: capacity, then the KVM host, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "Capacity by host resources (G40, G39, G43)", "an atomic activation check, then "
-         "placement by memory, then paced cold starts: designs accepted"),
-        ("2", "The next KVM-host window", "the egress host agent (G42), and the self-serve paths "
-         "run end to end from a user's own image"),
+        ("1", "Paced cold starts (G43)", "a limit on starts at once, then an optional idle grace; "
+         "design accepted"),
+        ("2", "The next KVM-host window", "the host agent for egress records (G42) and memory "
+         "(G39), and the self-serve paths run end to end"),
         ("3", "Propose upstream", "as reviewable PRs, from what the windows proved; upstream has "
          "no session templates today"),
     ]
@@ -516,8 +516,8 @@ def s_next(d):
         text(s, 6.0, y + 0.05, 6.7, 0.95, [b], size=14, color=MUTED)
         y += 1.35
     box(s, 0.6, 5.8, 12.1, 0.6, INFRA, "Done since",
-         ["users and roles through the API (G38); self-serve with your own gate records (G41); "
-          "a repository allowlist; each sandbox's egress records (G42), on the cluster"],
+         ["roles via the API (G38); own gate records (G41); an image allowlist; on the cluster: "
+          "egress records (G42), atomic activation (G40), memory placement (G39)"],
          size=12, align=PP_ALIGN.LEFT)
 
 
