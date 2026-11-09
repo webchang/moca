@@ -3,7 +3,15 @@ import { asRecord, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
-import { liveLeases, place, type HostMemory, type HostView } from './activation.js';
+import {
+  liveLeases,
+  place,
+  unattachedPlaced,
+  wantedBuilds,
+  type HostMemory,
+  type HostStart,
+  type HostView,
+} from './activation.js';
 import { isLive, type SandboxRecord } from './sandbox-store.js';
 import {
   EGRESS_DROP_WINDOW_S,
@@ -29,8 +37,10 @@ import {
  * this host claimed. On `built` it checks the build record against the create's request and the
  * policy (§8.2) and registers or rejects the build, automatically, with a `check` record.
  *
- *   GET  /v1/hosts/{host}/wanted             the builds this host should run (placed on it), and
- *                                            those it holds that it should stop (no lease left)
+ *   GET  /v1/hosts/{host}/wanted             the builds this host should run (placed on it, first
+ *                                            leased first), those it holds that it should stop (no
+ *                                            lease left), and, of `run`, those not attached yet
+ *                                            (`starting`, register G43: the agent's start limit)
  *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
  *   POST /v1/hosts/{host}/egress             {events, cursor}: the egress proxy's audit events, as it
  *                                            wrote them, into each sandbox's egress log (register G42)
@@ -91,6 +101,8 @@ export interface HostState {
     diskFreeGb: number;
     diskFloorGb: number;
   };
+  /** The agent's start limit and measured start time (register G43); absent from an older agent. */
+  start?: HostStart;
   /**
    * The inventory's `memory` (register G39), as far as it is well-formed; absent from an older
    * agent, and then its host is placed by activeLimit alone.
@@ -156,7 +168,22 @@ export function hostViewsOf(deps: CpDeps): HostView[] {
     activeLimit: h.limits.activeLimit,
     at: h.at,
     ...(h.memory ? { memory: h.memory } : {}),
+    ...(h.start ? { start: h.start } : {}),
   }));
+}
+
+/** The most a start limit or a start time is taken at (a malformed figure is dropped, not capped). */
+const START_MAX = 1_000_000;
+
+/**
+ * The inventory limits' startConcurrency and startSeconds (register G43): a concurrency of at least
+ * 1, and seconds only beside it. Neither from an older agent: then no start line for its host.
+ */
+export function parseHostStart(l: Record<string, unknown>): HostStart | undefined {
+  const c = nonNeg(l.startConcurrency);
+  if (c === undefined || c < 1 || c > START_MAX) return undefined;
+  const sec = nonNegNum(l.startSeconds);
+  return { concurrency: c, ...(sec !== undefined && sec <= START_MAX ? { seconds: sec } : {}) };
 }
 
 /** In-memory host state; the inventory is re-sent on every poll, so a restart loses nothing durable. */
@@ -404,11 +431,34 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) stop.push(entry);
       }
     }
+    // The agent starts `run` in order, as many as its start limit allows (register G43): first
+    // leased first, the order placement uses, so the oldest activations start first.
+    const order = new Map(wantedBuilds(docs, nowS).map((w, i) => [w.build.buildId, i]));
+    run.sort((a, b) => order.get(a.buildId as string)! - order.get(b.buildId as string)!);
+    // Register G43: of `run`, the builds whose worker is not attached to the relay (its presence, as
+    // readiness reads it); the agent counts those whose unit it runs as starting. Absent when the
+    // presence cannot be read: the agent then counts its own recent starts.
+    let starting: string[] | undefined;
+    if (deps.presence) {
+      try {
+        const attached = new Map(
+          (await deps.presence.list()).map((r) => [r.sandboxId, r.capacityMax]),
+        );
+        starting = unattachedPlaced(docs, p, attached, nowS)
+          .filter((x) => x.host === host)
+          .map((x) => x.buildId);
+      } catch {
+        starting = undefined;
+      }
+    }
     // Register G42: the workspace keys whose egress events the agent ships, and no others.
     const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
       .map((r) => r.wsk)
       .sort();
-    return { status: 200, body: { run, stop, remove, egressSids } };
+    return {
+      status: 200,
+      body: { run, stop, remove, ...(starting ? { starting } : {}), egressSids },
+    };
   },
 
   hostWorkerReport: async (ctx, deps) => {
@@ -476,7 +526,14 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       diskFloorGb: nonNeg(l.diskFloorGb) ?? 0,
     };
     const memory = parseHostMemory(b.memory);
-    deps.hosts?.set(host, { at: seconds(deps), holds, limits, ...(memory ? { memory } : {}) });
+    const start = parseHostStart(l);
+    deps.hosts?.set(host, {
+      at: seconds(deps),
+      holds,
+      limits,
+      ...(memory ? { memory } : {}),
+      ...(start ? { start } : {}),
+    });
     return { status: 200, body: { host, holds: Object.keys(holds).length } };
   },
 

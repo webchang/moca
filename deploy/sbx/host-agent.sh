@@ -19,8 +19,11 @@
 # the proxy's audit events, as the proxy wrote them, to POST /v1/hosts/<id>/egress, where each event
 # lands in its sandbox's egress log. It never touches moca-egress (no start, stop, restart or config):
 # a failed post changes nothing on the host's egress, it only leaves the journal cursor where it was.
-#   - Off when `systemctl is-enabled moca-egress.service` does not say enabled (a --no-egress host, or
-#     none installed): then no journal read, no post, no cursor file.
+#   - Off when `systemctl is-active moca-egress.service` does not say active (a --no-egress host, none
+#     installed, or a reused moca-egress not started): then no journal read, no post, no cursor file.
+#     Active, not enabled: install-host.sh reuses a moca-egress.service another install owns (a P6
+#     worker's) without enabling it, and that install may start it for a window only; what matters is
+#     that a proxy serves this host's workers now. A read, so the agent still never acts on moca-egress.
 #   - Only this host's sandboxes' events leave it: the wanted state's `egressSids` (the workspace keys
 #     of the sandboxes on its workers, live or just ended) is the list, and an event whose sid is not in
 #     it (a Moca P6 session's, served by the same proxy) is not sent, only counted (egressNotOurs).
@@ -76,6 +79,12 @@
 #   SBX_MEM_PRESSURE_LIMIT   default 10: while memory PSI `full avg10` (a percentage) is above it, the
 #                            host takes no new start (what it runs is kept); a number, more than 0,
 #                            at most 100, up to two decimals
+#   SBX_START_CONCURRENCY    default 4: at most this many workers STARTING at once (started, not yet
+#                            attached to the relay: cold-start pacing spec §4, register G43); a whole
+#                            number, at least 1 (0 is refused). Not SBX_ACTIVE_LIMIT, which caps running ones
+#   SBX_START_WINDOW_S       default 300: with a control plane that sends no `starting` (older than
+#                            openapi 1.9.0), a worker this agent started less than this many seconds ago,
+#                            whose unit is active and which is still wanted, counts as starting
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
 #   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs it
 #                            (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
@@ -102,12 +111,29 @@
 #     them ("memfileMismatch"), the control plane never places one here, and this agent refuses to
 #     start one (reported `refused`) whatever a control plane asks.
 #
+# The start limit (register G43), in activation(): a cold worker reads and pins its whole memory file
+# before it attaches, and starts at once share the disk, so the agent starts at most
+# SBX_START_CONCURRENCY less those starting now, per run, in the wanted answer's order (oldest lease
+# first); the rest wait for the next run (15 s) and are counted in the summary (startQueued).
+# activation() never waits for a start: `systemctl start` of the Type=simple worker unit returns at once.
+#   - "Starting" comes from the control plane: the wanted answer's `starting` (openapi 1.9.0) lists the
+#     builds placed here whose worker is not attached to the relay; a listed build whose unit is active
+#     is starting. A control plane without `starting` cannot say what is attached, so the agent counts
+#     its own: the workers it started less than SBX_START_WINDOW_S ago that are still active and wanted.
+#     The limit thus holds with an older control plane too (it is the agent's).
+#   - $SBX_SRV/start-times (0600) keeps each start: worker, build id, epoch. A start is done when the
+#     wanted answer still lists its build in `run` but no longer in `starting`; its time (to within the
+#     15 s poll) goes into $SBX_SRV/start-seconds (0600, the last 10), and the inventory's limits report
+#     their mean as startSeconds (absent until a start is done, so always with an older control plane),
+#     beside startConcurrency.
+#
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
 # summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
 # --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
 # "egressSkipped","egressRejected","egressNotOurs"; then, when there is something to say about memory,
-# "psi":"absent", "sliceUnread":[<worker id>...] and "memfileMismatch":<n>.
+# "psi":"absent", "sliceUnread":[<worker id>...] and "memfileMismatch":<n>; then "startQueued":<n> when
+# the start limit left wanted workers for a later run.
 # A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
@@ -127,7 +153,8 @@ EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NO
 EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 : "${SBX_SYS_ROOT:=/}"                                            # a test seam: /proc, /sys
-MEM_SUMMARY=''
+MEM_SUMMARY='' START_SUMMARY='' INFLIGHT=0
+BUILD_ID_RE='^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$'
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
 check_settings() {
@@ -145,6 +172,11 @@ check_settings() {
   [[ "$(<"$SBX_HOST_TOKEN_FILE")" =~ ^[0-9a-f]{64}$ ]] || refuse "$SBX_HOST_TOKEN_FILE must hold 64 hex characters"
   [[ -n "${SBX_KERNEL:-}" && -f "$SBX_KERNEL" ]] || refuse 'SBX_KERNEL must name the guest kernel file'
   [[ -x "$SBX_TEMPLATE_BUILD" ]] || refuse "no template-build.sh at $SBX_TEMPLATE_BUILD"
+  : "${SBX_START_CONCURRENCY:=4}" "${SBX_START_WINDOW_S:=300}"
+  [[ "$SBX_START_CONCURRENCY" =~ ^[1-9][0-9]{0,8}$ ]] ||
+    refuse 'SBX_START_CONCURRENCY must be a whole number, at least 1, without a leading zero (0 would start no worker)'
+  [[ "$SBX_START_WINDOW_S" =~ ^[1-9][0-9]{0,8}$ ]] ||
+    refuse 'SBX_START_WINDOW_S must be a whole number of seconds, at least 1, without a leading zero'
   for v in SBX_DISK_FLOOR_GB SBX_BUILD_CONCURRENCY SBX_ACTIVE_LIMIT SBX_IDLE_LIMIT_S; do
     [[ -z "${!v:-}" || "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || refuse "$v must be a whole number without a leading zero"
   done
@@ -261,10 +293,11 @@ memory_report() {
 }
 
 # The snapshots this host holds, by manifest hash, as template-build.sh's records name them; its
-# limits; and its memory (register G39).
+# limits, with its start limit and measured start time (register G43); and its memory (register G39).
 inventory() {
-  local f out="$WORK/inventory.json" mem='{}'
+  local f out="$WORK/inventory.json" mem='{}' secs
   if memory_report; then mem="$(jq -c '{memory: .}' "$WORK/memory.json")" || mem='{}'; fi
+  secs="$(start_seconds)"
   {
     printf '{"holds":['
     local sep=''
@@ -272,8 +305,9 @@ inventory() {
       printf '%s%s' "$sep" "$(jq -c '{template: .id, manifestHash: .manifest_hash}' "$f")"
       sep=','
     done < <(held_records)
-    printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d}}' \
-      "$SBX_ACTIVE_LIMIT" "$SBX_IDLE_LIMIT_S" "$SBX_BUILD_CONCURRENCY" "$(free_gb)" "$SBX_DISK_FLOOR_GB"
+    printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d,"startConcurrency":%d%s}}' \
+      "$SBX_ACTIVE_LIMIT" "$SBX_IDLE_LIMIT_S" "$SBX_BUILD_CONCURRENCY" "$(free_gb)" "$SBX_DISK_FLOOR_GB" \
+      "$SBX_START_CONCURRENCY" "${secs:+,\"startSeconds\":$secs}"
   } | jq -c --argjson m "$mem" '. + $m' >"$out"
   api POST "/v1/hosts/$SBX_HOST_ID/inventory" "$out" >/dev/null
 }
@@ -350,7 +384,7 @@ build_one() { # build_one JOB_JSON
     case "$code" in pull_failed) step=pull ;; probe_failed) step=probe ;; disk_floor) step=disk ;; spec_refused) step=spec ;; esac
     report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" --arg s "$step" '{event: "failed", step: $s, message: $m}')" >/dev/null ||
       error "report failed for $handle failed"
-    say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc}"
+    say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc,\"step\":\"$step\",\"code\":\"$code\"}"
     return
   fi
   # template-build.sh names the snapshot <id>-<first 12 hex of the image digest> and writes its record
@@ -384,12 +418,69 @@ worker_report() { # worker_report BUILD_ID EVENT [REASON]
   api POST "/v1/hosts/$SBX_HOST_ID/workers/report" "$WORK/worker.json" >/dev/null || error "worker report for $1 failed"
 }
 
+# The mean of the last completed starts' seconds ($SBX_SRV/start-seconds), rounded; empty with none.
+start_seconds() {
+  [[ -s "$SBX_SRV/start-seconds" ]] || return 0
+  awk '$1 ~ /^[0-9]+$/ { s += $1; n++ } END { if (n) printf "%d", s / n + 0.5 }' "$SBX_SRV/start-seconds"
+}
+
+# The start book (see the header), before this run's starts. Of $SBX_SRV/start-times it keeps the
+# starts still in flight, records the time of each one done, and drops the rest (stopped, no longer
+# wanted, or, with no `starting` from the control plane, SBX_START_WINDOW_S old). Then sets INFLIGHT,
+# the workers starting now. Reads $WORK/run.tsv (worker, build a line) and $WORK/starting.ids.
+start_book() { # start_book NOW HAS_STARTING
+  local now="$1" has="$2" w b t book="$SBX_SRV/start-times" keep="$WORK/start-times.keep" fin="$WORK/start-seconds.new"
+  : >"$keep"; : >"$fin"
+  if [[ -f "$book" ]]; then
+    while IFS=$'\t' read -r w b t; do
+      [[ "$w" =~ $WORKER_RE && "$b" =~ $BUILD_ID_RE && "$t" =~ ^[0-9]{1,12}$ ]] || continue
+      grep -qxF -- "$w"$'\t'"$b" "$WORK/run.tsv" || continue
+      systemctl is-active --quiet "sbx-worker@$w.service" || continue
+      if ((has == 1)); then
+        if grep -qxF -- "$b" "$WORK/starting.ids"; then
+          printf '%s\t%s\t%s\n' "$w" "$b" "$t" >>"$keep"
+        elif ((now >= t)); then
+          printf '%s\n' "$((now - t))" >>"$fin"
+          say "{\"agent\":\"attached\",\"worker\":\"$w\",\"startSeconds\":$((now - t))}"
+        fi
+      elif ((now - t < SBX_START_WINDOW_S)); then
+        printf '%s\t%s\t%s\n' "$w" "$b" "$t" >>"$keep"
+      fi
+    done <"$book"
+  fi
+  rm -f "$book.tmp"
+  (umask 077 && cat "$keep" >"$book.tmp") && mv -f "$book.tmp" "$book"
+  if [[ -s "$fin" ]]; then
+    (umask 077 && cat "$SBX_SRV/start-seconds" "$fin" 2>/dev/null | tail -n 10 >"$SBX_SRV/start-seconds.tmp") || true
+    mv -f "$SBX_SRV/start-seconds.tmp" "$SBX_SRV/start-seconds"
+  fi
+  INFLIGHT=0
+  if ((has == 1)); then
+    # The control plane's list, whoever started the unit: a listed build whose unit is active.
+    while IFS=$'\t' read -r w b; do
+      [[ "$w" =~ $WORKER_RE ]] && grep -qxF -- "$b" "$WORK/starting.ids" || continue
+      if systemctl is-active --quiet "sbx-worker@$w.service"; then INFLIGHT=$((INFLIGHT + 1)); fi
+    done <"$WORK/run.tsv"
+  else
+    INFLIGHT="$(wc -l <"$book" | tr -d ' ')"
+  fi
+}
+
+# Records a start in the start book, in place of an earlier one of the same worker.
+start_record() { # start_record WORKER BUILD NOW
+  local book="$SBX_SRV/start-times"
+  (umask 077 && { grep -v -- "^$1"$'\t' "$book" 2>/dev/null || true; printf '%s\t%s\t%s\n' "$1" "$2" "$3"; } >"$book.tmp") &&
+    mv -f "$book.tmp" "$book"
+}
+
 # Start what is wanted and installed; stop what is not wanted (the control plane leaves out a worker
 # with live sandboxes). Readiness is the relay's attached record, never this report. Under a lock, so
 # the build poll's pass and the --wanted-only one never start or stop the same worker at once; the
-# one that does not get it skips (the other is applying the same wanted state).
+# one that does not get it skips (the other is applying the same wanted state). At most
+# SBX_START_CONCURRENCY workers are starting at once (the start limit, see the header); a start is
+# never waited on.
 activation() {
-  local wanted w unit
+  local wanted w unit now has=0 slots queued=0
   exec 9>"$SBX_SRV/.activation.lock"
   if ! flock -n 9; then
     say '{"agent":"skipped","why":"another run is applying the wanted state"}'
@@ -399,6 +490,15 @@ activation() {
   # Kept for egress(), which takes its egressSids from this read rather than asking again.
   (umask 077 && printf '%s' "$wanted" >"$WORK/wanted.json")
   jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted" || { error 'wanted state malformed'; return; }
+  now="$(date +%s)"
+  jq -r '.run[] | [.worker, .buildId] | @tsv' <<<"$wanted" >"$WORK/run.tsv"
+  : >"$WORK/starting.ids"
+  if jq -e '(.starting | type) == "array"' >/dev/null 2>&1 <<<"$wanted"; then
+    has=1
+    jq -r '.starting[] | strings' <<<"$wanted" >"$WORK/starting.ids"
+  fi
+  start_book "$now" "$has"
+  slots=$((SBX_START_CONCURRENCY - INFLIGHT))
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a wanted worker id is malformed'; continue; }
     unit="sbx-worker@$w.service"
@@ -415,12 +515,24 @@ activation() {
       say "{\"agent\":\"refused\",\"worker\":\"$w\",\"why\":\"memfile mismatch\"}"
       continue
     fi
+    # The start limit: with no slot left, it waits for a later run (in order: it goes first then).
+    if ((slots <= 0)); then
+      queued=$((queued + 1))
+      continue
+    fi
+    slots=$((slots - 1))
+    # Returns at once (Type=simple): the worker reads its snapshot and attaches after this.
     if systemctl start "$unit"; then
       STARTED=$((STARTED + 1)); worker_report "$b" attached; say "{\"agent\":\"started\",\"worker\":\"$w\"}"
+      [[ ! "$b" =~ $BUILD_ID_RE ]] || start_record "$w" "$b" "$now"
     else
       worker_report "$b" refused "systemctl start $unit failed"; error "start $unit failed"
     fi
-  done < <(jq -r '.run[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+  done <"$WORK/run.tsv"
+  if ((queued > 0)); then
+    START_SUMMARY=",\"startQueued\":$queued"
+    say "{\"agent\":\"queued\",\"workers\":$queued,\"why\":\"$INFLIGHT starting, SBX_START_CONCURRENCY $SBX_START_CONCURRENCY: started in a later run\"}"
+  fi
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to stop is malformed'; continue; }
     unit="sbx-worker@$w.service"
@@ -513,7 +625,7 @@ egress_post() {
 
 # The egress step (see the header). Reads the journal only; never acts on moca-egress.
 egress() {
-  systemctl is-enabled --quiet moca-egress.service 2>/dev/null || return 0
+  systemctl is-active --quiet moca-egress.service 2>/dev/null || return 0
   EGRESS=on
   command -v journalctl >/dev/null || { error 'egress: no journalctl on PATH'; return; }
   exec 8>"$SBX_SRV/.egress.lock"
@@ -624,7 +736,7 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY$START_SUMMARY}"
     return 0
   fi
   local free
@@ -634,7 +746,7 @@ main() {
   if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
     say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY}"
     return 0
   fi
   if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
@@ -649,7 +761,7 @@ main() {
     fi
   fi
   activation
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY}"
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY}"
 }
 
 main "$@"
