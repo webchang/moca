@@ -411,7 +411,7 @@ ensure_redis_secret() {
   [[ -n "$pw" ]] || { log 'generating the Redis password'; pw="$(rand_hex)"; }
   (
     export S_0="$pw" S_1="redis://:$pw@redis.$NS.svc:6379"
-    S_2="$(printf 'requirepass %s\nappendonly yes\ndir /data\n' "$pw")"
+    S_2="$(printf 'requirepass %s\nappendonly yes\ndir /data\nmaxmemory 200mb\nmaxmemory-policy noeviction\n' "$pw")"
     export S_2
     apply_secret moca-redis REDIS_PASSWORD REDIS_URL redis.conf
   )
