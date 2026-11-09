@@ -642,4 +642,102 @@ grep -q 'no MemTotal or MemAvailable in /proc/meminfo' "$TMP/out" || fail 'no me
 mv "$SYS/proc/meminfo.off" "$SYS/proc/meminfo"
 pass 'refuses a bad SBX_MEM_FLOOR_MIB or SBX_MEM_PRESSURE_LIMIT before calling anything; no /proc/meminfo is an error line, not a refusal (G39)'
 
+# 22. The start limit (register G43): SBX_START_CONCURRENCY, default 4, 0 refused; at most that many
+#     workers starting at once, in the wanted order, the rest queued for a later run (startQueued);
+#     "starting" from the wanted answer's `starting`, or, from a control plane without it, the agent's
+#     own starts of the last SBX_START_WINDOW_S; a start never waited on; startSeconds once one is done.
+rm -f "$TMP/state/active-"* "$TMP/srv/start-times" "$TMP/srv/start-seconds"
+for i in 1 2 3 4 5 6; do : >"$TMP/workers/sbx_s$i.env"; done
+# wanted [STARTING_JSON]: the six builds s1..s6 in `run`, in that order; with `starting` when given.
+wanted() {
+  jq -n --arg st "${1:-}" '{run: [range(1; 7) | tostring | {template: ("s" + .), buildId: ("sha256:s" + .), worker: ("sbx_s" + .)}],
+    stop: [], egressSids: []} + (if $st == "" then {} else {starting: ($st | fromjson)} end)' >"$TMP/state/wanted-answer"
+}
+started() { grep -o 'systemctl start sbx-worker@sbx_s[0-9]' "$MOCK_LOG" | sed 's/.*@sbx_//' | tr '\n' ' '; }
+st_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
+# The default, reported; no startSeconds before a start is done.
+wanted '[]'
+st_run || fail 'the start-limit run failed'
+jq -e '.limits.startConcurrency == 4 and (.limits | has("startSeconds") | not)' "$INV" >/dev/null || fail "the default start limit: $(jq -c .limits "$INV")"
+# Six wanted, none starting: the first four start, in order; two wait, and the summary says so.
+[[ "$(started)" == 's1 s2 s3 s4 ' ]] || fail "six wanted, none starting, started: $(started)"
+grep -q '"agent":"summary".*"startQueued":2}' "$TMP/out" || fail 'the summary does not count the queued starts'
+grep -q '"started":4' "$TMP/out" || fail 'the summary does not count four starts'
+[[ "$(stat -c %a "$TMP/srv/start-times" 2>/dev/null || stat -f %Lp "$TMP/srv/start-times")" == 600 ]] || fail 'start-times is not 0600'
+[[ "$(wc -l <"$TMP/srv/start-times" | tr -d ' ')" == 4 ]] || fail 'start-times does not hold the four starts'
+# Three still starting (s1-s3, from `starting`), s4 attached 40 s after its start: one slot, s5 starts.
+T40=$(($(date +%s) - 40))
+awk -v t="$T40" 'BEGIN { FS = OFS = "\t" } $1 == "sbx_s4" { $3 = t } { print }' "$TMP/srv/start-times" >"$TMP/st" && cat "$TMP/st" >"$TMP/srv/start-times"
+wanted '["sha256:s1","sha256:s2","sha256:s3","sha256:s5","sha256:s6"]'
+st_run || fail 'the three-starting run failed'
+[[ "$(started)" == 's5 ' ]] || fail "three starting, started: $(started)"
+grep -q '"startQueued":1}' "$TMP/out" || fail 'the summary does not count the one queued'
+grep -q '"agent":"attached","worker":"sbx_s4","startSeconds":4[0-2]}' "$TMP/out" || fail 'the done start is not said'
+# The next inventory reports the measured start time (s4's 40 s) beside the limit.
+st_run || fail 'the run after a done start failed'
+jq -e '.limits.startConcurrency == 4 and (.limits.startSeconds | . >= 40 and . <= 42)' "$INV" >/dev/null ||
+  fail "startSeconds after a done start: $(jq -c .limits "$INV")"
+[[ "$(stat -c %a "$TMP/srv/start-seconds" 2>/dev/null || stat -f %Lp "$TMP/srv/start-seconds")" == 600 ]] || fail 'start-seconds is not 0600'
+# A set limit is reported as set.
+rm -f "$TMP/state/active-"* "$TMP/srv/start-times"
+wanted '[]'
+SBX_START_CONCURRENCY=2 st_run || fail 'the set-limit run failed'
+[[ "$(started)" == 's1 s2 ' ]] && jq -e '.limits.startConcurrency == 2' "$INV" >/dev/null || fail "a set limit of 2: $(started)"
+pass 'starts at most SBX_START_CONCURRENCY (default 4) less those starting, in order; queues the rest (startQueued); startSeconds once a start is done (G43)'
+
+# 23. An older control plane (no `starting`): the agent's own starts of the last SBX_START_WINDOW_S
+#     count as starting, so the limit still holds; past the window they no longer count.
+rm -f "$TMP/state/active-"* "$TMP/srv/start-times" "$TMP/srv/start-seconds"
+wanted ''
+st_run || fail 'the old-control-plane run failed'
+[[ "$(started)" == 's1 s2 s3 s4 ' ]] && grep -q '"startQueued":2}' "$TMP/out" || fail "old control plane, first run: $(started)"
+st_run || fail 'the second old-control-plane run failed'
+[[ -z "$(started)" ]] && grep -q '"startQueued":2}' "$TMP/out" || fail "old control plane, four in the window, started: $(started)"
+OLD=$(($(date +%s) - 400))
+awk -v t="$OLD" 'BEGIN { FS = OFS = "\t" } { $3 = t; print }' "$TMP/srv/start-times" >"$TMP/st" && cat "$TMP/st" >"$TMP/srv/start-times"
+st_run || fail 'the past-the-window run failed'
+[[ "$(started)" == 's5 s6 ' ]] && ! grep -q '"startQueued"' "$TMP/out" || fail "old control plane, past the window, started: $(started)"
+jq -e '.limits | has("startSeconds") | not' "$INV" >/dev/null || fail 'startSeconds without a starting list'
+SBX_START_WINDOW_S=1000 st_run || fail 'the set-window run failed'
+pass 'with a control plane without `starting`, its own starts of the last SBX_START_WINDOW_S count, so the limit holds (G43)'
+
+# 24. A start is never waited on: a worker that never attaches (still in `starting` run after run)
+#     holds its slot, and each run returns at once; no `systemctl start --wait` (the mock blocks on one).
+cat >"$TMP/bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >>"$MOCK_LOG"
+case "$1" in
+is-active) [[ -f "$MOCK_STATE/active-${!#}" ]] ;;
+is-enabled) [[ -f "$MOCK_STATE/enabled-${!#}" ]] ;;
+start) [[ " $* " != *" --wait "* && " $* " != *" --block "* ]] || sleep 600; touch "$MOCK_STATE/active-${!#}" ;;
+stop) rm -f "$MOCK_STATE/active-$2" ;;
+esac
+MOCK
+chmod +x "$TMP/bin/systemctl"
+rm -f "$TMP/state/active-"* "$TMP/srv/start-times"
+wanted '["sha256:s1","sha256:s2","sha256:s3","sha256:s4","sha256:s5","sha256:s6"]'
+for r in 1 2 3; do
+  t0=$SECONDS
+  st_run || fail "the never-attaching run $r failed"
+  ((SECONDS - t0 < 30)) || fail "run $r waited on a start ($((SECONDS - t0)) s)"
+  grep -q -- '--wait\|--block' "$MOCK_LOG" && fail 'a start was waited on'
+  grep -q '"startQueued":2}' "$TMP/out" || fail "run $r: the two not started are not queued"
+done
+n=0; for f in "$TMP/state/active-sbx-worker@sbx_s"*; do [[ -e "$f" ]] && n=$((n + 1)); done
+((n == 4)) || fail 'more than four started while none attached'
+pass 'activation never waits on a start: workers that never attach hold their slots and each run returns at once (G43)'
+
+# 25. Its start settings, refused (exit 2) before any call.
+for bad in 'SBX_START_CONCURRENCY=0' 'SBX_START_CONCURRENCY=04' 'SBX_START_CONCURRENCY=-1' 'SBX_START_CONCURRENCY=four' \
+  'SBX_START_CONCURRENCY=1.5' 'SBX_START_WINDOW_S=0' 'SBX_START_WINDOW_S=5m'; do
+  : >"$MOCK_LOG"
+  rc=0; env "$bad" bash "$A" --once >"$TMP/out" 2>&1 || rc=$?
+  [[ "$rc" == 2 ]] || fail "accepted $bad (rc $rc)"
+  [[ ! -s "$MOCK_LOG" ]] || fail "called the control plane before refusing $bad"
+done
+grep -q 'SBX_START_WINDOW_S must be' "$TMP/out" || fail 'the window refusal does not say why'
+rm -f "$TMP/state/active-"*
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+pass 'refuses SBX_START_CONCURRENCY 0 or anything but a whole number from 1, and a bad SBX_START_WINDOW_S, before calling anything (G43)'
+
 echo 'all host-agent tests passed'
