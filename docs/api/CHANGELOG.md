@@ -21,6 +21,8 @@ bytesDown}}, total, dropped, droppedBy: {proxy, cap, invalid}, complete, sealed,
   followed by `\n`. Its sha256 is `summary.sha256`.
 - `POST /v1/hosts/{host}/egress` (`hostToken`): the host agent's batches of up to 1000 events and its
   journal cursor, idempotent by (host, cursor).
+- `GET /v1/hosts/{host}/wanted` gains `egressSids`, the workspace keys whose events the host ships (the
+  set the egress route accepts); the agent sends no other sandbox's or session's events.
 - The `sandbox` provenance record that ends a sandbox (`state: terminated`) gains
   `egress: {events, sha256, dropped, complete}`. Events that arrive in the 600 s after the end are
   still taken; if any did, one more `sandbox` record with `state: egress` names the final log. No

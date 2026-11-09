@@ -3003,6 +3003,16 @@ paths:
                       lifecycle spec §6.1 step 7): uninstall the worker, delete the snapshot, report
                       `removed`. Absent from a control plane before retire.
                     items: { $ref: '#/components/schemas/WantedWorker' }
+                  egressSids:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The workspace keys of the sandboxes whose egress events this host ships (register
+                      G42): every sandbox on a worker of a build it holds, live or ended less than 600 s
+                      ago, the set `POST /v1/hosts/{host}/egress` accepts. The agent sends only these
+                      sandboxes' events (and `audit_dropped` reports), so the proxy's other clients'
+                      events never leave the host. Absent from a control plane before 1.7.0: the agent
+                      then sends nothing.
         '400':
           description: '`invalid_request`: this deployment stores no templates'
           content:

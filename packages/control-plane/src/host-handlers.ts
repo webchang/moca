@@ -54,6 +54,24 @@ async function hostWorkers(deps: CpDeps, host: string): Promise<Set<string>> {
 
 const endOf = (r: SandboxRecord) => r.deletedAt ?? r.expiresAt;
 
+/**
+ * The sandboxes whose egress events this host may ship (register G42): every sandbox on a worker of
+ * a build this host holds (hostSandboxes), live or ended less than EGRESS_GRACE_S ago
+ * (egressAccepts). hostEgress accepts events for exactly these, and hostWanted hands their workspace
+ * keys to the agent (`egressSids`), which sends nothing else, so the events of the proxy's other
+ * clients (a Moca P6 session) never leave the host.
+ */
+async function hostSandboxes(deps: CpDeps, host: string, nowS: number): Promise<SandboxRecord[]> {
+  if (!deps.sandboxes || !deps.egress) return [];
+  const workers = await hostWorkers(deps, host);
+  if (!workers.size) return [];
+  return (await deps.sandboxes.listAll(nowS)).filter((r) => workers.has(r.worker));
+}
+
+/** Of a host's sandboxes, the ones whose events are taken now: live, or ended within the grace. */
+const egressAccepts = (rs: SandboxRecord[], nowS: number): SandboxRecord[] =>
+  rs.filter((r) => nowS < endOf(r) + EGRESS_GRACE_S);
+
 /** An event's time in epoch seconds; `fallback` when it does not parse. */
 function eventSeconds(e: Record<string, unknown>, fallback: number): number {
   const t = typeof e.time === 'string' ? Date.parse(e.time) : NaN;
@@ -222,12 +240,9 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       );
     const nowS = seconds(deps);
     const retentionS = deps.config.sandbox?.retentionS ?? 0;
-    const workers = await hostWorkers(deps, host);
-    const mine =
-      deps.sandboxes && deps.egress && workers.size
-        ? (await deps.sandboxes.listAll(nowS)).filter((r) => workers.has(r.worker))
-        : [];
-    const byWsk = new Map(mine.map((r) => [r.wsk, r]));
+    // Every sandbox of the host's workers for the drop rule; only egressAccepts' for events.
+    const mine = await hostSandboxes(deps, host, nowS);
+    const byWsk = new Map(egressAccepts(mine, nowS).map((r) => [r.wsk, r]));
     const groups = new Map<string, EgressGroup>();
     const group = (r: SandboxRecord) => {
       let g = groups.get(r.id);
@@ -256,7 +271,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         continue;
       }
       const r = typeof o.sid === 'string' ? byWsk.get(o.sid) : undefined;
-      if (!r || nowS >= endOf(r) + EGRESS_GRACE_S) {
+      if (!r) {
         refused += 1;
         continue;
       }
@@ -269,7 +284,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     // and each is counted as dropped in its sandbox's log, as an event that is not an Event.
     for (const sid of oversized) {
       const r = typeof sid === 'string' ? byWsk.get(sid) : undefined;
-      if (!r || nowS >= endOf(r) + EGRESS_GRACE_S) refused += 1;
+      if (!r) refused += 1;
       else group(r).invalid += 1;
     }
     if (!deps.egress) {
@@ -318,7 +333,11 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) stop.push(entry);
       }
     }
-    return { status: 200, body: { run, stop, remove } };
+    // Register G42: the workspace keys whose egress events the agent ships, and no others.
+    const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
+      .map((r) => r.wsk)
+      .sort();
+    return { status: 200, body: { run, stop, remove, egressSids } };
   },
 
   hostWorkerReport: async (ctx, deps) => {

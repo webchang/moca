@@ -297,6 +297,25 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
     });
   });
 
+  it('hands the agent egressSids in the wanted state: exactly the sandboxes whose events it accepts', async () => {
+    const d = await setup();
+    const a = await create(d, 't1');
+    const b2 = await create(d, 't1', bob);
+    const far = await create(d, 't2'); // bm2's worker
+    const sids = async () =>
+      ((await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body).egressSids as string[];
+    expect(await sids()).toEqual([a.id, b2.id].sort());
+    expect(await sids()).not.toContain(far.id);
+    // Ended: still listed in the grace, then not; hostEgress agrees at each step.
+    await HANDLERS.deleteSandbox!(ctx({ principal: bob, params: { id: b2.id } }), d);
+    now += (EGRESS_GRACE_S - 1) * 1000;
+    expect(await sids()).toContain(b2.id);
+    expect(await post(d, 'bm1', [ev(b2.id)])).toMatchObject({ accepted: 1, refused: 0 });
+    now += 2000;
+    expect(await sids()).toEqual([a.id]);
+    expect(await post(d, 'bm1', [ev(b2.id), ev(a.id)])).toMatchObject({ accepted: 1, refused: 1 });
+  });
+
   it('refuses a post with no cursor, or more than 1000 events', async () => {
     const d = await setup();
     expect(await codeOf(() => HANDLERS.hostEgress!(asHost('bm1', { events: [] }), d))).toBe(
