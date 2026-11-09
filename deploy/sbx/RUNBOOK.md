@@ -988,7 +988,12 @@ template used again soon is warm (no memory-file read at all).
   needs one. A host over its memory with its graced workers lets the soonest-ending go first.
 - **Version skew:** an agent without the setting reports no `idleGraceSeconds`, which the control
   plane takes as 0 (off). A control plane older than 1.10.0 ignores the field, sends no `graced`, and
-  stops released workers as before; the agent then just applies `stop`. Upgrade either first.
+  stops released workers as before; the agent then just applies `stop`. Either may be upgraded first
+  **while the setting is 0.** But **set `SBX_IDLE_GRACE_S` on a host only once its control plane is
+  1.10.0 or later** (the hosts block shows `idleGraceSeconds` from 1.10.0): an older one doesn't list a
+  retired build in `stop`, and the removal step skips a running worker, so a retired graced worker
+  would keep running and its snapshot would not be removed. The order is: the control plane, then the
+  agent, then the setting.
 
 **Activations without waiting for a build** (register G31): the build poll applies the wanted
 state only after its builds, and its timer starts two minutes after the previous poll ends. Install

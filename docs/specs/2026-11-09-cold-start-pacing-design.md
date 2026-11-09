@@ -3,7 +3,8 @@
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
   by autobench-moca, autobench, image-factory and autobench-sandbox). **The start limit is
   implemented** (merged 64bb34fe): its control plane deployed on both namespaces (2026-11-09,
-  ccac7696), its host agent part pending a KVM-host window. The idle grace is not built yet
+  ccac7696), its host agent part pending a KVM-host window. **The idle grace is implemented** (merged
+  43379f55), not deployed yet
   (register G43). §4a records where the build differs from §4.
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
@@ -149,6 +150,30 @@ live, and a sandbox keeps its worker wanted.
   memory figures (G39's `runningWorkers`).
 - **The hosts block** shows `start: {concurrency, seconds, starting, queued}`; builds gain optional
   `queued` and `queuePosition`; openapi 1.9.0.
+
+## 4b. As built: the idle grace (43379f55), and why
+
+- **When the last lease ended:** a build's `lastLeaseEnd` (epoch s), set by a deactivate that drops the
+  last live lease; for a lease that ran out, the latest `until` among its expired leases (copied into
+  `lastLeaseEnd` before a write clears them). A build released before the change has neither and gets
+  no grace.
+- **What the grace needs:** the agent reports the worker running (`runningWorkers`), no live sandbox,
+  a free slot under `activeLimit` and G39's memory with its graced workers counted. If the host is
+  short, the soonest-ending graced workers drop first.
+- **The lease re-check at stop:** only displaced graced workers are re-read, from the catalog, under
+  the activation lock (G40's, moved to `activation-lock.ts` so the wanted answer and activation share
+  it); no host or Redis call runs under it.
+- **A retire or reject while graced:** the removal step skips a running worker, so on a host with a
+  grace the wanted answer lists a retired or rejected build in `stop` as well as `remove`; the agent
+  stops it, then removes it in the same run, and `workers/report` accepts `detached` for it.
+- **`stopNow`** on a build already in its grace ends it (a record with `leases: 0`, `stopNow: true`;
+  a repeat writes nothing); while other subjects still hold leases it changes nothing for them.
+- **A graced, attached worker's first use** takes a lease and creates the sandbox at once.
+- **The rollout order:** the control plane (1.10.0) first, then the agent, then the setting, since an
+  older control plane doesn't stop a retired graced worker (RUNBOOK).
+- **Fields:** `SBX_IDLE_GRACE_S` (0..86400, default 0); inventory `limits.idleGraceSeconds`; the wanted
+  answer's `graced: [buildId]`; builds' `graced`/`gracedUntil`; the hosts block's `idleGraceSeconds`
+  and `graced`; the agent summary's `graced`; `$SBX_SRV/graced` (0600). openapi 1.10.0.
 
 ## 5. Effects
 
