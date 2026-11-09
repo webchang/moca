@@ -12,6 +12,6 @@
     "expect_rc": 0,
     "expect": ["^git version ", "^42$", "^ripgrep "]
   },
-  "description": "MOCA's sandbox image: bash, git, Python 3, ripgrep",
+  "description": "Moca's sandbox image: bash, git, Python 3, ripgrep",
   "tools": ["bash", "git", "python3", "rg"]
 }

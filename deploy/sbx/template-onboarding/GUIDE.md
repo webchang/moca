@@ -1,6 +1,6 @@
 # Moca — Template Onboarding Guide
 
-**Last modified:** 2026-11-09T04:26:40Z
+**Last modified:** 2026-11-09T04:35:53Z
 
 > Hand-maintained. Bump the line above when you edit this guide.
 
@@ -200,7 +200,7 @@ This spec is [`examples/default.json`](examples/default.json) in this folder:
     "expect_rc": 0,
     "expect": ["^git version ", "^42$", "^ripgrep "]
   },
-  "description": "MOCA's sandbox image: bash, git, Python 3, ripgrep",
+  "description": "Moca's sandbox image: bash, git, Python 3, ripgrep",
   "tools": ["bash", "git", "python3", "rg"]
 }
 ```
@@ -674,7 +674,7 @@ templates file that `template-register.sh` wrote holds:
   {
     "id": "default",
     "worker": "sbx_default_eed901b838bf",
-    "description": "MOCA's sandbox image: bash, git, Python 3, ripgrep",
+    "description": "Moca's sandbox image: bash, git, Python 3, ripgrep",
     "tools": ["bash", "git", "python3", "rg"]
   },
   {
@@ -694,9 +694,12 @@ mocactl sbx templates
 ```
 
 ```
-default          MOCA's sandbox image: bash, git, Python 3, ripgrep
+default          Moca's sandbox image: bash, git, Python 3, ripgrep
 django-django-11133 SWE-bench django__django-11133 (lite) at its baseline bc348023edb4; seed with: cp -a /opt/testbed-src/. /workspace/
 ```
+
+(A `default` built from the sample before 2026-11-09 still shows its earlier spelling, "MOCA's": its
+description is part of its record.)
 
 (`--json` gives the same list as JSON, with `tools`.)
 

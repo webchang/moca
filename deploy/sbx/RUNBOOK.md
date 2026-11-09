@@ -271,6 +271,13 @@ Every template change re-runs `setup.sh`, which rolls the control plane but not 
 running `Exec`s on every template carry on. A worker added or retired at the same time is a token
 change, which the relay reads on each attach without a restart.
 
+**One control plane process per template store** (register G40): activation's quota and placement
+check and its lease write run under a lock inside the control plane process, which is enough because
+one process owns the store: the Deployment runs one replica, and the template store's volume
+(`ocp-sbx`'s and `ocp-combined`'s) is ReadWriteOnce with `strategy: Recreate`, so no second pod writes
+it, even during a rollout. Keep it that way. A control plane with more than one replica, or a rolling
+update, on one store would need a store-level lock. The other overlays configure no template store.
+
 **Self-serve templates and the policy** (a deployment with a template store, §15): clients create
 their own templates with `POST /v1/templates`, gated by the stored policy (`GET /v1/policy`), which
 only an admin changes (`PUT /v1/policy`, a `policy` record). What an operator sets there:
