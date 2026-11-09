@@ -50,7 +50,8 @@ const CURSOR_RE = /^[\x21-\x7e]{1,512}$/;
  * `guest_ram_mb`, so a create that named `guest_mb` passed the policy and then failed the build's own
  * spec check (the guide window, 2026-11-09). The job always names `guest_ram_mb`, with the value the
  * policy checked (`guest_mb ?? guest_ram_mb`, as M7 and the build's S.guest_ram_mb check read it);
- * `guest_mb` is dropped from it.
+ * `guest_mb` is dropped from it. The job's `id` and `image` are always the template's and the
+ * create's, whatever the spec carries.
  */
 export function buildJobSpec(
   id: string,
@@ -59,7 +60,9 @@ export function buildJobSpec(
 ): Record<string, unknown> {
   const { guest_mb, ...rest } = spec;
   const guest = guest_mb ?? rest.guest_ram_mb;
-  return { id, image, ...rest, ...(guest !== undefined ? { guest_ram_mb: guest } : {}) };
+  // The template's own id and the create's image come last, so a spec key of the same name (which
+  // the create does not refuse) can't rename the build or swap its image in the job.
+  return { ...rest, ...(guest !== undefined ? { guest_ram_mb: guest } : {}), id, image };
 }
 
 /** The workers of the builds a host holds (its last inventory): whose sandboxes it may report. */

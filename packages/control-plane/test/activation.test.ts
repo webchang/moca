@@ -1968,6 +1968,14 @@ describe('the build job names the guest size template-build.sh reads (guest_mb)'
       guest_ram_mb: 1024,
     });
     expect(buildJobSpec('t', 'i', { vcpus: 1 })).toEqual({ id: 't', image: 'i', vcpus: 1 });
+    // A spec's own id or image never renames the build or swaps its image.
+    expect(
+      buildJobSpec('t', 'i@sha256:x', { id: 'other', image: 'evil@sha256:y', vcpus: 1 }),
+    ).toEqual({
+      id: 't',
+      image: 'i@sha256:x',
+      vcpus: 1,
+    });
   });
 
   it("a create that names guest_mb is claimed with guest_ram_mb (the guide window's failure)", async () => {
