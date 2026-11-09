@@ -65,6 +65,7 @@ describe('the route table', () => {
         'POST /v1/hosts/{host}/builds/{build}/report',
         'GET /v1/hosts/{host}/wanted',
         'POST /v1/hosts/{host}/workers/report',
+        'POST /v1/hosts/{host}/egress',
         'POST /v1/templates/{id}/activate',
         'POST /v1/templates/{id}/deactivate',
         'POST /v1/sandboxes',
@@ -72,6 +73,7 @@ describe('the route table', () => {
         'GET /v1/sandboxes/{id}',
         'DELETE /v1/sandboxes/{id}',
         'POST /v1/sandboxes/{id}/token',
+        'GET /v1/sandboxes/{id}/egress',
         'GET /v1/janitor/sandboxes',
       ].sort(),
     );

@@ -81,6 +81,7 @@ import { MEMBER_HANDLERS } from './member-handlers.js';
 import type { MembersStore } from './members.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
 import type { EgressHost } from './egress-config.js';
+import type { EgressStore } from './egress-log.js';
 import { formatDestination, parseDestination } from './egress-destination.js';
 
 /** A stored destination in normalized form; a legacy or corrupt entry compares as written. */
@@ -202,6 +203,8 @@ export interface CpDeps {
   close?: () => Promise<void>;
   /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
   sandboxes?: SandboxStore;
+  /** Per-sandbox egress logs (register G42), beside `sandboxes`; absent, the routes store nothing. */
+  egress?: EgressStore;
   /**
    * The template catalog (template lifecycle spec §3.1). Absent: built from the sandbox profile's
    * SH_SANDBOX_TEMPLATES, as before the catalog existed.
@@ -243,7 +246,10 @@ export interface RequestCtx {
   host?: string;
 }
 
-export type Handler = (ctx: RequestCtx, deps: CpDeps) => Promise<{ status: number; body: unknown }>;
+export type Handler = (
+  ctx: RequestCtx,
+  deps: CpDeps,
+) => Promise<{ status: number; body: unknown; contentType?: string }>;
 
 export function requirePrincipal(ctx: RequestCtx): TokenClaims {
   if (!ctx.principal) throw new CpError('token_required', 'this route requires a token');

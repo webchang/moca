@@ -170,13 +170,13 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
       // and this is the runtime answer if one ever slips through.
       if (!handler) throw new CpError('internal_error', 'route has no handler');
 
-      const { status, body } = await handler(ctx, deps);
+      const { status, body, contentType } = await handler(ctx, deps);
       if (body === undefined) {
         res.writeHead(status).end();
         return;
       }
       if (typeof body === 'string') {
-        res.writeHead(status, { 'Content-Type': 'text/plain' }).end(body);
+        res.writeHead(status, { 'Content-Type': contentType ?? 'text/plain' }).end(body);
         return;
       }
       res.writeHead(status, JSON_HEADERS).end(JSON.stringify(body));
