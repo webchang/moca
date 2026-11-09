@@ -188,13 +188,17 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Policy, quota  | `GET`, `PUT /v1/policy` (admin); `GET /v1/quota`, `PUT /v1/quota/{subject\|default}` (admin)                                                                                                                                                                                                                                      |
 | Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}` (enroll, unenroll); `PUT`, `DELETE /v1/subjects/{subject}/roles/admin` (grant with an optional `until`, revoke); the list any admin, a change only an admin named in `SH_ADMIN_SUBJECTS`, API 1.4.0                                                                    |
 | Host agents    | `POST /v1/hosts/{host}/inventory`, `…/builds/claim`, `…/builds/{build}/log`, `…/builds/{build}/report`, `…/workers/report`; `GET …/wanted`, `…/blobs/{digest}`; the `hostToken` scheme                                                                                                                                            |
-| Sandboxes      | `POST`, `GET /v1/sandboxes`, `GET`, `DELETE /v1/sandboxes/{id}`, `POST /v1/sandboxes/{id}/token`; `GET /v1/janitor/sandboxes` (janitor); the `sandbox` profile only                                                                                                                                                               |
+| Sandboxes      | `POST`, `GET /v1/sandboxes`, `GET`, `DELETE /v1/sandboxes/{id}`, `POST /v1/sandboxes/{id}/token`, `GET /v1/sandboxes/{id}/egress` (its egress log, G42); `GET /v1/janitor/sandboxes` (janitor); the `sandbox` profile only                                                                                                        |
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
 The id is checked against the credential's catalog (400 `model_unavailable` when it is not listed); when the endpoint
 cannot list its models, the id is accepted unverified and the answer has `modelVerified: false`. Only the two list routes
 answer 503 `model_catalog_unavailable`. These routes came with API 1.1.0; see the [changelog](../api/CHANGELOG.md).
+
+A sandbox's egress log (`GET /v1/sandboxes/{id}/egress`, API 1.7.0, register G42) holds the KVM host's
+egress proxy events for it. Paths are logged without query, fragment or userinfo, and an injected
+credential appears by name only, but a secret a guest puts in a URL path segment is logged as sent.
 
 Templates, policy and host agents came with API 1.3.0, on both route profiles, when the deployment keeps a template
 store (`SH_PROVENANCE_DIR`); sandboxes came with 1.2.0 on the `sandbox` profile. A template is referenced as `id`,

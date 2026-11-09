@@ -64,6 +64,26 @@ export interface SbxTagsMoved {
   tags: { tag: string; buildId: string; before: string | null; record: string | null }[];
 }
 
+/** A sandbox's egress log, a page at a time (register G42): the proxy's events as it wrote them. */
+export interface SbxEgressPage {
+  events: Record<string, unknown>[];
+  next: string | null;
+  summary: SbxEgressSummary;
+}
+
+export interface SbxEgressSummary {
+  byHost: Record<
+    string,
+    { count: number; decisions: Record<string, number>; bytesUp: number; bytesDown: number }
+  >;
+  total: number;
+  dropped: number;
+  droppedBy?: { proxy: number; cap: number; budget?: number; invalid: number };
+  complete: boolean;
+  sealed?: boolean;
+  sha256: string;
+}
+
 export class SandboxApiClient extends ControlPlaneClient {
   sandboxDiscovery(): Promise<SbxDiscovery> {
     return this.json('GET', '/v1/discovery', { auth: false });
@@ -181,6 +201,21 @@ export class SandboxApiClient extends ControlPlaneClient {
 
   deleteSandbox(id: string): Promise<{ id: string; state: 'terminated'; reason: string }> {
     return this.json('DELETE', `/v1/sandboxes/${encodeURIComponent(id)}`);
+  }
+
+  /** One page of a sandbox's egress log (owner or admin), from `after` (a page's `next`). */
+  sandboxEgress(id: string, opts: { after?: string; limit?: number } = {}): Promise<SbxEgressPage> {
+    return this.json('GET', `/v1/sandboxes/${encodeURIComponent(id)}/egress`, {
+      query: { after: opts.after, limit: opts.limit },
+    });
+  }
+
+  /** The whole log as NDJSON, byte for byte as served: its sha256 is the summary's. */
+  async sandboxEgressNdjson(id: string): Promise<string> {
+    const res = await this.request('GET', `/v1/sandboxes/${encodeURIComponent(id)}/egress`, {
+      query: { format: 'ndjson' },
+    });
+    return res.text();
   }
 
   mintSandboxToken(id: string): Promise<SbxToken> {

@@ -49,6 +49,7 @@ import {
   sessionTemplatesFromEnv,
 } from './sandbox-config.js';
 import { RedisSandboxStore, type SandboxRedisLike } from './sandbox-redis.js';
+import { RedisEgressStore, type EgressRedisLike } from './egress-log.js';
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const v = env[name];
@@ -542,6 +543,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
     ...(servesSandboxes
       ? {
           sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike),
+          // A host's last post is kept for the replay check as long as a sandbox record is.
+          egress: new RedisEgressStore(
+            client as unknown as EgressRedisLike,
+            config.sandbox?.retentionS ?? 14 * 86_400,
+          ),
         }
       : {}),
     // Readiness (template lifecycle spec §3.3) from the relay's presence records, which the relay

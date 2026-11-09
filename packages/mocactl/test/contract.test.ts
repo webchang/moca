@@ -95,6 +95,8 @@ const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: 
     path: '/v1/sandboxes/{id}/token',
     reads: ['token', 'expiresAt', 'execEndpoint', 'wrk', 'wsk', 'execCa'],
   },
+  // `mocactl sbx egress` (register G42); its --ndjson reads the same route's NDJSON body.
+  { method: 'get', path: '/v1/sandboxes/{id}/egress', reads: ['events', 'next', 'summary'] },
   // The template lifecycle routes `mocactl sbx templates` calls (lifecycle spec §5).
   {
     method: 'post',
@@ -302,6 +304,17 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     },
   );
 
+  it('the egress summary holds the fields sbx egress prints (G42)', () => {
+    const s = resolveSchema(openapi.components.schemas.EgressSummary);
+    for (const f of ['byHost', 'total', 'dropped', 'complete', 'sha256'])
+      expect(Object.keys(s.properties)).toContain(f);
+    const host = s.properties.byHost.additionalProperties;
+    for (const f of ['count', 'decisions', 'bytesUp', 'bytesDown'])
+      expect(Object.keys(host.properties)).toContain(f);
+    const op = openapi.paths['/v1/sandboxes/{id}/egress'].get;
+    expect(Object.keys(op.responses['200'].content)).toContain('application/x-ndjson');
+  });
+
   it('the Sandbox items and templates hold the fields ls and templates print', () => {
     const sandbox = resolveSchema(openapi.components.schemas.Sandbox);
     for (const f of SBX_SANDBOX_READS) expect(Object.keys(sandbox.properties)).toContain(f);
@@ -326,6 +339,8 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     await c.getSandbox('ID');
     await c.deleteSandbox('ID');
     await c.mintSandboxToken('ID');
+    await c.sandboxEgress('ID');
+    await c.sandboxEgressNdjson('ID');
     await c.retireTemplate('TID');
     await c.retireTemplate('TID', { build: 'BID' });
     await c.moveTemplateTags('TID', ['default'], 'BID');
@@ -361,6 +376,8 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
         'getSandbox',
         'deleteSandbox',
         'mintSandboxToken',
+        'sandboxEgress',
+        'sandboxEgressNdjson',
         'retireTemplate',
         'moveTemplateTags',
         'removeTemplateTag',
