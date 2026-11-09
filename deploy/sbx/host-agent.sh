@@ -13,7 +13,22 @@
 #   sudo deploy/sbx/host-agent.sh --wanted-only   the inventory and the wanted state only: no claim,
 #                                                 no build (sbx-host-agent-wanted's timer, every 15 s,
 #                                                 so an activation waits seconds, not behind a build:
-#                                                 register G31)
+#                                                 register G31); then the egress step below
+#
+# The egress step (register G42), in --wanted-only runs only: it READS moca-egress's journal and posts
+# the proxy's audit events, as the proxy wrote them, to POST /v1/hosts/<id>/egress, where each event
+# lands in its sandbox's egress log. It never touches moca-egress (no start, stop, restart or config):
+# a failed post changes nothing on the host's egress, it only leaves the journal cursor where it was.
+#   - Off when `systemctl is-enabled moca-egress.service` does not say enabled (a --no-egress host, or
+#     none installed): then no journal read, no post, no cursor file.
+#   - The cursor is $SBX_SRV/egress.cursor (0600), the journal position after the last event the
+#     control plane took. With none, the step starts at this boot's first entry.
+#   - Batches of up to 1000 journal entries, at most 10 per run; a non-event line (the proxy's own log)
+#     is skipped. A batch is saved to $SBX_SRV/egress.pending.json (0600) before it is posted and re-sent
+#     unchanged until it is taken, so a retry repeats its cursor and the control plane, idempotent by
+#     (host, cursor), never stores it twice.
+#   - A post that fails (the control plane down, or one without the route) is an error in the summary;
+#     the cursor stays, and the next run retries.
 #
 # Run it through the unit (systemctl start sbx-host-agent.service): the unit loads host-agent.env; a
 # bare run sees none of it and refuses (SBX_API_URL). Installed outside the tree, it needs
@@ -38,8 +53,10 @@
 #   SBX_REGISTRY             optional; template-build.sh --registry
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
-# or registry host is logged. Output: one JSON line per action, then one summary line
-# {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}. A refusal of its own settings is exit 2.
+# or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
+# summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
+# --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused".
+# A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
 
@@ -54,6 +71,8 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
 CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
+EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0
+EGRESS_BATCH=1000 EGRESS_BATCHES=10
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
@@ -84,7 +103,8 @@ api() { # api METHOD PATH [BODY_FILE] -> the body on stdout; fails on any non-2x
   local ca=() data=()
   [[ -z "${SBX_API_CA_FILE:-}" ]] || ca=(--cacert "$SBX_API_CA_FILE")
   [[ -z "${3:-}" ]] || data=(-H 'Content-Type: application/json' --data-binary "@$3")
-  curl -fsS --max-time 60 --proto =https "${ca[@]}" -H "@$HDR" -X "$1" "${data[@]}" "$SBX_API_URL$2"
+  # ${a[@]+"${a[@]}"}: an empty array under set -u is an error in bash 3.2 (macOS's /bin/bash).
+  curl -fsS --max-time 60 --proto =https ${ca[@]+"${ca[@]}"} -H "@$HDR" -X "$1" ${data[@]+"${data[@]}"} "$SBX_API_URL$2"
 }
 
 # registry_logged_in: REGISTRY_AUTH_FILE holds an entry for SBX_REGISTRY (podman's auth.json shape).
@@ -162,7 +182,7 @@ build_one() { # build_one JOB_JSON
   fi
   [[ -z "${SBX_REGISTRY:-}" ]] || args+=(--registry "$SBX_REGISTRY")
   report "$handle" '{"event":"building"}' >/dev/null || { error "report building for $handle failed"; return; }
-  "$SBX_TEMPLATE_BUILD" "$spec" --kernel "$SBX_KERNEL" "${args[@]}" >"$WORK/$handle.log" 2>&1 || rc=$?
+  "$SBX_TEMPLATE_BUILD" "$spec" --kernel "$SBX_KERNEL" ${args[@]+"${args[@]}"} >"$WORK/$handle.log" 2>&1 || rc=$?
   # The full, unredacted log stays on the host (root-only), for whoever runs it; only redacted text
   # leaves (log_tail, the failure report).
   install -d -m 0700 "$SBX_SRV/agent-logs" && install -m 0600 "$WORK/$handle.log" "$SBX_SRV/agent-logs/$handle.log" ||
@@ -293,6 +313,55 @@ removal() {
   done < <(jq -r '.remove[] | [.worker, .buildId] | @tsv' <<<"$1")
 }
 
+# Posts the pending batch; on success records its cursor and drops it. Fails, keeping both, otherwise.
+egress_post() {
+  local pending="$SBX_SRV/egress.pending.json" out
+  out="$(api POST "/v1/hosts/$SBX_HOST_ID/egress" "$pending")" || return 1
+  jq -e '(.accepted | type) == "number"' >/dev/null 2>&1 <<<"$out" || return 1
+  EG_ACCEPTED=$((EG_ACCEPTED + $(jq -r .accepted <<<"$out")))
+  EG_REFUSED=$((EG_REFUSED + $(jq -r '.refused // 0' <<<"$out")))
+  (umask 077 && jq -j .cursor "$pending" >"$SBX_SRV/egress.cursor.tmp") && mv -f "$SBX_SRV/egress.cursor.tmp" "$SBX_SRV/egress.cursor"
+  rm -f "$pending"
+}
+
+# The egress step (see the header). Reads the journal only; never acts on moca-egress.
+egress() {
+  systemctl is-enabled --quiet moca-egress.service 2>/dev/null || return 0
+  EGRESS=on
+  command -v journalctl >/dev/null || { error 'egress: no journalctl on PATH'; return; }
+  exec 8>"$SBX_SRV/.egress.lock"
+  flock -n 8 || { say '{"agent":"skipped","why":"another run is shipping egress events"}'; return 0; }
+  local pending="$SBX_SRV/egress.pending.json" n i pos entries
+  if [[ -f "$pending" ]]; then
+    egress_post || { error 'egress post failed: the cursor stays, the next run retries'; exec 8>&-; return; }
+  fi
+  for ((i = 0; i < EGRESS_BATCHES; i++)); do
+    pos=(-b)
+    [[ ! -s "$SBX_SRV/egress.cursor" ]] || pos=(--after-cursor "$(<"$SBX_SRV/egress.cursor")")
+    entries="$WORK/egress.entries"
+    { journalctl -u moca-egress.service -o json --no-pager "${pos[@]}" 2>/dev/null || true; } | head -n "$EGRESS_BATCH" >"$entries" || true
+    n="$(wc -l <"$entries" | tr -d ' ')"
+    ((n > 0)) || break
+    EG_READ=$((EG_READ + n))
+    # Each entry's MESSAGE is a proxy event when it is a JSON object from moca-egress; others are skipped.
+    # An event over 8 KiB (a guest's long path) is not sent; its sid is, as `oversized`, and the
+    # control plane counts it as dropped in that sandbox's log. Nothing in an event is changed.
+    (umask 077 && jq -cs '(last | .__CURSOR) as $c
+        | [.[] | .MESSAGE | strings | (try fromjson catch null) | objects | select(.via == "moca-egress")] as $all
+        | {cursor: $c, events: [$all[] | select((tojson | utf8bytelength) <= 8192)],
+           oversized: [$all[] | select((tojson | utf8bytelength) > 8192) | (.sid // "" | tostring | .[0:128])]}' \
+      "$entries" >"$pending") || { rm -f "$pending"; error 'egress: the journal batch did not parse'; break; }
+    if [[ "$(jq '(.events | length) + (.oversized | length)' "$pending")" == 0 ]]; then
+      (umask 077 && jq -j .cursor "$pending" >"$SBX_SRV/egress.cursor.tmp") && mv -f "$SBX_SRV/egress.cursor.tmp" "$SBX_SRV/egress.cursor"
+      rm -f "$pending"
+    else
+      egress_post || { error 'egress post failed: the cursor stays, the next run retries'; break; }
+    fi
+    ((n == EGRESS_BATCH)) || break
+  done
+  exec 8>&-
+}
+
 main() {
   [[ $# -eq 1 && ( "$1" == --once || "$1" == --wanted-only ) ]] ||
     { echo 'usage: host-agent.sh --once | --wanted-only' >&2; exit 2; }
@@ -310,7 +379,8 @@ main() {
   fi
   if [[ "$mode" == --wanted-only ]]; then
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS}"
+    egress
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED}"
     return 0
   fi
   local free

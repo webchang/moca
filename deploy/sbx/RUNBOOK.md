@@ -472,6 +472,35 @@ never a timeout. No credential is involved.
 - **Uninstalling** the last worker also stops and removes the `moca-egress.service` this script
   installed; an allowlist you edited stays (`kept ... (edited)`).
 
+### Egress records (register G42)
+
+The host agent's wanted-state run (`sbx-host-agent-wanted`, every 15 s) also ships the proxy's audit
+events to the control plane, where each lands in its sandbox's egress log: `mocactl sbx egress
+SANDBOX`, or `GET /v1/sandboxes/{id}/egress`. Nothing to install: no new unit, timer or setting.
+
+- **On or off:** on when `systemctl is-enabled moca-egress.service` says enabled, off otherwise (a
+  `--no-egress` host). Off, the agent reads no journal, posts nothing and writes no cursor; its summary
+  says `"egress":"off"`.
+- **It only reads.** The agent reads `journalctl -u moca-egress.service` and never starts, stops or
+  configures `moca-egress`, so a failed post never blocks or changes a guest's egress.
+- **Where it is:** the journal cursor after the last event the control plane took is
+  `/srv/sbx/egress.cursor`; a batch being sent is `/srv/sbx/egress.pending.json` (both 0600). Without a
+  cursor, the first run starts at this boot.
+- **If a post fails** (the control plane down, or one older than this): the summary counts an error
+  (`egress post failed: the cursor stays, the next run retries`), the cursor stays, and the next run
+  re-sends the same batch first. The control plane takes a repeated batch once (idempotent by host
+  and cursor). Up to 10 batches of 1000 entries per run.
+- **What is kept:** each event exactly as the proxy wrote it, for as long as the sandbox record
+  (`SBX_RETENTION_DAYS`). A log holds at most 50,000 events.
+- **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
+  those, events past the cap, and the proxy's own `audit_dropped` reports, charged to every sandbox on
+  the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
+  record (`sandbox`, `state: terminated`) names `egress: {events, sha256, dropped, complete}`; if events
+  arrive in the 600 s after the end, a later `sandbox` record with `state: egress` names the final
+  log. The grader decides whether an incomplete log still counts.
+- **To turn it off** on a host without disabling egress: there is no switch but the unit's state, by
+  design. Roll back the host agent instead (`install-host.sh` with the previous tree).
+
 ### Credential injection (`--egress`)
 
 Prerequisite for both procedures: set `SBX_EGRESS_CREDENTIALS=1` (and optionally `SBX_EGRESS_HOSTS`)

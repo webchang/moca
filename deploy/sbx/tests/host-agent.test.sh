@@ -41,6 +41,11 @@ case "$method $path" in
 "POST /v1/hosts/bm1/builds/"*/report) echo '{"status":"registered","buildId":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}' ;;
 "GET /v1/hosts/bm1/wanted") cat "$MOCK_STATE/wanted-answer" ;;
 "POST /v1/hosts/bm1/workers/report") echo '{"recorded":"x"}' ;;
+"POST /v1/hosts/bm1/egress")
+  [[ ! -f "$MOCK_STATE/egress-fail" ]] || { echo 'curl: (7) Failed to connect' >&2; exit 7; }
+  cat "$data" >>"$MOCK_STATE/egress-posts"
+  printf '{"accepted":%d,"refused":0,"capped":0,"invalid":0,"dropped":0,"cursor":%s}' \
+    "$(jq '.events | length' "$data")" "$(jq .cursor "$data")" ;;
 *) echo "curl: (22) 404 $method $path" >&2; exit 22 ;;
 esac
 MOCK
@@ -62,6 +67,7 @@ cat >"$TMP/bin/systemctl" <<'MOCK'
 printf 'systemctl %s\n' "$*" >>"$MOCK_LOG"
 case "$1" in
 is-active) [[ -f "$MOCK_STATE/active-${!#}" ]] ;;
+is-enabled) [[ -f "$MOCK_STATE/enabled-${!#}" ]] ;;
 start) touch "$MOCK_STATE/active-$2" ;;
 stop) rm -f "$MOCK_STATE/active-$2" ;;
 esac
@@ -78,7 +84,24 @@ cat >"$TMP/bin/install-host" <<'MOCK'
 printf 'install-host %s\n' "$*" >>"$MOCK_LOG"
 [[ "$1" == --uninstall ]] && rm -f "$SBX_ENV_DIR/workers/$2.env"
 MOCK
-chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock" "$TMP/bin/install-host"
+# journalctl: logs its argv; answers -o json entries from $MOCK_STATE/journal (one JSON entry a line,
+# each with __CURSOR), after --after-cursor when given. Exits 1 if anything else is asked of it.
+cat >"$TMP/bin/journalctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'journalctl %s\n' "$*" >>"$MOCK_LOG"
+after=''
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [[ "${args[$i]}" == --after-cursor ]] && after="${args[$((i + 1))]}"
+done
+[[ " $* " == *" -u moca-egress.service -o json --no-pager "* ]] || exit 1
+[[ -f "$MOCK_STATE/journal" ]] || exit 0
+if [[ -z "$after" ]]; then cat "$MOCK_STATE/journal"; else
+  awk -v c="$after" 'seen { print } index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 }' "$MOCK_STATE/journal"
+fi
+MOCK
+# curl's egress answer: $MOCK_STATE/egress-fail makes the post fail, as an unreachable control plane.
+chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock" "$TMP/bin/install-host" "$TMP/bin/journalctl"
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
@@ -317,5 +340,69 @@ jq -n '{run: [], stop: [], remove: [{template: "x", buildId: "../../etc", worker
 grep -q 'build id to remove is malformed' "$TMP/out" || fail 'a malformed build id was not refused'
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 pass 'removes a retired build only when named and matched by its own record, never a running worker, and reports it (§6.1 step 7)'
+
+# 13. The egress step (register G42), in --wanted-only runs: off unless moca-egress is enabled (no
+#     journal read, no post, no cursor file); on, it posts the proxy's events exactly as written, in
+#     batches of up to 1000, the token from the 0600 header file; a failed post keeps the cursor and
+#     re-sends the same batch; a non-event line is skipped and never posted. example.com hosts only.
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+EV='{"time":"2026-11-08T12:00:00.5Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"pypi.example.com","dial_addr":"192.0.2.10:443","method":"CONNECT","status":200,"bytes_up":10,"bytes_down":20,"decision":"tunnel"}'
+EV2='{"time":"2026-11-08T12:00:01Z","via":"moca-egress","vm_id":"vm-1","sid":"sbx-0123456789abcdef0123456789","host":"files.example.com","method":"GET","path":"/x/","status":403,"bytes_up":0,"bytes_down":0,"credential":"mirror","decision":"destination_denied","coalesced":2}'
+entry() { jq -cn --arg c "$1" --arg m "$2" '{__CURSOR: $c, MESSAGE: $m, _SYSTEMD_UNIT: "moca-egress.service"}'; }
+{ entry c1 "$EV"; entry c2 'moca-egress: serving 3 allowlist entries'; entry c3 "$EV2"; } >"$TMP/state/journal"
+egress_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts"; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
+# Off: the unit is not enabled.
+rm -f "$TMP/state/enabled-moca-egress.service" "$TMP/srv/egress.cursor" "$TMP/srv/egress.pending.json"
+egress_run || fail 'the egress-off run failed'
+grep -q '^journalctl' "$MOCK_LOG" && fail 'read the journal with moca-egress not enabled'
+grep -q '/egress' "$MOCK_LOG" && fail 'posted with moca-egress not enabled'
+[[ ! -e "$TMP/srv/egress.cursor" && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'wrote a cursor or batch with egress off'
+grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0' "$TMP/out" || fail 'the off summary'
+# On: both events posted as written, the proxy's own log line skipped, the cursor at the last entry.
+touch "$TMP/state/enabled-moca-egress.service"
+egress_run || fail 'the egress run failed'
+grep -q 'journalctl -u moca-egress.service -o json --no-pager -b' "$MOCK_LOG" || fail 'the first read is not from this boot'
+jq -e --argjson a "$EV" --argjson b "$EV2" '.events == [$a, $b] and .cursor == "c3" and .oversized == []' "$TMP/state/egress-posts" >/dev/null ||
+  fail 'the post does not carry exactly the proxy events and the last cursor'
+jq -e '[.events[] | keys[]] - ["time","via","vm_id","sid","sub","host","dial_addr","method","path","status","bytes_up","bytes_down","credential","decision","dropped","coalesced"] == []' \
+  "$TMP/state/egress-posts" >/dev/null || fail 'a field beyond the proxy Event was posted'
+[[ "$(<"$TMP/srv/egress.cursor")" == c3 ]] || fail 'the cursor is not the last entry'
+[[ "$(stat -c %a "$TMP/srv/egress.cursor" 2>/dev/null || stat -f %Lp "$TMP/srv/egress.cursor")" == 600 ]] || fail 'the cursor file is not 0600'
+[[ ! -e "$TMP/srv/egress.pending.json" ]] || fail 'the posted batch was kept'
+grep -q 'curl .*-H @.*/v1/hosts/bm1/egress' "$MOCK_LOG" || fail 'the post did not use the header file'
+grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
+grep -q 'pypi.example.com' "$TMP/out" && fail 'an egress event was printed'
+grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0' "$TMP/out" || fail 'the on summary'
+grep -qE 'systemctl (start|stop|restart|reload|kill)[^@]*moca-egress' "$MOCK_LOG" && fail 'acted on moca-egress'
+# Nothing new: nothing posted, the cursor unchanged.
+egress_run || fail 'the idle egress run failed'
+grep -q 'journalctl .*--after-cursor c3' "$MOCK_LOG" || fail 'did not resume after the cursor'
+[[ ! -e "$TMP/state/egress-posts" ]] || fail 'posted with nothing new'
+# The control plane down: an error, the cursor where it was, the batch kept; the next run re-sends it.
+entry c4 "$EV" >>"$TMP/state/journal"
+touch "$TMP/state/egress-fail"
+egress_run || fail 'the failing egress run failed'
+[[ "$(<"$TMP/srv/egress.cursor")" == c3 ]] || fail 'the cursor moved on a failed post'
+grep -q '"errors":1,"egress":"on"' "$TMP/out" && grep -q 'egress post failed: the cursor stays' "$TMP/out" || fail 'the failed post is not an error'
+cp "$TMP/srv/egress.pending.json" "$TMP/pending.before"
+entry c5 "$EV2" >>"$TMP/state/journal"
+rm -f "$TMP/state/egress-fail"
+egress_run || fail 'the retry run failed'
+head -c "$(wc -c <"$TMP/pending.before")" "$TMP/state/egress-posts" | cmp -s - "$TMP/pending.before" || fail 'the retry did not re-send the same batch first'
+jq -s -e '.[0].cursor == "c4" and .[1].cursor == "c5"' "$TMP/state/egress-posts" >/dev/null || fail 'the retry and the next batch'
+[[ "$(<"$TMP/srv/egress.cursor")" == c5 ]] || fail 'the cursor after the retry'
+# Batches of 1000: 1001 entries are two posts.
+: >"$TMP/state/journal"
+for i in $(seq 6 1006); do entry "c$i" "$EV"; done >"$TMP/state/journal.new"
+{ entry c5 "$EV2"; cat "$TMP/state/journal.new"; } >"$TMP/state/journal"
+egress_run || fail 'the batch run failed'
+jq -s -e '(map(.events | length) == [1000, 1]) and .[1].cursor == "c1006"' "$TMP/state/egress-posts" >/dev/null || fail 'not batches of 1000'
+# An event over 8 KiB is kept back, and only its sid is sent, as oversized.
+BIG="$(jq -cn --argjson e "$EV" '$e + {path: ("/" + ("a" * 9000))}')"
+entry c1007 "$BIG" >>"$TMP/state/journal"
+egress_run || fail 'the oversized run failed'
+jq -e '.events == [] and .oversized == ["sbx-0123456789abcdef0123456789"]' "$TMP/state/egress-posts" >/dev/null || fail 'an oversized event'
+rm -f "$TMP/state/enabled-moca-egress.service"
+pass 'ships egress events as written, only with moca-egress enabled; batches of 1000; a failed post keeps the cursor and retries the same batch (G42)'
 
 echo 'all host-agent tests passed'
