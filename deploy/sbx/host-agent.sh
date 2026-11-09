@@ -19,8 +19,11 @@
 # the proxy's audit events, as the proxy wrote them, to POST /v1/hosts/<id>/egress, where each event
 # lands in its sandbox's egress log. It never touches moca-egress (no start, stop, restart or config):
 # a failed post changes nothing on the host's egress, it only leaves the journal cursor where it was.
-#   - Off when `systemctl is-enabled moca-egress.service` does not say enabled (a --no-egress host, or
-#     none installed): then no journal read, no post, no cursor file.
+#   - Off when `systemctl is-active moca-egress.service` does not say active (a --no-egress host, none
+#     installed, or a reused moca-egress not started): then no journal read, no post, no cursor file.
+#     Active, not enabled: install-host.sh reuses a moca-egress.service another install owns (a P6
+#     worker's) without enabling it, and that install may start it for a window only; what matters is
+#     that a proxy serves this host's workers now. A read, so the agent still never acts on moca-egress.
 #   - Only this host's sandboxes' events leave it: the wanted state's `egressSids` (the workspace keys
 #     of the sandboxes on its workers, live or just ended) is the list, and an event whose sid is not in
 #     it (a Moca P6 session's, served by the same proxy) is not sent, only counted (egressNotOurs).
@@ -381,7 +384,7 @@ build_one() { # build_one JOB_JSON
     case "$code" in pull_failed) step=pull ;; probe_failed) step=probe ;; disk_floor) step=disk ;; spec_refused) step=spec ;; esac
     report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" --arg s "$step" '{event: "failed", step: $s, message: $m}')" >/dev/null ||
       error "report failed for $handle failed"
-    say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc}"
+    say "{\"agent\":\"failed\",\"build\":\"$handle\",\"rc\":$rc,\"step\":\"$step\",\"code\":\"$code\"}"
     return
   fi
   # template-build.sh names the snapshot <id>-<first 12 hex of the image digest> and writes its record
@@ -622,7 +625,7 @@ egress_post() {
 
 # The egress step (see the header). Reads the journal only; never acts on moca-egress.
 egress() {
-  systemctl is-enabled --quiet moca-egress.service 2>/dev/null || return 0
+  systemctl is-active --quiet moca-egress.service 2>/dev/null || return 0
   EGRESS=on
   command -v journalctl >/dev/null || { error 'egress: no journalctl on PATH'; return; }
   exec 8>"$SBX_SRV/.egress.lock"

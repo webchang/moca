@@ -387,15 +387,20 @@ EV2='{"time":"2026-11-08T12:00:01Z","via":"moca-egress","vm_id":"vm-1","sid":"sb
 entry() { jq -cn --arg c "$1" --arg m "$2" --arg t "${3:-${1#c}}" '{__CURSOR: $c, __MONOTONIC_TIMESTAMP: $t, _BOOT_ID: "b1", MESSAGE: $m, _SYSTEMD_UNIT: "moca-egress.service"}'; }
 { entry c1 "$EV"; entry c2 'moca-egress: serving 3 allowlist entries'; entry c3 "$EV2"; } >"$TMP/state/journal"
 egress_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts"; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
-# Off: the unit is not enabled.
-rm -f "$TMP/state/enabled-moca-egress.service" "$TMP/srv/egress.cursor" "$TMP/srv/egress.pending.json"
+# Off: the unit is not active, even if it is enabled (a stopped proxy: nothing to ship).
+rm -f "$TMP/state/active-moca-egress.service" "$TMP/srv/egress.cursor" "$TMP/srv/egress.pending.json"
+touch "$TMP/state/enabled-moca-egress.service"
 egress_run || fail 'the egress-off run failed'
-grep -q '^journalctl' "$MOCK_LOG" && fail 'read the journal with moca-egress not enabled'
-grep -q '/egress' "$MOCK_LOG" && fail 'posted with moca-egress not enabled'
+grep -q '^journalctl' "$MOCK_LOG" && fail 'read the journal with moca-egress not active'
+grep -q '/egress' "$MOCK_LOG" && fail 'posted with moca-egress not active'
 [[ ! -e "$TMP/srv/egress.cursor" && ! -e "$TMP/srv/egress.pending.json" ]] || fail 'wrote a cursor or batch with egress off'
 grep -q '"egress":"off","egressRead":0,"egressAccepted":0,"egressRefused":0,"egressSkipped":0,"egressRejected":0,"egressNotOurs":0' "$TMP/out" || fail 'the off summary'
-# On: both events posted as written, the proxy's own log line skipped, the cursor at the last entry.
-touch "$TMP/state/enabled-moca-egress.service"
+grep -q 'systemctl is-active --quiet moca-egress.service' "$MOCK_LOG" || fail 'the switch did not ask is-active'
+grep -Eq 'systemctl (start|stop|restart|enable|disable)[^@]*moca-egress' "$MOCK_LOG" && fail 'acted on moca-egress'
+# On: active but NOT enabled (install-host.sh reuses a P6 moca-egress without enabling it): both events
+# posted as written, the proxy's own log line skipped, the cursor at the last entry.
+rm -f "$TMP/state/enabled-moca-egress.service"
+touch "$TMP/state/active-moca-egress.service"
 egress_run || fail 'the egress run failed'
 grep -q 'journalctl -u moca-egress.service -o json --no-pager -b' "$MOCK_LOG" || fail 'the first read is not from this boot'
 jq -e --argjson a "$EV" --argjson b "$EV2" '.events == [$a, $b] and .cursor == "c3" and .oversized == []' "$TMP/state/egress-posts" >/dev/null ||
@@ -438,7 +443,7 @@ BIG="$(jq -cn --argjson e "$EV" '$e + {path: ("/" + ("a" * 9000))}')"
 entry c1007 "$BIG" >>"$TMP/state/journal"
 egress_run || fail 'the oversized run failed'
 jq -e '.events == [] and .oversized == ["sbx-0123456789abcdef0123456789"]' "$TMP/state/egress-posts" >/dev/null || fail 'an oversized event'
-pass 'ships egress events as written, only with moca-egress enabled; batches of 1000; a failed post keeps the cursor and retries the same batch (G42)'
+pass 'ships egress events as written, only with moca-egress active (enabled or not), never acting on it; batches of 1000; a failed post keeps the cursor and retries the same batch (G42)'
 
 # 14. A 400 invalid_request (a batch the control plane will never take) is set aside, never retried
 #     forever: kept 0600 in egress.rejected/, the cursor past it, an error naming it; shipping goes on.
@@ -550,7 +555,7 @@ grep -q '"errors":0' "$TMP/out" || fail 'the budget stop counted an error'
 egress_run || fail 'the run after the budget failed'
 jq -e '.cursor == "c3006" and (.events | length) == 999' "$TMP/state/egress-posts" >/dev/null || fail 'the next run did not go on'
 grep -q 'EGRESS_BUDGET_S=120$' "$A" || fail 'the shipped budget is not 120 s'
-rm -f "$TMP/state/enabled-moca-egress.service"
+rm -f "$TMP/state/active-moca-egress.service"
 pass 'stops starting batches after the time budget, the cursor at the last batch taken; the next run goes on (G42)'
 
 # 18. Memory (register G39): the inventory's `memory` object, from /proc and the workers' slices.

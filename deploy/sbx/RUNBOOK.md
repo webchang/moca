@@ -502,8 +502,10 @@ SANDBOX`, or `GET /v1/sandboxes/{id}/egress`. Nothing to install: no new unit, t
 
 Paths are logged without query, fragment or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL path segment is logged as sent.
 
-- **On or off:** on when `systemctl is-enabled moca-egress.service` says enabled, off otherwise (a
-  `--no-egress` host). Off, the agent reads no journal, posts nothing and writes no cursor; its summary
+- **On or off:** on when `systemctl is-active moca-egress.service` says active, off otherwise (a
+  `--no-egress` host, or a moca-egress not started). Active, not enabled: `install-host.sh` reuses a
+  `moca-egress.service` another install owns (a P6 worker's) without enabling it, and that install may
+  start it for a window only. Off, the agent reads no journal, posts nothing and writes no cursor; its summary
   says `"egress":"off"`.
 - **Only this host's sandboxes' events leave it.** The wanted state names them (`egressSids`: the
   workspace keys of the sandboxes on this host's workers, live or ended within 600 s); an event with
