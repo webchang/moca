@@ -505,7 +505,10 @@ Paths are logged without query, fragment or userinfo, and an injected credential
 - **On or off:** on when `systemctl is-active moca-egress.service` says active, off otherwise (a
   `--no-egress` host, or a moca-egress not started). Active, not enabled: `install-host.sh` reuses a
   `moca-egress.service` another install owns (a P6 worker's) without enabling it, and that install may
-  start it for a window only. Off, the agent reads no journal, posts nothing and writes no cursor; its summary
+  start it for a window only. So on such a host, whether the agent reads the proxy's journal follows
+  that unit's state: while it runs for its own install (a P6 window), the agent reads its events every
+  15 s, ships only this host's SBX0 sandboxes' (`egressSids`), and counts the rest `egressNotOurs`.
+  Nothing of the other install's leaves the host, but check the unit's state at a window's start. Off, the agent reads no journal, posts nothing and writes no cursor; its summary
   says `"egress":"off"`.
 - **Only this host's sandboxes' events leave it.** The wanted state names them (`egressSids`: the
   workspace keys of the sandboxes on this host's workers, live or ended within 600 s); an event with
