@@ -825,7 +825,7 @@ registers or rejects each built build by policy; nobody approves it. It needs:
 - on the host, `/etc/sbx/host-agent.env` (`SBX_API_URL`, `SBX_HOST_ID`, `SBX_KERNEL`, optionally
   `SBX_DISK_FLOOR_GB`, `SBX_BUILD_CONCURRENCY`, `SBX_ACTIVE_LIMIT`, `SBX_IDLE_LIMIT_S`,
   `SBX_MEM_FLOOR_MIB`, `SBX_MEM_PRESSURE_LIMIT` (see "Memory-aware placement" below),
-  `SBX_START_CONCURRENCY`, `SBX_START_WINDOW_S` (see "Cold-start pacing" below), `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at
+  `SBX_START_CONCURRENCY`, `SBX_START_WINDOW_S`, `SBX_IDLE_GRACE_S` (see "Cold-start pacing" below), `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at
   `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer. The unit sets
   `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
   `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's home):
@@ -951,6 +951,44 @@ workers at once (default 4).
   its control plane, now starts at most 4 workers per run instead of every wanted one at once.
   A control plane older than 1.9.0 ignores the new inventory fields; an older agent sends none, and
   the control plane then shows no queue and answers Retry-After as before.
+
+**The idle grace** (register G43, openapi 1.10.0): a released worker can stay up for a while, so a
+template used again soon is warm (no memory-file read at all).
+
+- **The setting:** `SBX_IDLE_GRACE_S` in `host-agent.env` (0600), never in argv. **Default 0: off**,
+  and the host behaves exactly as before: a build with no lease and no live sandbox is stopped at
+  the next poll. A whole number of seconds, 0 to 86400, no leading zero; anything else is refused
+  (exit 2, before any call). The inventory reports it (`limits.idleGraceSeconds`).
+- **When to use it, and how long:** **600-900 s**, long enough to cover a batch's gaps between rounds
+  (94 s and 261 s in the Lite-28 window), so a runner can drop its own `KEEP_WARM`. Leave it off where
+  each task's cold start is what is measured, or use `stopNow` (below).
+- **What it does:** after a build's last lease ends (its release, or the lease running out), the
+  control plane keeps it in the wanted answer's `run` until that end plus `SBX_IDLE_GRACE_S`, and
+  lists it in `graced`. It is graced only if its worker runs on the host (`runningWorkers`), has no
+  live sandbox, and the host has room for it: a slot under `SBX_ACTIVE_LIMIT` and G39's memory
+  headroom. The agent never starts a graced build; it only keeps one running. A use within the grace
+  finds the worker attached and gets a sandbox at once (first use takes a lease; no `409`).
+- **A wanted build that needs the slot** (or the memory) **displaces** the graced worker that ends
+  soonest: it goes to `stop`. That is the only stop of a worker nobody asked to stop, and only of one
+  with no lease. **At stop time the control plane re-checks that it is still unleased** (under the
+  activation lock): a lease taken in between keeps it running. The agent logs such a stop as
+  `{"agent":"stopped","worker":"<id>","was":"graced"}`.
+- **`stopNow`, to force cold:** `POST /v1/templates/{id}/deactivate {"stopNow": true}` releases the
+  caller's lease and, if no lease remains, skips the grace: the worker is stopped at the next poll.
+  On a build already in its grace it ends the grace (`released: 0`). The `deactivate` record carries
+  `stopNow: true`. Use it for one-by-one comparisons, so each task still measures its cold start.
+- **A retire or a reject ends the grace at once:** the build leaves `run`, and on a host with a grace
+  the wanted answer lists it in `stop` beside `remove`, so the agent stops the worker and removes the
+  build in the same poll. Removal is never held for a grace.
+- **What you see:** the agent's summary line gains `"graced":<n>` when it keeps any; the hosts block
+  of `GET /v1/templates` shows `idleGraceSeconds` and `graced` (a count) per host with a grace; a
+  graced build reads `deactivating` with `graced: true` and `gracedUntil` (epoch seconds).
+- **What it costs:** a graced worker still pins its **whole memory file** (it is a running worker).
+  G39 counts it in `memory.usedMib`, and it holds a slot of `SBX_ACTIVE_LIMIT` until a wanted build
+  needs one. A host over its memory with its graced workers lets the soonest-ending go first.
+- **Version skew:** an agent without the setting reports no `idleGraceSeconds`, which the control
+  plane takes as 0 (off). A control plane older than 1.10.0 ignores the field, sends no `graced`, and
+  stops released workers as before; the agent then just applies `stop`. Upgrade either first.
 
 **Activations without waiting for a build** (register G31): the build poll applies the wanted
 state only after its builds, and its timer starts two minutes after the previous poll ends. Install

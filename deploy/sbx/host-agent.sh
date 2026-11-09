@@ -85,6 +85,10 @@
 #   SBX_START_WINDOW_S       default 300: with a control plane that sends no `starting` (older than
 #                            openapi 1.9.0), a worker this agent started less than this many seconds ago,
 #                            whose unit is active and which is still wanted, counts as starting
+#   SBX_IDLE_GRACE_S         default 0 (off): how long the control plane keeps a released build's running
+#                            worker before it is stopped (the idle grace, register G43); a whole number
+#                            of seconds, at most 86400 (a day), without a leading zero. Reported in the
+#                            inventory's limits (idleGraceSeconds); the control plane decides the grace
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
 #   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs it
 #                            (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
@@ -127,13 +131,21 @@
 #     their mean as startSeconds (absent until a start is done, so always with an older control plane),
 #     beside startConcurrency.
 #
+# The idle grace (register G43): with SBX_IDLE_GRACE_S > 0, the control plane keeps a released build in
+# `run` for that long after its last lease ends (if the host has the slot and the memory), and lists
+# it in the wanted answer's `graced`; a wanted build that needs the slot moves it to `stop`. The agent
+# applies the answer as ever (a graced worker's unit runs, so nothing is started for it), never starts
+# a graced build whose unit is not running (a grace keeps a worker, it never starts one), and counts the
+# graced workers it runs in the summary ("graced":<n>). A retired build may come in `stop` beside
+# `remove`: its worker is stopped first, and removed in the same run.
+#
 # The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
 # or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
 # summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
 # --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
 # "egressSkipped","egressRejected","egressNotOurs"; then, when there is something to say about memory,
 # "psi":"absent", "sliceUnread":[<worker id>...] and "memfileMismatch":<n>; then "startQueued":<n> when
-# the start limit left wanted workers for a later run.
+# the start limit left wanted workers for a later run; then "graced":<n> when the idle grace keeps any.
 # A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
@@ -153,7 +165,7 @@ EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NO
 EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
 : "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
 : "${SBX_SYS_ROOT:=/}"                                            # a test seam: /proc, /sys
-MEM_SUMMARY='' START_SUMMARY='' INFLIGHT=0
+MEM_SUMMARY='' START_SUMMARY='' GRACE_SUMMARY='' INFLIGHT=0
 BUILD_ID_RE='^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$'
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
@@ -177,6 +189,9 @@ check_settings() {
     refuse 'SBX_START_CONCURRENCY must be a whole number, at least 1, without a leading zero (0 would start no worker)'
   [[ "$SBX_START_WINDOW_S" =~ ^[1-9][0-9]{0,8}$ ]] ||
     refuse 'SBX_START_WINDOW_S must be a whole number of seconds, at least 1, without a leading zero'
+  : "${SBX_IDLE_GRACE_S:=0}"
+  [[ "$SBX_IDLE_GRACE_S" =~ ^(0|[1-9][0-9]{0,4})$ ]] && ((SBX_IDLE_GRACE_S <= 86400)) ||
+    refuse 'SBX_IDLE_GRACE_S must be a whole number of seconds, 0 (off) to 86400, without a leading zero'
   for v in SBX_DISK_FLOOR_GB SBX_BUILD_CONCURRENCY SBX_ACTIVE_LIMIT SBX_IDLE_LIMIT_S; do
     [[ -z "${!v:-}" || "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || refuse "$v must be a whole number without a leading zero"
   done
@@ -305,9 +320,9 @@ inventory() {
       printf '%s%s' "$sep" "$(jq -c '{template: .id, manifestHash: .manifest_hash}' "$f")"
       sep=','
     done < <(held_records)
-    printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d,"startConcurrency":%d%s}}' \
+    printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d,"startConcurrency":%d,"idleGraceSeconds":%d%s}}' \
       "$SBX_ACTIVE_LIMIT" "$SBX_IDLE_LIMIT_S" "$SBX_BUILD_CONCURRENCY" "$(free_gb)" "$SBX_DISK_FLOOR_GB" \
-      "$SBX_START_CONCURRENCY" "${secs:+,\"startSeconds\":$secs}"
+      "$SBX_START_CONCURRENCY" "$SBX_IDLE_GRACE_S" "${secs:+,\"startSeconds\":$secs}"
   } | jq -c --argjson m "$mem" '. + $m' >"$out"
   api POST "/v1/hosts/$SBX_HOST_ID/inventory" "$out" >/dev/null
 }
@@ -427,7 +442,8 @@ start_seconds() {
 # The start book (see the header), before this run's starts. Of $SBX_SRV/start-times it keeps the
 # starts still in flight, records the time of each one done, and drops the rest (stopped, no longer
 # wanted, or, with no `starting` from the control plane, SBX_START_WINDOW_S old). Then sets INFLIGHT,
-# the workers starting now. Reads $WORK/run.tsv (worker, build a line) and $WORK/starting.ids.
+# the workers starting now. Reads $WORK/run.tsv (worker, build a line), $WORK/starting.ids and
+# $WORK/graced.ids (a graced build is kept running, not wanted: its start, if any, is dropped).
 start_book() { # start_book NOW HAS_STARTING
   local now="$1" has="$2" w b t book="$SBX_SRV/start-times" keep="$WORK/start-times.keep" fin="$WORK/start-seconds.new"
   : >"$keep"; : >"$fin"
@@ -435,6 +451,8 @@ start_book() { # start_book NOW HAS_STARTING
     while IFS=$'\t' read -r w b t; do
       [[ "$w" =~ $WORKER_RE && "$b" =~ $BUILD_ID_RE && "$t" =~ ^[0-9]{1,12}$ ]] || continue
       grep -qxF -- "$w"$'\t'"$b" "$WORK/run.tsv" || continue
+      # Released before it was seen attached, and kept by the idle grace (G43): no start time to take.
+      ! grep -qxF -- "$b" "$WORK/graced.ids" || continue
       systemctl is-active --quiet "sbx-worker@$w.service" || continue
       if ((has == 1)); then
         if grep -qxF -- "$b" "$WORK/starting.ids"; then
@@ -480,7 +498,7 @@ start_record() { # start_record WORKER BUILD NOW
 # SBX_START_CONCURRENCY workers are starting at once (the start limit, see the header); a start is
 # never waited on.
 activation() {
-  local wanted w unit now has=0 slots queued=0
+  local wanted w unit now has=0 slots queued=0 graced=0
   exec 9>"$SBX_SRV/.activation.lock"
   if ! flock -n 9; then
     say '{"agent":"skipped","why":"another run is applying the wanted state"}'
@@ -497,11 +515,22 @@ activation() {
     has=1
     jq -r '.starting[] | strings' <<<"$wanted" >"$WORK/starting.ids"
   fi
+  # The idle grace's builds (register G43): kept running, never started. Absent: none. The last
+  # answer's list ($SBX_SRV/graced, 0600) says which stop ends a grace.
+  jq -r 'if (.graced | type) == "array" then .graced[] | strings else empty end' <<<"$wanted" >"$WORK/graced.ids" 2>/dev/null ||
+    : >"$WORK/graced.ids"
+  if [[ -f "$SBX_SRV/graced" ]]; then cp "$SBX_SRV/graced" "$WORK/graced.prev"; else : >"$WORK/graced.prev"; fi
+  (umask 077 && cat "$WORK/graced.ids" >"$SBX_SRV/graced.tmp") && mv -f "$SBX_SRV/graced.tmp" "$SBX_SRV/graced"
   start_book "$now" "$has"
   slots=$((SBX_START_CONCURRENCY - INFLIGHT))
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a wanted worker id is malformed'; continue; }
     unit="sbx-worker@$w.service"
+    if [[ -s "$WORK/graced.ids" ]] && grep -qxF -- "$b" "$WORK/graced.ids"; then
+      # A grace keeps a running worker; it never starts one (its unit stopped since the inventory).
+      if systemctl is-active --quiet "$unit"; then graced=$((graced + 1)); fi
+      continue
+    fi
     if [[ ! -f "$SBX_ENV_DIR/workers/$w.env" ]]; then
       worker_report "$b" refused 'worker not installed on this host (install-host.sh with its setup.sh bundle)'
       say "{\"agent\":\"refused\",\"worker\":\"$w\",\"why\":\"not installed\"}"
@@ -533,12 +562,15 @@ activation() {
     START_SUMMARY=",\"startQueued\":$queued"
     say "{\"agent\":\"queued\",\"workers\":$queued,\"why\":\"$INFLIGHT starting, SBX_START_CONCURRENCY $SBX_START_CONCURRENCY: started in a later run\"}"
   fi
+  ((graced == 0)) || GRACE_SUMMARY=",\"graced\":$graced"
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to stop is malformed'; continue; }
     unit="sbx-worker@$w.service"
     systemctl is-active --quiet "$unit" || continue
     if systemctl stop "$unit"; then
-      STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"}"
+      # A stop of a worker the idle grace kept (register G43) is logged as such: a wanted build needed
+      # its slot, its grace ended, or its build was released with stopNow or retired.
+      STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"$(! grep -qxF -- "$b" "$WORK/graced.prev" || printf ',"was":"graced"')}"
     else
       error "stop $unit failed"
     fi
@@ -736,7 +768,7 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY$START_SUMMARY}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
     return 0
   fi
   local free
@@ -746,7 +778,7 @@ main() {
   if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
     say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
     activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY}"
+    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
     return 0
   fi
   if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
@@ -761,7 +793,7 @@ main() {
     fi
   fi
   activation
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY}"
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
 }
 
 main "$@"
