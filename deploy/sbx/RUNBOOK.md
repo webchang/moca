@@ -809,6 +809,7 @@ registers or rejects each built build by policy; nobody approves it. It needs:
   delete the copy;
 - on the host, `/etc/sbx/host-agent.env` (`SBX_API_URL`, `SBX_HOST_ID`, `SBX_KERNEL`, optionally
   `SBX_DISK_FLOOR_GB`, `SBX_BUILD_CONCURRENCY`, `SBX_ACTIVE_LIMIT`, `SBX_IDLE_LIMIT_S`,
+  `SBX_MEM_FLOOR_MIB`, `SBX_MEM_PRESSURE_LIMIT` (see "Memory-aware placement" below),
   `SBX_REGISTRY`), the token alone in `/etc/sbx/host-agent.token` (0600, root), the script at
   `/usr/local/libexec/sbx-host-agent.sh`, and `sbx-host-agent.service` with its timer. The unit sets
   `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
@@ -842,6 +843,53 @@ record matches (the build id and the worker), never a running worker. It starts 
 template's worker as in §5 (its relay token comes from `setup.sh`; the record's id becomes its
 `SANDBOX_TEMPLATE`, the label Moca Pi sessions select by); until then the agent reports
 it `refused` (register gap G18).
+
+**Memory-aware placement** (register G39,
+[memory-aware placement spec](../../docs/specs/2026-11-09-memory-aware-placement-design.md)): each
+inventory also reports the host's memory, and the control plane starts a new worker on a host only
+if the host has the memory for it, whatever `SBX_ACTIVE_LIMIT` says. `SBX_ACTIVE_LIMIT` stays the
+upper bound; it no longer has to be set from a memory calculation by hand. Nothing running is
+stopped: the rule only holds back new starts.
+
+- **What the agent reports** (the inventory's `memory` object): `memTotalMib` and `memAvailableMib`
+  from `/proc/meminfo`; `memPressureFull10`, the memory PSI line's **`full avg10`** from
+  `/proc/pressure/memory` (a percentage: the share of the last 10 s in which every non-idle task
+  was stalled on memory); the workers of held builds whose `sbx-worker@<id>` runs; per running
+  worker, `vmCommittedMib`, its slice's `memory.current` (`sbx.slice/sbx-<id>.slice`) less its
+  pinned memory file; and `memFloorMib`, **the effective floor**, so the number placement uses is in
+  the inventory and in `GET /v1/templates`' hosts block (`memory.floorMib`), with no arithmetic.
+- **`SBX_MEM_FLOOR_MIB`**: the memory never placed into, a whole number of MiB. Unset, it is 10% of
+  MemTotal, at least 4096 (a host of 188.5 GiB: 19302 MiB). Set a fixed amount on a host shared with
+  other work (Moca's own P6 sessions).
+- **`SBX_MEM_PRESSURE_LIMIT`** (default 10): while `full avg10` is above it, the host takes no new
+  start; what it runs is kept. **No `/proc/pressure`** (an older kernel, or `psi=0` at boot): the
+  field is left out, which is **no brake**, never "no starts"; the agent's summary says
+  `"psi":"absent"` once per run.
+- Both live in `host-agent.env` (0600), never in argv. A bad value (a floor of 0, a leading zero, a
+  limit that is not a number in (0, 100] with at most two decimals) is refused like the agent's other
+  settings: exit 2, before any call.
+- **A worker's cost** is its guest's RAM (the registered build's guest size, which registration
+  checked against the manifest's `guest_ram_mb`) plus 128 MiB; a build with no recorded guest size
+  counts at 4096 + 128. A host's headroom is `min(total − floor − used, available − floor − pending)`,
+  `used` being its running workers' cost, their VMs' committed memory and the starts placed there
+  but not running yet. The hosts block shows `usedMib` and `headroomMib`.
+- **A stale host** (its last inventory over 60 s old: four missed 15 s reports) takes no new start
+  (`brake: stale`); one under pressure shows `brake: pressure`.
+- **The memory-file check:** for each build it holds, the agent checks that the snapshot's
+  `memfile` is exactly `guest_ram_mb × 1 MiB` (the manifest beside it). A worker pins that file
+  whole, so a different size (a future Diff snapshot, a balloon, a trimmed file) would make its cost
+  wrong. A mismatch is an error line naming the build, a `"memfileMismatch":<n>` count in the
+  summary, and the build in the inventory's `memfileMismatch`: the control plane never places it on
+  that host, and the agent refuses to start it (reported `refused`). Rebuild the snapshot.
+- **A slice it cannot read** (`memory.current` missing): that worker's VMs are left out of
+  `vmCommittedMib`, never guessed, and the summary names it (`"sliceUnread":[...]`).
+- **What a client sees:** an activation refused for memory is `409 no_active_slot` with
+  `reason: memory` and the usual `Retry-After`; at the active limit it answers as before, with no
+  reason. A build waiting for memory reads `readiness: unavailable` with `readinessReason: memory`.
+- **Version skew, both ways:** an agent older than G39 sends no `memory`, and the control plane
+  places that host by `SBX_ACTIVE_LIMIT` alone, as before. A control plane older than G39 (openapi
+  1.8.0) ignores the field and places by `SBX_ACTIVE_LIMIT` alone; the agent still refuses to start a
+  build whose memory file does not match. Upgrade either first; list both in the rollout.
 
 **Activations without waiting for a build** (register G31): the build poll applies the wanted
 state only after its builds, and its timer starts two minutes after the previous poll ends. Install
