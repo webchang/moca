@@ -1,7 +1,8 @@
 # Per-sandbox egress records through the API
 
-- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); built on branch `sbx-g42`,
-  under review, not deployed (register G42). §3-§5 describe the build.
+- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); implemented (merged 6b4ce998);
+  the control plane **deployed** on both ykt3 namespaces 2026-11-09 (image 2810c77f); the host agent's
+  part waits for a KVM-host window (register G42). §3-§5 describe the build.
 - **Date:** 2026-11-08
 - **Asked by:** the user, 2026-11-08: "per-sandbox egress records available through Moca API
   operations … a key requirement for Moca". A benchmark grader voids a rep for a download its rules

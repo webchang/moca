@@ -499,13 +499,13 @@ def s_issues(d):
 # --------------------------------------------------------------------------- 6. Next
 
 def s_next(d):
-    s = d.slide("Next: egress records, then capacity, then upstream",
+    s = d.slide("Next: capacity, then the KVM host, then upstream",
                 "In order, each with the user's decision first")
     rows = [
-        ("1", "Egress records through the API (G42)", "a sandbox's owner reads which hosts it "
-         "reached; its end record names the log's digest"),
-        ("2", "Capacity by host resources (G39, G43)", "placement weighs memory and paces cold "
-         "starts, from the batch window's measurements"),
+        ("1", "Capacity by host resources (G40, G39, G43)", "an atomic activation check, then "
+         "placement by memory, then paced cold starts: designs accepted"),
+        ("2", "The next KVM-host window", "the egress host agent (G42), and the self-serve paths "
+         "run end to end from a user's own image"),
         ("3", "Propose upstream", "as reviewable PRs, from what the windows proved; upstream has "
          "no session templates today"),
     ]
@@ -516,8 +516,9 @@ def s_next(d):
         text(s, 6.0, y + 0.05, 6.7, 0.95, [b], size=14, color=MUTED)
         y += 1.35
     box(s, 0.6, 5.8, 12.1, 0.6, INFRA, "Done since",
-         ["users and roles through the API (G38); general-user self-serve with its own gate "
-          "records (G41); a Docker Hub repository allowlist"], size=12, align=PP_ALIGN.LEFT)
+         ["users and roles through the API (G38); self-serve with your own gate records (G41); "
+          "a repository allowlist; each sandbox's egress records (G42), on the cluster"],
+         size=12, align=PP_ALIGN.LEFT)
 
 
 SECTIONS = [

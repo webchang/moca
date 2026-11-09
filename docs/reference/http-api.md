@@ -1,7 +1,7 @@
 # HTTP API guide
 
 > **Preview.** Describes the P6 runtime on `main` as of 2026-10-12, with the template, sandbox and host routes of
-> control-plane API 1.6.0 and the templated-session fields of data-plane API 1.1.0 (2026-11-08). The machine-readable contracts are
+> control-plane API 1.7.0 and the templated-session fields of data-plane API 1.1.0 (2026-11-09). The machine-readable contracts are
 > [`docs/api/openapi.yaml`](../api/openapi.yaml) (control plane) and
 > [`docs/api/harness-openapi.yaml`](../api/harness-openapi.yaml) (data plane); this page explains how
 > they fit together and records behaviour the specs do not. Workload routes are covered in
