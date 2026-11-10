@@ -106,10 +106,13 @@
 #     "psi":"absent", once per run.
 #   - runningWorkers: the workers of the held builds whose sbx-worker@<id> unit is active (a worker
 #     pins its snapshot's memory file whole at start, attached to the relay or not).
-#   - vmCommittedMib: per running worker, its slice's memory.current (cgroup v2,
-#     sbx.slice/sbx-<id>.slice) less its pinned memory file, at least 0: what its VMs hold. A slice
-#     whose memory.current cannot be read is left out, never guessed; the summary lists it
-#     ("sliceUnread").
+#   - vmCommittedMib: per running worker, what its VMs hold that the kernel cannot reclaim, from its
+#     slice's memory.stat (cgroup v2, sbx.slice/sbx-<id>.slice): anon + shmem + kernel (kernel_stack +
+#     pagetables + slab on a kernel without the `kernel` line). Never memory.current: that counts the
+#     page cache the VMs' files fill (rootfs, workspace), several GiB a worker that the kernel takes
+#     back at need (register G48). The pinned memory file is file-backed and mlocked, so it is in
+#     neither: the worker's cost counts it. A slice whose memory.stat cannot be read, or has no anon
+#     line, is left out, never guessed; the summary lists it ("sliceUnread").
 #   - memfileMismatch: the held builds whose memory file (snapshots/<snapshot>/memfile) is not exactly
 #     the manifest's guest_ram_mb x 1 MiB (or is missing): each is an error line, the summary counts
 #     them ("memfileMismatch"), the control plane never places one here, and this agent refuses to
@@ -270,15 +273,17 @@ memory_report() {
     grep -qxF -- "$w" "$running" && continue
     systemctl is-active --quiet "sbx-worker@$w.service" || continue
     printf '%s\n' "$w" >>"$running"
-    cur="$(cat "$root/sys/fs/cgroup/sbx.slice/sbx-$w.slice/memory.current" 2>/dev/null || true)"
+    # Its VMs' unreclaimable memory (G48): anon + shmem + kernel, bytes to MiB; no anon line: unread.
+    cur="$(awk '$2 ~ /^[0-9]+$/ { v[$1] = $2 }
+      END { if (!("anon" in v)) exit
+            k = ("kernel" in v) ? v["kernel"] : v["kernel_stack"] + v["pagetables"] + v["slab"]
+            printf "%d", (v["anon"] + v["shmem"] + k) / 1048576 }' \
+      "$root/sys/fs/cgroup/sbx.slice/sbx-$w.slice/memory.stat" 2>/dev/null || true)"
     if [[ "$cur" =~ ^[0-9]+$ ]]; then
-      [[ "$size" =~ ^[0-9]+$ ]] || size=0
-      cur=$(((cur - size) / 1048576))
-      ((cur >= 0)) || cur=0
       printf '%s\t%s\n' "$w" "$cur" >>"$committed"
     else
       printf '%s\n' "$w" >>"$unread"
-      say "{\"agent\":\"note\",\"worker\":\"$w\",\"why\":\"its slice's memory.current is unreadable: its VMs' memory is not reported\"}"
+      say "{\"agent\":\"note\",\"worker\":\"$w\",\"why\":\"its slice's memory.stat is unreadable: its VMs' memory is not reported\"}"
     fi
   done < <(held_records)
   [[ ! -s "$unread" ]] || MEM_SUMMARY+=",\"sliceUnread\":$(jq -Rsc 'split("\n") | map(select(length > 0))' "$unread")"

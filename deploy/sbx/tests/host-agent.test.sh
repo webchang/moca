@@ -559,7 +559,8 @@ rm -f "$TMP/state/active-moca-egress.service"
 pass 'stops starting batches after the time budget, the cursor at the last batch taken; the next run goes on (G42)'
 
 # 18. Memory (register G39): the inventory's `memory` object, from /proc and the workers' slices.
-#     Two held builds of 4 GiB guests: m1 running (its slice holds the memfile and 512 MiB more), m2
+#     Two held builds of 4 GiB guests: m1 running (its slice's memory.stat: 448 MiB anon, 16 MiB shmem,
+#     48 MiB kernel, and the memfile plus 3.5 GiB of page cache as file, which never counts: G48), m2
 #     stopped. The floor's default is 10% of MemTotal, at least 4096; a set floor is reported as set.
 rm -rf "$TMP/srv/templates" "$TMP/srv/snapshots"; mkdir -p "$TMP/srv/templates" "$TMP/srv/snapshots"
 rm -f "$TMP/state/active-"*
@@ -572,7 +573,17 @@ for i in 1 2; do
 done
 touch "$TMP/state/active-sbx-worker@sbx_m1.service"
 mkdir -p "$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice"
-echo $(((4096 + 512) * 1048576)) >"$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.current"
+MIB=1048576
+memstat() { # anon shmem kernel file [kernel_split]: a memory.stat for m1's slice, MiB
+  local f="$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.stat"
+  { printf 'anon %d\nfile %d\n' $(($1 * MIB)) $(($4 * MIB))
+    if [[ -n "${5:-}" ]]; then printf 'kernel_stack %d\npagetables %d\nslab %d\n' $((MIB * 8)) $((MIB * 8)) $((($3 - 16) * MIB))
+    else printf 'kernel %d\n' $(($3 * MIB)); fi
+    printf 'file_mapped %d\nshmem %d\nunevictable %d\ninactive_file %d\n' $((4096 * MIB)) $(($2 * MIB)) $((4096 * MIB)) $((3584 * MIB))
+  } >"$f"
+  echo $((($1 + $3 + $4) * MIB)) >"$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.current"
+}
+memstat 448 16 48 $((4096 + 3584))
 printf '{"run":[],"stop":[],"egressSids":[]}' >"$TMP/state/wanted-answer"
 mem_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
 INV="$TMP/state/POST_v1_hosts_bm1_inventory"
@@ -589,12 +600,16 @@ jq -e '.memory.memFloorMib == 26214' "$INV" >/dev/null || fail "the 10% floor: $
 SBX_MEM_FLOOR_MIB=2048 SBX_MEM_PRESSURE_LIMIT=2.5 mem_run || fail 'the set-floor run failed'
 jq -e '.memory.memFloorMib == 2048 and .memory.memPressureLimit == 2.5' "$INV" >/dev/null || fail 'a set floor or pressure limit'
 printf 'MemTotal:       16777216 kB\nMemFree:         1000000 kB\nMemAvailable:   12582912 kB\n' >"$SYS/proc/meminfo"
-pass 'reports memTotal, memAvailable, PSI full avg10, the effective floor (10%, at least 4096; or set), and each running worker'"'"'s VMs from its slice (G39)'
+# The kernel's three older lines in place of `kernel` (kernel_stack + pagetables + slab): the same 512.
+memstat 448 16 48 $((4096 + 3584)) split
+mem_run || fail 'the split-kernel run failed'
+jq -e '.memory.vmCommittedMib == {sbx_m1: 512}' "$INV" >/dev/null || fail "no kernel line: $(jq -c .memory.vmCommittedMib "$INV")"
+pass 'reports memTotal, memAvailable, PSI full avg10, the effective floor (10%, at least 4096; or set), and each running worker'"'"'s VMs from its slice'"'"'s memory.stat, never its page cache (G39, G48)'
 
 # 19. No /proc/pressure: no memPressureFull10 (no brake), one "psi":"absent" in the summary; never a
 #     refusal. An unreadable slice: that worker left out of vmCommittedMib, and the summary names it.
 mv "$SYS/proc/pressure" "$SYS/proc/pressure.off"
-rm -f "$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.current"
+rm -f "$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.stat"
 mem_run || fail 'the no-PSI run failed'
 jq -e '(.memory | has("memPressureFull10") | not) and .memory.vmCommittedMib == {} and .memory.runningWorkers == ["sbx_m1"]' "$INV" >/dev/null ||
   fail "no PSI, an unread slice: $(jq -c .memory "$INV")"
@@ -602,10 +617,18 @@ jq -e '(.memory | has("memPressureFull10") | not) and .memory.vmCommittedMib == 
 grep -q '"agent":"summary".*"psi":"absent","sliceUnread":\["sbx_m1"\]' "$TMP/out" || fail 'the summary does not say psi absent and the unread slice'
 grep -q '"errors":0' "$TMP/out" || fail 'no PSI counted as an error'
 mv "$SYS/proc/pressure.off" "$SYS/proc/pressure"
-echo $((4000 * 1048576)) >"$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.current"
-mem_run || fail 'the floored-slice run failed'
-jq -e '.memory.vmCommittedMib == {sbx_m1: 0}' "$INV" >/dev/null || fail 'a slice below its memfile is not floored at 0'
-pass 'no /proc/pressure: no brake field, said once; an unreadable slice is left out and named; a slice below its memfile is 0 (G39)'
+# G48, the batch window's slice: 9 MiB anon, 27 kernel, 0 shmem, 7637 file (the 4092 memfile + cache).
+memstat 9 0 27 7637
+mem_run || fail 'the cache-heavy run failed'
+jq -e '.memory.vmCommittedMib == {sbx_m1: 36}' "$INV" >/dev/null ||
+  fail "the page cache counted as committed: $(jq -c .memory.vmCommittedMib "$INV")"
+# A memory.stat with no anon line is unread, never 0.
+printf 'file %d\nkernel %d\n' $((4096 * MIB)) $((27 * MIB)) >"$SYS/sys/fs/cgroup/sbx.slice/sbx-sbx_m1.slice/memory.stat"
+mem_run || fail 'the no-anon run failed'
+jq -e '.memory.vmCommittedMib == {}' "$INV" >/dev/null || fail 'a memory.stat without anon was not left out'
+grep -q '"sliceUnread":\["sbx_m1"\]' "$TMP/out" || fail 'a memory.stat without anon was not named'
+memstat 448 16 48 $((4096 + 3584))
+pass 'no /proc/pressure: no brake field, said once; an unreadable or anon-less memory.stat is left out and named; page cache never counts (G39, G48)'
 
 # 20. A memory file that is not guest_ram_mb x 1 MiB: reported (memfileMismatch, an error line, the
 #     summary's count), and that build's worker never started here, whatever the wanted state says.
