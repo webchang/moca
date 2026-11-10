@@ -140,8 +140,9 @@ quotas: the server decides those.
 ### 3.8 A record per call (`--record F`)
 
 Every command that calls the API takes `--record F`, appending **one NDJSON line per HTTP attempt** (a
-retried POST shows as two): the mocactl command and an invocation id (to group a command's calls), the
-attempt number, method, the path (never the base URL or host), status or the transport error, the
+retried POST shows as two): the mocactl command and an invocation id (to group a command's calls),
+`seq` (the line's number in the invocation) and `try` (1, 2, … for the same method and path in a row),
+method, the path (never the base URL or host), status or the transport error, the
 request body, the answer's body, the request and answer times (UTC, ms), and the Retry-After. This is
 what a benchmark runner needs to drop its own client and still compose its provenance links from what
 mocactl did: the sandbox's id, `buildId` and `templateManifestHash`, the activate answer, and the
@@ -165,8 +166,9 @@ times.
 - No control-plane change: every call exists in openapi 1.10.0 (1.11.0 with M7).
 - The sandbox commands (`run`, `put`, `up`, `push`, `pull`) apart from token renewal, sessions, and
   the login flow.
-- **Open session gaps, not in this scope:** receive times in `run --json`'s frames (G-e), and
-  `run --patch-out F` (a session's workspace patch to a file).
+- **Open session gaps, not in this scope:** receive times in `run --json`'s frames (G-e),
+  `run --patch-out F` (a session's workspace patch to a file), and `--record` on `mocactl run` (a Moca
+  Pi session's id and times for a runner's provenance links).
 - `sbx token` and `mocactl auth token` still print tokens; nothing new does.
 
 ## 4a. As built (branch sbx-mocactl)
