@@ -872,7 +872,7 @@ stopped: the rule only holds back new starts.
   was stalled on memory); the workers of held builds whose `sbx-worker@<id>` runs; per running
   worker, `vmCommittedMib`, its slice's `memory.stat` (`sbx.slice/sbx-<id>.slice`) anon + shmem +
   kernel: its VMs' memory the kernel cannot reclaim, never its page cache (register G48; a memory
-  file is file-backed and mlocked, so the worker's cost counts it); and `memFloorMib`, **the effective floor**, so the number placement uses is in
+  file is file-backed and mlocked, so the worker's cost counts it; **keep `/srv/sbx` on a disk volume, never tmpfs**: a memory file on tmpfs is shmem, and would be counted twice); and `memFloorMib`, **the effective floor**, so the number placement uses is in
   the inventory and in `GET /v1/templates`' hosts block (`memory.floorMib`), with no arithmetic.
 - **`SBX_MEM_FLOOR_MIB`**: the memory never placed into, a whole number of MiB. Unset, it is 10% of
   MemTotal, at least 4096 (a host of 188.5 GiB: 19302 MiB). Set a fixed amount on a host shared with
