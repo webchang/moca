@@ -84,6 +84,129 @@ export interface SbxEgressSummary {
   sha256: string;
 }
 
+/** A build's readiness reason (openapi ReadinessReason, register G39): why it waits. */
+export type SbxReadinessReason = 'not_held' | 'no_slot' | 'memory' | 'memfile_mismatch';
+
+/** One build of a template (openapi TemplateBuild, template lifecycle spec §3.2, §3.3). */
+export interface SbxBuild {
+  buildId: string;
+  handle: string;
+  status: string;
+  profile: string;
+  readiness: string | null;
+  readinessReason?: SbxReadinessReason;
+  /** Register G43: waiting for a start slot on its host, and its place in the host's start line. */
+  queued?: boolean;
+  queuePosition?: number;
+  /** Register G43: in its host's idle grace, until `gracedUntil`. */
+  graced?: true;
+  gracedUntil?: number;
+  reason: { message: string; step?: string; rule?: string; code?: string } | null;
+  attestation?: 'deployment' | 'self';
+  heldBy: string[] | null;
+  tags: string[];
+  createdAt: number;
+  provenance: string | null;
+  spec?: {
+    guest_mb?: number;
+    vcpus?: number;
+    workspace_mb?: number;
+    seed?: string;
+    tools?: string[];
+  };
+}
+
+/** A template with its builds (openapi Template). */
+export interface SbxTemplateFull extends SbxTemplate {
+  owner: string | null;
+  visibility: 'private' | 'deployment';
+  attestation?: 'deployment' | 'self';
+  onboarding: string | null;
+  readiness: string | null;
+  readinessReason?: SbxReadinessReason;
+  tags: Record<string, string>;
+  builds: SbxBuild[];
+}
+
+/** One KVM host as `GET /v1/templates` reports it (template lifecycle spec §6.2, G39, G43). */
+export interface SbxHost {
+  id: string;
+  active: { limit: number; used: number };
+  idleLimitSeconds: number;
+  disk: { freeGb: number; floorGb: number };
+  memory?: { headroomMib: number; brake: string | null; usedMib: number; totalMib: number };
+  idleGraceSeconds?: number;
+  graced?: number;
+  start?: {
+    concurrency: number;
+    seconds: number | null;
+    starting: number | null;
+    queued: number | null;
+  };
+}
+
+/** What a create answers (openapi TemplateQueued): the build to follow. */
+export interface SbxQueued {
+  templateId: string;
+  buildId: string | null;
+  /** The build's path, `/v1/templates/{id}/builds/{handle}`. */
+  build: string;
+  status: string;
+  reused?: boolean;
+}
+
+/** The body of a template create (openapi TemplateCreate). */
+export interface SbxTemplateCreate {
+  id?: string;
+  image: string;
+  spec: Record<string, unknown>;
+  profile?: string;
+  /** The gate record file as sent, byte for byte. */
+  gateRecord?: string;
+  visibility?: string;
+}
+
+export type SbxLimitUse = { limit: number; used: number };
+export interface SbxQuotaView {
+  subject: string;
+  templates: SbxLimitUse;
+  buildsQueued: SbxLimitUse;
+  active: SbxLimitUse;
+  sandboxes?: SbxLimitUse;
+  quotaSource?: 'subject' | 'default';
+}
+
+export type SbxQuota = { templates: number; buildsQueued: number; active: number };
+
+/** A policy profile (openapi Policy.profiles), as much of it as mocactl reads. */
+export interface SbxProfile {
+  requires: string[];
+  selfAttest?: boolean;
+  selfAttestEgress?: boolean;
+  requireOfflineGate?: boolean;
+  envelope: {
+    maxGuestMb: number;
+    maxVcpus: number;
+    maxWorkspaceMb: number;
+    exact?: { guestMb: number; vcpus: number };
+  };
+}
+
+export interface SbxPolicyView {
+  policy: {
+    schema: string;
+    profiles: Record<string, SbxProfile>;
+    defaultProfile: string;
+    allowedRegistries: string[];
+    allowedRepositories?: Record<string, string[]>;
+    trustedGateRecords: string[];
+    quota: SbxQuota;
+    quotaBySubject?: Record<string, SbxQuota>;
+  };
+  digest: string;
+  record: string;
+}
+
 export class SandboxApiClient extends ControlPlaneClient {
   sandboxDiscovery(): Promise<SbxDiscovery> {
     return this.json('GET', '/v1/discovery', { auth: false });
@@ -91,6 +214,71 @@ export class SandboxApiClient extends ControlPlaneClient {
 
   async listTemplates(): Promise<SbxTemplate[]> {
     return (await this.json<{ templates: SbxTemplate[] }>('GET', '/v1/templates')).templates;
+  }
+
+  /** The KVM hosts' limits and use, the `hosts` block of `GET /v1/templates` (§6.2). */
+  async listHosts(): Promise<SbxHost[]> {
+    return (await this.json<{ hosts?: SbxHost[] }>('GET', '/v1/templates')).hosts ?? [];
+  }
+
+  /** One template with its builds and their specs (`GET /v1/templates/{id}`). */
+  getTemplate(id: string): Promise<SbxTemplateFull> {
+    return this.json('GET', `/v1/templates/${encodeURIComponent(id)}`);
+  }
+
+  /** One build, by build id or by the create's handle (`GET /v1/templates/{id}/builds/{b}`). */
+  getTemplateBuild(id: string, build: string): Promise<SbxBuild> {
+    return this.json(
+      'GET',
+      `/v1/templates/${encodeURIComponent(id)}/builds/${encodeURIComponent(build)}`,
+    );
+  }
+
+  /** Create a template, or a new build of one's own (lifecycle spec §4): `POST /v1/templates`. */
+  createTemplate(body: SbxTemplateCreate): Promise<SbxQueued> {
+    return this.json('POST', '/v1/templates', { body });
+  }
+
+  /** A new build of one's own template: `POST /v1/templates/{id}/builds` (the body's id ignored). */
+  createTemplateBuild(id: string, body: SbxTemplateCreate): Promise<SbxQueued> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/builds`, { body });
+  }
+
+  /** Withdraw a queued, building or probing build (register G22). */
+  cancelTemplateBuild(
+    id: string,
+    build: string,
+  ): Promise<{ templateId: string; build: string; status: 'failed' }> {
+    return this.json(
+      'POST',
+      `/v1/templates/${encodeURIComponent(id)}/builds/${encodeURIComponent(build)}/cancel`,
+    );
+  }
+
+  /** Take or renew the caller's lease on a registered build (§6.3). */
+  activateTemplate(
+    id: string,
+    body: { build?: string; leaseSeconds?: number },
+  ): Promise<{ templateId: string; buildId: string; leaseUntil: number; host: string | null }> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/activate`, { body });
+  }
+
+  /** Release the caller's lease; `stopNow` skips the host's idle grace (register G43). */
+  deactivateTemplate(
+    id: string,
+    body: { stopNow?: boolean },
+  ): Promise<{ templateId: string; released: number }> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/deactivate`, { body });
+  }
+
+  /** The caller's template quotas and use, and the live-sandbox cap (§6.2, register G27). */
+  getQuota(): Promise<SbxQuotaView> {
+    return this.json('GET', '/v1/quota');
+  }
+
+  /** The deployment's template policy (§8): profiles, registries, quotas, and its digest. */
+  getPolicy(): Promise<SbxPolicyView> {
+    return this.json('GET', '/v1/policy');
   }
 
   /** Retire a template, or one build of it (lifecycle spec §5.1): `POST …/retire` or `DELETE …/builds/{b}`. */
@@ -145,8 +333,14 @@ export class SandboxApiClient extends ControlPlaneClient {
   /** Set a subject's quota, or the default; null removes a subject's override (spec §5.2; admins). */
   putQuota(
     target: string,
-    quota: { templates: number; buildsQueued: number; active: number } | null,
-  ): Promise<{ target: string; quota: unknown; before: unknown; policy: string; record: string }> {
+    quota: SbxQuota | null,
+  ): Promise<{
+    target: string;
+    quota: SbxQuota | null;
+    before: SbxQuota | null;
+    policy: string;
+    record: string;
+  }> {
     return this.json('PUT', `/v1/quota/${encodeURIComponent(target)}`, { body: quota });
   }
 
@@ -183,7 +377,7 @@ export class SandboxApiClient extends ControlPlaneClient {
     template: string;
     name?: string;
     labels?: Record<string, string>;
-  }): Promise<SbxSandbox> {
+  }): Promise<SbxSandbox & { buildId?: string | null; templateManifestHash?: string | null }> {
     return this.json('POST', '/v1/sandboxes', { body });
   }
 
