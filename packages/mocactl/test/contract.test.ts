@@ -80,7 +80,8 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
 // The same for `mocactl sbx`'s SandboxApiClient (SBX0 §5.1), beyond the calls it inherits.
 const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: string[] }> = [
   { method: 'get', path: '/v1/discovery', reads: ['profile'] },
-  { method: 'get', path: '/v1/templates', reads: ['templates'] },
+  // `sbx hosts` reads the same list's `hosts` block (mocactl templates spec §3.1).
+  { method: 'get', path: '/v1/templates', reads: ['templates', 'hosts'] },
   {
     method: 'post',
     path: '/v1/sandboxes',
@@ -143,6 +144,76 @@ const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: 
   { method: 'delete', path: '/v1/subjects/{subject}' },
   { method: 'put', path: '/v1/subjects/{subject}/roles/admin', sends: ['until'] },
   { method: 'delete', path: '/v1/subjects/{subject}/roles/admin' },
+  // The whole client path (mocactl templates spec §3.1-§3.4).
+  {
+    method: 'post',
+    path: '/v1/templates',
+    reads: ['templateId', 'buildId', 'build', 'status', 'reused'],
+    sends: ['id', 'image', 'spec', 'profile', 'gateRecord', 'visibility'],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/builds',
+    reads: ['templateId', 'buildId', 'build', 'status'],
+    sends: ['image', 'spec', 'profile', 'gateRecord'],
+  },
+  {
+    method: 'get',
+    path: '/v1/templates/{id}',
+    reads: [
+      'id',
+      'owner',
+      'visibility',
+      'onboarding',
+      'readiness',
+      'readinessReason',
+      'tags',
+      'builds',
+    ],
+  },
+  {
+    method: 'get',
+    path: '/v1/templates/{id}/builds/{build}',
+    reads: [
+      'buildId',
+      'handle',
+      'status',
+      'readiness',
+      'readinessReason',
+      'queued',
+      'queuePosition',
+      'graced',
+      'gracedUntil',
+      'reason',
+      'attestation',
+      'heldBy',
+      'tags',
+      'spec',
+    ],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/builds/{build}/cancel',
+    reads: ['templateId', 'build', 'status'],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/activate',
+    reads: ['templateId', 'buildId', 'leaseUntil', 'host'],
+    sends: ['build', 'leaseSeconds'],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/deactivate',
+    reads: ['templateId', 'released'],
+    sends: ['stopNow'],
+  },
+  {
+    method: 'get',
+    path: '/v1/quota',
+    reads: ['subject', 'templates', 'buildsQueued', 'active', 'sandboxes', 'quotaSource'],
+  },
+  { method: 'get', path: '/v1/policy', reads: ['policy', 'digest', 'record'] },
 ];
 
 // The fields of each Sandbox and template `mocactl sbx ls` / `templates` print.
@@ -171,6 +242,14 @@ const CODES_USED = [
   'model_catalog_unavailable',
   'not_enrolled',
   'sandbox_not_found',
+  // The template commands (sbx/templates.ts, mocactl templates spec §3.2-§3.7).
+  'template_not_found',
+  'template_exists',
+  'template_not_active',
+  'no_active_slot',
+  'template_unavailable',
+  'quota_exceeded',
+  'policy_refused',
 ];
 
 function responseSchema(op: any): any {
@@ -214,7 +293,7 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
 
   it('covers every call the client makes', async () => {
     const reply = () => json({ credentials: [], sessions: [], nextCursor: null });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 30 }, () => reply));
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 40 }, () => reply));
     const c = new ControlPlaneClient('http://cp', () => 't', fetch);
     const invokedMethods = new Set<string>();
     const handler: ProxyHandler<ControlPlaneClient> = {
@@ -299,7 +378,8 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
       expect(op, `${method} ${path} missing from openapi.yaml`).toBeDefined();
       const schema = responseSchema(op);
       for (const f of reads ?? []) expect(Object.keys(schema?.properties ?? {})).toContain(f);
-      const req = op.requestBody?.content?.['application/json']?.schema;
+      // The create routes' body is a `$ref` (TemplateCreate): resolved as a response is.
+      const req = resolveSchema(op.requestBody?.content?.['application/json']?.schema);
       for (const f of sends ?? []) expect(Object.keys(req?.properties ?? {})).toContain(f);
     },
   );
@@ -330,7 +410,7 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
 
   it('covers every call SandboxApiClient adds', async () => {
     const reply = () => json({ templates: [], sandboxes: [] });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 30 }, () => reply));
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 40 }, () => reply));
     const c = new SandboxApiClient('http://cp', () => 't', fetch);
     await c.sandboxDiscovery();
     await c.listTemplates();
@@ -353,6 +433,16 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     await c.unenrollSubject('SUBJ');
     await c.grantAdmin('SUBJ', 1);
     await c.revokeAdmin('SUBJ');
+    await c.listHosts();
+    await c.getTemplate('TID');
+    await c.getTemplateBuild('TID', 'BID');
+    await c.createTemplate({ id: 'x', image: 'i', spec: {} });
+    await c.createTemplateBuild('TID', { image: 'i', spec: {} });
+    await c.cancelTemplateBuild('TID', 'BID');
+    await c.activateTemplate('TID', {});
+    await c.deactivateTemplate('TID', {});
+    await c.getQuota();
+    await c.getPolicy();
     const seen = calls.map(
       (k) =>
         `${k.method.toLowerCase()} ${new URL(k.url).pathname
@@ -389,6 +479,16 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
         'unenrollSubject',
         'grantAdmin',
         'revokeAdmin',
+        'listHosts',
+        'getTemplate',
+        'getTemplateBuild',
+        'createTemplate',
+        'createTemplateBuild',
+        'cancelTemplateBuild',
+        'activateTemplate',
+        'deactivateTemplate',
+        'getQuota',
+        'getPolicy',
       ]),
     );
   });

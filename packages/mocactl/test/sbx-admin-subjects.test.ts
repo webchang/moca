@@ -43,7 +43,9 @@ describe('mocactl sbx admin subjects', () => {
   it('enrolls, unenrolls, grants (with --until) and revokes, with the right requests', async () => {
     const { home, env, io } = setup();
     const answer = (record: string | null) => () => ({ status: 200, body: { ...SUBJECT, record } });
+    // §3.6: each write reads the subjects first; none listed, so each answer is consistent with it.
     const cp = fakeCp({
+      'GET /v1/subjects': () => ({ status: 200, body: { subjects: [] } }),
       'PUT /v1/subjects/github%3A9': answer('sha256:a'),
       'DELETE /v1/subjects/github%3A9': answer(null),
       'PUT /v1/subjects/github%3A9/roles/admin': answer('sha256:b'),
@@ -73,9 +75,24 @@ describe('mocactl sbx admin subjects', () => {
     expect(cp.calls.at(-1)).toMatchObject({ method: 'DELETE' });
   });
 
+  it('reports a 403 plainly and makes no second call (never retried as another role)', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/subjects': () => ({
+        status: 403,
+        body: { error: 'forbidden', message: 'managing subjects requires the admin role' },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain(['admin', 'subjects'], env, io, opts)).toBe(1);
+    expect(io.errs.join('\n')).toContain('requires the admin role');
+    expect(cp.calls.filter((c) => c.path.startsWith('/v1/subjects'))).toHaveLength(1);
+  });
+
   it('reports a control-plane refusal (403, 409) and refuses bad usage locally', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
+      'GET /v1/subjects': () => ({ status: 200, body: { subjects: [] } }),
       'DELETE /v1/subjects/github%3A1/roles/admin': () => ({
         status: 409,
         body: { error: 'bootstrap_subject', message: 'github:1 is an admin by the settings' },

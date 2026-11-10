@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 // sandbox-client's POSIX single quotes: safe to `eval`, whatever the control plane sent.
@@ -6,13 +7,25 @@ import { ApiError, TOKEN_CODES } from '../api/errors.js';
 import { deviceLogin, toCachedAuth } from '../core/auth.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
-import { saveConfig, storedLoginUrl } from '../config.js';
+import { sameControlPlane, saveConfig, storedLoginUrl } from '../config.js';
 import { deviceLoginEnd, devicePrompt, type Io, type LoginHelpers } from '../headless.js';
 import { setAuth, type RefreshFailure, type Runtime } from '../runtime.js';
-import type { SandboxApiClient, SbxDiscovery, SbxSandbox, SbxSubject } from './api.js';
+import { sandboxFailureText, type ExecFactory } from './exec.js';
+import { seedSandbox, waitRetired, type SeedResult } from './templates.js';
+import type { SandboxApiClient, SbxDiscovery, SbxQuota, SbxSandbox, SbxSubject } from './api.js';
 
-/** `mocactl sbx`'s exit codes (SBX0 §6.1), as `mocactl auth token`'s beyond 0 and 2. */
-export const SBX_EXIT = { ok: 0, failed: 1, usage: 2, loginRequired: 3, unreachable: 4 } as const;
+/**
+ * `mocactl sbx`'s exit codes (SBX0 §6.1), as `mocactl auth token`'s beyond 0 and 2; 5 when a wait
+ * (`templates follow`, `activate --wait`, `retire --wait`) ran out of time (mocactl templates spec §3.7).
+ */
+export const SBX_EXIT = {
+  ok: 0,
+  failed: 1,
+  usage: 2,
+  loginRequired: 3,
+  unreachable: 4,
+  timedOut: 5,
+} as const;
 
 export interface SbxCtx {
   rt: Runtime;
@@ -21,6 +34,9 @@ export interface SbxCtx {
   io: Io;
   json: boolean;
   signal?: AbortSignal;
+  /** The waits' sleep and clock (default the runtime's); tests pass fakes. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  now?: () => number;
   /**
    * The control-plane URL when it came from `--control-plane-url` or MOCACTL_SBX_URL rather than
    * config.json: `SBX_TOKEN_CMD` then names it, since another shell may have neither.
@@ -53,6 +69,9 @@ export function failRefresh(io: Io, error: unknown): number {
   return SBX_EXIT.unreachable;
 }
 
+/** The 404s the sandbox and template routes answer themselves: a real answer about the id. */
+const OWN_404 = new Set(['sandbox_not_found', 'template_not_found']);
+
 /**
  * One line per failure. A refusal from the control plane is exit 1 with its message; a network
  * failure (status 0) is exit 4; a token the control plane will not take any more is exit 3 --
@@ -72,15 +91,45 @@ export function fail(io: Io, err: unknown, refreshFailure?: RefreshFailure): num
   } else if (err instanceof ApiError && TOKEN_CODES.has(err.code)) {
     io.err('sbx: your sandbox-service login has expired: run `mocactl sbx login`');
     return SBX_EXIT.loginRequired;
-  } else if (err instanceof ApiError && err.status === 404 && err.code !== 'sandbox_not_found') {
-    // A heuristic: every sandbox route's own 404 is `sandbox_not_found`, so any other 404 (the
-    // server's bare `not_found` for an unmounted route, or a proxy's page) means the URL is not a
-    // sandbox-profile control plane -- a MOCA (harness profile) one, or one from before SBX0.
+  } else if (err instanceof ApiError && err.status === 404 && !OWN_404.has(err.code)) {
+    // A heuristic: every sandbox route's own 404 is `sandbox_not_found` (a template route's
+    // `template_not_found`), so any other 404 (the server's bare `not_found` for an unmounted route,
+    // or a proxy's page) means the URL is not a sandbox-profile control plane -- a MOCA (harness
+    // profile) one, or one from before SBX0.
     io.err('sbx: that control plane has no sandbox routes: is it the sandbox service?');
+  } else if (err instanceof ApiError) {
+    io.err(`sbx: ${refusalText(err)}`);
   } else {
     io.err(`sbx: ${describeError(err)}`);
   }
   return SBX_EXIT.failed;
+}
+
+/**
+ * A refusal in one line, with what the body says beside its code (mocactl templates spec §3.7): the
+ * policy rule, the quota, the readiness and why, the queue position and the Retry-After. Server
+ * text is sanitized (describeError).
+ */
+export function refusalText(err: ApiError): string {
+  const text = describeError(err);
+  const lead =
+    err.rule !== undefined
+      ? `refused by policy rule ${sanitizeRemote(err.rule)}: ${text}`
+      : err.quota !== undefined
+        ? `over your ${sanitizeRemote(err.quota)} quota: ${text}`
+        : text;
+  const notes = [
+    ...(err.readiness !== undefined
+      ? [
+          `readiness ${sanitizeRemote(err.readiness)}${err.readinessReason !== undefined ? ` (${sanitizeRemote(err.readinessReason)})` : ''}`,
+        ]
+      : []),
+    ...(err.queuePosition !== undefined ? [`queue position ${err.queuePosition}`] : []),
+    ...(err.retryAfterS !== undefined && err.status !== 0
+      ? [`retry after ${err.retryAfterS} s`]
+      : []),
+  ];
+  return notes.length ? `${lead} (${notes.join('; ')})` : lead;
 }
 
 /**
@@ -185,10 +234,10 @@ export async function cmdTemplates(c: SbxCtx): Promise<number> {
 export async function cmdRetireTemplate(
   c: SbxCtx,
   id: string,
-  opts: { build?: string; reason?: string },
+  opts: { build?: string; reason?: string; wait?: { timeoutS?: number } },
 ): Promise<number> {
   try {
-    const r = await c.api.retireTemplate(id, opts);
+    const r = await c.api.retireTemplate(id, { build: opts.build, reason: opts.reason });
     if (c.json) c.io.out(JSON.stringify(r) + '\n');
     else {
       const builds = r.builds ?? [{ build: r.build ?? '', record: r.record ?? null }];
@@ -197,6 +246,11 @@ export async function cmdRetireTemplate(
           `retired ${sanitizeRemote(r.templateId)} ${sanitizeRemote(b.build)}${b.record ? '' : ' (already retired)'}\n`,
         );
       }
+    }
+    // --wait (§3.4): until each build reads retired and no host holds it.
+    if (opts.wait) {
+      const builds = (r.builds ?? [{ build: r.build ?? opts.build ?? '' }]).map((b) => b.build);
+      return await waitRetired(c, r.templateId, builds, opts.wait.timeoutS);
     }
     return SBX_EXIT.ok;
   } catch (err) {
@@ -280,20 +334,106 @@ export async function cmdTransferTemplate(c: SbxCtx, id: string, owner: string):
   }
 }
 
-/** `sbx templates quota TARGET (--templates N --builds-queued N --active N | --clear)` (§5.2). */
+/** The API token issuer each profile's control plane mints under (control-plane token.ts). */
+const ISSUER_BY_PROFILE: Record<string, string> = {
+  sandbox: 'sbx-control-plane-api',
+  combined: 'sh-control-plane',
+};
+
+/** A JWT's `iss`, read WITHOUT verifying it (as jwtTimes): only to compare. */
+function jwtIssuer(token: string): string | undefined {
+  try {
+    const c = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
+      iss?: unknown;
+    };
+    return typeof c.iss === 'string' ? c.iss : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Before an admin write (mocactl templates spec §3.6): the login must be for this control plane,
+ * and its token minted under the issuer this control plane's profile mints under -- a login for one
+ * deployment pointed at another is refused here, before the read and the write. A token whose `iss`
+ * cannot be read (not a JWT) is left to the control plane to judge. Returns the refusal line.
+ */
+export async function loginMismatch(c: SbxCtx): Promise<string | undefined> {
+  const auth = c.rt.auth;
+  if (!auth) return undefined;
+  if (!sameControlPlane(auth.controlPlaneUrl, c.url))
+    return `the login is for ${sanitizeRemote(auth.controlPlaneUrl)}, not ${sanitizeRemote(c.url)}`;
+  const iss = jwtIssuer(auth.apiToken);
+  if (iss === undefined) return undefined;
+  const d: SbxDiscovery = await c.api.sandboxDiscovery();
+  const want = ISSUER_BY_PROFILE[d.profile ?? ''];
+  if (want !== undefined && iss !== want)
+    return `the login was issued by '${sanitizeRemote(iss)}', but ${sanitizeRemote(c.url)} (profile ${sanitizeRemote(d.profile ?? 'harness')}) issues '${want}': it is another deployment's login`;
+  return undefined;
+}
+
+/** Canonical JSON (keys sorted), to compare a value read with an answer's `before`. */
+export function canonical(v: unknown): string {
+  const sort = (x: unknown): unknown =>
+    Array.isArray(x)
+      ? x.map(sort)
+      : x && typeof x === 'object'
+        ? Object.fromEntries(
+            Object.keys(x as object)
+              .sort()
+              .map((k) => [k, sort((x as Record<string, unknown>)[k])]),
+          )
+        : x;
+  return JSON.stringify(sort(v ?? null));
+}
+
+/** The loud failure of §3.6: the value changed between this command's read and its write. */
+function raced(c: SbxCtx, what: string, read: string, before: string, now: string): number {
+  c.io.err(
+    `sbx: ${what} was changed by someone else between read and write: ${read} / ${before} / ${now} ` +
+      '(read / before this write / now): check it, and write again if need be',
+  );
+  return SBX_EXIT.failed;
+}
+
+const quotaText = (q: SbxQuota | null | undefined) =>
+  q
+    ? `templates ${q.templates}, builds queued ${q.buildsQueued}, active ${q.active}`
+    : 'the default';
+
+/**
+ * `sbx templates quota TARGET (--templates N --builds-queued N --active N | --clear)` (§5.2;
+ * admins). Reads the current value first (`GET /v1/policy`), writes, then compares the answer's
+ * `before` with the read: a difference is a concurrent write, reported loudly (exit 1). Prints old
+ * -> new and the new policy's digest and record.
+ */
 export async function cmdSetQuota(
   c: SbxCtx,
   target: string,
-  quota: { templates: number; buildsQueued: number; active: number } | null,
+  quota: SbxQuota | null,
 ): Promise<number> {
   try {
+    const mismatch = await loginMismatch(c);
+    if (mismatch) {
+      c.io.err(`sbx: refused: ${mismatch}`);
+      return SBX_EXIT.failed;
+    }
+    const pol = (await c.api.getPolicy()).policy;
+    const read = target === 'default' ? pol.quota : (pol.quotaBySubject?.[target] ?? null);
     const r = await c.api.putQuota(target, quota);
-    if (c.json) c.io.out(JSON.stringify(r) + '\n');
+    if (c.json) c.io.out(JSON.stringify({ ...r, read }) + '\n');
     else
       c.io.out(
-        quota === null
-          ? `${sanitizeRemote(r.target)}: back to the default quota\n`
-          : `${sanitizeRemote(r.target)}: templates ${quota.templates}, builds queued ${quota.buildsQueued}, active ${quota.active}\n`,
+        `${sanitizeRemote(r.target)}: ${quotaText(read)} -> ${quota === null ? 'back to the default quota' : quotaText(quota)}` +
+          ` (policy ${sanitizeRemote(r.policy)}, record ${sanitizeRemote(r.record)})\n`,
+      );
+    if (canonical(r.before) !== canonical(read))
+      return raced(
+        c,
+        `${target}'s quota`,
+        quotaText(read),
+        quotaText(r.before),
+        quotaText(r.quota),
       );
     return SBX_EXIT.ok;
   } catch (err) {
@@ -326,7 +466,42 @@ export async function cmdSubjects(c: SbxCtx): Promise<number> {
   }
 }
 
-/** `sbx admin subjects enroll|unenroll|grant|revoke SUBJECT` (register G38; admins). */
+/** An API-granted admin role's state: `none`, or `admin` with its `until` (null: no expiry). */
+const roleOf = (s: SbxSubject | undefined) => {
+  const r = s?.roles.find((x) => x.role === 'admin' && x.source === 'api');
+  return r ? `admin until ${r.until ?? 'no expiry'}` : 'none';
+};
+
+/**
+ * Whether the subject read is already in the state the action asks for, so the write should change
+ * nothing (`record: null`); undefined where the list cannot tell (an unenroll of a subject that is
+ * also an admin, whose own enrollment the list folds into its role).
+ */
+function alreadyThere(
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  s: SbxSubject | undefined,
+  until?: number,
+): boolean | undefined {
+  switch (action) {
+    case 'enroll':
+      return s?.enrolled === true;
+    case 'unenroll':
+      return s?.roles.length ? undefined : !(s?.enrolled === true && s.source === 'api');
+    case 'grant':
+      return roleOf(s) === `admin until ${until ?? 'no expiry'}`;
+    case 'revoke':
+      // A lapsed grant is listed as none, yet a revoke still records its removal: "none" tells nothing.
+      return roleOf(s) === 'none' ? undefined : false;
+  }
+}
+
+/**
+ * `sbx admin subjects enroll|unenroll|grant|revoke SUBJECT` (register G38; admins). As the quota
+ * write (§3.6): the subjects are read first, the change written, and the answer compared with the
+ * read. These answers name no `before`; their `record` does the same work (null when nothing
+ * changed), so a read that says "already so" with a record written, or "to change" with none, is a
+ * concurrent write, reported loudly (exit 1). Prints old -> new and the record's digest.
+ */
 export async function cmdSubjectChange(
   c: SbxCtx,
   action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
@@ -334,6 +509,12 @@ export async function cmdSubjectChange(
   until?: number,
 ): Promise<number> {
   try {
+    const mismatch = await loginMismatch(c);
+    if (mismatch) {
+      c.io.err(`sbx: refused: ${mismatch}`);
+      return SBX_EXIT.failed;
+    }
+    const read = (await c.api.listSubjects()).find((s) => s.subject === subject);
     const r =
       action === 'enroll'
         ? await c.api.enrollSubject(subject)
@@ -342,8 +523,27 @@ export async function cmdSubjectChange(
           : action === 'grant'
             ? await c.api.grantAdmin(subject, until)
             : await c.api.revokeAdmin(subject);
-    if (c.json) c.io.out(JSON.stringify(r) + '\n');
-    else c.io.out(`${subjectLine(r)}${r.record ? '' : '  (unchanged)'}\n`);
+    const state = (s: SbxSubject | undefined) =>
+      action === 'enroll' || action === 'unenroll'
+        ? s?.enrolled
+          ? `enrolled (${s.source})`
+          : 'not enrolled'
+        : roleOf(s);
+    if (c.json) c.io.out(JSON.stringify({ ...r, read: read ?? null }) + '\n');
+    else
+      c.io.out(
+        `${subjectLine(r)}${r.record ? '' : '  (unchanged)'}\n` +
+          `${sanitizeRemote(subject)}: ${state(read)} -> ${state(r)}${r.record ? ` (record ${sanitizeRemote(r.record)})` : ''}\n`,
+      );
+    const there = alreadyThere(action, read, until);
+    if (there !== undefined && there !== (r.record === null))
+      return raced(
+        c,
+        `${subject}'s ${action === 'enroll' || action === 'unenroll' ? 'enrollment' : 'admin role'}`,
+        state(read),
+        r.record === null ? 'already so' : 'changed by this write',
+        state(r),
+      );
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);
@@ -380,17 +580,41 @@ export async function createWaitingForActivation(
   }
 }
 
+/**
+ * `sbx create [--template ID[@BUILD]] [--seed]`. With --seed, the build's seed runs as the new
+ * sandbox's first command and the workspace is checked (mocactl templates spec §3.3): a failure
+ * there is exit 1, the sandbox kept and named, so its state can be looked at.
+ */
 export async function cmdCreate(
   c: SbxCtx,
   body: { template: string; name?: string; labels?: Record<string, string> },
+  seed?: { factory?: ExecFactory },
 ): Promise<number> {
   try {
     const s = await createWaitingForActivation(c, body);
-    if (c.json) c.io.out(JSON.stringify(s) + '\n');
-    else c.io.out(`${sanitizeRemote(s.id)}\n`);
     c.io.err(
       `created ${sanitizeRemote(s.id)} (${sanitizeRemote(s.template)}), expires ${when(s.expiresAt)}`,
     );
+    let seeded: SeedResult | undefined;
+    if (seed) {
+      const r = await seedSandbox(c, s, seed.factory).catch((err: unknown) =>
+        err instanceof ApiError ? Promise.reject(err) : sandboxFailureText(err),
+      );
+      if (typeof r === 'string') {
+        if (c.json) c.io.out(JSON.stringify({ ...s, seed: { error: r } }) + '\n');
+        else c.io.out(`${sanitizeRemote(s.id)}\n`);
+        c.io.err(`sbx: ${sanitizeRemote(s.id)}: ${r}`);
+        return SBX_EXIT.failed;
+      }
+      seeded = r;
+      c.io.err(
+        r.seed === ''
+          ? `${sanitizeRemote(s.id)}: the template has no seed`
+          : `seeded ${sanitizeRemote(s.id)}${r.head ? `: a clean tree at ${r.head}` : ''}`,
+      );
+    }
+    if (c.json) c.io.out(JSON.stringify(seeded ? { ...s, seed: seeded } : s) + '\n');
+    else c.io.out(`${sanitizeRemote(s.id)}\n`);
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);
@@ -462,8 +686,14 @@ export async function cmdRm(c: SbxCtx, id: string, o: { goneOk?: boolean } = {})
  * summary, read page by page. `--ndjson`: the log exactly as served, whose sha256 the summary and the
  * sandbox's end record name (verify-provenance.py --egress checks a saved copy).
  */
-export async function cmdEgress(c: SbxCtx, id: string, ndjson: boolean): Promise<number> {
+export async function cmdEgress(
+  c: SbxCtx,
+  id: string,
+  ndjson: boolean,
+  verify = false,
+): Promise<number> {
   try {
+    if (verify) return await verifyEgress(c, id);
     if (ndjson) {
       const body = await c.api.sandboxEgressNdjson(id);
       if (c.io.outBytes) c.io.outBytes(Buffer.from(body, 'utf8'));
@@ -503,14 +733,53 @@ export async function cmdEgress(c: SbxCtx, id: string, ndjson: boolean): Promise
   }
 }
 
-export async function cmdToken(c: SbxCtx, id: string): Promise<number> {
-  try {
-    const t = await c.api.mintSandboxToken(id);
+/**
+ * `sbx token [ID] [--renew-every S]`: a fresh sandbox token on stdout (the one command that prints
+ * one, on purpose). With --renew-every, a new one every S seconds until interrupted, so a client
+ * whose run outlives one token's life reads the newest line (mocactl templates spec §3.3).
+ */
+/**
+ * `sbx egress ID --verify` (mocactl templates spec §3.3): the log as served, its sha256 and line
+ * count checked against the summary's, which is what the sandbox's end record names (as
+ * verify-provenance.py --egress checks a saved copy against the record). Exit 0 only when both match.
+ */
+async function verifyEgress(c: SbxCtx, id: string): Promise<number> {
+  const summary = (await c.api.sandboxEgress(id, { limit: 1 })).summary;
+  const body = await c.api.sandboxEgressNdjson(id);
+  const sha256 = `sha256:${createHash('sha256').update(body, 'utf8').digest('hex')}`;
+  const lines = body.split('\n').filter((l) => l !== '').length;
+  const ok = sha256 === summary.sha256 && lines === summary.total;
+  if (c.json)
     c.io.out(
-      (c.json ? JSON.stringify({ token: t.token, expiresAt: t.expiresAt }) : t.token) + '\n',
+      JSON.stringify({
+        verified: ok,
+        sha256,
+        lines,
+        summary: { sha256: summary.sha256, total: summary.total, complete: summary.complete },
+      }) + '\n',
     );
-    return SBX_EXIT.ok;
+  else
+    c.io.out(
+      ok
+        ? `verified: ${lines} events, ${sanitizeRemote(sha256)}${summary.complete ? '' : `; INCOMPLETE: ${summary.dropped} dropped`}\n`
+        : `NOT verified: the log served is ${lines} events, ${sanitizeRemote(sha256)}; the summary names ${summary.total}, ${sanitizeRemote(summary.sha256)}\n`,
+    );
+  return ok ? SBX_EXIT.ok : SBX_EXIT.failed;
+}
+
+export async function cmdToken(c: SbxCtx, id: string, renewEveryS?: number): Promise<number> {
+  try {
+    for (;;) {
+      const t = await c.api.mintSandboxToken(id);
+      c.io.out(
+        (c.json ? JSON.stringify({ token: t.token, expiresAt: t.expiresAt }) : t.token) + '\n',
+      );
+      if (renewEveryS === undefined) return SBX_EXIT.ok;
+      await (c.sleep ?? c.rt.sleep)(renewEveryS * 1000, c.signal);
+      if (c.signal?.aborted) return SBX_EXIT.ok;
+    }
   } catch (err) {
+    if (c.signal?.aborted) return SBX_EXIT.ok;
     return failed(c, err);
   }
 }

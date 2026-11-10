@@ -380,7 +380,14 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
      guide-4b-1/0009), so write `guest_ram_mb`.
 
    `POST /v1/templates` with that body and your API token. A create is answered `202` with the build
-   to follow (as recorded, guide-4b-3/0001; also lc-1/0003):
+   to follow (as recorded, guide-4b-3/0001; also lc-1/0003). With mocactl (from 2026-11-10; not
+   yet run in a KVM-host window), the same create from that body saved as `my-python.json`, after
+   the policy's local checks:
+
+   ```bash
+   mocactl sbx templates create --spec my-python.json --dry-run   # nothing sent; names a failing rule
+   mocactl sbx templates create --spec my-python.json --json      # the answer below
+   ```
 
    ```json
    {
@@ -391,7 +398,9 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
    }
    ```
 
-3. **Follow the build** with `mocactl sbx templates --json` or `GET /v1/templates/<id>/builds/<build>`:
+3. **Follow the build** with `mocactl sbx templates follow <id>` (exit 0 once registered, 1 on
+   failed or rejected with the reason, 5 past `--timeout`, 3600 s by default) or
+   `GET /v1/templates/<id>/builds/<build>`:
    `queued`, `building`, `probing`, `built`, then `registered` (guide-4b-3/0014: registered,
    its build's `attestation` `deployment`, since `base` needs no gate record; the template itself was
    created `visibility: private`; also lc-1/0007 (queued) to lc-1/0103 (registered)).
@@ -407,7 +416,8 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 "spec_refused"}` (guide-4b-1/0009: `guest_mb`, above) and `{"step": "build", "code":
 "build_failed"}` (guide-4b-2/0013, Path A's second build: no git, above). Section 10 lists the usual causes.
 
-5. **Use it:** activate it (`POST /v1/templates/<id>/activate`, guide-4b-3/0018), then
+5. **Use it:** activate it (`POST /v1/templates/<id>/activate`, guide-4b-3/0018; with mocactl,
+   `mocactl sbx templates activate my-python --wait`, which polls until active), then
    `mocactl sbx create --template my-python` (guide-4b-3/0032: `201`). A first use may answer
    `409 template_not_active` with `Retry-After` (lc-1/0188) while a host starts its worker; the retry
    succeeds once it's attached. Behind a host's start limit the build reads `activating` with
@@ -417,7 +427,8 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 
 6. **Update and retire:** a new build of the same id (`POST /v1/templates/<id>/builds`), then
    `mocactl sbx templates tag <id> default --build <new build>`; retire with
-   `mocactl sbx templates retire <id>` (guide-4b-3/0039; also lc-1/0260). A create after that answers
+   `mocactl sbx templates retire <id>` (guide-4b-3/0039; also lc-1/0260; `--wait` returns once no
+   host holds it). A create after that answers
    `410 template_retired` (guide-4b-3/0041; also lc-1/0262). A retire is refused while a sandbox or session still uses the build
    (`409 build_in_use`) _(not yet recorded)_.
 

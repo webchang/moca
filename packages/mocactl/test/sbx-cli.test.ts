@@ -18,7 +18,17 @@ import { SandboxApiClient } from '../src/sbx/api.js';
 import { openSbxRuntime, sbxMain, sbxPaths } from '../src/sbx/cli.js';
 import { createWaitingForActivation } from '../src/sbx/commands.js';
 import { readBoundSandbox } from '../src/sbx/state.js';
-import { fakeCp, LOGIN, sandbox, SBX, setup, TOKEN, URL_, type Handler } from './helpers/sbx.js';
+import {
+  fakeCp,
+  LOGIN,
+  policyView,
+  sandbox,
+  SBX,
+  setup,
+  TOKEN,
+  URL_,
+  type Handler,
+} from './helpers/sbx.js';
 
 const MOCA_URL = 'https://moca-api.example.invalid';
 
@@ -337,7 +347,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(await sbxMain(['templates', 'retire', 'a', 'b'], env, io, opts)).toBe(2);
     expect(await sbxMain(['templates', '--build', 'x'], env, io, opts)).toBe(2);
     expect(await sbxMain(['ls', '--reason', 'x'], env, io, opts)).toBe(2);
-    expect(io.errs.join('\n')).toMatch(/--build only applies to templates retire and tag/);
+    expect(io.errs.join('\n')).toMatch(/--build only applies to templates retire, tag, show/);
     expect(io.errs.join('\n')).toMatch(/--reason only applies to templates retire/);
   });
 
@@ -454,6 +464,8 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
   it("sets a subject's quota or the default, and clears an override (admins, lifecycle §5.2)", async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
+      // §3.6: the value is read first, so its `before` can be compared.
+      'GET /v1/policy': () => ({ status: 200, body: policyView() }),
       'PUT /v1/quota/github%3A9': (req) => ({
         status: 200,
         body: {
@@ -490,10 +502,12 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       path: '/v1/quota/github%3A9',
       body: { templates: 5, buildsQueued: 2, active: 1 },
     });
-    expect(io.outs.join('')).toContain('github:9: templates 5, builds queued 2, active 1');
+    expect(io.outs.join('')).toContain(
+      'github:9: the default -> templates 5, builds queued 2, active 1 (policy sha256:p, record sha256:r)',
+    );
     io.outs.length = 0;
     expect(await sbxMain(['templates', 'quota', 'github:9', '--clear'], env, io, opts)).toBe(0);
-    expect(io.outs.join('')).toContain('github:9: back to the default quota');
+    expect(io.outs.join('')).toContain('github:9: the default -> back to the default quota');
     expect(await sbxMain(['templates', 'quota', 'github:9', '--active', '1'], env, io, opts)).toBe(
       2,
     );

@@ -185,6 +185,11 @@ mocactl sbx admin subjects grant github:<id> --until 1h      # a temporary admin
 mocactl sbx admin subjects revoke github:<id>
 ```
 
+Each change reads the subjects first and prints `old -> new` with its record; if the subject changed
+between that read and the write (another admin at once), it says so and exits 1: check and write
+again. `mocactl sbx templates quota TARGET …` does the same against the policy. A login minted for
+another deployment (another issuer or control plane) is refused before the write.
+
 It takes effect at the subject's next request. A subject in `SBX_ALLOWED_SUBJECTS` or
 `SBX_ADMIN_SUBJECTS` can't be unenrolled or revoked this way (`409 bootstrap_subject`): change the
 settings for those. An admin can't revoke its own role.
@@ -302,6 +307,9 @@ only an admin changes (`PUT /v1/policy`, a `policy` record). What an operator se
   the repository allowlist, take `docker.io` out of `allowedRegistries` first:** an older image
   ignores `allowedRepositories`, so it would admit every Docker Hub repository.
 - **Quotas:** `quota`, and `quotaBySubject` for an override.
+- **What clients see of it:** `mocactl sbx policy`, `mocactl sbx quota` and `mocactl sbx hosts`;
+  they create and follow their templates with `mocactl sbx templates create|follow|activate`
+  ([the user guide](../../docs/sbx/user-guide.md), §8).
 
 ## 6. Rotating the signing key
 
