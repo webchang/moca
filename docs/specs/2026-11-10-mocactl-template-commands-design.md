@@ -1,7 +1,7 @@
 # mocactl for templates and users: the client's whole path
 
-- **Status:** design draft, reviewed by autobench-moca and autobench (2026-11-10, their marks folded
-  in; no hold from either), for the user's decisions (§7). Not implemented.
+- **Status:** design accepted (the user, 2026-11-10: all seven recommendations in §7), after reviews by
+  autobench-moca and autobench. Not implemented yet.
 - **Date:** 2026-11-10
 - **Asked for by:** the user, 2026-11-09: "after we are done with Moca API enrichment/enhancement, we
   also need to enrich/enhance Moca's mocactl for template and user management/consumption."
