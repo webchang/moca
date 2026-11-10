@@ -2917,8 +2917,9 @@ paths:
                       type: object
                       additionalProperties: { type: integer }
                       description: |
-                        worker id -> its slice's memory.current less its pinned memory file, MiB, at
-                        least 0; a worker whose slice could not be read is absent
+                        worker id -> its VMs' unreclaimable memory, MiB: its slice's memory.stat
+                        anon + shmem + kernel, never page cache (register G48); a worker whose slice
+                        could not be read is absent
                     memfileMismatch:
                       type: array
                       items: { type: string }

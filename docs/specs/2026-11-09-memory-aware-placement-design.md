@@ -71,7 +71,8 @@ other work (Moca's own P6 sessions), need a lower limit than the operator's numb
     With no `/proc/pressure` (an older kernel, or PSI off at boot) the field is absent: no brake, and
     the agent logs it once. Never "no starts";
   - `vmCommittedMib`: what each attached worker's running VMs hold, from its slice
-    (`sbx-<id>.slice`'s `memory.current`, minus the pinned file, read by the agent), per worker;
+    (`sbx-<id>.slice`'s `memory.stat`: anon + shmem + kernel, read by the agent; never its page
+    cache, register G48), per worker;
   - `memFloorMib`: **the effective floor** it applies (below), so an operator sees it without the
     arithmetic.
 - **Each build's cost** is its guest RAM (`guest_ram_mb` in the manifest S, already checked against
@@ -120,16 +121,22 @@ other work (Moca's own P6 sessions), need a lower limit than the operator's numb
     image, locked once) plus the worker and its VMM.
   - Its running VMs are separate processes restored from that file. Each maps it privately:
     unmodified pages are the same page-cache pages, already in the cost, and the pages a VM writes are
-    private copies. **`vmCommittedMib`**, the slice's `memory.current` minus the file's size, is
-    those private pages plus the VMM processes.
+    private copies. **`vmCommittedMib`**, the slice's `memory.stat` anon + shmem + kernel, is
+    those private pages plus the VMM processes' memory.
+  - **Never `memory.current`** (as first built, register G48): it also counts the page cache the
+    VMs' files fill (rootfs, workspace). The G43 window measured a running worker's slice at about
+    7.5 GiB: the 4 GiB memory file (file-backed, mlocked), about 3.5 GiB of inactive file cache, and
+    under 10 MiB of anon. That cache is reclaimable, and MemAvailable already counts it as
+    available, so `memory.current` less the file over-counted by several GiB a worker and refused
+    placements on a host with about half its memory free.
   - The only overlap is the 128 MiB overhead with the VMM processes, a few hundred MiB per worker in
     the safe direction.
   - The batch window agrees: about 3.7 GiB per attached idle 4 GiB worker against a cost of 4.1 GiB
     (the cost over-reserves by about 0.4 GiB), and about 0.5 GiB per running rep on top.
-  - **The `min()` covers an under-count:** while a worker starts, or if its file's pages are still
-    charged to another cgroup (a snapshot just built on that host), `memory.current` minus the file
-    floors at 0, and `vmCommittedMib` reads low. MemAvailable sees every locked and dirty page,
-    whoever is charged, so the second term still binds.
+  - **The `min()` covers an under-count:** pages charged to another cgroup (a VM's write to a page
+    first faulted elsewhere) are missing from the slice's anon, and `vmCommittedMib` reads low.
+    MemAvailable sees every locked and dirty page, whoever is charged, so the second term still
+    binds.
 - **A memory-file mismatch** on every holder is its own reason, `memfile_mismatch`, answered
   `409 template_unavailable` (waiting can't clear it; a rebuild does). The agent also refuses to
   start a mismatched build itself (`refused`), so an older control plane can't start one.

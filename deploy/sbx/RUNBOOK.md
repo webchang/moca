@@ -870,9 +870,9 @@ stopped: the rule only holds back new starts.
   from `/proc/meminfo`; `memPressureFull10`, the memory PSI line's **`full avg10`** from
   `/proc/pressure/memory` (a percentage: the share of the last 10 s in which every non-idle task
   was stalled on memory); the workers of held builds whose `sbx-worker@<id>` runs; per running
-  worker, `vmCommittedMib`, its slice's `memory.current` (`sbx.slice/sbx-<id>.slice`) less its
-  pinned memory file (a lower bound while a worker starts: its file's pages may not be charged to
-  its slice yet, and MemAvailable then bounds placement); and `memFloorMib`, **the effective floor**, so the number placement uses is in
+  worker, `vmCommittedMib`, its slice's `memory.stat` (`sbx.slice/sbx-<id>.slice`) anon + shmem +
+  kernel: its VMs' memory the kernel cannot reclaim, never its page cache (register G48; a memory
+  file is file-backed and mlocked, so the worker's cost counts it; **keep `/srv/sbx` on a disk volume, never tmpfs**: a memory file on tmpfs is shmem, and would be counted twice); and `memFloorMib`, **the effective floor**, so the number placement uses is in
   the inventory and in `GET /v1/templates`' hosts block (`memory.floorMib`), with no arithmetic.
 - **`SBX_MEM_FLOOR_MIB`**: the memory never placed into, a whole number of MiB. Unset, it is 10% of
   MemTotal, at least 4096 (a host of 188.5 GiB: 19302 MiB). Set a fixed amount on a host shared with
@@ -897,7 +897,7 @@ stopped: the rule only holds back new starts.
   wrong. A mismatch is an error line naming the build, a `"memfileMismatch":<n>` count in the
   summary, and the build in the inventory's `memfileMismatch`: the control plane never places it on
   that host, and the agent refuses to start it (reported `refused`). Rebuild the snapshot.
-- **A slice it cannot read** (`memory.current` missing): that worker's VMs are left out of
+- **A slice it cannot read** (`memory.stat` missing, or with no `anon` line): that worker's VMs are left out of
   `vmCommittedMib`, never guessed, and the summary names it (`"sliceUnread":[...]`).
 - **What a client sees:** an activation refused for memory is `409 no_active_slot` with
   `reason: memory` and the usual `Retry-After`; at the active limit it answers as before, with no
