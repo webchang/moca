@@ -1087,13 +1087,14 @@ describe('--record F (§3.8)', () => {
     expect(l).toHaveLength(2);
     expect(l[0]).toMatchObject({
       command: 'sbx templates create',
-      attempt: 1,
+      seq: 1,
+      try: 1,
       method: 'POST',
       path: '/v1/templates',
       status: 429,
       retryAfter: '3',
     });
-    expect(l[1]).toMatchObject({ attempt: 2, status: 202, answer: QUEUED });
+    expect(l[1]).toMatchObject({ seq: 2, try: 2, status: 202, answer: QUEUED });
     expect(l[0]!.invocation).toBe(l[1]!.invocation);
     expect(String(l[0]!.requestAt)).toMatch(/^\d{4}-\d\d-\d\dT.*Z$/);
     const sent = (l[0]!.request as { gateRecord: string }).gateRecord;
@@ -1178,6 +1179,6 @@ describe('--record F (§3.8)', () => {
     chmodSync(rec, 0o600);
     expect(await w.run(['quota', '--record', rec])).toBe(0);
     expect(await w.run(['quota', '--record', rec])).toBe(0);
-    expect(lines(rec).map((x) => x.attempt)).toEqual([1, 1]);
+    expect(lines(rec).map((x) => x.seq)).toEqual([1, 1]);
   });
 });

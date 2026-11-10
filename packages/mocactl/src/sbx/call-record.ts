@@ -12,7 +12,8 @@ import {
 /**
  * `--record F` (mocactl templates spec §3.8): one NDJSON line per HTTP attempt a command makes, so a
  * benchmark runner can drop its own client and still compose its provenance links from what
- * mocactl did. Each line: the command and an invocation id, the attempt number, the method, the
+ * mocactl did. Each line: the command and an invocation id, `seq` (the line's number in this
+ * invocation) and `try` (1, 2, … for the same method and path in a row: a retry), the method, the
  * path (never the base URL or host), the status or the transport error, the request and answer
  * bodies, their times (UTC, ms) and the Retry-After.
  *
@@ -126,16 +127,26 @@ export function openCallRecord(
     };
   }
   const invocation = randomUUID();
-  let attempt = 0;
+  let seq = 0;
+  let last = '';
+  let tries = 0;
+  // The whole line, or the command fails: a short write (a full disk) never leaves part of a line.
+  const writeAll = (line: Buffer) => {
+    for (let off = 0; off < line.length;) {
+      const n = writeSync(fd, line, off, line.length - off);
+      if (n <= 0) throw new Error(`the record ${path}: a write wrote nothing`);
+      off += n;
+    }
+  };
   const write = (rec: Record<string, unknown>) => {
     const line = Buffer.from(JSON.stringify(rec) + '\n', 'utf8');
     if (line.length <= PIPE_BUF) {
-      writeSync(fd, line);
+      writeAll(line);
       return;
     }
     const release = lock(`${path}.lock`);
     try {
-      writeSync(fd, line);
+      writeAll(line);
     } finally {
       release();
     }
@@ -149,7 +160,13 @@ export function openCallRecord(
         const rec: Record<string, unknown> = {
           command,
           invocation,
-          attempt: ++attempt,
+          seq: ++seq,
+          try: (() => {
+            const key = `${init?.method ?? 'GET'} ${p || '/'}`;
+            tries = key === last ? tries + 1 : 1;
+            last = key;
+            return tries;
+          })(),
           method: init?.method ?? 'GET',
           path: (p || '/') + u.search,
           request: bodyOf(typeof init?.body === 'string' ? init.body : undefined, true),
