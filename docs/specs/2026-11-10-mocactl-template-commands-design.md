@@ -1,7 +1,7 @@
 # mocactl for templates and users: the client's whole path
 
 - **Status:** design draft, reviewed by autobench-moca and autobench (2026-11-10, their marks folded
-  in), for the user's decisions (§7). Not implemented.
+  in; no hold from either), for the user's decisions (§7). Not implemented.
 - **Date:** 2026-11-10
 - **Asked for by:** the user, 2026-11-09: "after we are done with Moca API enrichment/enhancement, we
   also need to enrich/enhance Moca's mocactl for template and user management/consumption."
@@ -149,7 +149,9 @@ times.
 - **No secret, in a header or a body.** Any field named `token`, `refreshToken`, `sessionToken`,
   `apiToken` or `accessToken`, and a gate record, is replaced by its sha256. `sbx token` and the `auth`
   commands never take `--record`. A test asserts that no recorded line matches a JWT (`eyJ…`) or a
-  refresh token's prefix.
+  refresh token's prefix. **And a value check as a backstop:** any string value, under any field name or nested
+  anywhere, that looks like a JWT (`eyJ…\.…\.…`) or starts with the refresh token's prefix is hashed
+  too, so a token field the API adds later is caught at write time, not only by the test.
 - **No host identifier or free text:** `execEndpoint`, `execCa`, an egress event's `dial_addr`,
   build-log text and reason messages are replaced by their length, as a benchmark runner's own
   client does.
