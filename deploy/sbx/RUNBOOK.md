@@ -977,6 +977,10 @@ template used again soon is warm (no memory-file read at all).
   caller's lease and, if no lease remains, skips the grace: the worker is stopped at the next poll.
   On a build already in its grace it ends the grace (`released: 0`). The `deactivate` record carries
   `stopNow: true`. Use it for one-by-one comparisons, so each task still measures its cold start.
+- **Counting releases in the records:** a host's worker reports share record kinds with clients'
+  calls. `attached` and `refused` are written as `activate`, `detached` as `deactivate` and `removed`
+  as `retire`, each with subject `host:<id>` and the report in `body.event`. So a reader counting a
+  client's releases or activations filters on the subject (or on `body.event` being absent).
 - **A retire or a reject ends the grace at once:** the build leaves `run`, and on a host with a grace
   the wanted answer lists it in `stop` beside `remove`, so the agent stops the worker and removes the
   build in the same poll. Removal is never held for a grace.
