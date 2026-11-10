@@ -10,12 +10,12 @@ changes, the major only with a `/v2` ([change policy](../reference/change-policy
 
 ### 1.11.0
 
-A create's spec may no longer name `id` or `image` (gating rule M7, register M7's follow-up from G46):
-`POST /v1/templates` (and a new build) answers `422 policy_refused` with `rule: M7.spec_id` or
-`M7.spec_image`, and records the refusal as a `check`, as for any rule. Before, the build job took both
-from the create's own fields and dropped the spec's copy silently (G46's fix), so such a spec could
-never take effect; now it is refused rather than ignored. No field or route is added or removed. A
-client that sent a spec with either key must drop it.
+A create's spec that names an `id` or `image` other than the create's own is refused (gating rule M7,
+the follow-up to G46): `POST /v1/templates` (and a new build) answers `422 policy_refused` with `rule:
+M7.spec_id` or `M7.spec_image`, recorded as a `check` like any rule. The build job takes both from the
+create's own fields (G46's fix), so a different copy in the spec was silently ignored; now it is refused.
+A spec that carries the same values, such as a gate record's template block sent unchanged, passes as
+before. No field or route is added or removed.
 
 ### 1.10.0
 
