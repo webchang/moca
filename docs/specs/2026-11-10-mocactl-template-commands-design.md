@@ -1,7 +1,8 @@
 # mocactl for templates and users: the client's whole path
 
-- **Status:** design accepted (the user, 2026-11-10: all seven recommendations in §7), after reviews by
-  autobench-moca and autobench. Not implemented yet.
+- **Status:** implemented (branch sbx-mocactl), as accepted (the user, 2026-11-10: all seven
+  recommendations in §7), after reviews by autobench-moca and autobench. As built: §4a. Not yet run
+  against a live control plane or in a KVM-host window (§5's side-by-side run).
 - **Date:** 2026-11-10
 - **Asked for by:** the user, 2026-11-09: "after we are done with Moca API enrichment/enhancement, we
   also need to enrich/enhance Moca's mocactl for template and user management/consumption."
@@ -167,6 +168,48 @@ times.
 - **Open session gaps, not in this scope:** receive times in `run --json`'s frames (G-e), and
   `run --patch-out F` (a session's workspace patch to a file).
 - `sbx token` and `mocactl auth token` still print tokens; nothing new does.
+
+## 4a. As built (branch sbx-mocactl)
+
+Code: `packages/mocactl/src/sbx/templates.ts` (the commands), `dry-run.ts` (§3.5),
+`call-record.ts` (§3.8), `api.ts` (the calls), `commands.ts` (errors, admin writes, `--seed`,
+`--renew-every`, `--verify`), `api/errors.ts` (§3.7); tests in `test/sbx-templates.test.ts`. Where it
+departs from §3, and why:
+
+- **`sbx quota`, `sbx policy`, `sbx hosts` are top-level** under `sbx`, as §3.1's table names them,
+  not under `sbx templates` (whose `templates quota TARGET` is the admin write, kept).
+- **`--record` is refused on `credentials`** as well as `token` and the login commands: its request
+  bodies are secrets. The record's backstop also hashes a field named `secret` and
+  `refresh_token` (the refresh request's own name), beside §3.8's list.
+- **The record's `command` is `sbx <command> [<subcommand>]`**, never the arguments (an id or a path
+  could be anything). Bodies that are not JSON (an egress NDJSON export) are kept as their length.
+  A request's `reason` (a retire's free text) is kept as its length, as a reason message is.
+- **`--dry-run` reads `GET /v1/policy`** for the profiles §3.5 checks against, so it needs a login
+  and one request; it creates nothing. Beyond §3.5's list it checks what the profile requires that
+  the inputs decide: the gate record passed and is for this image (X1, X1.image, X1.offline),
+  egress off (X11), commits refused with `skip_git_identity_check` (X12), `probe_status` (X14), the
+  exact size (X15). The trust of the record (X1.trusted, the self-attested scope) and quotas stay
+  the server's. Its two id and image rules are named `M7.spec_id` and `M7.spec_image` (the
+  control plane names no such rule today: it ignores the spec's own id and image). `base` with a
+  gate record is a local refusal, `gate.profile`.
+- **`create --seed` checks HEAD only when the build's spec names `baseline_commit`**: the spec
+  schema has no head field today (image-factory's records carry `baseline_commit` beside the
+  template block, not in it), so for most templates the check is the clean tree alone. A seed that
+  fails keeps the sandbox, exit 1.
+- **`token --renew-every S`** prints a fresh token every S seconds until interrupted; `run` and
+  `put` already re-mint inside one connection (`sandboxTokenFn`), so no change was made to them.
+- **§3.6's compare for `admin subjects`:** those answers carry no `before`, so the read is compared
+  with the answer's `record` (null when nothing changed): a read that says "already so" while a
+  record was written, or the reverse, is the loud failure. An unenroll of an admin, and a revoke of
+  a lapsed grant, cannot be judged from the list and are not compared.
+- **The issuer check** compares the login's control-plane URL with the target, then the API
+  token's `iss` (read, not verified) with the issuer the target's `/v1/discovery` profile mints
+  under (`sandbox`: `sbx-control-plane-api`, `combined`: `sh-control-plane`). It runs before admin
+  writes only; a token that is not a JWT is left to the server.
+- **A `404 template_not_found` is reported as itself**: before, every non-sandbox 404 read as "that
+  control plane has no sandbox routes", which also misreported `templates retire` of an unknown id.
+- **Many creates run one after another**, not in parallel; "N waiting" counts the specs not yet
+  posted. `--timeout` on `create` bounds the queue-slot wait (default 3600 s, exit 5).
 
 ## 5. Tests
 
