@@ -12,6 +12,16 @@ export class ApiError extends Error {
    * as its `code` instead.
    */
   readonly reason?: string;
+  /** `policy_refused`: the gating rule the create failed (`M7.id`, `X10`, ...). */
+  readonly rule?: string;
+  /** `quota_exceeded` on a template create or activation: which quota (`buildsQueued`, ...). */
+  readonly quota?: string;
+  /** `template_unavailable`, `no_active_slot`, `template_not_active`: the build's readiness. */
+  readonly readiness?: string;
+  /** Why an `unavailable` build waits (`not_held`, `no_slot`, `memory`, `memfile_mismatch`). */
+  readonly readinessReason?: string;
+  /** The build's place in its host's start line, when the body names it (register G43). */
+  readonly queuePosition?: number;
   constructor(
     readonly source: ErrorSource,
     readonly status: number,
@@ -20,13 +30,30 @@ export class ApiError extends Error {
     readonly retryAfterS?: number,
     causeCode?: string,
     reason?: string,
+    details: ApiErrorDetails = {},
   ) {
     super(message ?? code);
     this.name = 'ApiError';
     this.causeCode = causeCode;
     if (reason !== undefined) this.reason = reason;
+    for (const k of DETAIL_KEYS)
+      if (details[k] !== undefined) Object.assign(this, { [k]: details[k] });
   }
 }
+
+/** The body fields a template refusal carries beside its code (template lifecycle spec §8.1, §6.3). */
+export interface ApiErrorDetails {
+  rule?: string;
+  quota?: string;
+  readiness?: string;
+  readinessReason?: string;
+  queuePosition?: number;
+}
+const DETAIL_KEYS = ['rule', 'quota', 'readiness', 'readinessReason', 'queuePosition'] as const;
+
+/** The codes whose `reason` is the build's readinessReason (openapi Error.reason). */
+const READINESS_CODES = new Set(['no_active_slot', 'template_unavailable', 'template_not_active']);
+const READINESS_REASONS = new Set(['not_held', 'no_slot', 'memory', 'memfile_mismatch']);
 
 export class TurnCancelledError extends Error {
   constructor() {
@@ -40,15 +67,30 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
   let code = `http_${res.status}`;
   let message: string | undefined;
   let reason: string | undefined;
+  const details: ApiErrorDetails = {};
   try {
     // `/runs` reports failures as `{status, reason}`; most other routes as `{error}`, some with a
     // `reason` beside it (`{error:'sandbox_terminated', message, reason}`).
-    const body = JSON.parse(text) as { error?: unknown; message?: unknown; reason?: unknown };
+    const body = JSON.parse(text) as Record<string, unknown>;
     if (typeof body.error === 'string') {
       code = body.error;
       if (typeof body.reason === 'string') reason = body.reason;
     } else if (typeof body.reason === 'string') code = body.reason;
     if (typeof body.message === 'string') message = body.message;
+    for (const k of ['rule', 'quota', 'readiness', 'readinessReason'] as const) {
+      if (typeof body[k] === 'string') details[k] = body[k];
+    }
+    if (Number.isSafeInteger(body.queuePosition))
+      details.queuePosition = body.queuePosition as number;
+    // The Error body names a readiness reason `reason` (no_active_slot `memory`, ...): kept under its
+    // own name too, so a client branches on one field whichever the route used.
+    if (
+      !details.readinessReason &&
+      reason &&
+      READINESS_CODES.has(code) &&
+      READINESS_REASONS.has(reason)
+    )
+      details.readinessReason = reason;
   } catch {
     /* non-JSON body (e.g. a proxy's HTML page): keep http_<status>. */
   }
@@ -61,6 +103,7 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
     Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined,
     undefined,
     reason,
+    details,
   );
 }
 
