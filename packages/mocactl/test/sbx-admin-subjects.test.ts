@@ -75,6 +75,20 @@ describe('mocactl sbx admin subjects', () => {
     expect(cp.calls.at(-1)).toMatchObject({ method: 'DELETE' });
   });
 
+  it('reports a 403 plainly and makes no second call (never retried as another role)', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/subjects': () => ({
+        status: 403,
+        body: { error: 'forbidden', message: 'managing subjects requires the admin role' },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain(['admin', 'subjects'], env, io, opts)).toBe(1);
+    expect(io.errs.join('\n')).toContain('requires the admin role');
+    expect(cp.calls.filter((c) => c.path.startsWith('/v1/subjects'))).toHaveLength(1);
+  });
+
   it('reports a control-plane refusal (403, 409) and refuses bad usage locally', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({

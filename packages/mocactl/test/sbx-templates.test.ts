@@ -7,6 +7,7 @@ import { ApiError, errorFromResponse } from '../src/api/errors.js';
 import { resolvePaths, saveAuth } from '../src/config.js';
 import { sbxMain, sbxPaths } from '../src/sbx/cli.js';
 import { refusalText } from '../src/sbx/commands.js';
+import { redact } from '../src/sbx/call-record.js';
 import { dryRun } from '../src/sbx/dry-run.js';
 import {
   cleanupTmp,
@@ -1024,6 +1025,22 @@ describe('admin writes: read, write, compare (§3.6)', () => {
 });
 
 describe('--record F (§3.8)', () => {
+  it('redacts a host and a token by value: harnessUrl, any absolute URL, a refresh token inside text', () => {
+    const rt = `mrt_${'A'.repeat(43)}`;
+    const out = redact({
+      profile: 'sandbox',
+      harnessUrl: 'https://harness.example.com',
+      links: ['http://cp.example.com/v1/x', 'not a url'],
+      message: `refresh ${rt} was refused`,
+      note: 'plain text',
+    }) as Record<string, unknown>;
+    expect(out.harnessUrl).toEqual({ length: 'https://harness.example.com'.length });
+    expect(out.links).toEqual([{ length: 'http://cp.example.com/v1/x'.length }, 'not a url']);
+    expect(out.message).toMatch(/^sha256:/);
+    expect(out.note).toBe('plain text');
+    expect(JSON.stringify(out)).not.toContain('example.com');
+  });
+
   const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/;
   const lines = (f: string) =>
     readFileSync(f, 'utf8')

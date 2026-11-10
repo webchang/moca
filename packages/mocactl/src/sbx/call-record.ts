@@ -42,7 +42,11 @@ const SECRET_FIELDS = new Set([
   'secret',
 ]);
 /** Fields that name a host or carry free text: kept as their length only. */
-const LENGTH_FIELDS = new Set(['execEndpoint', 'execCa', 'dial_addr', 'log']);
+const LENGTH_FIELDS = new Set(['execEndpoint', 'execCa', 'dial_addr', 'log', 'harnessUrl']);
+/** A refresh token anywhere in a string (its shape: `mrt_` + 43 base64url characters). */
+const REFRESH_RE = new RegExp(`${REFRESH_TOKEN_PREFIX}[A-Za-z0-9_-]{43}`);
+/** An absolute URL names a host: kept as its length, whatever field it sits under. */
+const URL_RE = /^[a-z][a-z0-9+.-]*:\/\/[^\s/]/i;
 /** PIPE_BUF on Linux and macOS is at least 512; 4096 on both. */
 const PIPE_BUF = 4096;
 const LOCK_STALE_MS = 10_000;
@@ -51,7 +55,8 @@ const sha256 = (s: string) => `sha256:${createHash('sha256').update(s).digest('h
 const lengthOf = (v: unknown) => ({
   length: typeof v === 'string' ? v.length : JSON.stringify(v ?? null).length,
 });
-const secretLooking = (s: string) => JWT_RE.test(s) || s.startsWith(REFRESH_TOKEN_PREFIX);
+const secretLooking = (s: string) =>
+  JWT_RE.test(s) || s.startsWith(REFRESH_TOKEN_PREFIX) || REFRESH_RE.test(s);
 
 /**
  * A body as the record keeps it. `parent` is the field this value sits under: a `message` in a
@@ -64,7 +69,7 @@ export function redact(v: unknown, field?: string, parent?: string, request = fa
     return lengthOf(v);
   if (field === 'message' && parent === 'reason') return lengthOf(v);
   if (request && field === 'reason' && typeof v === 'string') return lengthOf(v);
-  if (typeof v === 'string') return secretLooking(v) ? sha256(v) : v;
+  if (typeof v === 'string') return secretLooking(v) ? sha256(v) : URL_RE.test(v) ? lengthOf(v) : v;
   if (Array.isArray(v)) return v.map((x) => redact(x, undefined, field, request));
   if (v && typeof v === 'object')
     return Object.fromEntries(
