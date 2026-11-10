@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.10.0
+  version: 1.11.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -519,7 +519,7 @@ components:
         rule:
           type: string
           description: |
-            policy_refused only: the gating rule the create failed (M1, M7.id, M8, M9, registry,
+            policy_refused only: the gating rule the create failed (M1, M7.id, M7.spec_id, M7.spec_image, M8, M9, registry,
             envelope, profile, X1, X1.trusted, X10, X10.record, X11, X12, X14, X15; governance
             GATING-RULES.md)
         quota:

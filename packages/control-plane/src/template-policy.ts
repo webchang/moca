@@ -373,6 +373,16 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
       `spec.${k} must be true or false`,
     );
   }
+  // M7.spec_keys: a spec never names the template's id or image. The build job takes both from the
+  // create (host-handlers.ts buildJobSpec: the create's always win), so a spec copy could only be
+  // silently ignored, or read by a tool that trusts the spec: refused, never dropped.
+  for (const k of ['id', 'image'] as const) {
+    rule(
+      `M7.spec_${k}`,
+      !Object.prototype.hasOwnProperty.call(s, k),
+      `spec.${k} is not allowed: the template's ${k} is the create's \`${k}\`, never the spec's`,
+    );
+  }
   // M8: a root identity is never copied into an image that refuses commits.
   rule(
     'M8',
