@@ -102,7 +102,8 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  withdraw a queued, building or probing build
   mocactl sbx templates activate ID [--build BUILD] [--lease S] [--wait [--timeout S]] [--json]
                                                  take or renew your lease; --wait: until active, saying
-                                                 why it waits (S default 1800)
+                                                 why it waits (S default: sized from the host's
+                                                 start line, at least 1800)
   mocactl sbx templates deactivate ID [--stop-now] [--json]
                                                  release your leases on it; --stop-now skips the host's
                                                  idle grace
