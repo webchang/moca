@@ -226,7 +226,10 @@ It reads `moca-mu1` with `kubectl` and writes `<dir>/.config/mocactl/sbx-auth.js
 cache `mocactl sbx` reads, with `XDG_CONFIG_HOME` unset. The key and the token reach no argv, log
 or output. The login cannot refresh: mint another when it ends (60 minutes by default, at most a
 day). Anyone who can read Secrets in the namespace can do this, so it grants nothing an operator
-lacks. Give each test user a `<dir>` of their own, as the smoke's two `HOME`s (§13).
+lacks. Give each test user a `<dir>` of their own, as the smoke's two `HOME`s (§13). A minted login writes
+no `config.json`, so `mocactl sbx` takes its control plane from the login itself; an admin write then needs
+`--control-plane-url` or `MOCACTL_SBX_URL` (it refuses a URL taken from the login, which can't be checked
+against the login).
 
 A second test user must still be a real `github:<id>` enrolled in `SBX_ALLOWED_SUBJECTS`. A made-up
 id is safe only while the client id is a placeholder, since nothing can then sign in through
