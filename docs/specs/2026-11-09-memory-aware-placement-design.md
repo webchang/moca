@@ -1,7 +1,7 @@
 # Memory-aware placement of template workers
 
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
-  by autobench-moca, autobench, image-factory and autobench-sandbox). **Implemented** (merged 6230e2cc, reviewed by autobench and autobench-sandbox); control plane deployed (both namespaces, 2026-11-09, c9696027); host agent pending (placement by activeLimit until a host reports memory) (register G39). §4a records where the build
+  by autobench-moca, autobench, image-factory and autobench-sandbox). **Implemented** (merged 6230e2cc, reviewed by autobench and autobench-sandbox); control plane deployed (both namespaces, 2026-11-09, c9696027); host agent deployed (the G43 window, 2026-11-10), its committed-memory count corrected by G48 and verified live at the grace window (2026-11-10) (registers G39, G48). §4a records where the build
   differs from §4.
 - **Date:** 2026-11-09
 - **Asked by:** autobench-moca, 2026-11-08, for the user ("per host resource availability"). The

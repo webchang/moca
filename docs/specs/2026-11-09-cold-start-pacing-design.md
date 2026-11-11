@@ -3,9 +3,9 @@
 - **Status:** design accepted (the user, 2026-11-09: the four recommendations in §7, reviewed and agreed
   by autobench-moca, autobench, image-factory and autobench-sandbox). **The start limit is
   implemented** (merged 64bb34fe): its control plane deployed on both namespaces (2026-11-09,
-  ccac7696), its host agent part pending a KVM-host window. **The idle grace is implemented** (merged
-  43379f55), not deployed yet
-  (register G43). §4a records where the build differs from §4.
+  ccac7696), its host agent part deployed at the grace window (2026-11-10). **The idle grace is implemented**
+  (merged 43379f55), its control plane deployed (2026-11-09) and its host agent at the same window,
+  where both were verified live (register G43). §4a records where the build differs from §4.
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
   and many activations waited minutes for their workers. The user kept the host's disk as it was
