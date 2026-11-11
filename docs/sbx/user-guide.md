@@ -682,6 +682,12 @@ the ones your operator provides, you can make your own from an image pinned by d
 [template onboarding guide](../../deploy/sbx/template-onboarding/GUIDE.md#4b-from-an-oci-image-to-a-moca-template-self-serve)
 describes over the API. Every command below takes `--json` (the API's answer, never a token).
 
+**Which control plane.** As everywhere in `mocactl sbx`: `--control-plane-url`, `MOCACTL_SBX_URL`,
+or the one `sbx login` remembered. A login your operator minted for you (a `sbx-auth.json` alone)
+names its own control plane, and the commands below use it. **An admin write** (`templates quota`,
+`admin subjects` changes) needs the first or second: a URL taken from the login can't be checked
+against the login, so it is refused, and the write names the URL it goes to.
+
 **What you may do.** `mocactl sbx quota` shows your template quotas and use; `mocactl sbx policy`
 the profiles a create can name, each with its size envelope and egress, and the registries an image
 may come from; `mocactl sbx hosts` each KVM host's active slots, start line, memory and disk.

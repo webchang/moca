@@ -227,6 +227,37 @@ describe('sbx quota, policy, hosts (§3.1)', () => {
     expect(JSON.parse(w.out())).toEqual(q);
   });
 
+  it('a minted login alone: reads use its own controlPlaneUrl, an admin write is refused until the URL is named', async () => {
+    const q = {
+      subject: 'github:1',
+      templates: { limit: 100, used: 0 },
+      buildsQueued: { limit: 10, used: 0 },
+      active: { limit: 8, used: 0 },
+      quotaSource: 'default',
+    };
+    const w = world({ 'GET /v1/quota': () => ({ status: 200, body: q }) });
+    // As mint-login.sh leaves it: sbx-auth.json with its controlPlaneUrl, no MOCACTL_SBX_URL, no config.
+    delete (w.env as Record<string, string | undefined>).MOCACTL_SBX_URL;
+    expect(await w.run(['quota'])).toBe(0);
+    expect(w.out()).toContain('github:1: the deployment default');
+    const calls = w.cp.calls.length;
+    expect(
+      await w.run([
+        'templates',
+        'quota',
+        'github:9',
+        '--templates',
+        '100',
+        '--builds-queued',
+        '10',
+        '--active',
+        '32',
+      ]),
+    ).toBe(1);
+    expect(w.err()).toContain('an admin write needs its control plane named');
+    expect(w.cp.calls.length).toBe(calls);
+  });
+
   it('policy: each profile, the registries and the digest', async () => {
     const w = world({ 'GET /v1/policy': () => ({ status: 200, body: policyView() }) });
     expect(await w.run(['policy'])).toBe(0);
