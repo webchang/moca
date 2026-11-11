@@ -118,6 +118,17 @@ rootfs, agent, vmstate, memfile; for Cloud Hypervisor `ch-config.json`) and one 
 field and digest, marked `"hash_version": 2`, so the hash names the build and any edit to the
 manifest is refused at worker start. The worker re-hashes the kernel, rootfs, agent and vmstate at
 every start, and the memory file only with `SH_VERIFY_MEMFILE=1` (a full read of the guest's RAM).
+The verify cache (G50, on by default; `SH_VERIFY_CACHE=0` turns it off, `SH_VERIFY_CACHE_PATH`
+moves it) spares the re-read: a file is hashed in full once on this host, and while its device,
+inode, size, mtime and ctime are unchanged a later start trusts that hash. The trust point is a full
+check on this host: an entry is written only after a full hash matched the manifest, and a cached
+digest is still compared with the manifest at every start. ctime is in the identity because a tool
+can set mtime back (`touch -d`) but not ctime; a device number that changes across a reboot only
+means a re-hash. `build-snapshot.sh` seeds the cache after it publishes, with the worker's own
+`microvm-worker -verify-snapshot OUT` (`--worker-bin`, default `/usr/local/bin/microvm-worker`;
+best-effort, it never fails a build), while the files are still in the page cache, so a fresh
+snapshot's first start is spared too. The memory file's pin (`PinMemoryFile`) still reads the
+whole memory file at every start.
 A snapshot built before version 2 (no `hash_version`) still verifies under its old rule, a hash over
 kernel, rootfs and agent only, until it is rebuilt. A version-2 manifest also carries
 `source_image_digest`, the image digest `build-rootfs.sh` recorded in `/etc/moca-rootfs-source`, so a
