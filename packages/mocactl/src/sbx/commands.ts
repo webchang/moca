@@ -42,6 +42,8 @@ export interface SbxCtx {
    * config.json: `SBX_TOKEN_CMD` then names it, since another shell may have neither.
    */
   explicitUrl?: string;
+  /** The URL came from the login itself (`sbx-auth.json`): never enough for an admin write. */
+  urlFromLogin?: boolean;
 }
 
 export type { RefreshFailure };
@@ -359,6 +361,8 @@ function jwtIssuer(token: string): string | undefined {
  * cannot be read (not a JWT) is left to the control plane to judge. Returns the refusal line.
  */
 export async function loginMismatch(c: SbxCtx): Promise<string | undefined> {
+  if (c.urlFromLogin)
+    return 'an admin write needs its control plane named: pass --control-plane-url URL or set MOCACTL_SBX_URL (this one came from the login itself, so the login cannot be checked against it)';
   const auth = c.rt.auth;
   if (!auth) return undefined;
   if (!sameControlPlane(auth.controlPlaneUrl, c.url))
@@ -418,6 +422,7 @@ export async function cmdSetQuota(
       c.io.err(`sbx: refused: ${mismatch}`);
       return SBX_EXIT.failed;
     }
+    c.io.err(`sbx: admin write to ${sanitizeRemote(c.url)}`);
     const pol = (await c.api.getPolicy()).policy;
     const read = target === 'default' ? pol.quota : (pol.quotaBySubject?.[target] ?? null);
     const r = await c.api.putQuota(target, quota);
@@ -514,6 +519,7 @@ export async function cmdSubjectChange(
       c.io.err(`sbx: refused: ${mismatch}`);
       return SBX_EXIT.failed;
     }
+    c.io.err(`sbx: admin write to ${sanitizeRemote(c.url)}`);
     const read = (await c.api.listSubjects()).find((s) => s.subject === subject);
     const r =
       action === 'enroll'

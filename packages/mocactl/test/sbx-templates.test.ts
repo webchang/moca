@@ -227,6 +227,37 @@ describe('sbx quota, policy, hosts (§3.1)', () => {
     expect(JSON.parse(w.out())).toEqual(q);
   });
 
+  it('a minted login alone: reads use its own controlPlaneUrl, an admin write is refused until the URL is named', async () => {
+    const q = {
+      subject: 'github:1',
+      templates: { limit: 100, used: 0 },
+      buildsQueued: { limit: 10, used: 0 },
+      active: { limit: 8, used: 0 },
+      quotaSource: 'default',
+    };
+    const w = world({ 'GET /v1/quota': () => ({ status: 200, body: q }) });
+    // As mint-login.sh leaves it: sbx-auth.json with its controlPlaneUrl, no MOCACTL_SBX_URL, no config.
+    delete (w.env as Record<string, string | undefined>).MOCACTL_SBX_URL;
+    expect(await w.run(['quota'])).toBe(0);
+    expect(w.out()).toContain('github:1: the deployment default');
+    const calls = w.cp.calls.length;
+    expect(
+      await w.run([
+        'templates',
+        'quota',
+        'github:9',
+        '--templates',
+        '100',
+        '--builds-queued',
+        '10',
+        '--active',
+        '32',
+      ]),
+    ).toBe(1);
+    expect(w.err()).toContain('an admin write needs its control plane named');
+    expect(w.cp.calls.length).toBe(calls);
+  });
+
   it('policy: each profile, the registries and the digest', async () => {
     const w = world({ 'GET /v1/policy': () => ({ status: 200, body: policyView() }) });
     expect(await w.run(['policy'])).toBe(0);
@@ -833,9 +864,14 @@ describe('sandboxes: --template id@build, --seed, token --renew-every, egress --
     expect(w.cp.calls.at(-1)!.body).toEqual({ template: `my-python@${BUILD_ID}` });
   });
 
-  const seeded = (seed: string, extra: Record<string, unknown> = {}) => {
+  const seeded = (
+    seed: string,
+    extra: Record<string, unknown> = {},
+    more: Parameters<typeof world>[0] = {},
+  ) => {
     const ws = workspaces();
     const w = world({
+      ...more,
       'POST /v1/sandboxes': () => ({
         status: 201,
         body: {
@@ -864,6 +900,27 @@ describe('sandboxes: --template id@build, --seed, token --renew-every, egress --
     expect(out.seed.head).toMatch(/^[0-9a-f]{40}$/);
     expect(s.ws.get(SBX).sent[0]!.command).toBe(GIT_SEED);
     expect(s.w.err()).toContain(`seeded ${SBX}: a clean tree at ${out.seed.head}`);
+  });
+
+  it("--seed: the seed's clean tree becomes the baseline, so a plain rm deletes it (no unpulled changes)", async () => {
+    let deleted = 0;
+    const s = seeded(
+      GIT_SEED,
+      {},
+      {
+        [`DELETE /v1/sandboxes/${SBX}`]: () => {
+          deleted++;
+          return {
+            status: 200,
+            body: { ...sandbox({ template: 'my-python' }), state: 'terminated' },
+          };
+        },
+      },
+    );
+    expect(await s.run(['create', '--template', 'my-python', '--seed'])).toBe(0);
+    expect(await s.run(['rm', SBX])).toBe(0);
+    expect(deleted).toBe(1);
+    expect(s.w.err()).not.toContain('not yet pulled');
   });
 
   it('--seed: a failing seed, a dirty tree, or another HEAD than the spec names is exit 1', async () => {

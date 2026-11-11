@@ -72,7 +72,8 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
   });
 
   it('needs a control plane URL, and says how to give one', async () => {
-    const { home, io } = setup();
+    // No login either: a login's own controlPlaneUrl is the last fallback (a minted login alone).
+    const { home, io } = setup({ loggedIn: false });
     expect(await sbxMain(['ls'], { HOME: home }, io, { home })).toBe(2);
     expect(io.errs.join('\n')).toMatch(/--control-plane-url|MOCACTL_SBX_URL/);
   });
