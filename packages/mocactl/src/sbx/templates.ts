@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { TOKEN_MARGIN_S } from '@moca/sandbox-client';
+import { TOKEN_MARGIN_S, WORKSPACE } from '@moca/sandbox-client';
 import { ApiError } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
@@ -14,6 +14,7 @@ import type {
 import { failed, refusalText, SBX_EXIT, type SbxCtx } from './commands.js';
 import { dryRun } from './dry-run.js';
 import { openExec, type ExecFactory } from './exec.js';
+import { baselineAtHead } from './push.js';
 
 /**
  * The template lifecycle from mocactl (mocactl templates spec §3.1-§3.4): the reads a client makes
@@ -774,6 +775,8 @@ export async function seedSandbox(
     const want = typeof spec?.baseline_commit === 'string' ? spec.baseline_commit : undefined;
     if (want !== undefined && head !== want)
       return `after the seed, /workspace's HEAD is ${head ?? 'none'}, not the spec's ${sanitizeRemote(want)}`;
+    // The seed's clean tree is the template's: the baseline `pull` and `rm` measure changes from.
+    if (git && head !== null) await baselineAtHead(x.exec, WORKSPACE, { signal: c.signal });
     return res;
   } finally {
     x.close();

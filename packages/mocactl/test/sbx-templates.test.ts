@@ -864,9 +864,14 @@ describe('sandboxes: --template id@build, --seed, token --renew-every, egress --
     expect(w.cp.calls.at(-1)!.body).toEqual({ template: `my-python@${BUILD_ID}` });
   });
 
-  const seeded = (seed: string, extra: Record<string, unknown> = {}) => {
+  const seeded = (
+    seed: string,
+    extra: Record<string, unknown> = {},
+    more: Parameters<typeof world>[0] = {},
+  ) => {
     const ws = workspaces();
     const w = world({
+      ...more,
       'POST /v1/sandboxes': () => ({
         status: 201,
         body: {
@@ -895,6 +900,27 @@ describe('sandboxes: --template id@build, --seed, token --renew-every, egress --
     expect(out.seed.head).toMatch(/^[0-9a-f]{40}$/);
     expect(s.ws.get(SBX).sent[0]!.command).toBe(GIT_SEED);
     expect(s.w.err()).toContain(`seeded ${SBX}: a clean tree at ${out.seed.head}`);
+  });
+
+  it("--seed: the seed's clean tree becomes the baseline, so a plain rm deletes it (no unpulled changes)", async () => {
+    let deleted = 0;
+    const s = seeded(
+      GIT_SEED,
+      {},
+      {
+        [`DELETE /v1/sandboxes/${SBX}`]: () => {
+          deleted++;
+          return {
+            status: 200,
+            body: { ...sandbox({ template: 'my-python' }), state: 'terminated' },
+          };
+        },
+      },
+    );
+    expect(await s.run(['create', '--template', 'my-python', '--seed'])).toBe(0);
+    expect(await s.run(['rm', SBX])).toBe(0);
+    expect(deleted).toBe(1);
+    expect(s.w.err()).not.toContain('not yet pulled');
   });
 
   it('--seed: a failing seed, a dirty tree, or another HEAD than the spec names is exit 1', async () => {

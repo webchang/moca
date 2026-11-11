@@ -726,7 +726,9 @@ mocactl sbx templates deactivate my-python --stop-now
 "memfile mismatch" fail at once, since waiting will not clear them. `create --template ID@BUILD`
 pins one build. `create --seed` runs the build's seed as the sandbox's first command, then checks
 `/workspace` is a clean git tree (at the spec's `baseline_commit`, when it names one); a failure
-keeps the sandbox, for you to look at. `deactivate --stop-now` skips the host's idle grace.
+keeps the sandbox, for you to look at. The seeded tree becomes the sandbox's baseline, so `sbx pull`
+returns only what changed after the seed, and `sbx rm` deletes it with no `--force`.
+`deactivate --stop-now` skips the host's idle grace.
 
 **Retire it:** `mocactl sbx templates retire my-python --wait` returns once no host holds it.
 
