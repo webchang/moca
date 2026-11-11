@@ -8,6 +8,8 @@ import { resolvePaths, saveAuth } from '../src/config.js';
 import { sbxMain, sbxPaths } from '../src/sbx/cli.js';
 import { refusalText } from '../src/sbx/commands.js';
 import { redact } from '../src/sbx/call-record.js';
+import type { SbxHost } from '../src/sbx/api.js';
+import { sizedActivateTimeoutS } from '../src/sbx/templates.js';
 import { dryRun } from '../src/sbx/dry-run.js';
 import {
   cleanupTmp,
@@ -703,6 +705,17 @@ describe('templates activate, deactivate (§3.3)', () => {
     expect(JSON.parse(w.out())).toEqual(LEASE);
   });
 
+  it('sizes --wait from the start line: (ceil(position / concurrency) + 1) start times plus a quarter, never under 1800 s', () => {
+    const host = (concurrency: number, seconds: number | null) =>
+      ({ id: 'kvm-1', start: { concurrency, seconds, starting: 4, queued: 24 } }) as SbxHost;
+    // The grace window's cold batch: position 28 behind 4 at a time, 320 s a start.
+    expect(sizedActivateTimeoutS({ queued: true, queuePosition: 28 }, host(4, 320))).toBe(3200);
+    expect(sizedActivateTimeoutS({ queued: true, queuePosition: 2 }, host(4, 320))).toBe(1800);
+    expect(sizedActivateTimeoutS({ queued: true, queuePosition: 28 }, host(4, null))).toBe(1800);
+    expect(sizedActivateTimeoutS({ queued: false }, host(4, 320))).toBe(1800);
+    expect(sizedActivateTimeoutS(undefined, undefined)).toBe(1800);
+  });
+
   it('--wait: retries no_active_slot, then polls through the queue to active', async () => {
     let refusals = 1;
     const seq = [
@@ -733,6 +746,35 @@ describe('templates activate, deactivate (§3.3)', () => {
     expect(w.err()).toContain('waiting: activating (starting)');
     expect(w.out()).toContain(`my-python ${BUILD_ID} active`);
     expect(w.clock.slept).toEqual([45_000, 5000, 5000]);
+  });
+
+  it("--wait with no --timeout: sized from the host's start line at the first read; --timeout wins", async () => {
+    const hosts = {
+      templates: [],
+      hosts: [
+        {
+          id: 'kvm-1',
+          active: { limit: 28, used: 28 },
+          idleLimitSeconds: 3600,
+          disk: { freeGb: 400, floorGb: 60 },
+          start: { concurrency: 4, seconds: 320, starting: 4, queued: 24 },
+        },
+      ],
+    };
+    const queued = build({ readiness: 'activating', queued: true, queuePosition: 28 });
+    const w = world({
+      'POST /v1/templates/my-python/activate': () => ({ status: 200, body: LEASE }),
+      'GET /v1/templates': () => ({ status: 200, body: hosts }),
+      [`GET ${BPATH}`]: () => ({ status: 200, body: queued }),
+    });
+    expect(await w.run(['templates', 'activate', 'my-python', '--wait'])).toBe(5);
+    expect(w.err()).toContain('queued at position 28; waiting up to 3200 s');
+    expect(w.err()).toContain('timed out after 3200 s');
+    expect(await w.run(['templates', 'activate', 'my-python', '--wait', '--timeout', '60'])).toBe(
+      5,
+    );
+    expect(w.err()).not.toContain('waiting up to');
+    expect(w.err()).toContain('timed out after 60 s');
   });
 
   it('--wait: not_held and memfile_mismatch fail at once; a long wait times out with exit 5', async () => {

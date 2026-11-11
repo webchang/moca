@@ -724,8 +724,10 @@ keeps the sandbox, for you to look at. `deactivate --stop-now` skips the host's 
 
 **Retire it:** `mocactl sbx templates retire my-python --wait` returns once no host holds it.
 
-**Waits and their exit.** `follow` waits up to 3600 s, `activate --wait` 1800 s, `retire --wait`
-300 s (`--timeout S` sets another); past it they exit **5**.
+**Waits and their exit.** `follow` waits up to 3600 s, `retire --wait` 300 s; `activate --wait` at
+least 1800 s, more for a build queued behind its host's start limit: (position ÷ starts at once, rounded
+up, plus 1) × the host's measured start time × 1.25, read at the first poll. `--timeout S` sets
+another. Past it they exit **5**.
 
 **A record of every call.** `--record calls.ndjson` on any of these (and every other command that
 calls the API, but `token`, `login`, `logout` and `credentials`) appends one JSON line per HTTP

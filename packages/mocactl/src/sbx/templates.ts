@@ -5,6 +5,7 @@ import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
 import type {
   SbxBuild,
+  SbxHost,
   SbxPolicyView,
   SbxQueued,
   SbxTemplateCreate,
@@ -24,6 +25,24 @@ import { openExec, type ExecFactory } from './exec.js';
 /** Default bounds of the waits (spec §7 decision 6), in seconds. */
 export const FOLLOW_TIMEOUT_S = 3600;
 export const ACTIVATE_TIMEOUT_S = 1800;
+
+/**
+ * `activate --wait`'s limit with no --timeout: a build queued behind its host's start limit waits
+ * (ceil(queuePosition / concurrency) + 1) start times, plus a quarter, from the host's measured start
+ * time; never less than ACTIVATE_TIMEOUT_S (cold starts at four at a time outgrow a fixed limit: 28
+ * on one host took about 1,890 s in the grace window). Without a queue position or a measured start
+ * time, the floor alone.
+ */
+export function sizedActivateTimeoutS(
+  b: Pick<SbxBuild, 'queued' | 'queuePosition'> | undefined,
+  host: SbxHost | undefined,
+): number {
+  const pos = b?.queued ? b.queuePosition : undefined;
+  const conc = host?.start?.concurrency;
+  const secs = host?.start?.seconds;
+  if (!pos || !conc || !secs) return ACTIVATE_TIMEOUT_S;
+  return Math.max(ACTIVATE_TIMEOUT_S, Math.ceil((Math.ceil(pos / conc) + 1) * secs * 1.25));
+}
 export const RETIRE_TIMEOUT_S = 300;
 /** Between two polls of a build, when the control plane names no Retry-After. */
 export const POLL_MS = 5000;
@@ -227,13 +246,19 @@ async function pollBuild(
   timeoutS: number,
   until: (b: SbxBuild) => boolean,
   note: (b: SbxBuild) => string,
+  extend?: (b: SbxBuild) => number | undefined,
 ): Promise<SbxBuild | 'timeout'> {
   const { sleep, now } = clock(c);
-  const end = now() + timeoutS * 1000;
+  const start = now();
+  let end = start + timeoutS * 1000;
   let said = '';
   for (;;) {
     try {
       const b = await c.api.getTemplateBuild(id, build);
+      // A longer limit, once, from the first read (activate --wait's start-line sizing).
+      const longer = extend?.(b);
+      extend = undefined;
+      if (longer !== undefined && start + longer * 1000 > end) end = start + longer * 1000;
       if (until(b)) return b;
       const n = note(b);
       if (n !== said) c.io.err(`${sanitizeRemote(id)} ${sanitizeRemote(build)}: ${n}`);
@@ -552,7 +577,7 @@ export async function cmdActivate(
   id: string,
   opts: { build?: string; leaseSeconds?: number; wait: boolean; timeoutS?: number },
 ): Promise<number> {
-  const timeoutS = opts.timeoutS ?? ACTIVATE_TIMEOUT_S;
+  let timeoutS = opts.timeoutS ?? ACTIVATE_TIMEOUT_S;
   const { sleep, now } = clock(c);
   const end = now() + timeoutS * 1000;
   const body = {
@@ -591,6 +616,16 @@ export async function cmdActivate(
         );
       return SBX_EXIT.ok;
     }
+    // No --timeout: the limit is sized from the host's start line at the first read (best effort:
+    // without the hosts block, the floor stands).
+    let host: SbxHost | undefined;
+    if (opts.timeoutS === undefined) {
+      try {
+        host = (await c.api.listHosts()).find((h) => h.id === lease.host);
+      } catch {
+        host = undefined;
+      }
+    }
     let hopeless: SbxBuild | undefined;
     const b = await pollBuild(
       c,
@@ -602,6 +637,17 @@ export async function cmdActivate(
         return x.readiness === 'active' || hopeless !== undefined || x.status !== 'registered';
       },
       (x) => `waiting: ${readinessText(x) || x.status}`,
+      opts.timeoutS === undefined
+        ? (x) => {
+            const sized = sizedActivateTimeoutS(x, host);
+            if (sized <= timeoutS) return undefined;
+            timeoutS = sized;
+            c.io.err(
+              `${sanitizeRemote(id)}: queued at position ${x.queuePosition}; waiting up to ${sized} s (sized from the host's start line)`,
+            );
+            return sized;
+          }
+        : undefined,
     );
     if (b === 'timeout') return timedOut(c, `${id} ${lease.buildId} to be active`, timeoutS);
     if (b.readiness !== 'active') {
