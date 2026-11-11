@@ -108,7 +108,7 @@ pass 'refuses a bad id, an unpinned image, bad sizes, egress, seed, probe or too
 spec
 run || fail 'a good spec did not build'
 grep -qx "podman pull registry.example.invalid/moca-microvm@$DIGEST" "$MOCK_LOG" || fail 'the image was not pulled by digest'
-grep -q "^build-rootfs --out $SBX_SRV/build/$NAME/rootfs --image registry.example.invalid/moca-microvm@$DIGEST --require base64 bash cat file git ls python3$" "$MOCK_LOG" ||
+grep -q "^build-rootfs --out $SBX_SRV/build/$NAME/rootfs --image registry.example.invalid/moca-microvm@$DIGEST --source-name registry.example.invalid/moca-microvm@$DIGEST --require base64 bash cat file git ls python3$" "$MOCK_LOG" ||
   fail "build-rootfs did not get the build dir and the image: $(grep build-rootfs "$MOCK_LOG")"
 A="$MOCK_STATE/snapshot-args"
 want_args="$(printf '%s\n' --kernel "$TMP/vmlinux" --rootfs "$SBX_SRV/build/$NAME/rootfs" --agent "$TMP/agent" \
@@ -211,11 +211,13 @@ spec '.image = "team/moca-microvm@'"$DIGEST"'"'
 run --force --registry registry.example.invalid:5000 || fail "--registry failed: $(cat "$TMP/out")"
 grep -qx "podman pull registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail "--registry did not prefix the pull: $(grep pull "$MOCK_LOG")"
 grep -q -- "--image registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail 'build-rootfs did not get the pulled reference'
+# G49: the guest's /etc/moca-rootfs-source names the spec's host-free image, never the pull reference.
+grep -q -- "--source-name team/moca-microvm@$DIGEST --require" "$MOCK_LOG" || fail "build-rootfs did not get the host-free source name: $(grep build-rootfs "$MOCK_LOG")"
 jq -e --arg i "team/moca-microvm@$DIGEST" '.image == $i' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'the record does not keep the spec image (host-free)'
 spec
 run --force --registry other.example.invalid || fail '--registry with a hosted image failed'
 grep -qx "podman pull registry.example.invalid/moca-microvm@$DIGEST" "$MOCK_LOG" || fail '--registry changed an image that names its registry'
-pass '--registry pulls a host-free image from HOST and keeps the record host-free; a hosted image is pulled as is'
+pass '--registry pulls a host-free image from HOST and keeps the record and the guest'"'"'s source file host-free (G49); a hosted image is pulled as is'
 
 # 8. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
 spec '.egress = true | .seed = ""'

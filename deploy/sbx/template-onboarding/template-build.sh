@@ -317,7 +317,7 @@ log "building the rootfs of $NAME"
 # guest agent itself runs (bash for every command; base64, cat, ls and file for the harness's file
 # operations). Not Moca's whole sandbox toolchain, which benchmark images do not carry.
 required="$(jq -r '[.tools[]] + ["bash","ls","cat","base64","file"] | unique | join(" ")' "$SPEC")"
-"$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$PULL" --require "$required"
+"$SBX_BUILD_ROOTFS" --out "$BUILD/rootfs" --image "$PULL" --source-name "$IMAGE" --require "$required"
 if [[ -n "$HOSTS_SHA" ]]; then
   got="$(sha256sum "$BUILD/rootfs/etc/hosts" 2>/dev/null || shasum -a 256 "$BUILD/rootfs/etc/hosts")" || die "the rootfs has no /etc/hosts"
   [[ "${got%% *}" == "$HOSTS_SHA" ]] || die "the rootfs's /etc/hosts has sha256 ${got%% *}, not the spec's $HOSTS_SHA"
