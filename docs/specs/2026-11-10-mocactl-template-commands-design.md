@@ -216,7 +216,7 @@ departs from §3, and why:
 - **`activate --wait`'s default, sized** (the grace window, 2026-11-10: 28 cold starts at four at a
   time took about 1,890 s, past a fixed 1800 s): with no `--timeout`, the first poll of a build queued
   behind its host's start limit sets the limit to (ceil(queuePosition / concurrency) + 1) × the host's
-  `start.seconds` × 1.25, never under 1800 s; without a position or a measured start time, 1800 s.
+  `start.seconds` × 1.25, never under 1800 s and never over 4 h (14,400 s, said on stderr when it applies: a host reporting an outlier start time can't make it sit for hours); without a position or a measured start time, 1800 s.
   `--timeout S` always wins. The same rule as autobench-moca's runner.
 
 ## 5. Tests

@@ -714,6 +714,8 @@ describe('templates activate, deactivate (§3.3)', () => {
     expect(sizedActivateTimeoutS({ queued: true, queuePosition: 28 }, host(4, null))).toBe(1800);
     expect(sizedActivateTimeoutS({ queued: false }, host(4, 320))).toBe(1800);
     expect(sizedActivateTimeoutS(undefined, undefined)).toBe(1800);
+    // A host reporting an outlier start time (hours) is capped at 4 h.
+    expect(sizedActivateTimeoutS({ queued: true, queuePosition: 28 }, host(4, 7200))).toBe(14_400);
   });
 
   it('--wait: retries no_active_slot, then polls through the queue to active', async () => {

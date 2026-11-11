@@ -41,8 +41,12 @@ export function sizedActivateTimeoutS(
   const conc = host?.start?.concurrency;
   const secs = host?.start?.seconds;
   if (!pos || !conc || !secs) return ACTIVATE_TIMEOUT_S;
-  return Math.max(ACTIVATE_TIMEOUT_S, Math.ceil((Math.ceil(pos / conc) + 1) * secs * 1.25));
+  const sized = Math.ceil((Math.ceil(pos / conc) + 1) * secs * 1.25);
+  return Math.min(ACTIVATE_TIMEOUT_CAP_S, Math.max(ACTIVATE_TIMEOUT_S, sized));
 }
+
+/** The sized limit's ceiling: a host reporting an outlier start time never makes --wait sit longer. */
+export const ACTIVATE_TIMEOUT_CAP_S = 14_400;
 export const RETIRE_TIMEOUT_S = 300;
 /** Between two polls of a build, when the control plane names no Retry-After. */
 export const POLL_MS = 5000;
@@ -643,7 +647,8 @@ export async function cmdActivate(
             if (sized <= timeoutS) return undefined;
             timeoutS = sized;
             c.io.err(
-              `${sanitizeRemote(id)}: queued at position ${x.queuePosition}; waiting up to ${sized} s (sized from the host's start line)`,
+              `${sanitizeRemote(id)}: queued at position ${x.queuePosition}; waiting up to ${sized} s (sized from the host's start line` +
+                `${sized >= ACTIVATE_TIMEOUT_CAP_S ? `, capped at ${ACTIVATE_TIMEOUT_CAP_S} s; pass --timeout for longer` : ''})`,
             );
             return sized;
           }
