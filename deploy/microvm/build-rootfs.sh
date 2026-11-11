@@ -49,7 +49,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
   --out) OUT="${2:-}"; shift 2 ;;
   --image) IMAGE="${2:-}"; shift 2 ;;
-  --source-name) SOURCE_NAME="${2:-}"; shift 2 ;;
+  --source-name)
+    [ -n "${2:-}" ] || { echo "build-rootfs.sh: --source-name needs a name" >&2; usage; }
+    SOURCE_NAME="$2"; shift 2 ;;
   --require)
     [ -n "${2:-}" ] || { echo "build-rootfs.sh: --require needs a list of tools" >&2; usage; }
     read -r -a REQUIRED_TOOLS <<<"$2"
@@ -130,4 +132,4 @@ rm -f "$OUT/usr/local/bin/remote-worker"
 mkdir -p "$OUT/dev" "$OUT/proc" "$OUT/sys"
 printf 'image=%s\ndigest=%s\n' "${SOURCE_NAME:-$IMAGE}" "$digest" >"$OUT/etc/moca-rootfs-source"
 
-echo "build-rootfs.sh: $OUT is ready (from $IMAGE @ $digest)"
+echo "build-rootfs.sh: $OUT is ready (from ${SOURCE_NAME:-$IMAGE} @ $digest)"
