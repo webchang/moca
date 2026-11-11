@@ -8,6 +8,15 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.11.0
+
+A create's spec that names an `id` or `image` other than the create's own is refused (gating rule M7,
+the follow-up to G46): `POST /v1/templates` (and a new build) answers `422 policy_refused` with `rule:
+M7.spec_id` or `M7.spec_image`, recorded as a `check` like any rule. The build job takes both from the
+create's own fields (G46's fix), so a different copy in the spec was silently ignored; now it is refused.
+A spec that carries the same values, such as a gate record's template block sent unchanged, passes as
+before. No field or route is added or removed.
+
 ### 1.10.0
 
 The idle grace of template workers ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md)

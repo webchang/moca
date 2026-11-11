@@ -106,6 +106,12 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     ['egress on a benchmark', { spec: { ...spec, egress: true } }, 'X11'],
     ['an unmeasured probe', { spec: { ...spec, probe_status: 'unmeasured' } }, 'M9'],
     ['a 32-character id (G12)', { id: 'llm-inference-batching-scheduler' }, 'M7.id'],
+    ['a spec naming another id', { spec: { ...spec, id: 'other-template' } }, 'M7.spec_id'],
+    [
+      'a spec naming another image',
+      { spec: { ...spec, image: IMAGE.replace(/.$/, '0') } },
+      'M7.spec_image',
+    ],
     ['a tag, not a digest', { image: 'image-factory/moca-microvm:latest' }, 'M1'],
     [
       'a registry the policy does not allow',
