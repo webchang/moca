@@ -11,7 +11,8 @@ changes, the major only with a `/v2` ([change policy](../reference/change-policy
 ### 1.12.0
 
 Merged from upstream (rossoctl/moca), which released these as its own 1.3.0: this document's 1.3.0
-was already the template routes, so they arrive here as 1.12.0, after 1.11.0. Nothing else changes.
+was already the template routes, so they arrive here as 1.12.0: a client sees `info.version` go
+from 1.11.0 to 1.12.0. Nothing else changes.
 
 Async turns: the owner-scoped submission API
 ([#387](https://github.com/rossoctl/moca/issues/387)) and the dequeue-time credential exchange
