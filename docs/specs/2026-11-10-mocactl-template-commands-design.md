@@ -1,6 +1,6 @@
 # mocactl for templates and users: the client's whole path
 
-- **Status:** implemented (branch sbx-mocactl), as accepted (the user, 2026-11-10: all seven
+- **Status:** implemented and merged (e2ba2aa4; `activate --wait`'s sized default 5b0c4696), as accepted (the user, 2026-11-10: all seven
   recommendations in §7), after reviews by autobench-moca and autobench. As built: §4a. Not yet run
   against a live control plane or in a KVM-host window (§5's side-by-side run).
 - **Date:** 2026-11-10
@@ -171,7 +171,7 @@ times.
   Pi session's id and times for a runner's provenance links).
 - `sbx token` and `mocactl auth token` still print tokens; nothing new does.
 
-## 4a. As built (branch sbx-mocactl)
+## 4a. As built
 
 Code: `packages/mocactl/src/sbx/templates.ts` (the commands), `dry-run.ts` (§3.5),
 `call-record.ts` (§3.8), `api.ts` (the calls), `commands.ts` (errors, admin writes, `--seed`,
