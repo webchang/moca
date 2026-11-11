@@ -14,8 +14,8 @@ import { createClient } from 'redis';
 import type { BundleRedisLike } from '@moca/config-bundle';
 import { fileURLToPath } from 'node:url';
 import type { KeyObject } from 'node:crypto';
-import { randomUUID } from 'node:crypto';
 import { defaultAuditLog } from './audit-log.js';
+import { defaultNewId } from './handler-util.js';
 import type { BundleBudgetRedisLike } from './bundle-budget.js';
 import { keksFromBase64 } from './envelope.js';
 import {
@@ -50,6 +50,10 @@ import {
 } from './sandbox-config.js';
 import { RedisSandboxStore, type SandboxRedisLike } from './sandbox-redis.js';
 import { RedisEgressStore, type EgressRedisLike } from './egress-log.js';
+import { readTenancy } from './tenancy.js';
+import { TurnStore } from './turn-store.js';
+import { RedisTurnQueue } from './turn-queue.js';
+import type { ResultRedisLike } from './turn-result.js';
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const v = env[name];
@@ -94,6 +98,33 @@ function byteBudgetEnv(env: NodeJS.ProcessEnv, name: string, def: number): numbe
   if (!/^[1-9][0-9]*$/.test(v))
     throw new Error(`${name} must be a positive integer (bytes), got "${v}"`);
   return Number(v);
+}
+
+/**
+ * A non-negative integer count. Unset means the default; anything else refuses to boot. Distinct
+ * from intEnv because ZERO is meaningful for the async quota -- an operator who writes 0 means "no
+ * async turns on this deployment", and silently serving 50 instead would be the opposite of the ask.
+ */
+function countEnv(env: NodeJS.ProcessEnv, name: string, def: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return def;
+  if (!/^(0|[1-9][0-9]*)$/.test(v))
+    throw new Error(`${name} must be a non-negative integer, got "${v}"`);
+  return Number(v);
+}
+
+/**
+ * The turn record's TTL: `LEAF_RESULT_TTL_SECONDS` plus a margin (async fan-out spec §5.1). The
+ * record must OUTLIVE its result -- a caller polling a finished turn whose record expired first
+ * would read `404 not submitted` for a turn that in fact succeeded. One hour, which is longer than
+ * any plausible gap between a result being read and a poll that follows it.
+ */
+const TURN_RECORD_TTL_MARGIN_SECONDS = 3_600;
+
+function turnRecordTtlFromEnv(env: NodeJS.ProcessEnv): number {
+  // Matches server.ts:49's parseInt of the same variable: one deployment, one meaning.
+  const result = countEnv(env, 'LEAF_RESULT_TTL_SECONDS', 86_400);
+  return result + TURN_RECORD_TTL_MARGIN_SECONDS;
 }
 
 /**
@@ -186,6 +217,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     bundleTotalBytes: byteBudgetEnv(env, 'SH_BUNDLE_TOTAL_BYTES', 64 * 1024 * 1024),
     version: resolveVersion(env),
     testUsers: testUsersFromEnv(env.SH_TEST_USERS),
+    // Async fan-out: the only containment against unbounded fan-out in M1 (spec §4.3). Counts
+    // NON-TERMINAL turns per owner, enforced before the enqueue.
+    asyncQueuedPerOwner: countEnv(env, 'MOCA_ASYNC_QUEUED_PER_OWNER', 50),
+    // The control plane reads MOCA_TENANCY for the first time here. readTenancy throws on a
+    // near-miss NAME, so a control-plane env with a misspelled switch now fails to boot -- the same
+    // contract the worker has had, and the point of the check.
+    tenancy: readTenancy(env),
+    turnRecordTtlSeconds: turnRecordTtlFromEnv(env),
   };
   // Validated at startup even though only the provider uses it: a deployment with
   // SH_TEST_USERS set and no secret must fail to boot, not serve an unguarded login path.
@@ -271,6 +310,9 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
     bundleTotalBytes: 0,
     version: resolveVersion(env),
     testUsers: 0,
+    asyncQueuedPerOwner: 0,
+    tenancy: 'single',
+    turnRecordTtlSeconds: turnRecordTtlFromEnv(env),
   };
   checkRefreshConfig(config);
   return config;
@@ -524,6 +566,14 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
       if (client.isOpen) client.destroy();
     },
     index: new OwnershipIndex(client as unknown as CpRedisLike),
+    turns: new TurnStore(client as unknown as CpRedisLike, {
+      resultTtlSeconds: config.turnRecordTtlSeconds - TURN_RECORD_TTL_MARGIN_SECONDS,
+      ttlMarginSeconds: TURN_RECORD_TTL_MARGIN_SECONDS,
+    }),
+    turnQueue: new RedisTurnQueue(client as unknown as CpRedisLike),
+    // The leaf result store's reader (§4.4). The same client, narrowed to one method: the control
+    // plane reads this key and never writes it -- the worker writes it, the cascade deletes it.
+    leafResults: client as unknown as ResultRedisLike,
     bundles: client as unknown as BundleRedisLike & BundleBudgetRedisLike,
     refresh: new RedisRefreshStore(
       client as unknown as RefreshRedisLike,
@@ -566,9 +616,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
     verifyKeys: verifyKeysFromEnv(env, signer.publicKeyBase64),
     config,
     now: () => Date.now(),
-    // randomUUID, so a control-plane-minted id is always identical to its leafSessionId
-    // sanitisation and the cascade needs no sanitising helper (plan gap #10).
-    newId: () => randomUUID(),
+    // A UUID, so a control-plane-minted id is always identical to its leafSessionId sanitisation
+    // and the cascade needs no sanitising helper (plan gap #10). Named rather than inlined because
+    // three consumers depend on its SHAPE and the turn one fails silently if it drifts --
+    // handler-util.ts says which, and the tests inject this same binding.
+    newId: defaultNewId,
     runKubectl: defaultRunKubectl,
     log: defaultAuditLog,
   };

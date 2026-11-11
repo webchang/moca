@@ -37,11 +37,13 @@
 #   4. boot_quiesce_snapshot -- boot cold, wait for the agent to park in accept(),
 #                      quiesce the guest, then ask the VMM to serialize memory and
 #                      device state to vmstate/memfile.
-#   5. write_manifest -- record image, vmm, instance type, kernel release, guest RAM,
+#   5. write_manifest -- record image, vmm, instance type, the GUEST's kernel release
+#                      (uname -r inside the booted VM, not the build host's), guest RAM,
 #                      vcpus, the capabilities probed INSIDE the guest before
-#                      snapshotting, the digests of kernel, rootfs, agent, vmstate,
-#                      memfile (and ch-config.json, the egress CA), and hash
-#                      version 2: one hash over every field and digest, in the
+#                      snapshotting, the features the image supports (lease-v1 on the
+#                      Firecracker arm; outside the hash), the digests of kernel, rootfs,
+#                      agent, vmstate, memfile (and ch-config.json, the egress CA), and
+#                      hash version 2: one hash over every other field and digest, in the
 #                      exact line format vmpool.Manifest.ComputeHash hashes (spec
 #                      2026-11-03 §8, PV2-PV3). kernel_sha256 is expected to legitimately
 #                      DIFFER between a firecracker-arm and a cloud-hypervisor-arm
@@ -668,6 +670,42 @@ install_egress_ca() {
   done
 }
 
+# add_sbx_identity gives lease mode its exec identity: user sbx (uid 7000) in group
+# sbx-ws (gid 7000), HOME /tmp/sbx-home. The agent's leasePrepare creates that HOME at
+# boot (it is on the /tmp tmpfs), so only the passwd/group lines are baked here. The
+# entries are appended directly rather than via useradd: the build host may not have
+# it, and running the tree's own useradd under chroot would need more of the tree than
+# a base rootfs promises. It refuses, before writing anything, when the tree already
+# uses uid/gid 7000 or the names sbx/sbx-ws for something else, since a lease Exec would
+# then run as that other identity. The exact entries already present is a no-op, so a
+# rerun over the same tree is idempotent.
+add_sbx_identity() {
+  local etc="$STAGE/rootfs-tree/etc"
+  local pw_line='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' gr_line='sbx-ws:x:7000:'
+  local f clash
+  mkdir -p "$etc"
+  for f in passwd group; do [ -e "$etc/$f" ] || : >"$etc/$f"; done
+  clash="$(awk -F: -v want="$pw_line" '($1 == "sbx" || $3 == "7000") && $0 != want' "$etc/passwd")"
+  if [ -n "$clash" ]; then
+    echo "build-snapshot.sh: the rootfs /etc/passwd already uses the name sbx or uid 7000 for another account; lease mode needs it as '$pw_line': $clash" >&2
+    exit 1
+  fi
+  clash="$(awk -F: -v want="$gr_line" '($1 == "sbx-ws" || $3 == "7000") && $0 != want' "$etc/group")"
+  if [ -n "$clash" ]; then
+    echo "build-snapshot.sh: the rootfs /etc/group already uses the name sbx-ws or gid 7000 for another group; lease mode needs it as '$gr_line': $clash" >&2
+    exit 1
+  fi
+  # The leading newline guards a file that lacks a trailing one.
+  if ! grep -qxF "$pw_line" "$etc/passwd"; then
+    if [ -s "$etc/passwd" ] && [ -n "$(tail -c1 "$etc/passwd")" ]; then echo >>"$etc/passwd"; fi
+    echo "$pw_line" >>"$etc/passwd"
+  fi
+  if ! grep -qxF "$gr_line" "$etc/group"; then
+    if [ -s "$etc/group" ] && [ -n "$(tail -c1 "$etc/group")" ]; then echo >>"$etc/group"; fi
+    echo "$gr_line" >>"$etc/group"
+  fi
+}
+
 assemble_rootfs() {
   log "assembling the rootfs from $ROOTFS"
   rm -rf "$STAGE/rootfs-tree"
@@ -703,6 +741,7 @@ assemble_rootfs() {
     sed 's|^\./||' | grep -E '^[A-Za-z0-9._/+-]+$' | LC_ALL=C sort | head -1 || true)"
   rm -f "$STAGE/rootfs-tree/sbin/init" "$STAGE/rootfs-tree/usr/local/bin/agent"
   install -m 0555 "$STAGE/agent" "$STAGE/rootfs-tree/usr/local/bin/agent"
+  add_sbx_identity
 
   # A minimal init: mount the ephemeral filesystems every run needs writable, then
   # EXEC (not fork) the agent as PID 1 so the agent's own exit tears the VM down
@@ -714,6 +753,9 @@ assemble_rootfs() {
 set -e
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
+# Lease mode puts each Exec in its own cgroup under /sys/fs/cgroup/moca-execs, and kills
+# the whole cgroup when the Exec ends; the agent creates that directory itself.
+mount -t cgroup2 cgroup2 /sys/fs/cgroup || { echo "init: cgroup2 mount failed (guest kernel lacks cgroup v2?)" >&2; exit 1; }
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 # /var is writable and fresh in every VM, but keeps what the image put there: an overlay with the
 # image's own /var (on the read-only rootfs) underneath and a tmpfs on top. A plain tmpfs here hid
@@ -786,7 +828,7 @@ if [ ! -x /usr/local/bin/agent ]; then
   exit 1
 fi
 
-exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025
+exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 --lease-cgroup-root /sys/fs/cgroup/moca-execs
 INIT
   # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
   # /tmp is already mounted; the agent inherits init's environment, and so does every command.
@@ -825,6 +867,15 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
 GITCONFIG
 
   [ -n "$EGRESS_CA" ] && install_egress_ca
+
+  # Lease mode runs each Exec as sbx with no capabilities and no_new_privs, but a setuid
+  # root binary (su, sudo, mount, passwd) is still the shortest way back to root in a VM
+  # that now outlives one Exec. No sandbox command needs one, so the bits go. This is the
+  # last change to the tree before mkfs, after every step that writes into it (the chroot
+  # trust-store hooks included), so nothing can reintroduce a bit afterwards; the tree is
+  # the staged copy, never the caller's ROOTFS. check_lease_support re-checks in the
+  # booted guest.
+  find "$STAGE/rootfs-tree" -xdev -type f -perm /6000 -exec chmod ug-s {} +
 
   # A single ext4 image is what the VMM's block device backend wants; building it
   # here (rather than shipping a directory tree) is also what makes the "rootfs"
@@ -1082,6 +1133,67 @@ probe_capabilities() {
     -command 'for c in bash rg base64 file python3 git gh node ripgrep curl; do command -v "$c" >/dev/null 2>&1 && echo "$c"; done' \
     2>/dev/null || true)"
   printf '%s\n' "$out" | sed '/^$/d' | sort -u
+}
+
+# probe_guest_kernel records the GUEST's kernel release for the manifest. The build
+# host's `uname -r` said nothing about the snapshot: the guest boots --kernel, which is
+# a different kernel from the host's by construction.
+probe_guest_kernel() {
+  local uds="$1"
+  local out
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 10 \
+    -command 'uname -r' \
+    2>/dev/null || true)"
+  out="$(printf '%s' "$out" | tr -d '[:space:]')"
+  if [ -z "$out" ]; then
+    echo "build-snapshot.sh: could not read the guest kernel release (uname -r in the guest printed nothing)" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# check_lease_support (lease-v1): the image advertises lease-v1, so prove in the booted
+# guest what lease mode relies on -- cgroup2 mounted at /sys/fs/cgroup, a user-namespace
+# sysctl the agent can write (it disables user namespaces at the first lease request;
+# per-Exec VMs keep them), the sbx identity in /etc/passwd, no setuid/setgid file on the
+# rootfs -- rather than trusting that init and assemble_rootfs did it. ONE ordinary
+# per-Exec request, never `lease: true`: the first lease request sets the agent's lease
+# latch, and anything set before the snapshot is baked into every VM restored from it
+# (the old clockOK latch failure). It creates nothing in the guest, so nothing reaches
+# the snapshot either. grep, not getent: the guest image need not have getent.
+check_lease_support() {
+  local uds="$1"
+  local out rc cg userns sbx suid err="$STAGE/lease-check.err"
+  # stdout only is parsed, line by line; stderr goes aside so a stray diagnostic cannot
+  # shift the four answers, and is shown when the check could not run at all. Each probe
+  # prints exactly one line, so a missing answer cannot shift the next into its place.
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 60 \
+    -command 'cat /sys/fs/cgroup/cgroup.controllers >/dev/null 2>&1 && echo cg2 || echo no-cg2; test -w /proc/sys/user/max_user_namespaces && echo userns-ok || echo no-userns; grep "^sbx:" /etc/passwd || echo no-sbx; find / -xdev -type f -perm /6000 2>/dev/null | head -1' \
+    2>"$err")" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "build-snapshot.sh: the lease-v1 check could not run in the guest (exit $rc); guest_client diagnostics: $(cat "$err")" >&2
+    exit 1
+  fi
+  cg="$(printf '%s\n' "$out" | sed -n 1p)"
+  userns="$(printf '%s\n' "$out" | sed -n 2p)"
+  sbx="$(printf '%s\n' "$out" | sed -n 3p)"
+  suid="$(printf '%s\n' "$out" | sed -n 4p)"
+  if [ "$cg" != cg2 ]; then
+    echo "build-snapshot.sh: lease-v1: cgroup2 is not mounted at /sys/fs/cgroup in the guest (the init must mount it, and the guest kernel needs cgroup v2)" >&2
+    exit 1
+  fi
+  if [ "$userns" != userns-ok ]; then
+    echo "build-snapshot.sh: lease-v1: /proc/sys/user/max_user_namespaces is not writable in the guest (got '$userns'; the agent disables user namespaces through it at the first lease request, and the guest kernel needs CONFIG_USER_NS)" >&2
+    exit 1
+  fi
+  if [ "$sbx" != 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' ]; then
+    echo "build-snapshot.sh: lease-v1: the guest /etc/passwd has no 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' line (got '$sbx')" >&2
+    exit 1
+  fi
+  if [ -n "$suid" ]; then
+    echo "build-snapshot.sh: lease-v1: the guest rootfs still has a setuid/setgid file: $suid" >&2
+    exit 1
+  fi
 }
 
 # check_git_identity (#415): the P4-tier counterpart of the system gitconfig the sandbox
@@ -1755,10 +1867,12 @@ boot_quiesce_snapshot_firecracker() {
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
+  MANIFEST_GUEST_KERNEL="$(probe_guest_kernel "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
   check_dev_fd "$vsock_uds"
   check_var "$vsock_uds"
+  check_lease_support "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create; the VM stays paused because create has no resume field at all)"
@@ -1931,10 +2045,12 @@ boot_quiesce_snapshot_cloud_hypervisor() {
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
+  MANIFEST_GUEST_KERNEL="$(probe_guest_kernel "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
   check_dev_fd "$vsock_uds"
   check_var "$vsock_uds"
+  check_lease_support "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (ch-remote pause + snapshot, no resume afterwards)"
@@ -1980,7 +2096,7 @@ write_manifest() {
   # boots -- both now need it in place at the jail-relative name "/kernel"
   # pre-boot, not just afterwards for hashing.
 
-  local khash rhash ahash vhash mhash chhash cahash srcdig hash caps_json caps_csv built_at krel egress_json f
+  local khash rhash ahash vhash mhash chhash cahash srcdig hash caps_json caps_csv built_at krel egress_json features_json f
   khash="sha256:$(sha256sum "$STAGE/kernel" | cut -d' ' -f1)"
   rhash="sha256:$(sha256sum "$STAGE/rootfs" | cut -d' ' -f1)"
   ahash="sha256:$(sha256sum "$STAGE/agent" | cut -d' ' -f1)"
@@ -2005,7 +2121,8 @@ write_manifest() {
   caps_json="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | sort | awk '{printf "%s\"%s\"", sep, $0; sep=","}')"
   caps_csv="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | sort | paste -sd, -)"
   built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  krel="$(uname -r)"
+  # The GUEST's kernel release, probed in the booted VM (probe_guest_kernel), not the build host's.
+  krel="${MANIFEST_GUEST_KERNEL:-}"
 
   # These lines, in this order, are what vmpool.Manifest.ComputeHash hashes for version 2;
   # a difference here makes every worker refuse a perfectly good snapshot at start. A value
@@ -2032,6 +2149,13 @@ write_manifest() {
   local ch_json=""
   [ -n "$chhash" ] && ch_json=",
   \"ch_config_sha256\": \"$chhash\""
+  # lease-v1 on the Firecracker arm only: Cloud Hypervisor's Run mounts the virtiofs
+  # workspace inside every command (chvWrapCommand), which a lease Exec, uid 7000 with
+  # no capabilities, cannot do.
+  features_json=""
+  if [ "$VMM" = firecracker ]; then
+    features_json='"lease-v1"'
+  fi
 
   cat >"$STAGE/manifest.json" <<MANIFEST
 {
@@ -2039,10 +2163,11 @@ write_manifest() {
   "image": "$IMAGE",
   "vmm": "$VMM",
   "instance_type": "$INSTANCE_TYPE",
-  "kernel_release": "$krel",
+  "kernel_release": "$MANIFEST_GUEST_KERNEL",
   "guest_ram_mb": $GUEST_RAM_MB,
   "vcpus": $VCPUS,
   "capabilities": [$caps_json],
+  "features": [$features_json],
   "built_at": "$built_at",
   "kernel_sha256": "$khash",
   "rootfs_sha256": "$rhash",

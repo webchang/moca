@@ -1,7 +1,9 @@
 package vmpool
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -236,5 +238,40 @@ func TestRunOverConnAgainstTheAgentTakesLargeStdinButNotALargeCommand(t *testing
 	big := strings.Repeat("y", 175*1024)
 	if out, err := run(Command{Command: "wc -c", Stdin: []byte(big)}); err != nil || strings.TrimSpace(out) != "179200" {
 		t.Fatalf("175 KiB stdin: out=%q err=%v", out, err)
+	}
+}
+
+func TestRunOverConnSurfacesTeardownFailed(t *testing.T) {
+	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{ExitCode: 0, TeardownFailed: true})
+	})
+	res, err := runOverConn(context.Background(), conn, Command{Command: "true", CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if err != nil {
+		t.Fatalf("runOverConn: %v", err)
+	}
+	if !res.TeardownFailed {
+		t.Fatalf("res = %+v, want TeardownFailed", res)
+	}
+}
+
+func TestSendRequestCarriesTheLeaseFlags(t *testing.T) {
+	var buf bytes.Buffer
+	enc, err := json.Marshal(guestRequest(Command{Command: "true", Lease: true, NormaliseWorkspace: true}, OutputCapBytes, time.Now()))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := sendRequest(&buf, enc, nil); err != nil {
+		t.Fatalf("sendRequest: %v", err)
+	}
+	_, p, err := ga.ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	var req ga.Request
+	if err := ga.DecodeJSON(p, &req); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	if !req.Lease || !req.NormaliseWorkspace {
+		t.Fatalf("req = %+v, want both lease flags forwarded", req)
 	}
 }

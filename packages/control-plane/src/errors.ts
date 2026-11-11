@@ -46,6 +46,13 @@ export const CP_ERROR_CODES = [
   'bundle_quota_exceeded',
   'config_bundle_not_found',
   'configRef_invalid',
+  'envelope_invalid',
+  'async_quota_exhausted',
+  'workload_runs_unavailable',
+  'async_tenancy_unsupported',
+  'turn_not_cancellable',
+  'turn_not_found',
+  'turn_not_claimable',
   'credential_required',
   'credential_ambiguous',
   'credential_not_found',
@@ -118,6 +125,35 @@ const STATUS: Record<CpErrorCode, number> = {
   config_bundle_not_found: 404,
   // Spelled as knative-server's existing /v1/turn code on purpose: same concept, second call site.
   configRef_invalid: 400,
+  // Spelled as knative-server's existing /runs code on purpose: same concept, second call site.
+  envelope_invalid: 400,
+  // 429: the per-owner queued-turn quota (async fan-out spec §4.3). The body names the owner's
+  // current count, so a client backs off against a number rather than guessing.
+  async_quota_exhausted: 429,
+  // 501, spelled as the data plane's own refusal (knative-server server.ts:972): same concept,
+  // second call site. An async turn naming a workload is refused at submission so the 501 stays
+  // synchronous instead of becoming a dead-letter (async spec §4.2).
+  workload_runs_unavailable: 501,
+  // 501: the M1 gate (async spec §9). Async needs the credential resolved from the turn record at
+  // dequeue, which MI1 S2's interim allows under `single` only. A dated, conditional refusal rather
+  // than an omission -- the shape ADR-0041 used for its own deprecation window.
+  async_tenancy_unsupported: 501,
+  // 409: DELETE on a turn that is not `queued`. A running leaf finishes and writes its result; the
+  // message names the state so a client need not guess why (async spec §4.5).
+  turn_not_cancellable: 409,
+  // 404: the dequeue exchange was handed a turn id with no record, and it is what tells a worker
+  // holding a stale queue entry to ack and drop rather than retry. Deliberately DISTINGUISHABLE
+  // from the other claim refusals, and NOT the 404-not-403 of spec §8.1 -- the argument lives in
+  // openapi.yaml's `/internal/turn-credentials` 404 description, and has to be reread when M2 stops
+  // returning a real key, so it is stated in one place rather than four.
+  // The harness emits a same-named `turn_not_found` of its own (knative-server server.ts); the two
+  // are distinct codes at distinct hops that happen to share a name, not one code reused.
+  turn_not_found: 404,
+  // 409: the record exists but is `cancelled` or already terminal, so no credential is minted
+  // (async spec §5.4). NEVER returned for `running`: a redelivery is the case the claim exists for.
+  // Distinct from turn_not_cancellable, which is the CALLER's DELETE being refused; this is the
+  // WORKER's claim being refused.
+  turn_not_claimable: 409,
   credential_required: 400,
   credential_ambiguous: 400,
   credential_not_found: 404,

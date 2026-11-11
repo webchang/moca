@@ -7,6 +7,8 @@ import { MemorySandboxStore } from '../../src/sandbox-store.js';
 import { MemoryEgressStore } from '../../src/egress-log.js';
 import { MemoryRefreshStore, type AuditFields } from '../../src/refresh-store.js';
 import { makeSigner, publicKeyFromBase64, type TokenClaims } from '../../src/token.js';
+import { MemoryTurnQueue } from '../../src/turn-queue.js';
+import { TurnStore } from '../../src/turn-store.js';
 import { fakeBundleRedis, fakeRedis } from './fake-redis.js';
 import { StubIdentity } from './stub-identity.js';
 
@@ -37,6 +39,13 @@ export function makeDeps(
   over: Partial<Omit<CpDeps, 'config'>> & {
     config?: Partial<CpConfig>;
     withStreams?: boolean;
+    /**
+     * Overridable because a caller-supplied `index` brings its OWN fake Redis: left at the default
+     * this would point at a different fake than the one `index` writes to, so every audit-stream
+     * assertion would read a permanently empty map and could never fail. See the note at the end of
+     * this function.
+     */
+    streams?: Map<string, Record<string, string>[]>;
   } = {},
 ): TestDeps {
   const { privateKey } = generateKeyPairSync('ed25519');
@@ -56,6 +65,9 @@ export function makeDeps(
     sandboxTiers: null,
     bundleSubjectBytes: 16 * 1024 * 1024,
     bundleTotalBytes: 64 * 1024 * 1024,
+    asyncQueuedPerOwner: 50,
+    tenancy: 'single',
+    turnRecordTtlSeconds: 86_400 + 3_600,
     sandbox: {
       templates: [
         {
@@ -102,6 +114,9 @@ export function makeDeps(
     newId: () => 'sid-fixed',
     log: (line) => logLines.push(line),
     logLines,
+    turns: new TurnStore(fake.redis, { resultTtlSeconds: 86_400, ttlMarginSeconds: 3_600 }),
+    turnQueue: new MemoryTurnQueue(),
+    leafResults: { get: async (k: string) => fake.strings.get(k) ?? null },
   };
   // A caller-supplied `index` brings its own fake, so `streams` must follow it or an audit assertion
   // would read the wrong map.

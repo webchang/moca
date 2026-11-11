@@ -134,6 +134,7 @@ export {
   type Handler,
   type RequestCtx,
 } from './handlers.js';
+export { isTenancyNearMiss, readTenancy, type Tenancy } from './tenancy.js';
 export { projectResources, resolveSandbox, type SandboxView } from './resources.js';
 // The store's SandboxView is aliased: resources.ts's SandboxView (a session's sandbox tier) owns the name.
 export {
@@ -175,6 +176,7 @@ export {
   type ExchangeResponse,
   type ResolvedInference,
 } from './exchange.js';
+export { exchangeTurnCredential, type TurnExchangeResponse } from './turn-exchange.js';
 export { buildHandler, startControlPlane } from './server.js';
 export {
   CREDENTIAL_STORES,

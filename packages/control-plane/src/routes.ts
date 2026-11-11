@@ -239,6 +239,32 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: HARNESS,
     operationId: 'mintSessionToken',
   },
+  // The async turn routes (async fan-out spec §4.1, §4.4, §4.5). No `bodyRequired: false` on the
+  // POST -- the body IS the envelope, so the router's generic empty-body guard is correct here.
+  {
+    method: 'POST',
+    path: '/v1/sessions/{id}/turns',
+    auth: 'api',
+    sessionScoped: true,
+    profiles: HARNESS,
+    operationId: 'submitTurn',
+  },
+  {
+    method: 'GET',
+    path: '/v1/sessions/{id}/turns/{turnId}',
+    auth: 'api',
+    sessionScoped: true,
+    profiles: HARNESS,
+    operationId: 'getTurn',
+  },
+  {
+    method: 'DELETE',
+    path: '/v1/sessions/{id}/turns/{turnId}',
+    auth: 'api',
+    sessionScoped: true,
+    profiles: HARNESS,
+    operationId: 'cancelTurn',
+  },
   {
     method: 'GET',
     path: '/v1/credentials',
@@ -308,6 +334,21 @@ export const ROUTES: readonly RouteSpec[] = [
     sessionScoped: false,
     profiles: HARNESS,
     operationId: 'exchangeCredential',
+  },
+  /**
+   * The DEQUEUE-time credential exchange (async fan-out spec §5.4). Beside `/internal/credentials`
+   * and on the same shared bearer, because it is the same hop: the data plane asking the control
+   * plane for the credential a turn spends. It differs in what it presents -- a turn id rather than a
+   * session token -- because at dequeue there is no session token, and putting one in the queue is
+   * what MI1 §6.5 forbids.
+   */
+  {
+    method: 'POST',
+    path: '/internal/turn-credentials',
+    auth: 'exchange',
+    sessionScoped: false,
+    profiles: HARNESS,
+    operationId: 'exchangeTurnCredential',
   },
   // SBX0 §5.1: the sandbox resource, on the sandbox profile only (sandbox-handlers.ts).
   {

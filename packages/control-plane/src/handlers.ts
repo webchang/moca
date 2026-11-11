@@ -54,6 +54,8 @@ import {
   sessionTemplate,
 } from './exchange.js';
 import { MODEL_ID_RE } from './models.js';
+import { exchangeTurnCredential } from './turn-exchange.js';
+import { isMintedTurnId } from './turn-record.js';
 import {
   catalogAllowList,
   chooseModel,
@@ -80,6 +82,11 @@ import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handle
 import { MEMBER_HANDLERS } from './member-handlers.js';
 import type { MembersStore } from './members.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
+import { TURN_HANDLERS } from './turn-handlers.js';
+import type { Tenancy } from './tenancy.js';
+import type { TurnQueue } from './turn-queue.js';
+import type { ResultRedisLike } from './turn-result.js';
+import type { TurnStore } from './turn-store.js';
 import type { EgressHost } from './egress-config.js';
 import type { EgressStore } from './egress-log.js';
 import { formatDestination, parseDestination } from './egress-destination.js';
@@ -156,6 +163,24 @@ export interface CpConfig {
   testUsers: number;
   /** The sandbox profile's settings (SBX0 §4, §5); configFromEnv sets it on that profile only. */
   sandbox?: SandboxConfig;
+  /**
+   * Non-terminal async turns one owner may hold (`MOCA_ASYNC_QUEUED_PER_OWNER`, default 50; async
+   * spec §4.3). The only containment against unbounded fan-out in M1, which is why it ships with
+   * the submission route rather than after it. Distinct from the worker's SH_TURNS_PER_SUBJECT
+   * (#360): that counts turns EXECUTING, in one process; this counts turns WAITING, per deployment.
+   */
+  asyncQueuedPerOwner: number;
+  /**
+   * `MOCA_TENANCY` (async spec §9). Async submission is refused by name under `multi` until M2:
+   * M1 resolves the credential from the turn record at dequeue, which MI1 S2's interim allows under
+   * `single` only.
+   */
+  tenancy: Tenancy;
+  /**
+   * How long a TERMINAL turn record lives: `LEAF_RESULT_TTL_SECONDS` plus a margin (async spec
+   * §5.1). A non-terminal record has no TTL at all, which is the invariant TurnStore owns.
+   */
+  turnRecordTtlSeconds: number;
 }
 
 export interface CpDeps {
@@ -225,6 +250,12 @@ export interface CpDeps {
   hosts?: HostRegistry;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
+  /** The async turn record store (async spec §5.1); absent only in suites that never submit. */
+  turns?: TurnStore;
+  /** The leaf queue, holding turn ids and nothing else (§5.1). */
+  turnQueue?: TurnQueue;
+  /** Reads `leaf:result:<sid>` for the status route (§4.4); absent means a turn reports no result. */
+  leafResults?: ResultRedisLike;
 }
 
 /** `deps.log` with the production default; keeps the field optional on `CpDeps`. */
@@ -997,6 +1028,11 @@ export const HANDLERS: Record<string, Handler> = {
     const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
     const inFlight = await turnInFlight(rec.sessionId, deps);
     await deps.index.cascadeDelete(rec);
+    // Reclaim this session's open async turns and their quota slots (F2): nothing else in the
+    // design will ever move an orphaned queued/running turn to terminal, so without this a
+    // submit-then-delete cycle burns a slot forever. `deps.turns` is absent on the sandbox profile,
+    // which mounts no turn routes and so can never have created one.
+    await deps.turns?.deleteSessionTurns(rec.sessionId, rec.owner);
     const deletedEntry = {
       subject: rec.owner,
       sessionId: rec.sessionId,
@@ -1231,6 +1267,30 @@ export const HANDLERS: Record<string, Handler> = {
     return { status: 200, body: await exchangeCredential(token, deps) };
   },
 
+  exchangeTurnCredential: async (ctx, deps) => {
+    // The router performs the shared-bearer check (it is the only layer that sees headers) and marks
+    // the request. A handler reached without that mark is a routing bug, and 401 is the safe answer.
+    if (!ctx.exchangeAuthorized) {
+      throw new CpError('unauthorized', 'exchange authentication failed');
+    }
+    const turnId = asRecord(ctx.body).turnId;
+    if (typeof turnId !== 'string' || turnId.length === 0) {
+      throw new CpError('invalid_request', 'turnId is required');
+    }
+    // Refused BEFORE Redis, so caller input cannot pick the key shape this route reads. `submitTurn`
+    // is the only minter and its ids are always `t-<uuid>`, so a well-formed id that has no record
+    // still answers 404 `turn_not_found` -- the shape check only removes ids no submission could
+    // have produced. 400 rather than 404 deliberately, for the reason openapi.yaml's 404 description
+    // gives: nothing this route refuses tells its caller anything a success would not.
+    if (!isMintedTurnId(turnId)) {
+      throw new CpError('invalid_request', 'turnId is not a turn id this control plane minted');
+    }
+    // `turnId` ALONE. No deliveryCount, no caps, no envelope: everything else comes from the record
+    // the control plane wrote at the authenticated enqueue, which is what makes a queue entry
+    // carrying one id sufficient (§5.1) and a queue entry carrying a credential unnecessary (§6.5).
+    return { status: 200, body: await exchangeTurnCredential(turnId, deps) };
+  },
+
   /**
    * Readiness is "can I serve session routes", i.e. is Redis answering. Credentials live in
    * Kubernetes Secrets, so they stay up while Redis is down (spec §7.1, §9.2) -- which is why this
@@ -1265,4 +1325,5 @@ export const HANDLERS: Record<string, Handler> = {
   ...MEMBER_HANDLERS,
   ...HOST_HANDLERS,
   ...EGRESS_HANDLERS,
+  ...TURN_HANDLERS,
 };
