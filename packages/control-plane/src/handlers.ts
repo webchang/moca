@@ -47,6 +47,8 @@ import {
   viewTier,
 } from './exchange.js';
 import { MODEL_ID_RE } from './models.js';
+import { exchangeTurnCredential } from './turn-exchange.js';
+import { isMintedTurnId } from './turn-record.js';
 import {
   catalogAllowList,
   chooseModel,
@@ -1096,6 +1098,30 @@ export const HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', 'token is required');
     }
     return { status: 200, body: await exchangeCredential(token, deps) };
+  },
+
+  exchangeTurnCredential: async (ctx, deps) => {
+    // The router performs the shared-bearer check (it is the only layer that sees headers) and marks
+    // the request. A handler reached without that mark is a routing bug, and 401 is the safe answer.
+    if (!ctx.exchangeAuthorized) {
+      throw new CpError('unauthorized', 'exchange authentication failed');
+    }
+    const turnId = asRecord(ctx.body).turnId;
+    if (typeof turnId !== 'string' || turnId.length === 0) {
+      throw new CpError('invalid_request', 'turnId is required');
+    }
+    // Refused BEFORE Redis, so caller input cannot pick the key shape this route reads. `submitTurn`
+    // is the only minter and its ids are always `t-<uuid>`, so a well-formed id that has no record
+    // still answers 404 `turn_not_found` -- the shape check only removes ids no submission could
+    // have produced. 400 rather than 404 deliberately, for the reason openapi.yaml's 404 description
+    // gives: nothing this route refuses tells its caller anything a success would not.
+    if (!isMintedTurnId(turnId)) {
+      throw new CpError('invalid_request', 'turnId is not a turn id this control plane minted');
+    }
+    // `turnId` ALONE. No deliveryCount, no caps, no envelope: everything else comes from the record
+    // the control plane wrote at the authenticated enqueue, which is what makes a queue entry
+    // carrying one id sufficient (§5.1) and a queue entry carrying a credential unnecessary (§6.5).
+    return { status: 200, body: await exchangeTurnCredential(turnId, deps) };
   },
 
   /**
