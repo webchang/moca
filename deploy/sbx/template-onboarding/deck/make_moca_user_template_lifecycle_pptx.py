@@ -16,7 +16,8 @@ Sources, in the order they win (a slide restates them; change the source first):
   4. docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md (policy §8, quotas §6.2)
   5. the sources make_template_lifecycle_pptx.py names, for the slides imported from it
   6. the upstream PRs as `gh pr list -R rossoctl/moca` lists them on 2026-11-12 (numbers and titles)
-  7. autobench-moca's run records: runs/l28b-7-d, l28b-6-d, l28b-3-d FINDINGS.md (the speed charts)
+  7. autobench-moca's run records: runs/l28b-7-d, l28b-6-d, l28b-3-d FINDINGS.md, and runs/g50-1-d
+     rounds batch-1 and batch-3 (the speed charts)
 """
 import sys
 from pathlib import Path
@@ -157,8 +158,8 @@ def s_demo_templates(d):
     label(s, 0.6, 4.6, 6.0, 0.3, "Two refusals, shown between steps 2 and 3; nothing is built",
           size=12, color=INK, align=PP_ALIGN.LEFT)
     note(s, 0.6, 4.95, 5.95, 1.25, "1. Refused by mocactl, before sending",
-         ["`create --spec F --image <another digest>`", "rule `M7.spec_image`: the image must "
-          "be the spec's own; exit 1, no request"], size=12)
+         ["`create --spec F --image <another digest>`", "rule `M7.spec_image`: `--image` must "
+          "match the image named in the spec; refused locally, nothing sent"], size=12)
     note(s, 6.75, 4.95, 5.95, 1.25, "2. Refused by the control plane's policy",
          ["`create --spec F --profile benchmark`", "`422 policy_refused`: no trusted gate "
           "record; a `check` record"], size=12)
@@ -401,6 +402,35 @@ def s_perf_queue(d):
     text(s, 0.6, 6.1, 12.1, 0.4, [SHARED], size=11, color=MUTED)
 
 
+def s_perf_cache(d):
+    # runs/g50-1-d/rounds/batch-1 (the cache as first built) and batch-3 (13179c7b's worker), each
+    # instance's request_to_active_s; read per start, the 72.87 GiB total and the files re-hashed
+    # from runs/g50-1-d/FINDINGS.md ("Bytes read", from the diskstats counters; "Journal lines").
+    s = d.slide("The fixed verify cache halves a cold start's reads",
+                "Seconds until active, 8 cold activations posted at once (G50 window, 2026-11-12, "
+                "750 MiB/s, start limit 4)",
+                notes="8 SWE-bench Lite templates (4 GiB guest RAM, snapshots 7.3-13.5 GiB, 72.87 "
+                      "GiB in all); page cache dropped before each round; activations only; each "
+                      "worker had one restore since its cache was seeded. Before = the cache as "
+                      "first built, which missed after every restore (ctime in its identity).")
+    before, after = [84.5, 143.2, 204.0], [47.5, 49.3, 100.7]
+    assert round(before[-1] / after[-1], 1) == 2.0
+    bar_chart(s, 0.6, 1.5, 8.0, 4.4, ["first active", "fourth active", "all 8 active"],
+              {"cache as first built": before, "cache fixed": after},
+              [NEUTRAL[1], ACCENT[1]], number_format="#,##0.0")
+    text(s, 9.0, 1.65, 3.7, 2.6, [
+        "**Read per start:** 8.99 → 4.00 GiB, the memory file alone, which a start still "
+        "pins.",
+        "**Files re-hashed per start:** 4 of 4 → 0 of 4.",
+    ], size=13, gap=10)
+    note(s, 9.0, 4.4, 3.7, 1.5, "Why the first build missed",
+         ["each VM restore links and chowns the files into its jail, which moved the ctime the "
+          "cache keyed on"], size=12)
+    text(s, 0.6, 6.1, 12.1, 0.4, [
+        "one KVM host, 8 SWE-bench Lite templates (4 GiB, snapshots 7.3-13.5 GiB), page cache "
+        "dropped before each round"], size=11, color=MUTED)
+
+
 # --------------------------------------------------------------------------- 6. Upstream, next
 
 # The upstream PRs (gh pr list -R rossoctl/moca, 2026-11-12), grouped by what they bring.
@@ -414,15 +444,17 @@ UPSTREAM = [
     ["mocactl", "#767, #768", "authoring commands; `--record`; token renewal"],
     ["", "#761, #755", "retry a refused command (exit 75); `--version`"],
     ["Hosts", "#757, #758", "microVM worker and snapshot fixes; deploy fixes"],
+    ["", "#771, #772", "from an image to a registered template; the host agent"],
+    ["", "#773", "a verify cache: a start re-hashes only changed snapshot files"],
 ]
 
 
 def s_upstream(d):
     s = d.slide("The enhancements are open upstream, as reviewable PRs",
                 "rossoctl/moca, 2026-11-12: each stacked where it builds on another")
-    table(s, 0.6, 1.45, 12.1, [["Area", "PRs", "What it brings"]] + UPSTREAM,
-          [2.2, 2.2, 7.7], right_from=-1, size=12, row_h=0.4, bold_first_col=True)
-    note(s, 0.6, 5.75, 12.1, 0.6, "Each one reviewed before its push",
+    table(s, 0.6, 1.4, 12.1, [["Area", "PRs", "What it brings"]] + UPSTREAM,
+          [2.2, 2.2, 7.7], right_from=-1, size=12, row_h=0.36, bold_first_col=True)
+    note(s, 0.6, 5.95, 12.1, 0.6, "Each one reviewed before its push",
          ["a tree check, a deploy-input diff, and a scan for hosts, ids, tokens and results"],
          size=12)
 
@@ -432,8 +464,8 @@ def s_next(d):
                 "In order, each with the user's decision first")
     rows = [
         ("1", "Upstream review", "answer the reviews of the open PRs; land them in stack order"),
-        ("2", "Host agent and verify cache", "the next PRs, for issues #741 and #746, stacked "
-         "on the build tooling's (#740)"),
+        ("2", "The next PRs", "activation, removal, memory, pacing and egress (#742-#745, "
+         "#752), on the host agent (#772)"),
         ("3", "The demo, rescheduled", "self-serve template and user lifecycle, live, on the "
          "synced code"),
     ]
@@ -461,7 +493,7 @@ SECTIONS = [
      [s_states, s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
     ("5", "Validation and speed", "windows 1-4; cold and warm starts",
      [s_windows, s_lifecycle_window, s_activation_chart, s_perf_disk,
-      s_perf_warm, s_perf_queue]),
+      s_perf_warm, s_perf_queue, s_perf_cache]),
     ("6", "At scale, upstream, next", "Lite-28, findings, PRs, next",
      [s_lite28, s_two_brains, s_issues, s_upstream, s_next]),
     ("B", "Backup", "", [s_problem]),
