@@ -81,6 +81,7 @@ mocactl run "prompt" [--session ID | --new] [--option inferenceCredential=NAME] 
 mocactl promote DIR [--dry-run] [--json]    # upload DIR's .claude/skills and .claude/commands
 mocactl run "prompt" --config DIGEST        # start the new session with that config bundle
 mocactl run "prompt" --show-tools           # print each tool call between the turn's text
+mocactl run "prompt" --record F             # one redacted NDJSON line per HTTP attempt to F (no token, host or text)
 mocactl bundles list [--json]               # your own live bundles, newest first; prints the full digest
 mocactl bundles delete DIGEST [--json]      # delete a bundle you promoted; frees your budget
 ```
