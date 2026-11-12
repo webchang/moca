@@ -168,7 +168,7 @@ times.
   the login flow.
 - **Open session gaps, not in this scope:** receive times in `run --json`'s frames (G-e),
   `run --patch-out F` (a session's workspace patch to a file), and `--record` on `mocactl run` (a Moca
-  Pi session's id and times for a runner's provenance links).
+  Pi session's id and times for a runner's provenance links; built since, see §4a).
 - `sbx token` and `mocactl auth token` still print tokens; nothing new does.
 
 ## 4a. As built
@@ -186,6 +186,12 @@ departs from §3, and why:
 - **The record's `command` is `sbx <command> [<subcommand>]`**, never the arguments (an id or a path
   could be anything). Bodies that are not JSON (an egress NDJSON export) are kept as their length.
   A request's `reason` (a retire's free text) is kept as its length, as a reason message is.
+- **Streams and `mocactl run --record F` (after this scope):** a streamed answer (SSE or NDJSON) is
+  passed through unheld; its line (`stream: true`) is written at the headers and a `stream_end` line
+  (bytes, sha256, frames, `error`) at its end, so an egress `--ndjson` export is recorded that way
+  now, not as its length. `run` adds `endpoint` (control-plane or harness) and keeps its own free
+  text (prompt, reply, patch, messages, a credential's hosts) as its length, in a set of its own
+  (`RUN_LENGTH_FIELDS`), so the template record keeps every field it had.
 - **`--dry-run` reads `GET /v1/policy`** for the profiles §3.5 checks against, so it needs a login
   and one request; it creates nothing. Beyond §3.5's list it checks what the profile requires that
   the inputs decide: the gate record passed and is for this image (X1, X1.image, X1.offline),

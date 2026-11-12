@@ -741,7 +741,11 @@ another. Past it they exit **5**.
 calls the API, but `token`, `login`, `logout` and `credentials`) appends one JSON line per HTTP
 attempt: the command, the path, the status, both bodies and their times. The file is created
 `0600` (an existing one readable by others is refused). Tokens and gate records are kept only as
-their sha256, and hosts and build-log text only as their length, so a record can be shared.
+their sha256, and hosts and build-log text only as their length, so a record can be shared. A
+streamed answer (an egress `--ndjson` export) is passed through as it arrives: its line has
+`stream: true`, and a `stream_end` line for the same `seq` gives its bytes, their sha256 and its
+line count. `mocactl run "prompt" --record F` writes the same record for a Moca Pi session's calls
+([CLI reference](../reference/cli-mocactl.md#run)), its prompt, reply and patch as their length.
 
 **For admins.** `mocactl sbx templates quota TARGET …` and `mocactl sbx admin subjects
 enroll|unenroll|grant|revoke` read the current value first and print `old -> new` and the record
