@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { buildHandler, startControlPlane } from '../src/server.js';
 import { TestUserProvider } from '../src/identity.js';
 import { makeDeps, seedCredential, type TestDeps } from './helpers/deps.js';
@@ -291,6 +292,57 @@ describe('the exchange hop', () => {
       mode: 'direct',
       anthropicBaseUrl: 'https://litellm.internal/v1',
     });
+  });
+
+  it('401s the dequeue exchange without the shared exchange token', async () => {
+    const res = await request('POST', '/internal/turn-credentials', { body: { turnId: 't-1' } });
+    expect(res.status).toBe(401);
+    expect((res.json() as { error: string }).error).toBe('unauthorized');
+  });
+
+  it('401s the dequeue exchange with the wrong shared token, before reading the body', async () => {
+    // Authentication comes first and the body second (server.ts). A caller with a bad bearer must not
+    // learn whether `t-1` exists, so the 401 has to arrive for a turn id that was never submitted.
+    const res = await request('POST', '/internal/turn-credentials', {
+      body: { turnId: 't-1' },
+      headers: { Authorization: 'Bearer wrong' }, // notsecret
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('400s a dequeue exchange with no turnId, authenticated', async () => {
+    const res = await request('POST', '/internal/turn-credentials', {
+      body: {},
+      headers: { Authorization: 'Bearer shared-abc' }, // notsecret
+    });
+    expect(res.status).toBe(400);
+    expect((res.json() as { error: string }).error).toBe('invalid_request');
+  });
+
+  it('404s an unknown but well-formed turn id, authenticated', async () => {
+    // The authenticated no-such-turn answer, over real HTTP: this is what proves the new code maps
+    // to 404 through the server's error mapper and not only in the unit suite. The id has to be
+    // SHAPED like one submitTurn mints, or the shape gate below answers first and this stops
+    // covering the 404 at all.
+    const res = await request('POST', '/internal/turn-credentials', {
+      body: { turnId: `t-${randomUUID()}` },
+      headers: { Authorization: 'Bearer shared-abc' }, // notsecret
+    });
+    expect(res.status).toBe(404);
+    expect((res.json() as { error: string }).error).toBe('turn_not_found');
+  });
+
+  it('400s a turn id the control plane could never have minted, before Redis', async () => {
+    // Bounds the key space this shared-bearer route reads: the id is the only caller input that
+    // reaches `sh:cp:turn:<id>`, so anything outside `t-<uuid>` is refused rather than looked up.
+    for (const turnId of ['t-nobody', 't-*', `t-${randomUUID()}:tag`, 'sh:cp:turn:t-1']) {
+      const res = await request('POST', '/internal/turn-credentials', {
+        body: { turnId },
+        headers: { Authorization: 'Bearer shared-abc' }, // notsecret
+      });
+      expect(res.status, turnId).toBe(400);
+      expect((res.json() as { error: string }).error, turnId).toBe('invalid_request');
+    }
   });
 
   it('does not accept the exchange token as an /v1 credential', async () => {

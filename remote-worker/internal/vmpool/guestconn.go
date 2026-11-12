@@ -105,7 +105,12 @@ func runOverConn(ctx context.Context, rw io.ReadWriteCloser, c Command, out Sink
 			if err := ga.DecodeJSON(payload, &e); err != nil {
 				return Result{}, refusal(RefuseShortResponse, "%v: undecodable End: %v", ErrShortResponse, err)
 			}
-			return Result{ExitCode: e.ExitCode, DroppedStdout: e.DroppedStdout, DroppedStderr: e.DroppedStderr}, nil
+			return Result{
+				ExitCode:       e.ExitCode,
+				DroppedStdout:  e.DroppedStdout,
+				DroppedStderr:  e.DroppedStderr,
+				TeardownFailed: e.TeardownFailed,
+			}, nil
 		case ga.KindError:
 			return Result{}, fmt.Errorf("%w: %s", ErrGuest, payload)
 		default:
@@ -120,12 +125,14 @@ func runOverConn(ctx context.Context, rw io.ReadWriteCloser, c Command, out Sink
 // guestRequest is the request frame's content for c.
 func guestRequest(c Command, capBytes int64, now time.Time) ga.Request {
 	return ga.Request{
-		Command:       c.Command,
-		TimeoutS:      c.TimeoutS,
-		Streaming:     c.Streaming,
-		CapBytes:      capBytes,
-		HasStdin:      len(c.Stdin) > 0,
-		HostUnixNanos: now.UnixNano(),
+		Command:            c.Command,
+		TimeoutS:           c.TimeoutS,
+		Streaming:          c.Streaming,
+		CapBytes:           capBytes,
+		HasStdin:           len(c.Stdin) > 0,
+		HostUnixNanos:      now.UnixNano(),
+		Lease:              c.Lease,
+		NormaliseWorkspace: c.NormaliseWorkspace,
 	}
 }
 

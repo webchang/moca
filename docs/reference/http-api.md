@@ -165,9 +165,16 @@ is the leaf result; both are specified in [Leaf envelope and result](leaf-and-en
 - `GET /runs/status?sessionId=ID` returns the stored result: `{status: "queued"}` until one exists
   (also for a session that never existed), then the result for that status. 400 `sessionId_required`.
 - An authenticated caller may not pass `tenant` (400 `tenant_not_allowed`).
-- **`async: true` is removed.** It returns 400 `async_removed`, naming the removal: the KEDA drainer
-  that consumed the queue was removed with the Knative/KEDA path (ADR-0041) and no P6 equivalent
-  exists yet.
+- **`async: true` is removed, and stays removed.** It returns 400 `async_removed`: the KEDA drainer
+  that consumed the queue went with the Knative/KEDA path (ADR-0041). This route is not coming back
+  — it is unauthenticated when `SH_REQUIRE_AUTH` is off, which would be a second trust model for one
+  queue. Its replacement is the authenticated, owner-scoped `POST /v1/sessions/{id}/turns` with
+  `async: true` → `202 {sessionId, turnId}`, designed in
+  [ADR-0047](../adrs/0047-p6-async-fan-out-in-worker-drain.md) and documented in
+  [`docs/api/openapi.yaml`](../api/openapi.yaml). **Submission is implemented; the consumer that
+  drains the queue is not** ([#389](https://github.com/rossoctl/moca/issues/389)) — a submitted turn
+  is recorded and queued, and runs once the drain loop ships. Poll
+  `GET /v1/sessions/{id}/turns/{turnId}` for its state. Run leaves synchronously meanwhile.
 - On a saturated pool the sync path waits with backoff (up to `KAGENTI_SYNC_SATURATION_WAIT_MS`, 30 s)
   and then returns 503 with `Retry-After` and `{"status":"failed","reason":"saturated"}`.
 
@@ -183,7 +190,7 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Models         | `GET /v1/models?credential=` (the models a credential's endpoint lists), `GET /v1/sessions/{id}/models` (the models the session's credential lists)                                                                                                                                                                               |
 | Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                                                                                                                                                                                                                  |
 | Config bundles | `POST` and `GET /v1/config-bundles` (your own, newest first), `DELETE /v1/config-bundles/{digest}`                                                                                                                                                                                                                                |
-| Internal       | `POST /internal/credentials`: data plane only, authenticated with `SH_EXCHANGE_TOKEN`                                                                                                                                                                                                                                             |
+| Internal       | `POST /internal/credentials` (session token → credential) and `POST /internal/turn-credentials` (queued turn id → credential, at dequeue): data plane only, both authenticated with `SH_EXCHANGE_TOKEN`                                                                                                                           |
 | Templates      | `GET /v1/templates[/{id}]`, `…/builds[/{build}]`, `…/tags`; `POST /v1/templates`, `…/builds`, `…/builds/{build}/cancel`; `POST …/activate`, `…/deactivate`; `POST`/`DELETE …/tags[/{tag}]`; `PATCH /v1/templates/{id}`; `PUT …/owner` (admin); `POST …/builds/{build}/reject` (admin); `POST …/retire`, `DELETE …/builds/{build}` |
 | Policy, quota  | `GET`, `PUT /v1/policy` (admin); `GET /v1/quota`, `PUT /v1/quota/{subject\|default}` (admin)                                                                                                                                                                                                                                      |
 | Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}` (enroll, unenroll); `PUT`, `DELETE /v1/subjects/{subject}/roles/admin` (grant with an optional `until`, revoke); the list any admin, a change only an admin named in `SH_ADMIN_SUBJECTS`, API 1.4.0                                                                    |
@@ -192,6 +199,9 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
+An async turn that is still **queued** is a next turn, not a running one: it picks up the new model when a worker claims
+it, however long ago it was submitted, because `/internal/turn-credentials` reads `model` from the session as it is at
+dequeue. Pinning the model a queued turn was submitted with is M2 ([#388](https://github.com/rossoctl/moca/issues/388)).
 The id is checked against the credential's catalog (400 `model_unavailable` when it is not listed); when the endpoint
 cannot list its models, the id is accepted unverified and the answer has `modelVerified: false`. Only the two list routes
 answer 503 `model_catalog_unavailable`. These routes came with API 1.1.0; see the [changelog](../api/CHANGELOG.md).
@@ -224,11 +234,12 @@ Another user's session returns 404, not 403. Control-plane error codes and statu
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`, `unknown_template`,
 `digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`, `model_unavailable`), 401 (`token_required`,
 `token_invalid`, `token_expired`, `unauthorized`), 403 (`forbidden`, `not_enrolled`), 404 (`session_not_found`, `config_bundle_not_found`,
-`credential_not_found`, `template_not_found`, `sandbox_not_found`), 409 (`template_exists`, `template_not_active`,
+`credential_not_found`, `template_not_found`, `sandbox_not_found`, `turn_not_found`), 409 (`template_exists`, `template_not_active`,
 `template_unavailable`, `no_active_slot`, `build_in_use`, `name_conflict`, `sandbox_terminated`, `bootstrap_subject`,
-`self_revoke`, `self_attested`), 410 (`device_code_expired`,
+`self_revoke`, `self_attested`, `turn_not_cancellable`, `turn_not_claimable`), 410 (`device_code_expired`,
 `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429 (`quota_exceeded`,
-`bundle_quota_exceeded`), 500 `internal_error`, 502 `identity_provider_misconfigured`, 503
+`bundle_quota_exceeded`, `async_quota_exhausted`), 500 `internal_error`, 501
+(`async_tenancy_unsupported`, `workload_runs_unavailable`), 502 `identity_provider_misconfigured`, 503
 (`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in
 `packages/control-plane/src/errors.ts`.
 

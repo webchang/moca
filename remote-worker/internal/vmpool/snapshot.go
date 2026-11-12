@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +75,21 @@ type Manifest struct {
 	// every rebuild even when nothing behavioural did. Version 2 does, because it names
 	// one build, not one toolchain.
 	Hash string `json:"hash"`
+
+	// Features names what the guest image supports beyond per-Exec, e.g. lease-v1.
+	// It is outside Hash in both versions (version 2's line set does not name it), so a
+	// snapshot built before the field existed still verifies; it simply advertises nothing.
+	Features []string `json:"features,omitempty"`
+}
+
+// FeatureLeaseV1 marks an image built for lease mode: cgroup2 mounted, user
+// namespaces disabled, the sbx exec identity present and no setuid binaries
+// (deploy/microvm/build-snapshot.sh). A worker refuses lease mode without it.
+const FeatureLeaseV1 = "lease-v1"
+
+// HasFeature reports whether the snapshot advertises f.
+func (m Manifest) HasFeature(f string) bool {
+	return slices.Contains(m.Features, f)
 }
 
 // HashVersionAll is the manifest hash that covers every field and file.

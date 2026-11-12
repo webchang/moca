@@ -75,6 +75,18 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
     reads: ['model', 'modelVerified'],
     sends: ['model'],
   },
+  {
+    method: 'post',
+    path: '/v1/sessions/{id}/turns',
+    reads: ['sessionId', 'turnId'],
+    sends: ['async', 'prompt', 'idempotencyKey', 'caps'],
+  },
+  {
+    method: 'get',
+    path: '/v1/sessions/{id}/turns/{turnId}',
+    reads: ['turnId', 'state', 'attempts', 'result'],
+  },
+  { method: 'delete', path: '/v1/sessions/{id}/turns/{turnId}' },
 ];
 
 // The same for `mocactl sbx`'s SandboxApiClient (SBX0 §5.1), beyond the calls it inherits.
@@ -250,6 +262,8 @@ const CODES_USED = [
   'template_unavailable',
   'quota_exceeded',
   'policy_refused',
+  'async_quota_exhausted',
+  'turn_not_cancellable',
 ];
 
 function responseSchema(op: any): any {
@@ -293,7 +307,7 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
 
   it('covers every call the client makes', async () => {
     const reply = () => json({ credentials: [], sessions: [], nextCursor: null });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 40 }, () => reply));
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 43 }, () => reply));
     const c = new ControlPlaneClient('http://cp', () => 't', fetch);
     const invokedMethods = new Set<string>();
     const handler: ProxyHandler<ControlPlaneClient> = {
@@ -341,11 +355,15 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
     await cProxy.listModels('cred');
     await cProxy.listSessionModels('ID');
     await cProxy.setSessionModel('ID', null);
+    await cProxy.submitTurn('ID', { async: true, prompt: 'x' });
+    await cProxy.getTurn('ID', 'TURN');
+    await cProxy.cancelTurn('ID', 'TURN');
     const seen = calls.map((k) => {
       const path = new URL(k.url).pathname
         .replace('/ID', '/{id}')
         .replace('/NAME', '/{name}')
-        .replace('/DIGEST', '/{digest}');
+        .replace('/DIGEST', '/{digest}')
+        .replace('/TURN', '/{turnId}');
       return `${k.method.toLowerCase()} ${path}`;
     });
     expect(new Set(seen)).toEqual(new Set(USED.map((u) => `${u.method} ${u.path}`)));
