@@ -129,6 +129,13 @@ means a re-hash. `build-snapshot.sh` seeds the cache after it publishes, with th
 best-effort, it never fails a build), while the files are still in the page cache, so a fresh
 snapshot's first start is spared too. The memory file's pin (`PinMemoryFile`) still reads the
 whole memory file at every start.
+Why it matters, as measured on one KVM host with an EBS gp3 root volume (2026-11-11, 28 cold starts,
+4 at a time, snapshots of 7.3-13.6 GiB, before G50): each start read its whole snapshot, the re-hash
+3.5-9.6 GiB of it. At 125 MiB/s all 28 were active after 1,977 s; with the volume raised to 750 MiB/s
+and 3,000 IOPS, after 638 s, the disk at a median 423 MiB/s in 128 KiB reads. 128 KiB is the device's
+largest request (`max_hw_sectors_kb`), so readahead cannot make the reads larger: after the volume,
+reading fewer bytes per start is the lever left, and G50 leaves about 4 GiB (the memory file) of a
+start's read.
 A snapshot built before version 2 (no `hash_version`) still verifies under its old rule, a hash over
 kernel, rootfs and agent only, until it is rebuilt. A version-2 manifest also carries
 `source_image_digest`, the image digest `build-rootfs.sh` recorded in `/etc/moca-rootfs-source`, so a
