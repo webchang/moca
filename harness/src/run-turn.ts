@@ -339,8 +339,13 @@ function seedOrigin(t: { seedSource?: 'build' | 'declared'; build?: string }): T
  * travels with that workspace and no other session's.
  */
 export const SEED_MARKER = '.moca-seeded';
-/** The seed's own output, kept in the workspace for the operator; the agent never reads it. */
+/**
+ * The seed's own output, kept in the workspace for the operator: never in the turn's output, but in
+ * the agent's own workspace, where the agent can read it, so a seed must not print a secret.
+ */
 export const SEED_LOG = '.moca-seed.log';
+/** The lock that holds concurrent first turns of one session to one seed run. */
+export const SEED_LOCK = '.moca-seed.lock';
 /**
  * The commit the seed left the workspace at (`git rev-parse HEAD` right after it), relative to the
  * workspace like the marker: the base a turn's patch is taken against (spec §5.1). Absent when the
@@ -367,7 +372,9 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * leaves no marker, so the next turn runs it again on whatever it left: a seed must be safe to
  * re-run (`cp -a` is; a bare `git clone` into the workspace is not). A workspace reset has no
  * marker and is seeded again. The seed's output goes to SEED_LOG, never into the turn: only the
- * exit code is read, so a chatty seed cannot trip the output cap.
+ * exit code is read, so a chatty seed cannot trip the output cap. When the workspace is a git
+ * repository's root (a seeded checkout), the seed's own files are added to its `info/exclude`, so a
+ * patch taken with `git add -A` or `git status --porcelain` never carries them.
  */
 export async function seedWorkspace(
   transport: {
@@ -379,11 +386,16 @@ export async function seedWorkspace(
 ): Promise<void> {
   // The baseline is best effort: a seed that leaves no repository still seeds, with no baseline.
   const baseline = `{ git rev-parse --verify -q HEAD >${SEED_BASELINE} 2>/dev/null || rm -f ${SEED_BASELINE}; true; }`;
-  const body = `[ -e ${SEED_MARKER} ] || { bash -c ${shq(seed)} >${SEED_LOG} 2>&1 && ${baseline} && touch ${SEED_MARKER}; }`;
+  const files = [SEED_MARKER, SEED_LOG, SEED_LOCK, SEED_BASELINE];
+  // Best-effort: no git, or not a repository, skips it; it never fails the seed.
+  const exclude =
+    `{ x="$(git rev-parse --git-path info/exclude 2>/dev/null)" && mkdir -p "$(dirname "$x")" && ` +
+    `for f in ${files.map((f) => `/${f}`).join(' ')}; do grep -qxF "$f" "$x" 2>/dev/null || echo "$f" >>"$x"; done; true; }`;
+  const body = `[ -e ${SEED_MARKER} ] || { bash -c ${shq(seed)} >${SEED_LOG} 2>&1 && ${baseline} && ${exclude} && touch ${SEED_MARKER}; }`;
   // flock(1) is util-linux, in every shipped sandbox image; without it the guard still runs, unlocked.
   const command =
     `cd ${shq(workspace)} && if command -v flock >/dev/null 2>&1; then ` +
-    `flock .moca-seed.lock bash -c ${shq(body)}; else ${body}; fi`;
+    `flock ${SEED_LOCK} bash -c ${shq(body)}; else ${body}; fi`;
   let res: { exitCode: number | null };
   try {
     res = await transport.exec(command, { timeout: 600 });
