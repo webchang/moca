@@ -366,10 +366,18 @@ class Deck:
 
     def outline(self, blurbs):
         """Slide 2: one card per section, listing its slides by number. Up to six sections."""
-        s = self.slide("Outline", f"{len(blurbs)} sections; the numbers are slide numbers",
-                       number=2)
+        # A section numbered "B" holds backup slides: no card, named in the kicker instead.
+        backup = [n for sec, n, _ in self.index if sec[0] == "B"]
+        main = sum(1 for no in blurbs if no != "B")
+        kick = f"{main} sections; the numbers are slide numbers"
+        if backup:
+            kick += (f"; backup: slide {backup[0]}" if len(backup) == 1
+                     else f"; backup: slides {backup[0]}-{backup[-1]}")
+        s = self.slide("Outline", kick, number=2)
         secs = []
         for sec, n, t in self.index:
+            if sec[0] == "B":
+                continue
             if not secs or secs[-1][0] != sec:
                 secs.append((sec, []))
             secs[-1][1].append((n, t))
@@ -388,8 +396,9 @@ class Deck:
             box(s, x, y, cw, ch, INFRA, None, (), line_w=1.25)
             text(s, x + 0.15, y + 0.1, cw - 0.3, 0.42, [f"**{no}  {name}**"], size=17)
             text(s, x + 0.15, y + 0.5, cw - 0.3, 0.45, [blurbs[no]], size=11, color=MUTED)
+            # outline_size: a deck whose sections list five long titles sets 10 (the floor).
             text(s, x + 0.15, y + 0.95, cw - 0.3, ch - 1.0,
-                 [f"{n}   {t}" for n, t in slides], size=11, gap=2)
+                 [f"{n}   {t}" for n, t in slides], size=getattr(self, "outline_size", 11), gap=2)
 
     def build(self, sections, title_slide):
         """sections: [(number, name, blurb, [slide functions])]. Each function takes the deck."""

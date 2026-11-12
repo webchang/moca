@@ -3,18 +3,21 @@
 A generated deck: `make_template_lifecycle_pptx.py` is the source of truth, and the PDF beside it
 is its build output. Never edit the `.pptx` or the PDF by hand; change the script and rebuild.
 
-| File                               | What                                                                           |
-| ---------------------------------- | ------------------------------------------------------------------------------ |
-| `make_template_lifecycle_pptx.py`  | one function per slide; its docstring names the sources, in the order they win |
-| `deck_kit.py`                      | the palette, shapes and build (a copy of the tech-deck kit)                    |
-| `template-lifecycle-overview.pdf`  | the build output, committed                                                    |
-| `template-lifecycle-overview.pptx` | the build output, not committed (`.gitignore`)                                 |
+| File                                              | What                                                                                                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make_template_lifecycle_pptx.py`                 | one function per slide; its docstring names the sources, in the order they win                                                                       |
+| `deck_kit.py`                                     | the palette, shapes and build (a copy of the tech-deck kit)                                                                                          |
+| `template-lifecycle-overview.pdf`                 | the build output, committed                                                                                                                          |
+| `template-lifecycle-overview.pptx`                | the build output, not committed (`.gitignore`)                                                                                                       |
+| `make_moca_user_template_lifecycle_pptx.py`       | the 2026-11-12 meeting deck: the overview's slides (imported) plus self-serve users, policy profiles, own gate records, mocactl and the upstream PRs |
+| `2026-11-12-mtg-moca_user-template-lifecycle.pdf` | its build output, committed (the `.pptx` beside it is not)                                                                                           |
 
 Build, from this folder, in its own venv:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python make_template_lifecycle_pptx.py    # the .pptx and the PDF (PowerPoint, else LibreOffice)
+.venv/bin/python make_moca_user_template_lifecycle_pptx.py   # the meeting deck, the same way
 ```
 
 `DECK_PDF_VIA=soffice` forces LibreOffice; `DECK_PDF_VIA=none` writes the `.pptx` only. The build
