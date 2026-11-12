@@ -17,7 +17,7 @@ Sources, in the order they win (a slide restates them; change the source first):
   5. the sources make_template_lifecycle_pptx.py names, for the slides imported from it
   6. the upstream PRs as `gh pr list -R rossoctl/moca` lists them on 2026-11-12 (numbers and titles)
   7. autobench-moca's run records: runs/l28b-7-d, l28b-6-d, l28b-3-d FINDINGS.md, and runs/g50-1-d
-     rounds batch-1 and batch-3 (the speed charts)
+     rounds batch-1, batch-3 and batch-4 (the speed charts)
 """
 import sys
 from pathlib import Path
@@ -443,6 +443,32 @@ def s_perf_cache(d):
         "dropped before each round"], size=11, color=MUTED)
 
 
+def s_perf_readahead(d):
+    # runs/g50-1-d/FINDINGS.md "D1c step 2": batch-3 (read_ahead_kb 128) against batch-4 (512),
+    # each instance's request_to_active_s in rounds/batch-3 and batch-4; busy-interval medians and
+    # reads per start from the same section.
+    s = d.slide("Read-ahead 512 lets the disk reach its cap",
+                "Seconds until active, 8 cold activations at once, fixed verify cache; only "
+                "read_ahead_kb changed: 1.6× faster (G50, 2026-11-12)",
+                notes="As slide 30: 8 SWE-bench Lite templates, 750 MiB/s volume, start limit 4, "
+                      "page cache dropped before each round, activations only. read_ahead_kb was "
+                      "set back to 128 after the round.")
+    ra128, ra512 = [47.5, 49.3, 100.7], [29.2, 30.9, 62.2]
+    assert round(ra128[-1] / ra512[-1], 1) == 1.6
+    bar_chart(s, 0.6, 1.5, 8.0, 4.4, ["first active", "fourth active", "all 8 active"],
+              {"read_ahead_kb 128": ra128, "read_ahead_kb 512": ra512},
+              [NEUTRAL[1], ACCENT[1]], number_format="#,##0.0")
+    text(s, 9.0, 1.65, 3.7, 2.8, [
+        "**Disk, busy intervals:** 420.8 → 742.3 MiB/s median, at the volume's 750 MiB/s cap.",
+        "**Same work:** about 4 GiB read per start; reads stayed 127.5 KiB, the device's largest.",
+    ], size=13, gap=10)
+    note(s, 9.0, 4.55, 3.7, 1.25, "One round per setting",
+         ["a measurement, not a distribution"], size=12)
+    text(s, 0.6, 6.1, 12.1, 0.4, [
+        "one KVM host, 8 SWE-bench Lite templates (4 GiB, snapshots 7.3-13.5 GiB), page cache "
+        "dropped before each round"], size=11, color=MUTED)
+
+
 # --------------------------------------------------------------------------- 6. Upstream, next
 
 # The upstream PRs (gh pr list -R rossoctl/moca, 2026-11-12), grouped by what they bring.
@@ -478,8 +504,8 @@ def s_next(d):
         ("1", "Upstream review", "answer the reviews of the open PRs; land them in stack order"),
         ("2", "The next PRs", "activation, removal, memory, pacing and egress (#742-#745, "
          "#752), on the host agent (#772)"),
-        ("3", "The demo, rescheduled", "self-serve template and user lifecycle, live, on the "
-         "synced code"),
+        ("3", "The demo, not before 2026-11-19", "self-serve template and user lifecycle, live, "
+         "on the tip the G50 window tested"),
     ]
     y = 1.65
     for n, t, b in rows:
@@ -505,7 +531,7 @@ SECTIONS = [
      [s_states_defined, s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
     ("5", "Validation and speed", "windows 1-4; cold and warm starts",
      [s_windows, s_lifecycle_window, s_activation_chart, s_perf_disk,
-      s_perf_warm, s_perf_queue, s_perf_cache]),
+      s_perf_warm, s_perf_queue, s_perf_cache, s_perf_readahead]),
     ("6", "At scale, upstream, next", "Lite-28, findings, PRs, next",
      [s_lite28, s_two_brains, s_issues, s_upstream, s_next]),
     ("B", "Backup", "", [s_problem]),
