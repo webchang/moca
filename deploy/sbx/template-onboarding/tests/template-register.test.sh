@@ -52,7 +52,7 @@ jq -e --arg w "$W1" 'length == 2 and .[1] == {id: "astropy-astropy-14995", worke
   description: "SWE-bench astropy__astropy-14995", tools: ["bash", "git", "python3"]}' "$TMP/templates.json" >/dev/null ||
   fail "the templates file is wrong: $(cat "$TMP/templates.json")"
 [[ "$(diff "$TMP/env.before" "$TMP/sbx.env" | grep -c '^[<>]')" == 2 ]] || fail 'more than the SBX_WORKERS line changed'
-[[ "$(stat -f '%Lp' "$TMP/sbx.env" 2>/dev/null || stat -c '%a' "$TMP/sbx.env")" == 600 ]] || fail 'the env file lost its mode'
+[[ "$(stat -c '%a' "$TMP/sbx.env" 2>/dev/null || stat -f '%Lp' "$TMP/sbx.env")" == 600 ]] || fail 'the env file lost its mode'
 [[ ! -s "$TMP_LOG" ]] || fail 'setup.sh ran without --apply'
 grep -q 'next: .*setup.sh --env-file' "$TMP/out" && grep -q -- "--snapshot astropy-astropy-14995-aaaaaaaaaaaa --budget-mb <at least 13408> --no-egress" "$TMP/out" ||
   fail 'the add does not say what to run next'
