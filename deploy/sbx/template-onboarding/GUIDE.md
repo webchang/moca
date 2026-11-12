@@ -647,7 +647,10 @@ cp platforms/moca/microvm/django__django-11133.json django__django-11133.gate-re
 ```
 
 The second file is the image's **gate record**, unchanged: the build checks the image against it
-(§5.2). Both are in [`examples/`](examples/).
+(§5.2), and the control plane trusts it by the sha256 of those exact bytes. Both are in
+[`examples/`](examples/); the copy of the gate record there has the gate's own test results
+(`test_cmd_rc`, the passed, failed and dropped counts) removed, so its sha256 is not the image
+builder's. Create from the builder's own file, as above.
 
 The fields that matter: `id: django-django-11133` (the instance id lower-cased, `__` → `-`; a
 Verified image also in Lite gets `-v`), 4096 MiB and 2 vCPUs, `egress: false`, `seed:

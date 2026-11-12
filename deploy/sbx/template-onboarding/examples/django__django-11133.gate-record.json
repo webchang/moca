@@ -90,11 +90,7 @@
       "os_release": "ubuntu 22.04",
       "testbed_writable": true,
       "context_files_found": 0,
-      "test_cmd_rc": 0,
-      "test_cmd_ms": 912,
-      "test_cmd_failed": 0,
-      "test_cmd_passed": 64,
-      "test_cmd_targets_dropped": 0
+      "test_cmd_ms": 912
     },
     "guest": {
       "id": "root 0",

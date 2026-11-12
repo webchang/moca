@@ -22,7 +22,7 @@ what each step records): [`governance/`](governance/README.md).
 | [`verify-provenance.py`](verify-provenance.py)                                                     | **anywhere, Python 3 only:** verifies a template provenance export offline (digests, chain, heads, cited gate records); `--head` compares a head kept elsewhere |
 | [`examples/default.json`](examples/default.json)                                                   | sample spec 1: Moca's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                                                  |
 | [`examples/django__django-11133.json`](examples/django__django-11133.json)                         | sample spec 2: a SWE-bench instance (image-factory's spec block, host-free image), template `django-django-11133`                                               |
-| [`examples/django__django-11133.gate-record.json`](examples/django__django-11133.gate-record.json) | sample 2's gate record, image-factory's (commit c3ea3a4), passed with `--gate-record`                                                                           |
+| [`examples/django__django-11133.gate-record.json`](examples/django__django-11133.gate-record.json) | sample 2's gate record, image-factory's (commit c3ea3a4) with the gate's test results removed, passed with `--gate-record`                                      |
 | [`tests/`](tests/)                                                                                 | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                                              |
 
 ## Related files elsewhere in the repository
