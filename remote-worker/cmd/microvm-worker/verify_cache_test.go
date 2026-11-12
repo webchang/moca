@@ -65,7 +65,13 @@ func TestVerifyCachePath(t *testing.T) {
 	if p, err := verifyCachePath(envOf(map[string]string{"SH_VERIFY_CACHE_PATH": "/state/c.json"}), snap); p != "/state/c.json" || err != nil {
 		t.Errorf("SH_VERIFY_CACHE_PATH = %q, %v", p, err)
 	}
-	for _, bad := range []map[string]string{{"SH_VERIFY_CACHE": "yes"}, {"SH_VERIFY_CACHE_PATH": "rel/c.json"}} {
+	if d, err := verifyCachePath(envOf(map[string]string{"SH_VERIFY_CACHE_DIR": "/srv/sbx/verify-cache/"}), snap); filepath.Dir(d) != "/srv/sbx/verify-cache" || filepath.Base(d) != filepath.Base(def) || err != nil {
+		t.Errorf("SH_VERIFY_CACHE_DIR = %q, %v (want the default's name under it)", d, err)
+	}
+	if p, _ := verifyCachePath(envOf(map[string]string{"SH_VERIFY_CACHE_DIR": "/srv/sbx/verify-cache", "SH_VERIFY_CACHE_PATH": "/state/c.json"}), snap); p != "/state/c.json" {
+		t.Errorf("SH_VERIFY_CACHE_PATH beside _DIR = %q, want the path to win", p)
+	}
+	for _, bad := range []map[string]string{{"SH_VERIFY_CACHE": "yes"}, {"SH_VERIFY_CACHE_PATH": "rel/c.json"}, {"SH_VERIFY_CACHE_DIR": "rel/dir"}} {
 		if _, err := verifyCachePath(envOf(bad), snap); err == nil {
 			t.Errorf("%v accepted", bad)
 		}

@@ -2549,7 +2549,7 @@ publish_snapshot() {
 # is logged and the build still succeeds, its first start hashing in full as before. The
 # environment is cleared (env -i) so an older binary, which takes no arguments and would
 # start as a worker, stops at once on its missing SH_SNAPSHOT_DIR instead of registering;
-# only the two cache settings pass through.
+# only the three cache settings pass through.
 seed_verify_cache() {
   if [ ! -x "$WORKER_BIN" ]; then
     log "verify cache not seeded: no executable microvm-worker at $WORKER_BIN (--worker-bin); its first start hashes the snapshot in full"
@@ -2559,6 +2559,7 @@ seed_verify_cache() {
   local -a envs=(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
   [ -z "${SH_VERIFY_CACHE+x}" ] || envs+=("SH_VERIFY_CACHE=$SH_VERIFY_CACHE")
   [ -z "${SH_VERIFY_CACHE_PATH+x}" ] || envs+=("SH_VERIFY_CACHE_PATH=$SH_VERIFY_CACHE_PATH")
+  [ -z "${SH_VERIFY_CACHE_DIR+x}" ] || envs+=("SH_VERIFY_CACHE_DIR=$SH_VERIFY_CACHE_DIR")
   env -i "${envs[@]}" "$WORKER_BIN" -verify-snapshot "$OUT" || rc=$?
   if [ "$rc" -eq 0 ]; then
     log "verify cache seeded for $OUT"

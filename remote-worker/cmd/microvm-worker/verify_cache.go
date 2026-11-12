@@ -24,7 +24,9 @@ const defaultVerifyCacheDir = "/var/lib/moca-microvm-worker/verify-cache"
 //
 //	SH_VERIFY_CACHE=0       no cache: every file hashed in full at every start (the old way)
 //	SH_VERIFY_CACHE=1 / ""  the cache, at SH_VERIFY_CACHE_PATH if set, else
-//	                        defaultVerifyCacheDir/<image>-<16 hex of sha256(canonical snapDir)>.json
+//	                        <dir>/<image>-<16 hex of sha256(canonical snapDir)>.json, where <dir> is
+//	                        SH_VERIFY_CACHE_DIR if set (SBX0: under its own /srv/sbx), else
+//	                        defaultVerifyCacheDir
 //
 // The default name depends only on the snapshot directory, so build-snapshot.sh's seed
 // (microvm-worker -verify-snapshot DIR) and the worker that later serves DIR find the same
@@ -44,6 +46,13 @@ func verifyCachePath(get func(string) string, snapDir string) (string, error) {
 		}
 		return filepath.Clean(p), nil
 	}
+	dir := defaultVerifyCacheDir
+	if d := get("SH_VERIFY_CACHE_DIR"); d != "" {
+		if !filepath.IsAbs(d) {
+			return "", fmt.Errorf("SH_VERIFY_CACHE_DIR=%q must be an absolute path", d)
+		}
+		dir = filepath.Clean(d)
+	}
 	canon := snapDir
 	if real, err := filepath.EvalSymlinks(snapDir); err == nil {
 		canon = real
@@ -58,7 +67,7 @@ func verifyCachePath(get func(string) string, snapDir string) (string, error) {
 		}
 		return '_'
 	}, filepath.Base(canon))
-	return filepath.Join(defaultVerifyCacheDir, name+"-"+hex.EncodeToString(sum[:8])+".json"), nil
+	return filepath.Join(dir, name+"-"+hex.EncodeToString(sum[:8])+".json"), nil
 }
 
 // runCLI is microvm-worker invoked with arguments; with none, main runs the worker. Today

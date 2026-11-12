@@ -108,6 +108,7 @@ for k in SH_PARENT_CGROUP SH_CHROOT_BASE SH_WORKSPACE_ROOT; do
   [[ -n "$va" && "$va" != "$vb" ]] || fail "$k is shared between workers ($va)"
 done
 grep -qx 'SH_PARENT_CGROUP=sbx.slice/sbx-sbx_py312.slice' "$B" || fail 'parent cgroup is not the worker slice'
+grep -qx "SH_VERIFY_CACHE_DIR=$SBX_SRV/verify-cache" "$B" || fail 'the verify cache is not under SBX_SRV (G50)'
 grep -qx "SH_TEMPLATE_RECORD=$SBX_SRV/templates/py312.json" "$B" || fail "$B: SH_TEMPLATE_RECORD does not name the snapshot's record"
 ! grep -q '^SH_TEMPLATE_RECORD=' "$A" || fail "$A: SH_TEMPLATE_RECORD set with no record"
 grep -qx 'SANDBOX_TEMPLATE=py312' "$B" || fail "$B: SANDBOX_TEMPLATE is not the record's id"
