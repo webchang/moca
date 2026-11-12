@@ -16,8 +16,10 @@
 # record's id (the worker's moca.dev/template label, which Moca Pi sessions select by).
 # Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
 # moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
-# SBX_WORKER_BIN (an absolute path) runs another microvm-worker build, so SBX0 beside deploy/microvm's
-# P4 worker never replaces the binary that one runs; a missing one is refused before systemd.
+# SBX_WORKER_BIN (an absolute path; default /usr/local/libexec/sbx/microvm-worker, SBX0's own build)
+# is the microvm-worker SBX0's workers run, never deploy/microvm's /usr/local/bin one, so SBX0 beside
+# Moca's own P4 worker never runs or replaces the binary that one runs; a missing one is refused
+# before systemd (template-build.sh's verify-cache seed uses the same default, G50).
 #
 # Guest egress (#623, P4.1): a worker install also installs and starts moca-egress, the host's
 # allowlisted egress proxy, before the worker, and wires the worker to its control socket
@@ -69,9 +71,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SBX_ATTACH_TIMEOUT:=120}"
 : "${SBX_ATTACH_SETTLE:=5}"
 : "${SBX_BIN_DIR:=/usr/local/bin}"
-# The worker binary the template unit runs. A host that also runs deploy/microvm's P4 worker shares
-# /usr/local/bin/microvm-worker with it; another path keeps SBX0's build from replacing that one's.
-: "${SBX_WORKER_BIN:=/usr/local/bin/microvm-worker}"
+# The worker binary the template unit runs: SBX0's own build, never deploy/microvm's /usr/local/bin
+# one (see the header).
+: "${SBX_WORKER_BIN:=/usr/local/libexec/sbx/microvm-worker}"
 # moca-egress's control socket: the path inside the unit is fixed (RuntimeDirectory=moca-egress); the
 # override exists for tests only. The wait is as setup-microvm.sh's.
 : "${MOCA_EGRESS_SOCKET:=/run/moca-egress/control.sock}"

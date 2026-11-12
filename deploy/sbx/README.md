@@ -146,10 +146,11 @@ and outbound TCP 443 to the attach host. Build each template's snapshot under
     ssh <host> rm -r sbx-<id>
 
 The worker's guest RAM comes from the snapshot's `manifest.json`, and `--budget-mb` (default 8192)
-must hold one session of it: (guest RAM + 32) × 3 + 1024 MiB, 13408 for a 4096 MiB guest. On a host
-that also runs `deploy/microvm`'s P4 worker, set `SBX_WORKER_BIN` to an absolute path of SBX0's own
-`microvm-worker` build, so the install never replaces the binary at `/usr/local/bin/microvm-worker`
-that the P4 worker runs. After a template change, `deploy/sbx/templates-check.sh` checks that each
+must hold one session of it: (guest RAM + 32) × 3 + 1024 MiB, 13408 for a 4096 MiB guest. SBX0's workers
+run their own `microvm-worker` build, `SBX_WORKER_BIN` (default `/usr/local/libexec/sbx/microvm-worker`,
+built from the same tree: `CGO_ENABLED=0 go build -o /usr/local/libexec/sbx/microvm-worker
+./remote-worker/cmd/microvm-worker`), never the `/usr/local/bin/microvm-worker` that `deploy/microvm`'s P4
+worker runs; a missing one is refused. After a template change, `deploy/sbx/templates-check.sh` checks that each
 template's sandboxes run on its own worker ([the runbook](RUNBOOK.md#14-checking-the-templates)).
 
 The script waits up to `SBX_ATTACH_TIMEOUT` (120 s) for the worker's attach to hold. A newly added
