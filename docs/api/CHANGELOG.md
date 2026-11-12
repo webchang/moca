@@ -8,6 +8,15 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.13.0
+
+The member, owner and quota routes take an OIDC subject as well as a GitHub one (#701's `oidc:<sub>`,
+adapted on our side before filing, joint list D2): `PUT`/`DELETE /v1/subjects/{subject}` and its role
+routes, `PUT /v1/templates/{id}/owner`'s `owner`, `PUT /v1/quota/{subject}` and the policy's
+`quotaBySubject` keys accept `github:<numeric id>` or `oidc:<provider sub>` (the same sub pattern login
+verifies). `test:<n>` is still refused there. The `Subject` schema's and the five path and body patterns
+widen to match; no field or route is added or removed, and a GitHub deployment sees no change.
+
 ### 1.12.0
 
 Merged from upstream (rossoctl/moca), which released these as its own 1.3.0: this document's 1.3.0

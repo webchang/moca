@@ -57,6 +57,7 @@ import {
   summarize,
   type EgressStore,
 } from './egress-log.js';
+import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
 import type { TokenClaims } from './token.js';
 
 /**
@@ -1430,8 +1431,8 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const { cat, prov } = writable(deps);
   const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
   const owner = asRecord(ctx.body).owner;
-  if (typeof owner !== 'string' || !/^github:[0-9]+$/.test(owner))
-    throw new CpError('invalid_request', 'owner must be a subject, github:<numeric id>');
+  if (typeof owner !== 'string' || !MEMBER_SUBJECT_RE.test(owner))
+    throw new CpError('invalid_request', `owner must be a subject, ${MEMBER_SUBJECT_FORMS}`);
   // The new owner must be able to act on it: enrolled now, by the allow list, an admin role or the
   // members store (register G38).
   const om = await membershipNow(deps, owner, []);
@@ -1727,10 +1728,10 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       );
     const subject = ctx.params.subject ?? '';
     const isDefault = subject === 'default';
-    if (!isDefault && !/^github:[0-9]+$/.test(subject))
+    if (!isDefault && !MEMBER_SUBJECT_RE.test(subject))
       throw new CpError(
         'invalid_request',
-        "the quota's target is 'default' or a subject, github:<id>",
+        `the quota's target is 'default' or a subject, ${MEMBER_SUBJECT_FORMS}`,
       );
     const { policy: cur } = await deps.policy.current();
     const body = ctx.body;

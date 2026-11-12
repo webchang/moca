@@ -50,7 +50,7 @@ export type { RefreshFailure };
 
 /**
  * The not-enrolled refusal: the control plane's own message, which names the caller's subject
- * (`github:<id>`, what the operator adds), then what to do about it.
+ * (`github:<id>` or `oidc:<sub>`, what the operator adds), then what to do about it.
  */
 export function notEnrolledMessage(err: ApiError): string {
   const server =

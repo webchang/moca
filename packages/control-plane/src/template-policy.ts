@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
 
 /**
  * Policy at create (template lifecycle spec §8.1): the checks a template create passes before any
@@ -619,8 +620,8 @@ export function policyProblems(p: unknown): string[] {
       out.push('quotaBySubject must map subjects to quotas');
     else
       for (const [s, v] of Object.entries(by as Record<string, unknown>)) {
-        if (!/^github:[0-9]+$/.test(s))
-          out.push(`quotaBySubject: ${s} is not a subject (github:<id>)`);
+        if (!MEMBER_SUBJECT_RE.test(s))
+          out.push(`quotaBySubject: ${s} is not a subject (${MEMBER_SUBJECT_FORMS})`);
         if (!quotaOk(v))
           out.push(`quotaBySubject.${s} must hold whole numbers templates, buildsQueued, active`);
       }

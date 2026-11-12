@@ -120,17 +120,20 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx templates edit ID [--visibility private|deployment] [--description TEXT] [--json]
                                                  change who sees it, or its description
   mocactl sbx templates transfer ID SUBJECT [--json]
-                                                 make SUBJECT (github:<id>) its owner (admins only)
+                                                 make SUBJECT (github:<id> or oidc:<sub>) its owner
+                                                 (admins only)
   mocactl sbx templates quota TARGET --templates N --builds-queued N --active N [--json]
   mocactl sbx templates quota TARGET --clear [--json]
-                                                 set a subject's quota (TARGET github:<id>) or the
-                                                 default (TARGET default); --clear removes an override
-                                                 (admins only; prints old -> new, and fails if the
-                                                 value changed between its read and its write)
+                                                 set a subject's quota (TARGET github:<id> or
+                                                 oidc:<sub>) or the default (TARGET default); --clear
+                                                 removes an override (admins only; prints old -> new,
+                                                 and fails if the value changed between its read and
+                                                 its write)
   mocactl sbx admin subjects [--json]            every enrolled subject and its roles (admins only)
   mocactl sbx admin subjects enroll|unenroll SUBJECT [--json]
-                                                 enroll SUBJECT (github:<id>) or unenroll one enrolled
-                                                 through the API (the settings' lists stay; admins only)
+                                                 enroll SUBJECT (github:<id> or oidc:<sub>) or unenroll
+                                                 one enrolled through the API (the settings' lists
+                                                 stay; admins only)
   mocactl sbx admin subjects grant SUBJECT [--until DURATION|EPOCH] [--json]
   mocactl sbx admin subjects revoke SUBJECT [--json]
                                                  grant or revoke the admin role; --until (e.g. 30m, 2h,

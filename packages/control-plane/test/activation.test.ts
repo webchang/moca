@@ -1217,6 +1217,14 @@ describe('owner transfer (§5.2)', () => {
     expect(await refusal(() => transfer(d, 't1', 'bob'))).toBe('invalid_request');
     expect(await refusal(() => transfer(d, 't1', 'github:5555'))).toBe('invalid_request');
     expect(await refusal(() => transfer(d, 'nope', bob.sub))).toBe('template_not_found');
+    // #701: an oidc subject passes the grammar (refused here only as not enrolled); test:N never does.
+    const why = (owner: string) =>
+      transfer(d, 't1', owner).then(
+        () => 'none',
+        (e: Error) => e.message,
+      );
+    expect(await why('oidc:erin@example.com')).not.toMatch(/must be a subject/);
+    expect(await why('test:1')).toMatch(/owner must be a subject, github:<numeric id> or oidc:/);
   });
 });
 
@@ -1287,6 +1295,17 @@ describe('admin quotas (§5.2)', () => {
       await refusal(() => putQuota(d, alice.sub, { templates: -1, buildsQueued: 1, active: 1 })),
     ).toBe('invalid_request');
     expect(await refusal(() => putQuota(d, 'default', null))).toBe('invalid_request');
+    expect(
+      await refusal(() => putQuota(d, 'test:1', { templates: 1, buildsQueued: 1, active: 1 })),
+    ).toBe('invalid_request');
+  });
+
+  it("takes an oidc subject's override as a github one's (#701)", async () => {
+    const d = await setup();
+    const erin = 'oidc:erin@example.com';
+    const r = (await putQuota(d, erin, { templates: 2, buildsQueued: 1, active: 1 })).body as Body;
+    expect(r).toMatchObject({ target: erin, quota: { templates: 2 }, before: null });
+    expect((await putQuota(d, erin, null)).body).toMatchObject({ quota: null });
   });
 });
 

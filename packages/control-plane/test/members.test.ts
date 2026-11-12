@@ -145,6 +145,23 @@ describe('enroll and unenroll (spec §4)', () => {
     ]);
   });
 
+  it('enrolls an oidc subject too (#701), and refuses what no provider mints', async () => {
+    const d = setup();
+    const a = who(ENV_ADMIN);
+    const ERIN = 'oidc:erin@example.com';
+    expect(await codeOf(() => call(d, 'listTemplates', who(ERIN)))).toBe('not_enrolled');
+    const r = (await call(d, 'enrollSubject', a, { subject: ERIN }, { enrolled: true })).body as {
+      enrolled: boolean;
+    };
+    expect(r.enrolled).toBe(true);
+    await call(d, 'listTemplates', who(ERIN));
+    for (const bad of ['oidc:', 'oidc:a:b', 'oidc:-x', 'github:abc', 'gitlab:1', 'test:1']) {
+      expect(
+        await codeOf(() => call(d, 'enrollSubject', a, { subject: bad }, { enrolled: true })),
+      ).toBe('invalid_request');
+    }
+  });
+
   it('refuses a body other than {enrolled: true}', async () => {
     const d = setup();
     expect(

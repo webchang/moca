@@ -11,7 +11,7 @@
 openapi: 3.1.0
 info:
   title: MOCA control plane
-  version: 1.12.0
+  version: 1.13.0
   description: |
     Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
     This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
@@ -427,7 +427,8 @@ components:
       type: object
       required: [subject, enrolled, source, roles]
       properties:
-        subject: { type: string, pattern: '^github:[0-9]+$' }
+        subject:
+          { type: string, pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$' }
         enrolled: { type: boolean }
         source:
           type: string
@@ -543,7 +544,7 @@ components:
       required: [sessionId, owner, tenant, createdAt, state, turns]
       properties:
         sessionId: { type: string }
-        owner: { type: string, description: 'github:<numeric id>' }
+        owner: { type: string, description: 'github:<numeric id> or oidc:<provider sub>' }
         tenant: { type: string }
         createdAt: { type: integer, description: epoch ms }
         state: { type: string, enum: [active, deleting] }
@@ -758,7 +759,7 @@ components:
           type: string
           pattern: '^sbx-[0-9a-f]{26}$'
           description: '`sbx-` plus 26 random lowercase hex characters; also the workspace key'
-        owner: { type: string, description: 'github:<numeric id>' }
+        owner: { type: string, description: 'github:<numeric id> or oidc:<provider sub>' }
         name:
           type: [string, 'null']
           pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
@@ -2679,7 +2680,11 @@ paths:
               type: object
               required: [owner]
               properties:
-                owner: { type: string, pattern: '^github:[0-9]+$' }
+                owner:
+                  {
+                    type: string,
+                    pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$',
+                  }
       responses:
         '200':
           description: transferred (or already theirs)
@@ -2856,7 +2861,7 @@ paths:
       summary: Set the deployment's default quota, or one subject's (an admin)
       description: |
         Template lifecycle spec §5.2. `subject` is `default` (the deployment default) or a subject
-        (`github:<id>`, an override); a body of `null` removes a subject's override, returning it to
+        (`github:<id>` or `oidc:<sub>`, an override); a body of `null` removes a subject's override, returning it to
         the default. Each change is a policy change: a new `policy` record (the whole policy), whose
         digest is answered, so the chain shows who set which quota when. Enforced at once.
       security: [{ sessionToken: [] }]
@@ -2939,7 +2944,8 @@ paths:
         - name: subject
           in: path
           required: true
-          schema: { type: string, pattern: '^github:[0-9]+$' }
+          schema:
+            { type: string, pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$' }
       requestBody:
         required: true
         content:
@@ -2985,7 +2991,8 @@ paths:
         - name: subject
           in: path
           required: true
-          schema: { type: string, pattern: '^github:[0-9]+$' }
+          schema:
+            { type: string, pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$' }
       responses:
         '200':
           description: unenrolled (or it was not)
@@ -3031,7 +3038,8 @@ paths:
         - name: subject
           in: path
           required: true
-          schema: { type: string, pattern: '^github:[0-9]+$' }
+          schema:
+            { type: string, pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$' }
       requestBody:
         required: false
         content:
@@ -3086,7 +3094,8 @@ paths:
         - name: subject
           in: path
           required: true
-          schema: { type: string, pattern: '^github:[0-9]+$' }
+          schema:
+            { type: string, pattern: '^(?:github:[0-9]+|oidc:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127})$' }
       responses:
         '200':
           description: revoked (or it held none)

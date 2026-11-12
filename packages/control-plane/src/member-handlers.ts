@@ -1,7 +1,7 @@
 import { CpError } from './errors.js';
 import { asRecord, isAdmin, requireEnrolledPrincipal, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import { GITHUB_SUBJECT_RE } from './identity.js';
+import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
 import { ADMIN, type MembersStore } from './members.js';
 import type { TokenClaims } from './token.js';
 
@@ -41,8 +41,8 @@ function settingsAdmin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members
 
 function subjectParam(ctx: RequestCtx): string {
   const s = ctx.params.subject ?? '';
-  if (!GITHUB_SUBJECT_RE.test(s))
-    throw new CpError('invalid_request', 'subject must be github:<numeric id>');
+  if (!MEMBER_SUBJECT_RE.test(s))
+    throw new CpError('invalid_request', `subject must be ${MEMBER_SUBJECT_FORMS}`);
   return s;
 }
 
