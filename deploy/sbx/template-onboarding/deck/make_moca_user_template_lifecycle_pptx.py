@@ -139,7 +139,9 @@ def s_demo_templates(d):
                 "As the demo runs it, as one enrolled user, profile `base` (demo runbook §1-§4)",
                 notes="The spec is flat: its own id and image, guest_ram_mb, vcpus, egress, tools, "
                       "a probe (cmd, expect_rc, expect). Refusal 1 changes --image so it differs "
-                      "from the spec's own; refusal 2 asks for the benchmark profile, which needs "
+                      "from the spec's own (--image exists for a spec that names no image, and "
+                      "must equal the spec's own when it does); refusal 2 asks for the benchmark "
+                      "profile, which needs "
                       "a trusted gate record.")
     table(s, 0.6, 1.4, 12.1, [
         ["Step", "Command", "What the room sees"],
@@ -158,8 +160,9 @@ def s_demo_templates(d):
     label(s, 0.6, 4.6, 6.0, 0.3, "Two refusals, shown between steps 2 and 3; nothing is built",
           size=12, color=INK, align=PP_ALIGN.LEFT)
     note(s, 0.6, 4.95, 5.95, 1.25, "1. Refused by mocactl, before sending",
-         ["`create --spec F --image <another digest>`", "rule `M7.spec_image`: `--image` must "
-          "match the image named in the spec; refused locally, nothing sent"], size=12)
+         ["`create --spec F --image <another digest>`", "rule `M7.spec_image`: `--image` "
+          "supplies an image a spec lacks, never a different one; refused locally, nothing "
+          "sent"], size=12)
     note(s, 6.75, 4.95, 5.95, 1.25, "2. Refused by the control plane's policy",
          ["`create --spec F --profile benchmark`", "`422 policy_refused`: no trusted gate "
           "record; a `check` record"], size=12)
@@ -332,6 +335,15 @@ def s_provenance(d):
          size=12)
 
 
+def s_states_defined(d):
+    """The overview's states slide, with "a build" defined once at its foot (this deck only)."""
+    s_states(d)
+    s = d.prs.slides[-1]
+    box(s, 0.6, 5.85, 12.1, 0.62, INFRA, "A build, in Moca",
+        ["the KVM host turns the template's container image into a microVM snapshot, then runs "
+         "the spec's probe in a VM restored from it"], size=12, align=PP_ALIGN.LEFT)
+
+
 # --------------------------------------------------------------------------- 5. Performance
 # Figures from autobench-moca's run records (runs/<run>/FINDINGS.md), checked there 2026-11-12.
 # Shared conditions: one KVM host (96 CPUs), 28 SWE-bench Lite templates (4 GiB guest RAM, 2 vCPUs,
@@ -490,7 +502,7 @@ SECTIONS = [
      [s_seq_create, s_seq_refusals, s_policy_profiles, s_self_attest, s_mocactl_path,
       s_provenance]),
     ("4", "Using a template", "a build's states, activation, sessions",
-     [s_states, s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
+     [s_states_defined, s_seq_activate, s_first_use, s_seq_session, s_combined, s_lifecycle_api]),
     ("5", "Validation and speed", "windows 1-4; cold and warm starts",
      [s_windows, s_lifecycle_window, s_activation_chart, s_perf_disk,
       s_perf_warm, s_perf_queue, s_perf_cache]),
