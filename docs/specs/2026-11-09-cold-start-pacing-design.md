@@ -49,7 +49,7 @@ autobench-moca's l28b-2-d records (private: the findings and the per-activation 
   file reads; memory pressure stayed low.
 - **The cause was confirmed on the host,** not inferred: the workers' start logs and the volume's
   throughput.
-- **Width doesn't raise the disk's throughput:** one cold start alone took about 37 s, and a wave of
+- **Width doesn't raise the disk's throughput:** cold starts one at a time took 78 s on average (at most 120 s; l28b-3-d serial-1), and a wave of
   four about 3-4 minutes. So a start limit bounds **each start's wait**, not the total: on this
   volume, 28 cold 4 GiB starts take about 20 minutes at any width. (Measured after a round's release;
   a start right after its build reads from the page cache and looks faster, so measure with the cache

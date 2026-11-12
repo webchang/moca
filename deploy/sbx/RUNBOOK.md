@@ -966,7 +966,7 @@ workers at once (default 4).
   counts as starting the workers it started less than `SBX_START_WINDOW_S` ago (default 300) that
   are still running and wanted. Its starts are kept in `/srv/sbx/start-times` (0600).
 - **What it bounds:** each start's wait, not the total. The disk sets the total. On a
-  general-purpose volume of about 125 MB/s, one cold 4 GiB start took about 37 s, and a wave of four
+  general-purpose volume of about 125 MB/s, cold 4 GiB starts one at a time took 78 s on average (at most 120 s; l28b-3-d serial-1), and a wave of four
   about 3-4 minutes; 28 cold starts take about 20 minutes at any width. Raise the limit only on a
   faster disk.
 - **What the agent reports:** `startConcurrency` and `startSeconds` in the inventory's limits.
