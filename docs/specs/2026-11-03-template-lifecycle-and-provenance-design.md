@@ -351,6 +351,11 @@ registered builds by manifest hash:
 Activation is a start and deactivation a stop: no file changes, no relay or control-plane restart.
 A stopped worker costs no memory. A build no host declares is `unavailable`.
 
+A host agent that is still running reports every build it claimed: `built`, or `failed` on any
+other way out. When it cannot carry on with a build it claimed (a gate record it cannot fetch or
+whose bytes do not match its sha256, a report not accepted, no template record or manifest after
+the build), the failure's reason leads with `agent_error`, so the build never stays `building`.
+
 **The build host handles untrusted images** in a self-serve model. The image is pulled only from a
 registry the policy allows (§8.1), its export runs as today (`build-rootfs.sh`, as root, owners kept,
 M4) into a size-capped scratch directory, and everything the image runs, runs inside the Firecracker
