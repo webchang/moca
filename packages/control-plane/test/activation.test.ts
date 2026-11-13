@@ -2033,6 +2033,22 @@ describe('admin quotas (§5.2)', () => {
     expect((await activate(d, 't2')).status).toBe(200);
   });
 
+  it('keeps both of two quota writes made together, for different subjects', async () => {
+    const d = await setup();
+    const erin = 'oidc:erin@example.test';
+    const [a, e] = await Promise.all([
+      putQuota(d, alice.sub, { templates: 5, buildsQueued: 2, active: 1 }),
+      putQuota(d, erin, { templates: 2, buildsQueued: 1, active: 1 }),
+    ]);
+    expect((a.body as Body).before).toBeNull();
+    expect((e.body as Body).before).toBeNull();
+    // Neither write started from a policy the other had not yet changed.
+    expect((await d.policy!.current()).policy.quotaBySubject).toEqual({
+      [alice.sub]: { templates: 5, buildsQueued: 2, active: 1 },
+      [erin]: { templates: 2, buildsQueued: 1, active: 1 },
+    });
+  });
+
   it('refuses a non-admin, a bad target and a bad quota', async () => {
     const d = await setup();
     expect(

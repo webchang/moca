@@ -127,6 +127,7 @@ added or removed.
   host as last reported, a silent one too. A `T.unique` rejection naming a retired build says how to
   rebuild.
 - **A retired or admin-rejected build is listed in `stop` beside `remove` on every host:** before, only on a host with an idle grace, so on a host without one a worker running when its build was retired was never stopped (the agent skips the removal of a running worker), nor removed.
+- **Two quota writes made together keep both changes:** `PUT /v1/quota/{subject}`'s read, change and write of the policy are now one step of the policy store, so two admins' writes for two subjects never drop each other's change while both answer 200.
 
 ### 1.13.0
 
