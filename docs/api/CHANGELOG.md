@@ -84,6 +84,15 @@ added or removed.
   whose last inventory is older than 360 s (`HOST_STALE_S`, three build polls), until it reports
   again: a host whose agent died or was removed takes no new placement and no slot. When every
   host is silent, readiness is the workers' presence alone.
+- Placement counts the workers a host runs: each `holds` entry of an inventory may carry `running`
+  (its worker unit runs), kept current between inventories by the host's `attached`, `detached`
+  and `refused` reports. Placement is sticky (a wanted build already running on a holder stays
+  there), and a host's count starts with the workers that stay running on it: the wanted builds it
+  runs and the unleased ones still draining a live sandbox. `active.used` in the hosts block shows
+  that count. A leased build that runs on a host while placement keeps it on another is in that
+  host's `stop` (never under a live sandbox), so one worker id does not stay on two hosts. With
+  memory figures, a worker started since the inventory (an attached report) is counted as pending,
+  since the host's MemAvailable cannot show it yet.
 
 ### 1.13.0
 

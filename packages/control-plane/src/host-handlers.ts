@@ -117,6 +117,11 @@ export interface HostState {
   at: number;
   /** manifest hash -> template id, what the host holds. */
   holds: Record<string, string>;
+  /**
+   * The held builds whose worker unit runs: as the last inventory said, then kept current by the
+   * host's attached and detached reports, so placement counts what the host really runs.
+   */
+  running: string[];
   limits: {
     activeLimit: number;
     idleLimitSeconds: number;
@@ -198,25 +203,19 @@ export function hostViewsOf(deps: CpDeps): HostView[] {
     holds: h.holds,
     activeLimit: h.limits.activeLimit,
     at: h.at,
+    running: h.running,
     ...(h.memory ? { memory: h.memory } : {}),
     ...(h.start ? { start: h.start } : {}),
     ...(h.idleGraceSeconds ? { idleGraceSeconds: h.idleGraceSeconds } : {}),
   }));
 }
 
-/**
- * The workers with a live sandbox, for placement's idle grace (register G43: a draining worker is
- * never graced, so never displaced). Read only when a host reports a grace; else undefined, and
- * placement reads exactly as before.
- */
-export async function graceBusy(
-  deps: CpDeps,
-  hosts: HostView[],
-  nowS: number,
-): Promise<Set<string> | undefined> {
-  if (!deps.sandboxes || !hosts.some((h) => (h.idleGraceSeconds ?? 0) > 0)) return undefined;
+/** The workers with a live sandbox: never stopped under one, so they drain and keep their slot. */
+export async function busyWorkers(deps: CpDeps, nowS: number): Promise<Set<string>> {
   const busy = new Set<string>();
-  for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+  if (deps.sandboxes) {
+    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+  }
   return busy;
 }
 
@@ -525,6 +524,13 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       throw new CpError('not_found', `no ${want} build this host holds`);
     }
     const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;
+    // What the host runs, as placement counts it, without waiting for its next inventory: started
+    // (attached) runs; stopped (detached), not started (refused) and removed do not. The memory
+    // report's runningWorkers stay as the inventory said: they are what its MemAvailable reflects,
+    // and a worker started since is pending on that side until the next inventory (place()).
+    const st = deps.hosts!.get(host)!;
+    const others = st.running.filter((x) => x !== buildId);
+    st.running = event === 'attached' ? [...others, buildId] : others;
     await prov.append({
       stream: `template/${doc.id}`,
       kind: event === 'removed' ? 'retire' : event === 'detached' ? 'deactivate' : 'activate',
@@ -543,6 +549,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     const host = hostOf(ctx);
     const b = asRecord(ctx.body);
     const holds: Record<string, string> = {};
+    const running: string[] = [];
     const inv = Array.isArray(b.holds) ? b.holds : [];
     for (const h of inv) {
       const r = asRecord(h);
@@ -552,6 +559,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         typeof r.template === 'string'
       ) {
         holds[r.manifestHash] = r.template;
+        if (r.running === true) running.push(r.manifestHash);
       }
     }
     const l = asRecord(b.limits);
@@ -568,6 +576,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     deps.hosts?.set(host, {
       at: seconds(deps),
       holds,
+      running,
       limits,
       ...(memory ? { memory } : {}),
       ...(start ? { start } : {}),
@@ -825,15 +834,12 @@ async function wantedAnswer(
   const { cat } = catalogOf(deps);
   const docs = await cat.list();
   const mine = deps.hosts?.get(host);
-  // A worker is never stopped under a live sandbox (§6.3): it drains first.
-  const busy = new Set<string>();
-  if (deps.sandboxes) {
-    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
-  }
+  // A worker is never stopped under a live sandbox (§6.3): it drains first, and keeps its slot.
+  const busy = await busyWorkers(deps, nowS);
   // Read-only: the same placement takeLease judges by (hostViewsOf), for the wanted answer. With a
-  // grace on any host (G43) it also says which unleased builds keep their running worker there
+  // grace on any host it also says which unleased builds keep their running worker there
   // (`graced`); `busy` is passed for every host's answer, so they all agree on it.
-  const p = place(docs, views, nowS, { busy });
+  const p = place(docs, views, nowS, busy);
   const run: Record<string, unknown>[] = [];
   const stop: Record<string, unknown>[] = [];
   // Retired builds this host still holds, with no live sandbox on their worker (§6.1 step 7): the
@@ -861,9 +867,18 @@ async function wantedAnswer(
       if (b.status !== 'registered') continue;
       if (p.placed.get(b.buildId) === host) run.push(entry);
       else if (grace && p.graced.get(b.buildId)?.host === host) keep.push(entry);
-      else if (liveLeases(b, nowS).length === 0 && !busy.has(b.worker)) {
+      else if (busy.has(b.worker)) continue;
+      else if (liveLeases(b, nowS).length === 0) {
         if (p.displaced.get(b.buildId) === host) displaced.push(entry);
         else stop.push(entry);
+      } else {
+        // Leased, but placed on another host while it runs here (one worker id on two hosts):
+        // this host's copy stops. "Runs here" is the union placement reads: a held build marked
+        // running, or its worker in the memory report's runningWorkers.
+        const runsHere =
+          mine.running.includes(b.buildId) ||
+          (b.worker !== '' && (mine.memory?.running ?? []).includes(b.worker));
+        if (runsHere) stop.push(entry);
       }
     }
   }

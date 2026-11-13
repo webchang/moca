@@ -89,12 +89,12 @@ async function registered(
     ctx({ principal, body: { id, image: IMAGE, spec: BASE_SPEC, profile: 'base' } }),
     d,
   );
-  const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+  const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
   const build = c.builds[0].build;
   const r = (
     await HANDLERS.hostBuildReport!(
       asHost(
-        'bm1',
+        'host-1',
         { build },
         {
           event: 'built',
@@ -121,14 +121,17 @@ async function registered(
   ).body as Body;
   expect(r.status).toBe('registered');
 }
+/** A host's inventory: its holds, its activeLimit, and its memory or the builds it marks running. */
 const inventory = (
   d: TestDeps,
   host: string,
   holds: Record<string, string>,
   activeLimit: number,
-  memory?: Record<string, unknown>,
-) =>
-  HANDLERS.hostInventory!(
+  memoryOrRunning?: Record<string, unknown> | string[],
+) => {
+  const running = Array.isArray(memoryOrRunning) ? memoryOrRunning : [];
+  const memory = Array.isArray(memoryOrRunning) ? undefined : memoryOrRunning;
+  return HANDLERS.hostInventory!(
     asHost(
       host,
       {},
@@ -136,6 +139,7 @@ const inventory = (
         holds: Object.entries(holds).map(([manifestHash, template]) => ({
           manifestHash,
           template,
+          ...(running.includes(manifestHash) ? { running: true } : {}),
         })),
         limits: { activeLimit, idleLimitSeconds: 3600 },
         ...(memory ? { memory } : {}),
@@ -143,6 +147,7 @@ const inventory = (
     ),
     d,
   );
+};
 const readiness = async (d: TestDeps, id: string) =>
   ((await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id } }), d)).body as Body)
     .readiness;
@@ -154,17 +159,17 @@ describe('activation (§6.2-§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     expect(await readiness(d, 't1')).toBe('inactive');
     const r = (await activate(d, 't1')).body as Body;
     expect(r).toMatchObject({
       templateId: 't1',
       buildId: hash('1'),
-      host: 'bm1',
+      host: 'host-1',
       leaseUntil: Math.floor(now / 1000) + 3600,
     });
     expect(await readiness(d, 't1')).toBe('activating');
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     attachedNow = ['sbx_t1'];
     expect(await readiness(d, 't1')).toBe('active');
@@ -173,7 +178,7 @@ describe('activation (§6.2-§6.4)', () => {
       d,
     );
     expect(await readiness(d, 't1')).toBe('deactivating');
-    expect(((await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body).stop).toHaveLength(1);
+    expect(((await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body).stop).toHaveLength(1);
     attachedNow = [];
     expect(await readiness(d, 't1')).toBe('inactive');
     const kinds = (await d.provenance!.chain('template/t1')).map((x) => x.kind);
@@ -184,7 +189,7 @@ describe('activation (§6.2-§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1', alice, { leaseSeconds: 120 });
     expect(await readiness(d, 't1')).toBe('activating');
     now += 121_000;
@@ -194,7 +199,7 @@ describe('activation (§6.2-§6.4)', () => {
   it('renews a lease without limit, a day at most per grant', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     for (let i = 0; i < 3; i++) {
       await activate(d, 't1', alice, { leaseSeconds: 86_400 });
       now += 43_200_000;
@@ -248,7 +253,7 @@ describe('activation (§6.2-§6.4)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2', bob);
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
     await activate(d, 't1', alice, { leaseSeconds: 600 });
     const e = await activate(d, 't2', bob).catch((x) => x);
     expect(e.code).toBe('no_active_slot');
@@ -272,7 +277,7 @@ describe('activation (§6.2-§6.4)', () => {
       readiness: 'unavailable',
     });
     // The held build is untouched; once its lease ends, the other fits.
-    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+    expect((await HANDLERS.hostWanted!(asHost('host-1'), d)).body).toMatchObject({
       run: [{ template: 't1' }],
     });
     now += 601_000;
@@ -284,11 +289,11 @@ describe('activation (§6.2-§6.4)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2', bob);
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
     expect((await activate(d, 't2', bob)).status).toBe(200);
     const e = await activate(d, 't1', alice).catch((x) => x);
     expect(e.code).toBe('no_active_slot');
-    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+    expect((await HANDLERS.hostWanted!(asHost('host-1'), d)).body).toMatchObject({
       run: [{ template: 't2' }],
     });
   });
@@ -296,7 +301,7 @@ describe('activation (§6.2-§6.4)', () => {
   it('refuses a build no host holds as template_unavailable, and a draft build too', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', {}, 2);
+    await inventory(d, 'host-1', {}, 2);
     expect(await activate(d, 't1').catch((x) => x.code)).toBe('template_unavailable');
     await HANDLERS.createTemplate!(
       ctx({
@@ -312,7 +317,7 @@ describe('activation (§6.2-§6.4)', () => {
     const d = await setup(1);
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
     await activate(d, 't1');
     const e = await activate(d, 't2').catch((x) => x);
     expect(e.code).toBe('quota_exceeded');
@@ -326,7 +331,7 @@ describe('activation (§6.2-§6.4)', () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1', alice);
     await activate(d, 't1', bob);
     await HANDLERS.deactivateTemplate!(
@@ -339,17 +344,98 @@ describe('activation (§6.2-§6.4)', () => {
   it('fills the hosts block from the agents: limits, use, disk', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     const b = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
     expect(b.hosts).toEqual([
       {
-        id: 'bm1',
+        id: 'host-1',
         active: { limit: 2, used: 1 },
         idleLimitSeconds: 3600,
         disk: { freeGb: 0, floorGb: 0 },
       },
     ]);
+  });
+
+  it('keeps a running build on its host: an earlier lease ending moves nothing', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await registered(d, 't3', hash('3'), 'sbx_t3');
+    const both = { [hash('1')]: 't1', [hash('2')]: 't2' };
+    await inventory(d, 'host-1', { ...both, [hash('3')]: 't3' }, 1);
+    await inventory(d, 'host-2', both, 1);
+    expect(((await activate(d, 't2', bob)).body as Body).host).toBe('host-1');
+    now += 1000;
+    expect(((await activate(d, 't1')).body as Body).host).toBe('host-2');
+    const report = (host: string, h: string, event: string) =>
+      HANDLERS.hostWorkerReport!(asHost(host, {}, { buildId: h, event }), d);
+    await report('host-1', hash('2'), 'attached');
+    await report('host-2', hash('1'), 'attached');
+    // t2's lease ends: t1 stays on host-2, which runs it; host-1 is told to stop t2, not to run t1.
+    await HANDLERS.deactivateTemplate!(ctx({ principal: bob, params: { id: 't2' }, body: {} }), d);
+    expect((await HANDLERS.hostWanted!(asHost('host-2'), d)).body).toMatchObject({
+      run: [{ template: 't1' }],
+    });
+    const w1 = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
+    expect(w1.run).toEqual([]);
+    expect(w1.stop).toContainEqual({ template: 't2', buildId: hash('2'), worker: 'sbx_t2' });
+    await report('host-1', hash('2'), 'detached');
+    // host-1's slot is free for a build only it holds; the hosts block counts what each runs.
+    expect(((await activate(d, 't3')).body as Body).host).toBe('host-1');
+    const hb = ((await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body).hosts;
+    expect(hb.map((h: Body) => [h.id, h.active.used])).toEqual([
+      ['host-1', 1],
+      ['host-2', 1],
+    ]);
+  });
+
+  it("counts a draining worker against its host's activeLimit until its last sandbox ends", async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    const holds = { [hash('1')]: 't1', [hash('2')]: 't2' };
+    await inventory(d, 'host-1', holds, 1);
+    await activate(d, 't1');
+    await HANDLERS.hostWorkerReport!(
+      asHost('host-1', {}, { buildId: hash('1'), event: 'attached' }),
+      d,
+    );
+    const sb = (
+      await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d)
+    ).body as Body;
+    await HANDLERS.deactivateTemplate!(
+      ctx({ principal: alice, params: { id: 't1' }, body: {} }),
+      d,
+    );
+    // t1 has no lease but drains a live sandbox: never stopped, and it keeps host-1's one slot.
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
+    expect([...w.run, ...w.stop].map((x: Body) => x.template)).not.toContain('t1');
+    expect((await activate(d, 't2', bob).catch((x) => x)).code).toBe('no_active_slot');
+    // Its last sandbox ends: it is to stop, and its slot is free.
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id } }), d);
+    expect(((await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body).stop).toContainEqual({
+      template: 't1',
+      buildId: hash('1'),
+      worker: 'sbx_t1',
+    });
+    expect(((await activate(d, 't2', bob)).body as Body).host).toBe('host-1');
+  });
+
+  it("stops a host's copy of a leased build that another host runs and is placed on", async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    const holds = { [hash('1')]: 't1' };
+    await inventory(d, 'host-1', holds, 2, [hash('1')]);
+    await inventory(d, 'host-2', holds, 2, [hash('1')]);
+    expect(((await activate(d, 't1')).body as Body).host).toBe('host-1');
+    expect((await HANDLERS.hostWanted!(asHost('host-2'), d)).body).toMatchObject({
+      run: [],
+      stop: [{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }],
+    });
   });
 
   it('leaves out a host whose last inventory is older than HOST_STALE_S, until it reports again', async () => {
@@ -381,17 +467,20 @@ describe('activation (§6.2-§6.4)', () => {
   it("records a host's attach and detach reports for a build it holds, and refuses others", async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await HANDLERS.hostWorkerReport!(
-      asHost('bm1', {}, { buildId: hash('1'), event: 'attached' }),
+      asHost('host-1', {}, { buildId: hash('1'), event: 'attached' }),
       d,
     );
     expect((await d.provenance!.chain('template/t1')).at(-1)).toMatchObject({
       kind: 'activate',
-      subject: 'host:bm1',
+      subject: 'host:host-1',
     });
     await expect(
-      HANDLERS.hostWorkerReport!(asHost('bm2', {}, { buildId: hash('1'), event: 'attached' }), d),
+      HANDLERS.hostWorkerReport!(
+        asHost('host-2', {}, { buildId: hash('1'), event: 'attached' }),
+        d,
+      ),
     ).rejects.toMatchObject({ code: 'not_found' });
   });
 });
@@ -417,7 +506,7 @@ describe('activation on first use (§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     expect(await refusal(() => createSandbox(d, { template: 't1' }))).toEqual({
       code: 'template_not_active',
       readiness: 'activating',
@@ -427,7 +516,7 @@ describe('activation on first use (§6.4)', () => {
     expect((await leases(d, 't1')).map((l) => l.subject)).toEqual([alice.sub]);
     const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
     expect(rec).toMatchObject({ kind: 'activate', body: { reason: 'first_use' } });
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     // No sandbox was kept while waiting.
     expect(await d.sandboxes!.listByOwner(alice.sub, Math.floor(now / 1000))).toHaveLength(0);
@@ -446,7 +535,7 @@ describe('activation on first use (§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await seedCredential(d);
     const session = (sandbox: Record<string, unknown>) =>
       HANDLERS.createSession!(ctx({ principal: alice, body: { sandbox } }), d);
@@ -486,7 +575,7 @@ describe('activation on first use (§6.4)', () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await seedCredential(d);
     await activate(d, 't1');
     const act = (await d.provenance!.chain('template/t1'))
@@ -549,10 +638,10 @@ describe('activation on first use (§6.4)', () => {
       }),
       d,
     );
-    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
     await HANDLERS.hostBuildReport!(
       asHost(
-        'bm1',
+        'host-1',
         { build: c.builds[0].build },
         {
           event: 'built',
@@ -576,7 +665,7 @@ describe('activation on first use (§6.4)', () => {
       ),
       d,
     );
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await seedCredential(d);
     await activate(d, 't1');
     const declared = {
@@ -603,7 +692,7 @@ describe('activation on first use (§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     expect(await refusal(() => createSandbox(d, { template: 't1', activate: false }))).toEqual({
       code: 'template_not_active',
       readiness: 'inactive',
@@ -620,7 +709,7 @@ describe('activation on first use (§6.4)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
     await activate(d, 't1', bob);
     expect((await refusal(() => createSandbox(d, { template: 't2' }))).code).toBe('no_active_slot');
     expect(await leases(d, 't2')).toHaveLength(0);
@@ -630,8 +719,8 @@ describe('activation on first use (§6.4)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    d.config.templateHosts = [{ id: 'bm1', token: 'f'.repeat(64) }];
-    // No inventory from bm1 yet: refused, not left to wait at the relay; the lease is taken.
+    d.config.templateHosts = [{ id: 'host-1', token: 'f'.repeat(64) }];
+    // No inventory from host-1 yet: refused, not left to wait at the relay; the lease is taken.
     expect(await refusal(() => createSandbox(d, { template: 't1' }))).toEqual({
       code: 'template_not_active',
       readiness: 'activating',
@@ -639,9 +728,9 @@ describe('activation on first use (§6.4)', () => {
     });
     expect((await leases(d, 't1')).map((l) => l.subject)).toEqual([alice.sub]);
     expect(await d.sandboxes!.listByOwner(alice.sub, Math.floor(now / 1000))).toHaveLength(0);
-    // Once bm1 reports, it is asked to run the build the lease wants.
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    // Once host-1 reports, it is asked to run the build the lease wants.
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     // A control plane restarted under attached workers (no inventory yet) still serves them.
     d.hosts = new HostRegistry();
@@ -705,7 +794,7 @@ describe('retire (§5.1)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     const r = await retire(d, 't1', alice, { reason: 'done with it' });
     expect(r.status).toBe(200);
@@ -770,17 +859,17 @@ describe('retire (§5.1)', () => {
       ).heldBy;
     // No host has reported, but hosts are configured: an empty list, not null.
     d.config.templateHosts = [
-      { id: 'bm1', token: 'f'.repeat(64) },
-      { id: 'bm2', token: 'e'.repeat(64) },
+      { id: 'host-1', token: 'f'.repeat(64) },
+      { id: 'host-2', token: 'e'.repeat(64) },
     ];
     expect(await held()).toEqual([]);
-    await inventory(d, 'bm2', { [hash('1')]: 't1' }, 2);
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
-    expect(await held()).toEqual(['bm1', 'bm2']);
+    await inventory(d, 'host-2', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    expect(await held()).toEqual(['host-1', 'host-2']);
     await retire(d, 't1');
-    await inventory(d, 'bm1', {}, 2);
-    expect(await held()).toEqual(['bm2']);
-    await inventory(d, 'bm2', {}, 2);
+    await inventory(d, 'host-1', {}, 2);
+    expect(await held()).toEqual(['host-2']);
+    await inventory(d, 'host-2', {}, 2);
     expect(await held()).toEqual([]);
     // Without host agents, there is nothing to report.
     const plain = await setup();
@@ -799,45 +888,48 @@ describe('retire (§5.1)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
-    expect(((await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body).remove).toEqual([]);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    expect(((await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body).remove).toEqual([]);
     await retire(d, 't1');
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.remove).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     expect(w.run).toEqual([]);
     expect(w.stop).toEqual([]);
     // Another host, not holding it, is asked for nothing.
-    await inventory(d, 'bm2', {}, 2);
-    expect(((await HANDLERS.hostWanted!(asHost('bm2'), d)).body as Body).remove).toEqual([]);
+    await inventory(d, 'host-2', {}, 2);
+    expect(((await HANDLERS.hostWanted!(asHost('host-2'), d)).body as Body).remove).toEqual([]);
     const r = await HANDLERS.hostWorkerReport!(
-      asHost('bm1', {}, { buildId: hash('1'), event: 'removed' }),
+      asHost('host-1', {}, { buildId: hash('1'), event: 'removed' }),
       d,
     );
     expect((r.body as Body).recorded).toBe('removed');
     const rec = (await d.provenance!.chain('template/t1')).at(-1)!;
     expect(rec).toMatchObject({
       kind: 'retire',
-      subject: 'host:bm1',
+      subject: 'host:host-1',
       body: { buildId: hash('1'), event: 'removed' },
     });
     // `removed` for a build not retired is refused.
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 2);
     expect(
       await refusal(() =>
-        HANDLERS.hostWorkerReport!(asHost('bm1', {}, { buildId: hash('2'), event: 'removed' }), d),
+        HANDLERS.hostWorkerReport!(
+          asHost('host-1', {}, { buildId: hash('2'), event: 'removed' }),
+          d,
+        ),
       ),
     ).toBe('not_found');
     // Once the host stops holding it, it is no longer asked.
-    await inventory(d, 'bm1', { [hash('2')]: 't2' }, 2);
-    expect(((await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body).remove).toEqual([]);
+    await inventory(d, 'host-1', { [hash('2')]: 't2' }, 2);
+    expect(((await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body).remove).toEqual([]);
   });
 
   it('never retires a build under a live sandbox (409 build_in_use); retires one build alone', async () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     const sb = (
       await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d)
@@ -860,7 +952,7 @@ describe('retire (§5.1)', () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     await seedCredential(d);
     const s = (
@@ -917,10 +1009,10 @@ describe('tags (§3.2, §5.1)', () => {
       }),
       d,
     );
-    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
     await HANDLERS.hostBuildReport!(
       asHost(
-        'bm1',
+        'host-1',
         { build: c.builds[0].build },
         {
           event: 'built',
@@ -1040,7 +1132,7 @@ describe('reject after the fact (§5.2)', () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     // Not the owner's to reject, and never without a reason.
     expect(await refusal(() => reject(d, 't1', hash('1'), alice, { reason: 'X12 broken' }))).toBe(
@@ -1073,13 +1165,13 @@ describe('reject after the fact (§5.2)', () => {
         HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d),
       ),
     ).toBe('unknown_template');
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.remove).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     expect(
       (
         (
           await HANDLERS.hostWorkerReport!(
-            asHost('bm1', {}, { buildId: hash('1'), event: 'removed' }),
+            asHost('host-1', {}, { buildId: hash('1'), event: 'removed' }),
             d,
           )
         ).body as Body
@@ -1347,7 +1439,7 @@ describe('admin quotas (§5.2)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
     expect((await quotaOf(d)).quotaSource).toBe('default');
     const before = (await d.provenance!.chain('policy')).length;
     const r = (await putQuota(d, alice.sub, { templates: 5, buildsQueued: 2, active: 1 }))
@@ -1413,7 +1505,7 @@ describe('every link of a sandbox is a record digest (§7.1)', () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     const sb = (
       await HANDLERS.createSandbox!(
@@ -1447,7 +1539,7 @@ describe('every link of a sandbox is a record digest (§7.1)', () => {
     await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id } }), d);
     await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' } }), d);
     await HANDLERS.hostWorkerReport!(
-      asHost('bm1', {}, { buildId: hash('1'), event: 'removed' }),
+      asHost('host-1', {}, { buildId: hash('1'), event: 'removed' }),
       d,
     );
     const after = await d.provenance!.chain('template/t1');
@@ -1468,7 +1560,7 @@ describe('every link of a sandbox is a record digest (§7.1)', () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
     await activate(d, 't1');
     const sb = (
       await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 't1' } }), d)
@@ -1544,7 +1636,7 @@ describe('activation is one check-and-write at a time across templates (G40)', (
     await registered(d, 't3', hash('3'), 'sbx_t3');
     await inventory(
       d,
-      'bm1',
+      'host-1',
       { [hash('0')]: 't0', [hash('1')]: 't1', [hash('2')]: 't2', [hash('3')]: 't3' },
       8,
     );
@@ -1574,12 +1666,12 @@ describe('activation is one check-and-write at a time across templates (G40)', (
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2', bob);
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
     const g = gateActivateRecords(d);
     const out = await race(g, [() => activate(d, 't1', alice), () => activate(d, 't2', bob)]);
     expect([...out].sort()).toEqual(['no_active_slot', 'ok']);
     expect(await liveLeasesOf(d)).toHaveLength(1);
-    expect((await HANDLERS.hostWanted!(asHost('bm1'), d)).body).toMatchObject({
+    expect((await HANDLERS.hostWanted!(asHost('host-1'), d)).body).toMatchObject({
       run: [{ template: out[0] === 'ok' ? 't1' : 't2' }],
     });
   });
@@ -1589,7 +1681,7 @@ describe('activation is one check-and-write at a time across templates (G40)', (
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
     const g = gateActivateRecords(d);
     const out = await race(g, [
       () => activate(d, 't1'),
@@ -1608,7 +1700,7 @@ describe('activation is one check-and-write at a time across templates (G40)', (
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1);
     const first = (await activate(d, 't1', alice, { leaseSeconds: 600 })).body as Body;
     now += 60_000;
     const g = gateActivateRecords(d);
@@ -1805,6 +1897,52 @@ describe('memory-aware placement (register G39)', () => {
     );
   });
 
+  it('keeps a build on the memory-reporting host already running its worker, counting it once', () => {
+    // h1 sorts first by id and has fewer builds placed; the worker runs on h2.
+    const docs = [doc('a', hash('a'), 1, 4096), doc('b', hash('b'), 2, 4096)];
+    const h1 = host('h1', [hash('a')], 100_000);
+    const h2 = host('h2', [hash('a'), hash('b')], 100_000, { running: ['w_a'] });
+    const p = place(docs, [h1, h2], 100);
+    expect(p.placed.get(hash('a'))).toBe('h2');
+    expect(p.placed.get(hash('b'))).toBe('h2');
+    // h2 counts a once (running, not pending) and b once (placed, pending).
+    expect(p.memory.get('h2')).toMatchObject({ usedMib: 2 * G, pendingMib: G });
+    expect(p.memory.get('h1')).toMatchObject({ usedMib: 0, pendingMib: 0 });
+  });
+
+  it('sticky placement and the memory rule together: running is the union of both reports', () => {
+    const docs = [doc('a', hash('a'), 1, 4096), doc('b', hash('b'), 2, 4096)];
+    // Running by the held build's `running` flag only (an attached report newer than the memory
+    // report): kept on h2 though h1 sorts first, counted against h2's limit, its memory paid for.
+    const h1 = host('h1', [hash('a'), hash('b')], 100_000);
+    const h2 = { ...host('h2', [hash('a'), hash('b')], G - 1, {}, 1), running: [hash('a')] };
+    const p = place(docs, [h1, h2], 100);
+    expect(p.placed.get(hash('a'))).toBe('h2');
+    expect(p.placed.get(hash('b'))).toBe('h1');
+    expect(p.used.get('h2')).toBe(1);
+    expect(p.memory.get('h2')).toMatchObject({ usedMib: G, pendingMib: G });
+    // Running by runningWorkers only: the same; braked (stale) and at its limit, it still keeps it.
+    const w2 = host('h2', [hash('a')], 0, { running: ['w_a'] }, 1, 0);
+    const q = place(docs, [h1, w2], 100);
+    expect(q.placed.get(hash('a'))).toBe('h2');
+    expect(q.used.get('h2')).toBe(1);
+    // Started since the inventory (an attached report; not in its runningWorkers): MemAvailable
+    // cannot show it yet, so its cost comes off that bound too, and b no longer fits beside it.
+    const fresh = {
+      ...host('h2', [hash('a'), hash('b')], G + 10, { totalMib: 1_000_000 }),
+      running: [hash('a')],
+    };
+    const r = place(docs, [fresh], 100);
+    expect(r.placed.get(hash('a'))).toBe('h2');
+    expect(r.memory.get('h2')).toMatchObject({ usedMib: G, pendingMib: G });
+    expect(r.unplaced.get(hash('b'))).toBe('memory');
+    const listed = { ...fresh, memory: { ...fresh.memory!, running: ['w_a'] } };
+    expect(place(docs, [listed], 100).placed.get(hash('b'))).toBe('h2');
+    // A memory file reported wrong overrides stickiness: that host is never chosen for it.
+    const bad = { ...h2, memory: { ...h2.memory!, memfileMismatch: [hash('a')] } };
+    expect(place(docs, [h1, bad], 100).placed.get(hash('a'))).toBe('h1');
+  });
+
   it('a host without memory figures places exactly by activeLimit, as before', () => {
     const docs = [doc('a', hash('a'), 1, 4096), doc('b', hash('b'), 2, 4096)];
     const bare: HostView = {
@@ -1890,7 +2028,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2', bob);
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4, mem(G + 100));
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4, mem(G + 100));
     await activate(d, 't1', alice, { leaseSeconds: 600 });
     const e = await activate(d, 't2', bob).catch((x) => x);
     expect(e.code).toBe('no_active_slot');
@@ -1934,7 +2072,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     expect(c.code).toBe('template_not_active');
     expect(c.extra).toMatchObject({ readiness: 'unavailable', reason: 'memory' });
     // At the active limit with memory to spare, the refusal is as before: no reason field.
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1, mem(100_000));
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 1, mem(100_000));
     const e2 = await activate(d, 't2', bob).catch((x) => x);
     expect(e2.code).toBe('no_active_slot');
     expect(e2.extra).toEqual({ readiness: 'unavailable' });
@@ -1947,7 +2085,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 2);
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 2);
     expect((await activate(d, 't1')).status).toBe(200);
     expect((await activate(d, 't2')).status).toBe(200);
     const b = (await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body;
@@ -1960,7 +2098,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await inventory(
       d,
-      'bm1',
+      'host-1',
       { [hash('1')]: 't1' },
       4,
       mem(16384, {
@@ -1990,7 +2128,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
   it('a stale inventory takes no new start; a memfile mismatch on every holder is template_unavailable', async () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 4, mem(100_000));
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 4, mem(100_000));
     now += 61_000;
     const e = await activate(d, 't1').catch((x) => x);
     expect(e.code).toBe('no_active_slot');
@@ -1999,7 +2137,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     expect(b.hosts[0].memory).toMatchObject({ brake: 'stale', headroomMib: 0 });
     await inventory(
       d,
-      'bm1',
+      'host-1',
       { [hash('1')]: 't1' },
       4,
       mem(100_000, { memfileMismatch: [hash('1')] }),
@@ -2007,7 +2145,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     const m = await activate(d, 't1').catch((x) => x);
     expect(m.code).toBe('template_unavailable');
     expect(m.extra).toEqual({ readiness: 'unavailable', reason: 'memfile_mismatch' });
-    await inventory(d, 'bm1', { [hash('1')]: 't1' }, 4, mem(100_000));
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 4, mem(100_000));
     expect((await activate(d, 't1')).status).toBe(200);
   });
 
@@ -2015,7 +2153,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2');
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4, mem(100_000));
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4, mem(100_000));
     await activate(d, 't1');
     now += 1000;
     await activate(d, 't2');
@@ -2023,12 +2161,12 @@ describe('memory-aware placement through the routes (register G39)', () => {
     // run; t1's runs, t2's has not started and no longer fits.
     await inventory(
       d,
-      'bm1',
+      'host-1',
       { [hash('1')]: 't1', [hash('2')]: 't2' },
       4,
       mem(G + 10, { runningWorkers: ['sbx_t1'] }),
     );
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run.map((x: Body) => x.template)).toEqual(['t1']);
   });
 
@@ -2037,7 +2175,7 @@ describe('memory-aware placement through the routes (register G39)', () => {
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
     await registered(d, 't2', hash('2'), 'sbx_t2', bob);
-    await inventory(d, 'bm1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 8, mem(2 * G - 1));
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 8, mem(2 * G - 1));
     const prov = d.provenance!;
     const orig = prov.append.bind(prov);
     let open!: () => void;
@@ -2115,37 +2253,37 @@ describe('cold-start pacing: the start limit (register G43)', () => {
     const d = await setup();
     attachedNow = [];
     await three(d);
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2 });
     // Leased t3, then t1, then t2: run and starting follow the leases, first leased first.
     await activate(d, 't3');
     now += 1000;
     await activate(d, 't1');
     now += 1000;
     await activate(d, 't2');
-    let w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    let w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run.map((x: Body) => x.template)).toEqual(['t3', 't1', 't2']);
     expect(w.starting).toEqual([hash('3'), hash('1'), hash('2')]);
     // t3 attaches: it is no longer starting, and still in run.
     attachedNow = ['sbx_t3'];
-    w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run.map((x: Body) => x.template)).toEqual(['t3', 't1', 't2']);
     expect(w.starting).toEqual([hash('1'), hash('2')]);
     // Another host's builds are never in this host's starting.
-    expect(((await HANDLERS.hostWanted!(asHost('bm2'), d)).body as Body).starting).toEqual([]);
+    expect(((await HANDLERS.hostWanted!(asHost('host-2'), d)).body as Body).starting).toEqual([]);
   });
 
   it('leaves starting out when the presence cannot be read (the agent counts its own starts)', async () => {
     const d = await setup();
     attachedNow = [];
     await registered(d, 't1', hash('1'), 'sbx_t1');
-    await inventoryStart(d, 'bm1', { [hash('1')]: 't1' }, { startConcurrency: 4 });
+    await inventoryStart(d, 'host-1', { [hash('1')]: 't1' }, { startConcurrency: 4 });
     await activate(d, 't1');
     d.presence = {
       list: async () => {
         throw new Error('relay down');
       },
     };
-    const w = (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.run).toHaveLength(1);
     expect(w).not.toHaveProperty('starting');
   });
@@ -2154,12 +2292,12 @@ describe('cold-start pacing: the start limit (register G43)', () => {
     const d = await setup();
     attachedNow = [];
     await three(d);
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2, startSeconds: 40 });
     for (const id of ['t1', 't2', 't3']) {
       await activate(d, id);
       now += 1000;
     }
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2, startSeconds: 40 });
     expect(await build(d, 't1')).toMatchObject({
       readiness: 'activating',
       queued: false,
@@ -2189,12 +2327,12 @@ describe('cold-start pacing: the start limit (register G43)', () => {
     const d = await setup();
     attachedNow = [];
     await three(d);
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2, startSeconds: 40 });
     await activate(d, 't1');
     now += 1000;
     await activate(d, 't2');
     now += 1000;
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2, startSeconds: 40 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2, startSeconds: 40 });
     // First use of t3 takes its lease: third in line, the second wave, 2 x 40 s.
     expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
       code: 'template_not_active',
@@ -2206,13 +2344,13 @@ describe('cold-start pacing: the start limit (register G43)', () => {
       retryAfterS: 40,
     });
     // One start at a time: the third waits three waves (3 x 37.4 s, rounded up).
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 1, startSeconds: 37.4 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 1, startSeconds: 37.4 });
     expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
       code: 'template_not_active',
       retryAfterS: 113,
     });
     // No start measured yet: the line is shown, and Retry-After is as before.
-    await inventoryStart(d, 'bm1', holds3, { startConcurrency: 2 });
+    await inventoryStart(d, 'host-1', holds3, { startConcurrency: 2 });
     expect(await build(d, 't3')).toMatchObject({ queued: true, queuePosition: 3 });
     expect(await retryOf(() => createSandbox(d, { template: 't3' }))).toEqual({
       code: 'template_not_active',
@@ -2226,12 +2364,12 @@ describe('cold-start pacing: the start limit (register G43)', () => {
     const d = await setup();
     attachedNow = [];
     await three(d);
-    await inventoryStart(d, 'bm1', holds3, null);
+    await inventoryStart(d, 'host-1', holds3, null);
     for (const id of ['t1', 't2', 't3']) {
       await activate(d, id);
       now += 1000;
     }
-    await inventoryStart(d, 'bm1', holds3, null);
+    await inventoryStart(d, 'host-1', holds3, null);
     const b3 = await build(d, 't3');
     expect(b3.readiness).toBe('activating');
     expect(b3).not.toHaveProperty('queued');
@@ -2248,7 +2386,7 @@ describe('cold-start pacing: the start limit (register G43)', () => {
       { startConcurrency: -1 },
       { startConcurrency: 1.5 },
     ]) {
-      await inventoryStart(d, 'bm1', holds3, { ...bad, startSeconds: 40 });
+      await inventoryStart(d, 'host-1', holds3, { ...bad, startSeconds: 40 });
       expect(await build(d, 't3')).not.toHaveProperty('queued');
     }
     expect(parseHostStart({ startConcurrency: 4, startSeconds: -3 })).toEqual({ concurrency: 4 });
@@ -2347,7 +2485,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
   ) =>
     HANDLERS.hostInventory!(
       asHost(
-        'bm1',
+        'host-1',
         {},
         {
           holds: Object.entries(holds).map(([manifestHash, template]) => ({
@@ -2364,7 +2502,8 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
       ),
       d,
     );
-  const wanted = async (d: TestDeps) => (await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body;
+  const wanted = async (d: TestDeps) =>
+    (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
   const ids = (xs: Body[]) => xs.map((x) => x.template);
   const build = async (d: TestDeps, id: string) =>
     ((await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id } }), d)).body as Body)
@@ -2375,7 +2514,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
     ((await HANDLERS.listTemplates!(ctx({ principal: alice }), d)).body as Body).hosts[0] as Body;
   const one = { [hash('1')]: 't1' };
   const two = { [hash('1')]: 't1', [hash('2')]: 't2' };
-  /** t1 registered, leased, running and attached on bm1, then released by alice at `released`. */
+  /** t1 registered, leased, running and attached on host-1, then released by alice at `released`. */
   const released = async (grace: unknown = GRACE, holds = one, activeLimit = 8) => {
     const d = await setup();
     await registered(d, 't1', hash('1'), 'sbx_t1');
@@ -2400,7 +2539,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
       const h = await hostsBlock(d);
       expect(h).not.toHaveProperty('graced');
       expect(h).not.toHaveProperty('idleGraceSeconds');
-      expect(d.hosts!.get('bm1')!.idleGraceSeconds ?? 0).toBe(0);
+      expect(d.hosts!.get('host-1')!.idleGraceSeconds ?? 0).toBe(0);
     }
   });
 
@@ -2474,7 +2613,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
     expect((await wanted(d)).graced).toEqual([hash('1')]);
     // t2 fits only in t1's slot: placed, not refused, and t1 is stopped.
     const r = (await activate(d, 't2')).body as Body;
-    expect(r.host).toBe('bm1');
+    expect(r.host).toBe('host-1');
     const w = await wanted(d);
     expect(ids(w.run)).toEqual(['t2']);
     expect(ids(w.stop)).toEqual(['t1']);
@@ -2483,7 +2622,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
     expect(await hostsBlock(d)).toMatchObject({ graced: 0, active: { limit: 1, used: 1 } });
     // Without a grace, as today: t1 (no lease) holds no slot, t2 is placed and t1 stopped.
     const plain = await released(0, two, 1);
-    expect(((await activate(plain, 't2')).body as Body).host).toBe('bm1');
+    expect(((await activate(plain, 't2')).body as Body).host).toBe('host-1');
     expect(ids((await wanted(plain)).stop)).toEqual(['t1']);
   });
 
@@ -2502,7 +2641,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
     const inv = (running: string[], avail: number) =>
       HANDLERS.hostInventory!(
         asHost(
-          'bm1',
+          'host-1',
           {},
           {
             holds: Object.entries(two).map(([manifestHash, template]) => ({
@@ -2579,7 +2718,7 @@ describe('cold-start pacing: the idle grace (register G43)', () => {
       // The agent's stop of the retired worker is recorded, then its removal.
       for (const event of ['detached', 'removed']) {
         const r = await HANDLERS.hostWorkerReport!(
-          asHost('bm1', {}, { buildId: hash('1'), event }),
+          asHost('host-1', {}, { buildId: hash('1'), event }),
           d,
         );
         expect((r.body as Body).recorded).toBe(event);
@@ -2698,7 +2837,7 @@ describe('the build job names the guest size template-build.sh reads (guest_mb)'
       d,
     );
     expect(r.status).toBe(202);
-    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
     expect(c.builds[0].spec.guest_ram_mb).toBe(g);
     expect(c.builds[0].spec.guest_mb).toBeUndefined();
   });

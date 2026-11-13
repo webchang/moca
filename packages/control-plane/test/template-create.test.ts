@@ -316,10 +316,10 @@ describe('POST /v1/templates (§4, §8.1)', () => {
       diskFreeGb: 200,
       diskFloorGb: 60,
     };
-    hosts.set('bm1', { at: 0, holds: { [H]: ID }, limits });
+    hosts.set('host-1', { at: 0, holds: { [H]: ID }, running: [], limits });
     expect((await create(d)).body).toMatchObject({ reused: true, buildId: H });
     // The snapshot was removed after a window: no host holds it, so the create builds again.
-    hosts.set('bm1', { at: 0, holds: {}, limits });
+    hosts.set('host-1', { at: 0, holds: {}, running: [], limits });
     const again = await create(d);
     expect(again.status).toBe(202);
     expect(again.body).not.toHaveProperty('reused');

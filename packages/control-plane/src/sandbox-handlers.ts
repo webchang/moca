@@ -32,7 +32,7 @@ import {
   type StartQueue,
 } from './activation.js';
 import { activationLock } from './activation-lock.js';
-import { freshHosts, graceBusy, hostViewsOf } from './host-handlers.js';
+import { busyWorkers, freshHosts, hostViewsOf } from './host-handlers.js';
 import {
   checkCreate,
   normalizeSpec,
@@ -278,11 +278,10 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
   const nowS = seconds(deps);
   const trusted = await trustedSet(deps);
   const hosts = hostViews(deps);
-  // Register G43: the workers with a live sandbox are never graced (read only with a grace).
-  const busy = await graceBusy(deps, hosts, nowS);
+  // The workers with a live sandbox: they drain and keep their slot, and are never graced.
   const placement =
     hosts.length > 0
-      ? place(docs ?? (await catalog(deps).list()), hosts, nowS, busy ? { busy } : {})
+      ? place(docs ?? (await catalog(deps).list()), hosts, nowS, await busyWorkers(deps, nowS))
       : null;
   let attached: Map<string, number> | null = null;
   if (deps.presence) {
@@ -863,14 +862,15 @@ function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
 }
 
 /**
- * Per host: its limits, its use (builds placed on it now) and its disk (§4, §6.2), and, from an agent
+ * Per host: its limits, its use (the workers placement counts on it: placed, running, draining) and
+ * its disk (§4, §6.2), and, from an agent
  * that reports it (register G39), its memory: the figures, the effective floor, the use and headroom
  * placement counts, and the brake (pressure or a stale inventory) that stops new starts. A host
  * silent for over HOST_STALE_S is left out, as placement leaves it out.
  */
 function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
-  const used = new Map<string, number>();
-  for (const h of f.placement?.placed.values() ?? []) used.set(h, (used.get(h) ?? 0) + 1);
+  // The workers placement counts against each host's activeLimit: placed, running and draining.
+  const used = f.placement?.used ?? new Map<string, number>();
   const graced = new Map<string, number>();
   for (const g of f.placement?.graced.values() ?? [])
     graced.set(g.host, (graced.get(g.host) ?? 0) + 1);
@@ -1056,12 +1056,12 @@ async function takeLeaseLocked(
   );
   // Register G43: a graced worker gives its slot up to this lease (it is not `placed`, so never
   // "displaced" below); the workers with a live sandbox are never graced.
-  const busy = await graceBusy(deps, hosts, nowS);
-  const pl = place(trial, hosts, nowS, busy ? { busy } : {});
+  const busy = await busyWorkers(deps, nowS);
+  const pl = place(trial, hosts, nowS, busy);
   // A held build is never evicted to make room (§6.3): placement breaks a tie of equal `since` (whole
   // seconds) by buildId, so a lease taken in the same second as a placed one could otherwise sort
   // ahead of it and push it off its host. Such a lease waits, as one that does not fit.
-  const before = place(docs, hosts, nowS, busy ? { busy } : {});
+  const before = place(docs, hosts, nowS, busy);
   const displaced = [...before.placed.keys()].find(
     (b) => b !== target.buildId && !pl.placed.has(b),
   );
