@@ -74,6 +74,12 @@ added or removed.
   the entries' grammar (uppercase, or an empty, `.` or `..` segment) is refused (`registry.repository`,
   saying the path is malformed) before it is matched, so the policy and the build host's puller read
   one path the same way.
+- A template imported from `SH_SANDBOX_TEMPLATES` (its build `imported:<12 hex>`, which no host's
+  inventory can hold) is never gated by activation: a sandbox create on it serves whenever its
+  worker is attached, its readiness is its worker's presence alone, it is never placed, run or
+  stopped by the wanted state, and activate refuses it with `400 invalid_request` (the deployment
+  runs its worker; it takes no lease). Before, once a host was configured, such a template was
+  refused `template_not_active` for good.
 
 ### 1.13.0
 

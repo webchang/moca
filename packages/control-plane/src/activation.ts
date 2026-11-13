@@ -175,6 +175,15 @@ export function graceUntil(b: TemplateBuild, graceS: number, nowS: number): numb
   return end + graceS;
 }
 
+/**
+ * Whether a host agent can hold, run and stop this build: one registered from a host's build, named
+ * by its snapshot's manifest hash (§6.1). A build imported from SH_SANDBOX_TEMPLATES
+ * (`imported:<12 hex>`) names no snapshot, so no host's inventory ever holds it: the deployment runs
+ * its worker. Such a build takes no lease, is never placed, and its readiness is its worker's
+ * presence alone, on every deployment, with host agents or without.
+ */
+export const hostManaged = (b: TemplateBuild): boolean => b.buildId.startsWith('sha256:');
+
 /** The wanted builds, their leases' earliest start breaking ties: first leased, first placed. */
 export function wantedBuilds(
   docs: TemplateDoc[],
@@ -183,7 +192,7 @@ export function wantedBuilds(
   const out: { doc: TemplateDoc; build: TemplateBuild; since: number }[] = [];
   for (const doc of docs) {
     for (const build of doc.builds) {
-      if (build.status !== 'registered') continue;
+      if (build.status !== 'registered' || !hostManaged(build)) continue;
       const live = liveLeases(build, nowS);
       if (live.length === 0) continue;
       out.push({ doc, build, since: Math.min(...live.map((l) => l.since ?? l.until)) });
@@ -380,7 +389,11 @@ export function place(
   return { placed, unplaced, memory: memUse, graced, displaced };
 }
 
-/** Readiness of a registered build (§3.3), from what is wanted, placed and attached. */
+/**
+ * Readiness of a registered build (§3.3), from what is wanted, placed and attached. `p` is null on
+ * a deployment where no host agent has reported: readiness is then the worker's presence alone, as
+ * it always is for a build no host can hold (hostManaged).
+ */
 export function readinessOf(
   build: TemplateBuild,
   nowS: number,
@@ -390,7 +403,7 @@ export function readinessOf(
   if (attached === null) return 'unknown';
   const isAttached = build.worker !== '' && attached.has(build.worker);
   const wanted = liveLeases(build, nowS).length > 0;
-  if (!p) return isAttached ? 'active' : 'inactive';
+  if (!p || !hostManaged(build)) return isAttached ? 'active' : 'inactive';
   if (wanted) {
     if (p.unplaced.has(build.buildId)) return isAttached ? 'active' : 'unavailable';
     return isAttached ? 'active' : 'activating';

@@ -315,6 +315,11 @@ template_exists` (register G34). An admin hands it to a subject with `PUT
 retires it like any template of theirs. A retired template's id stays its owner's: another subject's
 create under it is still `409 template_exists`.
 
+A build imported from the env list (`imported:<12 hex>`) names no snapshot, so no host's inventory
+ever holds it: the deployment runs its worker. It is never gated by activation (§6.4), never placed,
+run or stopped by a host's wanted state, its readiness is its worker's presence alone, and it takes
+no lease (activate answers `400 invalid_request`).
+
 ## 6. Builds and activation on a host
 
 ### 6.1 The host agent
