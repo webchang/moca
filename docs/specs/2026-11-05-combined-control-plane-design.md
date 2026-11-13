@@ -71,7 +71,8 @@ profile today get one rule each:
 **Login stays open as on `harness`** (any GitHub account; test users if configured), and
 **enrollment moves from the login to the routes:** on `combined`, `requireEnrolled` is checked by
 every sandbox route and every template write (create, build, cancel, activate, deactivate, policy
-PUT), and a test user is refused there (`not_enrolled`), as template lifecycle §4.1 requires
+PUT), and so does a session's activation on first use (§3.4); a test user is refused there
+(`not_enrolled`), as template lifecycle §4.1 requires
 ("on `harness`, the sandbox routes check the subject themselves"). Sessions, models and bundles
 stay open to any logged-in subject, as today on `harness`, and so do the template, policy and quota
 reads (on `sandbox` they stay enrolled-only). **As built (increment 2):** `isEnrolled` is the login
@@ -99,8 +100,12 @@ keeps the `sandbox` profile.
   the fallback without `SH_PROVENANCE_DIR`.
 - **First use (§6.4) for sessions:** the same `requireActive` rule: on a deployment with host
   agents, a session on a build that is not active takes the caller's lease and answers
-  `409 template_not_active` with `Retry-After`; `activate: false` starts nothing. `mocactl`'s
-  session create retries it, as `sbx create` does.
+  `409 template_not_active` with `Retry-After`; `activate: false` starts nothing. Activation stays
+  enrolled-only (§3.2): a caller not enrolled for sandboxes takes no lease. It waits (409) on a
+  build another subject's lease is starting, and is refused (`403 not_enrolled`) on one nobody is
+  starting. The activation is the create's last check, after the `configRef`, credential and model
+  checks, so a create refused for another reason holds no lease. `mocactl`'s session create
+  retries it, as `sbx create` does.
   **As built (increment 4):** with a template store, `createSession` uses the sandbox path's
   `resolveForUse` and `requireActive` (`sandbox.activate` in the body); without one, the static list
   as before. `SessionManager.create` waits up to 10 minutes, saying why in headless runs.
