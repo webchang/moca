@@ -93,6 +93,9 @@ added or removed.
   host's `stop` (never under a live sandbox), so one worker id does not stay on two hosts. With
   memory figures, a worker started since the inventory (an attached report) is counted as pending,
   since the host's MemAvailable cannot show it yet.
+- `409 no_active_slot`'s `Retry-After` is the seconds until the soonest a build placed on one of
+  this build's holders loses its last live lease (when its slot frees), not the earliest end of any
+  lease in the catalog; 60 when no lease gives that time.
 
 ### 1.13.0
 
