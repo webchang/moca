@@ -122,6 +122,12 @@ export interface HostState {
    * host's attached and detached reports, so placement counts what the host really runs.
    */
   running: string[];
+  /**
+   * buildId -> the last `refused` report (its reason) this host made for a build it is still asked
+   * to run: a repeat is not recorded again (hostWorkerReport). Cleared once the build leaves the
+   * host's `run`, or on any other report for it.
+   */
+  refused?: Record<string, string>;
   limits: {
     activeLimit: number;
     idleLimitSeconds: number;
@@ -531,6 +537,18 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     const st = deps.hosts!.get(host)!;
     const others = st.running.filter((x) => x !== buildId);
     st.running = event === 'attached' ? [...others, buildId] : others;
+    // A refusal the same as this host's last one for a build it is still asked to run (the agent
+    // retries every 15 s: a worker not installed, a unit whose start keeps failing) is not appended
+    // again: the template's stream is append-only provenance, and would grow by one record a poll.
+    st.refused ??= {};
+    if (event === 'refused') {
+      if (st.refused[buildId] === (reason ?? '')) {
+        return { status: 200, body: { recorded: null } };
+      }
+      st.refused[buildId] = reason ?? '';
+    } else {
+      delete st.refused[buildId];
+    }
     await prov.append({
       stream: `template/${doc.id}`,
       kind: event === 'removed' ? 'retire' : event === 'detached' ? 'deactivate' : 'activate',
@@ -573,10 +591,13 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     const memory = parseHostMemory(b.memory);
     const start = parseHostStart(l);
     const grace = parseIdleGrace(l);
+    // A host's unrepeated refusals outlive its inventories (each poll replaces the rest).
+    const refused = deps.hosts?.get(host)?.refused ?? {};
     deps.hosts?.set(host, {
       at: seconds(deps),
       holds,
       running,
+      refused,
       limits,
       ...(memory ? { memory } : {}),
       ...(start ? { start } : {}),
@@ -865,10 +886,18 @@ async function wantedAnswer(
         continue;
       }
       if (b.status !== 'registered') continue;
-      if (p.placed.get(b.buildId) === host) run.push(entry);
-      else if (grace && p.graced.get(b.buildId)?.host === host) keep.push(entry);
-      else if (busy.has(b.worker)) continue;
-      else if (liveLeases(b, nowS).length === 0) {
+      if (p.placed.get(b.buildId) === host) {
+        run.push(entry);
+        continue;
+      }
+      if (grace && p.graced.get(b.buildId)?.host === host) {
+        keep.push(entry);
+        continue;
+      }
+      // Out of this host's `run`: a refusal it reports for this build again is a new episode.
+      if (mine.refused) delete mine.refused[b.buildId];
+      if (busy.has(b.worker)) continue;
+      if (liveLeases(b, nowS).length === 0) {
         if (p.displaced.get(b.buildId) === host) displaced.push(entry);
         else stop.push(entry);
       } else {

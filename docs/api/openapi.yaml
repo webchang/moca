@@ -3619,7 +3619,12 @@ paths:
           description: recorded
           content:
             application/json:
-              schema: { type: object, properties: { recorded: { type: string } } }
+              schema:
+                type: object
+                properties:
+                  recorded:
+                    type: [string, 'null']
+                    description: the event recorded; null for a repeated refusal, not recorded
         '400':
           description: '`invalid_request`'
           content:

@@ -100,6 +100,10 @@ added or removed.
   retry under its own lease is answered `409 template_not_active` with the readiness and
   `Retry-After`, and writes nothing (no renewal, no new `activate` record per retry). Another
   subject's first use still takes its own lease.
+- A host's `refused` worker report that repeats its last one for the build (the same reason) while
+  the build stays in the host's `run` is not recorded again (`recorded: null`): the agent retries
+  every 15 s, and the template's stream is append-only. A different reason, any other report for
+  the build, or the build leaving the host's `run` starts a new episode, recorded again.
 
 ### 1.13.0
 
