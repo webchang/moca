@@ -717,8 +717,10 @@ mocactl sbx templates follow my-python                         # exit 0 once reg
 - Several `--spec` make one create each. When your `buildsQueued` quota is full, the next waits for
   a slot ("N waiting for a queue slot") rather than failing. Ctrl-C stops it with exit 130: the
   specs not yet posted are not posted.
-- Run the same create again (say, after your laptop slept through its answer): an id already yours
-  is followed, not created twice. An id someone else owns is refused with its owner's name.
+- A create on an id already yours is a new build of it. The same create again (same image, spec,
+  profile and gate record, say after your laptop slept through its answer) answers the build it
+  already made (`reused`), not a second one; a changed spec, image or profile queues a new build.
+  An id someone else owns is refused with its owner's name.
 - `follow` polls until the build is `registered` (exit 0), `failed` or `rejected` (exit 1, with
   its reason's step and code). `templates show ID` prints it once; `templates cancel ID --build B`
   withdraws one not yet built. `templates build ID --spec F` is a new build of your template.

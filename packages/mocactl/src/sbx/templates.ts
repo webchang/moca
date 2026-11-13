@@ -503,9 +503,10 @@ async function createOne(
 
 /**
  * `templates create --spec F … [--dry-run]` and `templates build ID --spec F` (§3.2): each spec
- * posted once, in order, its answer printed (one JSON object per line with --json). A
- * `409 template_exists` says whose the id is: the caller's own is followed instead (a create whose
- * 202 was lost), another's is a refusal, and a declared one can be handed over by an admin (G34).
+ * posted once, in order, its answer printed (one JSON object per line with --json). A create on the
+ * caller's own id is a new build of it (or the build of the same inputs, `reused`); a
+ * `409 template_exists` is a refusal, saying whose the id is, and a declared one can be handed over
+ * by an admin.
  */
 export async function cmdCreateTemplates(
   c: SbxCtx,
@@ -549,7 +550,11 @@ export async function cmdCreateTemplates(
   return code;
 }
 
-/** A `409 template_exists`: the caller's own template is followed to its newest build; another's is named. */
+/**
+ * A `409 template_exists`: the id is another subject's, or one the deployment declared (a create on
+ * the caller's own id is a new build of it, never a 409). The template is read to say whose; if it
+ * reads as the caller's own, the server's refusal is printed as sent.
+ */
 async function existing(c: SbxCtx, id: string, err: ApiError): Promise<number> {
   let t: SbxTemplateFull;
   try {
@@ -559,33 +564,12 @@ async function existing(c: SbxCtx, id: string, err: ApiError): Promise<number> {
     return SBX_EXIT.failed;
   }
   const me = c.rt.auth?.subject;
-  if (t.owner !== null && t.owner === me) {
-    const b = t.builds[0];
-    if (!b) {
-      c.io.err(`sbx: ${sanitizeRemote(id)} is yours but has no build`);
-      return SBX_EXIT.failed;
-    }
-    c.io.err(
-      `${sanitizeRemote(id)} is already yours: following its newest build, ${sanitizeRemote(b.handle)}`,
-    );
-    const q: SbxQueued = {
-      templateId: t.id,
-      buildId: b.status === 'registered' ? b.buildId : null,
-      build: `/v1/templates/${t.id}/builds/${b.handle}`,
-      status: b.status,
-      reused: true,
-    };
-    if (c.json) c.io.out(JSON.stringify(q) + '\n');
-    else
-      c.io.out(
-        `${sanitizeRemote(t.id)} ${sanitizeRemote(b.handle)} ${sanitizeRemote(b.status)} (yours already)\n`,
-      );
-    return SBX_EXIT.ok;
-  }
   c.io.err(
     t.owner === null
-      ? `sbx: ${sanitizeRemote(id)} is a template the deployment declared: an admin can hand it over to you (mocactl sbx templates transfer ${sanitizeRemote(id)} ${sanitizeRemote(me ?? 'github:<your id>')}, G34)`
-      : `sbx: ${sanitizeRemote(id)} belongs to ${sanitizeRemote(t.owner)}: pick another id`,
+      ? `sbx: ${sanitizeRemote(id)} is a template the deployment declared: an admin can hand it over to you (mocactl sbx templates transfer ${sanitizeRemote(id)} ${sanitizeRemote(me ?? 'github:<your id>')})`
+      : t.owner !== me
+        ? `sbx: ${sanitizeRemote(id)} belongs to ${sanitizeRemote(t.owner)}: pick another id`
+        : `sbx: ${refusalText(err)}`,
   );
   return SBX_EXIT.failed;
 }

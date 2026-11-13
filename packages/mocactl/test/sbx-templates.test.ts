@@ -413,7 +413,7 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
     });
   });
 
-  it('409 template_exists: follows your own newest build and posts nothing more', async () => {
+  it('409 template_exists on an id read as your own: the refusal as sent, no answer made up', async () => {
     const f = files({ 'spec.json': SPEC });
     const w = world({
       'POST /v1/templates': () => ({
@@ -427,17 +427,14 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
         }),
       }),
     });
-    expect(await w.run(['templates', 'create', '--spec', f['spec.json']!, '--json'])).toBe(0);
+    expect(await w.run(['templates', 'create', '--spec', f['spec.json']!, '--json'])).toBe(1);
     expect(w.cp.calls.filter((c) => c.method === 'POST')).toHaveLength(1);
-    expect(JSON.parse(w.out())).toMatchObject({
-      build: BUILD_PATH,
-      status: 'building',
-      reused: true,
-    });
-    expect(w.err()).toContain(`my-python is already yours: following its newest build, ${HANDLE}`);
+    expect(w.out()).toBe('');
+    expect(w.err()).toContain("template 'my-python' exists");
+    expect(w.err()).not.toContain('following');
   });
 
-  it("409 template_exists: names another's owner, and a declared one's hand-over (G34)", async () => {
+  it("409 template_exists: names another's owner, and a declared one's hand-over", async () => {
     const f = files({ 'spec.json': SPEC });
     let owner: string | null = 'github:9';
     const w = world({
@@ -449,7 +446,7 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
     owner = null;
     expect(await w.run(['templates', 'create', '--spec', f['spec.json']!])).toBe(1);
     expect(w.err()).toContain(
-      'a template the deployment declared: an admin can hand it over to you (mocactl sbx templates transfer my-python github:1, G34)',
+      'a template the deployment declared: an admin can hand it over to you (mocactl sbx templates transfer my-python github:1)',
     );
   });
 
