@@ -122,6 +122,9 @@ keeps the `sandbox` profile.
   (`session.WithBuild`); the exchange returns `sandboxBuildId` for a manifest-hash build (never an
   `imported:` one); the data plane (`turn-auth`, `run-turn`) passes it to `selectPoolSandbox`, which
   keeps only records labelled with it and refuses the turn when none is attached.
+  The label is the worker's own claim, from its Hello: the relay does not check it against the
+  attach token, so a compromised worker can claim any build. That is the trust `moca.dev/template`
+  already has, and no new exposure.
   **Upgrade order:** sandboxes route by worker id and ignore the label; an unpinned session matches
   by template as before; only a pinned session refuses a worker without the label. So the worker
   rebuild must precede the first pinned Moca Pi session on a combined deployment, and nothing else
@@ -156,6 +159,13 @@ callers, one namespace and **no cluster-scoped object**. `deploy/sbx/setup.sh` d
 its own addresses, the supervisor's Route (`SBX_MOCA_HOST`); tested without a cluster in
 `deploy/sbx/tests/setup.test.sh`. It writes to `deploy/sbx/.generated-<namespace>/`, so the same checkout
 leaves an SBX0 namespace's generated files alone. Run on ykt3 on 2026-11-05 (`moca-combined`, §4 increment 6).
+
+**The isolation boundary changes.** The relay takes two kinds of Exec caller on one listener: the
+harness's exec token (`MOCA_RELAY_EXEC_TOKEN`, checked first in `execCaller`) and the per-sandbox
+tokens. The harness's token is not scoped to a sandbox: it allows Exec into any attached worker, so
+on `combined` also into the sandboxes of enrolled users. A compromised supervisor, which holds that
+token, therefore reaches those sandboxes; with SBX0 in a namespace of its own it reaches none. A
+deployment that needs that separation keeps the two profiles in two namespaces.
 
 **For the validation:** a new namespace on ykt3 (for example `moca-combined`), so the SBX0
 deployment in `moca-sbx-template` stays as it is; the first combined window brings its templates
