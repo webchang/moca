@@ -8,6 +8,17 @@ plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+### 1.14.0
+
+Review fixes from the upstream template and enrollment PRs, brought into this document. No route is
+added or removed.
+
+- `DELETE /v1/subjects/{subject}` refuses a subject holding a live admin grant with the new error
+  code `admin_granted` (409; revoke the role first): the grant keeps it enrolled, so the unenroll
+  would change nothing.
+- A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from the settings and any
+  role); enrolling a subject the settings enroll writes nothing (`record: null`).
+
 ### 1.13.0
 
 The member, owner and quota routes take an OIDC subject as well as a GitHub one (#701's `oidc:<sub>`,
