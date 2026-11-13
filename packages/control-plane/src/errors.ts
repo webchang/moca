@@ -42,6 +42,7 @@ export const CP_ERROR_CODES = [
   'self_attested',
   'bootstrap_subject',
   'self_revoke',
+  'admin_granted',
   'digest_mismatch',
   'bundle_quota_exceeded',
   'config_bundle_not_found',
@@ -117,6 +118,8 @@ const STATUS: Record<CpErrorCode, number> = {
   self_attested: 409,
   bootstrap_subject: 409,
   self_revoke: 409,
+  // 409: an unenroll of a subject that holds an admin grant: the grant would keep its access.
+  admin_granted: 409,
   // A client-built bundle whose bytes do not hash to the digest it claimed (config-bundle store).
   digest_mismatch: 400,
   // 429: the config-bundle byte budget (per subject or deployment-wide) is full; retry after expiry.

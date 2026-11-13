@@ -62,13 +62,13 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 
 ## 4. The API (reads: any admin; changes: an admin named in the settings; both profiles where templates are)
 
-| Route                                       | Body               | Effect                                                              | Record                          |
-| ------------------------------------------- | ------------------ | ------------------------------------------------------------------- | ------------------------------- |
-| `GET /v1/subjects`                          |                    | every enrolled subject, with roles and `source: env \| api`         |                                 |
-| `PUT /v1/subjects/{subject}`                | `{enrolled: true}` | enroll                                                              | `member` (enrolled, before)     |
-| `DELETE /v1/subjects/{subject}`             |                    | unenroll (refused for a bootstrap subject: `409 bootstrap_subject`) | `member` (unenrolled, before)   |
-| `PUT /v1/subjects/{subject}/roles/admin`    | `{until?}`         | grant admin (a settings admin; `until` optional)                    | `role` (granted, until, before) |
-| `DELETE /v1/subjects/{subject}/roles/admin` |                    | revoke admin (refused for a bootstrap admin and for oneself)        | `role` (revoked, before)        |
+| Route                                       | Body               | Effect                                                                                                                                                  | Record                          |
+| ------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `GET /v1/subjects`                          |                    | every enrolled subject, with roles and `source: env \| api`                                                                                             |                                 |
+| `PUT /v1/subjects/{subject}`                | `{enrolled: true}` | enroll                                                                                                                                                  | `member` (enrolled, before)     |
+| `DELETE /v1/subjects/{subject}`             |                    | unenroll (refused for a bootstrap subject: `409 bootstrap_subject`; for a subject holding an admin grant, which keeps it enrolled: `409 admin_granted`) | `member` (unenrolled, before)   |
+| `PUT /v1/subjects/{subject}/roles/admin`    | `{until?}`         | grant admin (a settings admin; `until` optional)                                                                                                        | `role` (granted, until, before) |
+| `DELETE /v1/subjects/{subject}/roles/admin` |                    | revoke admin (refused for a bootstrap admin and for oneself)                                                                                            | `role` (revoked, before)        |
 
 - **Errors:** 400 for a malformed subject, 403 for a caller who isn't an admin, and 409 for a bootstrap
   subject or for revoking oneself.
@@ -126,3 +126,13 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 - **Decided here (the spec left it open):** a grant to a subject not yet enrolled is allowed: the
   admin role enrolls it, as a bootstrap admin is. Re-granting an unexpired grant with the same `until`
   writes nothing; with another `until` it writes a new `granted` record.
+
+## 9. Limits
+
+- **A record is an attempted change; `members.json` is the state.** A change's record is appended
+  before the file is replaced, so a crash or a failed write between the two leaves a `member` or
+  `role` record for a change the store does not hold (never the reverse), and the caller's retry
+  appends a second one with the same body. Read the stream as a log of intent; `GET /v1/subjects`
+  and the file say what is in effect.
+- **Unenrolling an admin** is refused (`409 admin_granted`): an admin is enrolled by its role, so
+  revoke the role first, then unenroll.
