@@ -320,17 +320,21 @@ memory_report() {
         memfileMismatch: ($m | split("\n") | map(select(length > 0)) | unique)}' >"$WORK/memory.json"
 }
 
-# The snapshots this host holds, by manifest hash, as template-build.sh's records name them; its
-# limits, with its start limit and measured start time (register G43); and its memory (register G39).
+# The snapshots this host holds, by manifest hash, as template-build.sh's records name them, each
+# with whether its worker's unit is running (the control plane counts running workers against
+# SBX_ACTIVE_LIMIT and keeps a running build on this host); its limits, with its start limit and
+# measured start time; and its memory.
 inventory() {
-  local f out="$WORK/inventory.json" mem='{}' secs
+  local f w r out="$WORK/inventory.json" mem='{}' secs
   if memory_report; then mem="$(jq -c '{memory: .}' "$WORK/memory.json")" || mem='{}'; fi
   secs="$(start_seconds)"
   {
     printf '{"holds":['
     local sep=''
     while IFS= read -r f; do
-      printf '%s%s' "$sep" "$(jq -c '{template: .id, manifestHash: .manifest_hash}' "$f")"
+      w="$(jq -r '.worker // ""' "$f")" r=false
+      if [[ "$w" =~ $WORKER_RE ]] && systemctl is-active --quiet "sbx-worker@$w.service"; then r=true; fi
+      printf '%s%s' "$sep" "$(jq -c --argjson r "$r" '{template: .id, manifestHash: .manifest_hash, running: $r}' "$f")"
       sep=','
     done < <(held_records)
     printf '],"limits":{"activeLimit":%d,"idleLimitSeconds":%d,"buildConcurrency":%d,"diskFreeGb":%d,"diskFloorGb":%d,"startConcurrency":%d,"idleGraceSeconds":%d%s}}' \
@@ -553,6 +557,20 @@ activation() {
     : >"$WORK/graced.ids"
   if [[ -f "$SBX_SRV/graced" ]]; then cp "$SBX_SRV/graced" "$WORK/graced.prev"; else : >"$WORK/graced.prev"; fi
   (umask 077 && cat "$WORK/graced.ids" >"$SBX_SRV/graced.tmp") && mv -f "$SBX_SRV/graced.tmp" "$SBX_SRV/graced"
+  # Stops first, so a slot (or the memory) a stopped worker frees is free before a start uses it.
+  while IFS=$'\t' read -r w b; do
+    [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to stop is malformed'; continue; }
+    unit="sbx-worker@$w.service"
+    systemctl is-active --quiet "$unit" || continue
+    if systemctl stop "$unit"; then
+      # A stop of a worker the idle grace kept is logged as such: a wanted build needed
+      # its slot, its grace ended, or its build was released with stopNow or retired.
+      STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"$(! grep -qxF -- "$b" "$WORK/graced.prev" || printf ',"was":"graced"')}"
+    else
+      error "stop $unit failed"
+    fi
+  done < <(jq -r '.stop[] | [.worker, .buildId] | @tsv' <<<"$wanted")
+  # The start book after the stops: a worker stopped just now is no longer starting.
   start_book "$now" "$has"
   slots=$((SBX_START_CONCURRENCY - INFLIGHT))
   while IFS=$'\t' read -r w b; do
@@ -595,18 +613,6 @@ activation() {
     say "{\"agent\":\"queued\",\"workers\":$queued,\"why\":\"$INFLIGHT starting, SBX_START_CONCURRENCY $SBX_START_CONCURRENCY: started in a later run\"}"
   fi
   ((graced == 0)) || GRACE_SUMMARY=",\"graced\":$graced"
-  while IFS=$'\t' read -r w b; do
-    [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to stop is malformed'; continue; }
-    unit="sbx-worker@$w.service"
-    systemctl is-active --quiet "$unit" || continue
-    if systemctl stop "$unit"; then
-      # A stop of a worker the idle grace kept (register G43) is logged as such: a wanted build needed
-      # its slot, its grace ended, or its build was released with stopNow or retired.
-      STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"$(! grep -qxF -- "$b" "$WORK/graced.prev" || printf ',"was":"graced"')}"
-    else
-      error "stop $unit failed"
-    fi
-  done < <(jq -r '.stop[] | [.worker, .buildId] | @tsv' <<<"$wanted")
   [[ "$(jq -r '.remove | type' <<<"$wanted")" != array ]] || removal "$wanted"
   exec 9>&-
 }
