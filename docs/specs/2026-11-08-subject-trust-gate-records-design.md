@@ -53,10 +53,18 @@ The default policy keeps `benchmark` as curated, and adds two profiles with `sel
 
 On a `selfAttest` profile, when the record's sha256 is not in `trustedGateRecords`:
 
-- **X1.trusted** passes for the creating subject.
+- **X1.trusted** passes for the template's owner: the creating subject, or, for an admin's build on
+  another subject's template, that template's owner (an imported template has none, so it is
+  refused).
 - **X1.self.scope:** refused if another subject has already self-attested this sha256. The trust key
-  is (subject, sha256), found from the catalog: each build's create names its record's sha256, and the
-  template its owner.
+  is (subject, sha256), found from the catalog: a build self-attested at create (`selfAttested`)
+  names its record's sha256, and its template the owner the record counts for, as the `gate`
+  record's `scope` does. A build made while the record was trusted claims nothing. The claim is
+  made by an admitted self-attested create and is held while its build is queued, building,
+  probing, built, registered, rejected or retired (a real use, or an admin's decision). It is
+  released when the build ends `failed`, which never admitted a template, so no subject holds a
+  published record for good with a build that fails. A refused create claims nothing. The lookup and the create's write run as one step per sha256 (in the control plane's
+  process), so two subjects sending one record at once can't both claim it.
 - **X12.self:** commits are always refused (`observed.testbed.agent_can_commit == "no"` and
   `observed.guest.git_identity == "none"`), whether or not the spec skips the identity check.
 - **X1.self.egress:** `spec.egress` must be false unless the profile sets `selfAttestEgress`.
@@ -76,8 +84,10 @@ shows `gateFloorCheckedOffline`, and, from a `network_needed` gate, `gateFloorMe
 ## 5. What is recorded and shown
 
 - **The `gate` provenance record** (written at create, its `subject` the submitter): `record_sha256`,
-  `source` (`trusted`, `self`, or `client` on a profile that doesn't require X1), `scope` (the
-  submitter, for `self`), and `policy` (the policy record in force at create). The submitted bytes are
+  `source` (`trusted`, `self`, or `client` on a profile that doesn't require X1), `scope` (for `self`,
+  the subject the record counts for: the template's owner, the submitter itself except on an
+  admin's build for another subject's template), and `policy` (the policy record in force at
+  create). The submitted bytes are
   a blob, so an admin promoting a record sees exactly what was trusted and by whom.
 - **The build** keeps two facts of its create: `selfAttested: true` when its record was untrusted
   then (a self-attestation), and `selfAttestProfile: true` whenever it was made on a `selfAttest`
@@ -96,7 +106,8 @@ shows `gateFloorCheckedOffline`, and, from a `network_needed` gate, `gateFloorMe
 - **The user's decision Q4 (i):** when an admin removes a record's sha256 from `trustedGateRecords`, a
   deployment-visible template whose registered builds become self-attested falls back to **private on
   read**: a build self-attested at create, and a build made on a `selfAttest` profile while the record
-  was trusted, by its submitter or by another subject. Other subjects no longer see it in the list, can't read it, and can't use it (a sandbox or a
+  was trusted, by its submitter or by another subject. Whose record it is stays X1.self.scope's (§4):
+  a self-attested claim is held unless its build failed. Other subjects no longer see it in the list, can't read it, and can't use it (a sandbox or a
   session create answers as for an unknown template). Its owner keeps using it.
 - So that nothing is silent, `PUT /v1/policy` names the narrowed builds (`narrowed: [{template,
 buildId}]`) in its answer and in its `policy` record.
@@ -138,3 +149,5 @@ buildId}]`) in its answer and in its `policy` record.
   shows the stored `visibility`.
 - **Old `gate` records** with `source: client` are read unchanged. `verify-provenance.py` checks a gate
   record's cited blob only, so the new fields need no change there.
+- **X1.self.scope is serialized within one control plane process**, as the catalog's own writes are
+  per template id: a deployment runs one control plane writing its template store.

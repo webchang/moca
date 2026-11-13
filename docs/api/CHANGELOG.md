@@ -52,6 +52,10 @@ added or removed.
 - A build made on a `selfAttest` profile with a gate record now stores `selfAttestProfile`, trusted
   or not at create, and its `attestation` is `self` whenever its record is not trusted now: a trust
   removal narrows such a build (its template private to its owner) whatever the order of events.
+- `X1.self.scope` counts only builds self-attested at create (the record untrusted then), keyed on
+  the template's owner; a claim is held unless its build failed, and two creates sending one
+  untrusted record at once are serialized, so never both claim it. The `gate` record's `scope` is
+  the template's owner (the submitter, except on an admin's build for another subject's template).
 
 ### 1.13.0
 
