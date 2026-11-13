@@ -80,6 +80,10 @@ added or removed.
   stopped by the wanted state, and activate refuses it with `400 invalid_request` (the deployment
   runs its worker; it takes no lease). Before, once a host was configured, such a template was
   refused `template_not_active` for good.
+- Placement, the hosts block of `GET /v1/templates` and the default lease leave out any host
+  whose last inventory is older than 360 s (`HOST_STALE_S`, three build polls), until it reports
+  again: a host whose agent died or was removed takes no new placement and no slot. When every
+  host is silent, readiness is the workers' presence alone.
 
 ### 1.13.0
 

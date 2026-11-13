@@ -32,7 +32,7 @@ import {
   type StartQueue,
 } from './activation.js';
 import { activationLock } from './activation-lock.js';
-import { graceBusy, hostViewsOf } from './host-handlers.js';
+import { freshHosts, graceBusy, hostViewsOf } from './host-handlers.js';
 import {
   checkCreate,
   normalizeSpec,
@@ -865,7 +865,8 @@ function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
 /**
  * Per host: its limits, its use (builds placed on it now) and its disk (§4, §6.2), and, from an agent
  * that reports it (register G39), its memory: the figures, the effective floor, the use and headroom
- * placement counts, and the brake (pressure or a stale inventory) that stops new starts.
+ * placement counts, and the brake (pressure or a stale inventory) that stops new starts. A host
+ * silent for over HOST_STALE_S is left out, as placement leaves it out.
  */
 function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
   const used = new Map<string, number>();
@@ -873,7 +874,7 @@ function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
   const graced = new Map<string, number>();
   for (const g of f.placement?.graced.values() ?? [])
     graced.set(g.host, (graced.get(g.host) ?? 0) + 1);
-  return (deps.hosts?.all() ?? []).map(([id, h]) => {
+  return freshHosts(deps).map(([id, h]) => {
     const q = f.queue?.byHost.get(id);
     // Register G43: its start limit, measured start time, and start line, from an agent that reports it.
     const start = h.start
@@ -1832,8 +1833,8 @@ export const FIRST_USE_RETRY_S = 30;
  * agent starts its worker; the retry succeeds once it is attached. No sandbox record is kept while
  * waiting, so a wait never uses the caller's live-sandbox cap. Without host agents (workers run
  * by the deployment, SH_TEMPLATE_HOSTS unset) nothing changes: the create succeeds as before.
- * With hosts configured but none reported yet (a fresh deploy, a restart, a host down), readiness
- * is the worker's presence alone: an attached worker serves, and an absent one is refused rather
+ * With hosts configured but none reported within HOST_STALE_S (a fresh deploy, a restart, every
+ * host down), readiness is the worker's presence alone: an attached worker serves, and an absent one is refused rather
  * than left to wait at the relay. A build imported from SH_SANDBOX_TEMPLATES (no snapshot, so no
  * host ever holds it) is never gated: the deployment runs its worker.
  */
