@@ -45,6 +45,9 @@ added or removed.
   the check acts on) and an `envelope.exact` that is not two positive whole numbers. A stored policy
   naming an unknown id, or with such an `exact`, fails closed when read, until an admin sets a
   valid one: read `GET /v1/policy` and fix it before upgrading.
+- A tag is looked up as the template's own property everywhere (moving, removing, `id:tag`, the tag
+  list), so a tag named like an `Object.prototype` member (`constructor`) is a tag like any other;
+  `DELETE …/tags/{tag}` refuses a name outside the tag grammar with `400 invalid_request`.
 - A refused create is recorded as a `check` provenance record only on an existing template's stream
   the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
   only answered, and one on an id no template holds writes one audit line instead

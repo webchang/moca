@@ -1348,8 +1348,10 @@ async function moveTemplateTags(ctx: RequestCtx, deps: CpDeps) {
     const next = { ...cur!.tags };
     const meta = { ...(cur!.tagsMeta ?? {}) };
     for (const t of tags as string[]) {
-      if (next[t] === target.buildId) continue;
-      moved.push({ tag: t, from: next[t] ?? null });
+      // An own property only: a tag such as `constructor` is not Object.prototype's.
+      const from = Object.hasOwn(next, t) ? next[t]! : null;
+      if (from === target.buildId) continue;
+      moved.push({ tag: t, from });
       next[t] = target.buildId;
       meta[t] = { at: nowS, by: p.sub };
     }
@@ -1393,12 +1395,15 @@ async function moveTemplateTags(ctx: RequestCtx, deps: CpDeps) {
 async function removeTemplateTag(ctx: RequestCtx, deps: CpDeps) {
   const { p, cat, prov, d0 } = await ownTemplate(ctx, deps, 'removes its tags');
   const tag = ctx.params.tag ?? '';
+  if (!TEMPLATE_ID_RE.test(tag))
+    throw new CpError('invalid_request', `tag '${tag}' must match ${TEMPLATE_ID_RE.source}`);
   if (tag === 'default')
     throw new CpError(
       'invalid_request',
       'the default tag is moved (POST …/tags), never removed: the bare id must resolve',
     );
-  const before = d0.tags[tag];
+  // An own property only: a tag such as `constructor` is not Object.prototype's.
+  const before = Object.hasOwn(d0.tags, tag) ? d0.tags[tag] : undefined;
   if (before === undefined)
     throw new CpError('template_not_found', `no tag '${tag}' on this template`);
   await cat.update(d0.id, async (cur) => {
@@ -1953,7 +1958,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const tags = Object.entries(d.tags)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([tag, buildId]) => {
-        const m = d.tagsMeta?.[tag];
+        const m = d.tagsMeta && Object.hasOwn(d.tagsMeta, tag) ? d.tagsMeta[tag] : undefined;
         return { tag, buildId, assignedAt: m?.at ?? d.createdAt, assignedBy: m?.by ?? d.owner };
       });
     return { status: 200, body: { tags } };
