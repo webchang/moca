@@ -199,6 +199,18 @@ export function graceUntil(b: TemplateBuild, graceS: number, nowS: number): numb
  */
 export const hostManaged = (b: TemplateBuild): boolean => b.buildId.startsWith('sha256:');
 
+/** A build an admin rejected after the fact (§5.2), as against one policy rejected at registration. */
+export const rejectedByAdmin = (b: TemplateBuild): boolean =>
+  b.status === 'rejected' && b.reason?.rule === 'admin';
+
+/**
+ * A build whose use has ended while its worker may still run (draining a live sandbox until its
+ * host stops it): a retired one (§5.1), or one an admin rejected after the fact (§5.2). One
+ * rejected at registration never had a worker.
+ */
+export const endedWithWorker = (b: TemplateBuild): boolean =>
+  (b.status === 'retired' || rejectedByAdmin(b)) && b.worker !== '';
+
 /** The wanted builds, their leases' earliest start breaking ties: first leased, first placed. */
 export function wantedBuilds(
   docs: TemplateDoc[],
@@ -219,7 +231,8 @@ export function wantedBuilds(
 /**
  * Placement (§6.2, with its memory rule). Each host's count starts at the workers that stay
  * running on it whatever this pass decides: the wanted builds it runs, and the unleased ones it
- * runs whose worker has a live sandbox (`busy`: they drain, and are never stopped under one). Then,
+ * runs whose worker has a live sandbox (`busy`: they drain, and are never stopped under one),
+ * retired and admin-rejected builds included. Then,
  * in the wanted order (first leased, first placed), a build already running on a holder stays there
  * (the first by id, when more than one runs it), counted already and paid for: no start at all
  * (§6.5), and no displacement for it; any other goes to a holder under its activeLimit, the one
@@ -268,11 +281,15 @@ export function place(
   const wantedIds = new Set(wanted.map((w) => w.build.buildId));
   const workerOf = new Map<string, string>();
   const buildOfWorker = new Map<string, string>();
+  // A retired or admin-rejected build's worker still draining a live sandbox keeps running too
+  // (§5.1, §5.2), so it counts against its host's activeLimit while it drains. A worker id that a
+  // registered build also has names that build in the memory report.
   for (const d of docs)
     for (const b of d.builds)
-      if (b.status === 'registered') {
+      if (b.status === 'registered' || endedWithWorker(b)) {
         workerOf.set(b.buildId, b.worker);
-        if (b.worker) buildOfWorker.set(b.worker, b.buildId);
+        if (b.worker && (b.status === 'registered' || !buildOfWorker.has(b.worker)))
+          buildOfWorker.set(b.worker, b.buildId);
       }
   // Every build's cost by its worker, whatever its status: a draining or retired build's worker
   // that still runs holds its memfile as much as a wanted one's.

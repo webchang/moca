@@ -21,6 +21,7 @@ import {
 import {
   hostManaged,
   lastLeaseEnd,
+  rejectedByAdmin,
   liveLeases,
   place,
   readinessOf,
@@ -32,7 +33,7 @@ import {
   type StartQueue,
 } from './activation.js';
 import { activationLock, templateUseLock } from './activation-lock.js';
-import { busyWorkers, freshHosts, hostViewsOf } from './host-handlers.js';
+import { busyWorkers, freshHosts, hostViewsOf, liveSnapshots } from './host-handlers.js';
 import {
   checkCreate,
   normalizeSpec,
@@ -264,8 +265,16 @@ interface ReadinessFacts {
    * its startConcurrency; null without placement or presence.
    */
   queue: StartQueue | null;
-  /** The hosts as last reported, for each build's `heldBy` (null without host agents). */
+  /** The fresh hosts as last reported (placement's), for start lines (null without host agents). */
   hosts: HostView[] | null;
+  /**
+   * Every host as last reported, stale ones too, for each build's `heldBy`: it is the snapshot
+   * inventory, not placement, and a silent host still holds what it last reported (it is told to
+   * remove a retired build once it reports again). Null without host agents.
+   */
+  holders: HostView[] | null;
+  /** Whether a build's snapshot or worker a build whose use has not ended shares (liveSnapshots). */
+  shared: (b: TemplateBuild) => boolean;
   /** The current policy's trusted gate records (G41 (c): attestation and visibility in effect). */
   trusted: ReadonlySet<string>;
   nowS: number;
@@ -278,11 +287,23 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
   const nowS = seconds(deps);
   const trusted = await trustedSet(deps);
   const hosts = hostViews(deps);
+  // Every template, not only those the caller sees: sharing is judged across the catalog, as the
+  // wanted state judges it.
+  docs ??= await catalog(deps).list();
+  const shared = liveSnapshots(docs);
   // The workers with a live sandbox: they drain and keep their slot, and are never graced.
   const placement =
-    hosts.length > 0
-      ? place(docs ?? (await catalog(deps).list()), hosts, nowS, await busyWorkers(deps, nowS))
-      : null;
+    hosts.length > 0 ? place(docs, hosts, nowS, await busyWorkers(deps, nowS)) : null;
+  // Fresh hosts only for placement (HOST_STALE_S); every reported host for `heldBy`.
+  const holders = viewsOrNull(
+    deps,
+    (deps.hosts?.all() ?? []).map(([id, h]) => ({
+      id,
+      holds: h.holds,
+      activeLimit: h.limits.activeLimit,
+      running: h.running,
+    })),
+  );
   let attached: Map<string, number> | null = null;
   if (deps.presence) {
     try {
@@ -292,10 +313,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       attached = null;
     }
   }
-  const queue =
-    placement && attached
-      ? startQueue(docs ?? (await catalog(deps).list()), hosts, placement, attached, nowS)
-      : null;
+  const queue = placement && attached ? startQueue(docs, hosts, placement, attached, nowS) : null;
   if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
     return {
       attached,
@@ -304,6 +322,8 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       placement,
       queue,
       hosts: viewsOrNull(deps, hosts),
+      holders,
+      shared,
       trusted,
       nowS,
     };
@@ -322,6 +342,8 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     placement,
     queue,
     hosts: viewsOrNull(deps, hosts),
+    holders,
+    shared,
     trusted,
     nowS,
   };
@@ -359,13 +381,17 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
             inUse: f.inUse === null ? null : (f.inUse.get(b.worker) ?? 0),
           }
         : null,
+    // A retired or admin-rejected build whose snapshot or worker a build whose use has not ended
+    // shares: no host removes it for this one, its worker kept for that build. False otherwise.
+    shared: (b.status === 'retired' || rejectedByAdmin(b)) && f.shared(b),
     lastUsedAt: f.lastUsed === null ? null : (f.lastUsed.get(b.worker) ?? null),
-    // The hosts whose last inventory holds this build's snapshot (§6.1): ids only, no paths. A
-    // client sees a retired build's removal here as its host drops out. Null without host agents.
+    // The hosts whose last inventory holds this build's snapshot (§6.1), a host silent past
+    // HOST_STALE_S too: ids only, no paths. A client sees a retired build's removal here as its
+    // host drops out. Null without host agents.
     heldBy:
-      f.hosts === null
+      f.holders === null
         ? null
-        : f.hosts
+        : f.holders
             .filter((h) => h.holds[b.buildId] !== undefined)
             .map((h) => h.id)
             .sort(),

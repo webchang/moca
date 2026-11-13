@@ -118,6 +118,14 @@ added or removed.
   is written inside the catalog update, so a record that cannot be written leaves the build as it
   was; its `buildRecord` is the build's `build` record matched by handle, so a build built and then
   rejected cites it too.
+- The wanted state never stops or removes a retired or admin-rejected build whose snapshot
+  (manifest hash) or worker a build whose use has not ended shares, in any template: that build's
+  own entries decide whether the worker runs, a host's `removed` report of it is refused
+  `409 build_in_use`, and `TemplateBuild` reports `shared: true` (`retire --wait` is then done at
+  once). One worker id is never in both `run` and `stop`. A retired or admin-rejected build's
+  worker still draining a live sandbox counts against its host's activeLimit. `heldBy` lists every
+  host as last reported, a silent one too. A `T.unique` rejection naming a retired build says how to
+  rebuild.
 
 ### 1.13.0
 

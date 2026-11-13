@@ -1169,6 +1169,27 @@ describe('templates retire --wait (§3.4)', () => {
     expect(await w.run(['templates', 'retire', 'my-python', '--wait', '--timeout', '7'])).toBe(5);
     expect(await w.run(['templates', 'retire', 'my-python', '--timeout', '7'])).toBe(2);
   });
+
+  it('is done at once for a shared build: no host removes it for this retire', async () => {
+    const w = world({
+      'POST /v1/templates/my-python/retire': () => ({
+        status: 200,
+        body: {
+          templateId: 'my-python',
+          subject: 'github:1',
+          status: 'retired',
+          builds: [{ build: HANDLE, buildId: BUILD_ID, readiness: 'retired', record: 'sha256:r' }],
+        },
+      }),
+      [`GET ${BUILD_PATH}`]: () => ({
+        status: 200,
+        body: build({ status: 'retired', readiness: 'retired', heldBy: ['kvm-1'], shared: true }),
+      }),
+    });
+    expect(await w.run(['templates', 'retire', 'my-python', '--wait', '--timeout', '7'])).toBe(0);
+    expect(w.err()).toContain('also serves a build that is not retired, so no host removes it');
+    expect(w.clock.slept).toEqual([]);
+  });
 });
 
 describe('admin writes: read, write, compare (§3.6)', () => {

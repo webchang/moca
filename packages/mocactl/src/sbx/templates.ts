@@ -716,7 +716,9 @@ export async function cmdDeactivate(c: SbxCtx, id: string, stopNow: boolean): Pr
 
 /**
  * `templates retire … --wait` (§3.4): after the retire, until each build it named reads `retired`
- * and no host holds it (`heldBy` empty, or null on a deployment without host agents).
+ * and no host holds it (`heldBy` empty, or null on a deployment without host agents). A `shared`
+ * build (its snapshot or worker serves a build that is not retired) is done at once: no host
+ * removes it for this retire, its worker kept for that build, and that is said.
  */
 export async function waitRetired(
   c: SbxCtx,
@@ -731,13 +733,19 @@ export async function waitRetired(
         id,
         build,
         timeoutS,
-        (x) => x.status === 'retired' && (x.heldBy === null || x.heldBy.length === 0),
+        (x) =>
+          x.status === 'retired' &&
+          (x.shared === true || x.heldBy === null || x.heldBy.length === 0),
         (x) =>
           `${x.status}${x.heldBy?.length ? `, still held by ${x.heldBy.map(sanitizeRemote).join(',')}` : ''}`,
       );
       if (b === 'timeout')
         return timedOut(c, `${id} ${build} to be gone from every host`, timeoutS);
-      c.io.err(`${sanitizeRemote(id)} ${sanitizeRemote(build)}: retired, held by no host`);
+      c.io.err(
+        b.shared === true
+          ? `${sanitizeRemote(id)} ${sanitizeRemote(build)}: retired; its snapshot or worker also serves a build that is not retired, so no host removes it for this one`
+          : `${sanitizeRemote(id)} ${sanitizeRemote(build)}: retired, held by no host`,
+      );
     }
     return SBX_EXIT.ok;
   } catch (err) {

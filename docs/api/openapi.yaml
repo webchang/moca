@@ -431,7 +431,15 @@ components:
           description: |
             the ids of the hosts whose last inventory holds this build's snapshot (template lifecycle
             spec §6.1), sorted; no paths. A retired build's host drops out once it has removed it.
+            A host silent past HOST_STALE_S is still listed (it still holds what it last reported).
             `[]` when no host holds it; null on a deployment without host agents
+        shared:
+          type: boolean
+          description: |
+            true for a retired or admin-rejected build whose snapshot (manifest hash) or worker a
+            build whose use has not ended also has, in any template: no host stops or removes it
+            for this one (that build's own entries decide), and a host's `removed` report of it is
+            refused 409 build_in_use. False otherwise
         tags: { type: array, items: { type: string } }
         createdAt: { type: integer, description: epoch seconds }
         provenance:

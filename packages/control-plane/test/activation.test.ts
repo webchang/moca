@@ -1299,6 +1299,75 @@ describe('retire (§5.1)', () => {
       leases: [],
     });
   });
+
+  const wanted = async (d: TestDeps, host: string) =>
+    (await HANDLERS.hostWanted!(asHost(host), d)).body as Body;
+
+  it('never stops or removes a retired build whose snapshot or worker a build not retired shares', async () => {
+    const d = await setup();
+    attachedNow = [];
+    const report = (buildId: string, event: string) =>
+      HANDLERS.hostWorkerReport!(asHost('host-1', {}, { buildId, event }), d);
+    // The same snapshot (manifest hash) registered again, in another template, beside a retired one.
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('1'), 'sbx_t2');
+    // The same worker id kept by another build of the template (another spec, another hash).
+    await registered(d, 't3', hash('3'), 'sbx_t3');
+    await registered(d, 't3', hash('4'), 'sbx_t3', alice, { another: true, vcpus: 4 });
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('3')]: 't3', [hash('4')]: 't3' }, 2);
+    await retire(d, 't1');
+    await retireBuild(d, 't3', hash('3'));
+    const w = await wanted(d, 'host-1');
+    expect(w.remove).toEqual([]);
+    expect(w.stop).not.toContainEqual(expect.objectContaining({ template: 't1' }));
+    expect(w.stop).not.toContainEqual(expect.objectContaining({ buildId: hash('3') }));
+    // Its `removed` is refused, and the live build keeps its host.
+    expect(await refusal(() => report(hash('1'), 'removed'))).toBe('build_in_use');
+    expect(await refusal(() => report(hash('3'), 'removed'))).toBe('build_in_use');
+    const held = (id: string, build: string) =>
+      HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id, build } }), d);
+    expect(((await held('t2', hash('1'))).body as Body).heldBy).toEqual(['host-1']);
+    // Once the sharing build is retired too, both are removed as any retired build is.
+    await retireBuild(d, 't3', hash('4'));
+    const entry = (b: string) => ({ template: 't3', buildId: b, worker: 'sbx_t3' });
+    const both = (await wanted(d, 'host-1')).remove as unknown[];
+    expect(both).toHaveLength(2);
+    expect(both).toEqual(expect.arrayContaining([entry(hash('3')), entry(hash('4'))]));
+    expect(((await report(hash('3'), 'removed')).body as Body).recorded).toBe('removed');
+  });
+
+  it('never lists one worker in run and stop for two registered builds that share it', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't1', hash('2'), 'sbx_t1', alice, { another: true, vcpus: 4 });
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't1' }, 2);
+    // Build 2 is leased and placed; build 1, unleased, would be stopped, but its worker is build 2's.
+    await activate(d, 't1', alice, { build: hash('2') });
+    expect(await wanted(d, 'host-1')).toMatchObject({
+      run: [{ template: 't1', buildId: hash('2'), worker: 'sbx_t1' }],
+      stop: [],
+      remove: [],
+    });
+  });
+
+  it('keeps a silent host in heldBy: the build is still its to remove once it reports', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    await retire(d, 't1');
+    // The host stops reporting past HOST_STALE_S (it is left out of placement) while its worker
+    // still runs: it still holds the build, so a waiting client keeps waiting.
+    now += (HOST_STALE_S + 1) * 1000;
+    const b = (
+      await HANDLERS.getTemplateBuild!(
+        ctx({ principal: alice, params: { id: 't1', build: hash('1') } }),
+        d,
+      )
+    ).body as Body;
+    expect(b).toMatchObject({ heldBy: ['host-1'] });
+  });
 });
 
 describe('tags (§3.2, §5.1)', () => {
@@ -2225,6 +2294,61 @@ describe('place, alone', () => {
   });
   it('reads readiness unknown when presence is unreadable', () => {
     expect(readinessOf(doc('a', hash('a'), 0).builds[0]!, 0, null, null)).toBe('unknown');
+  });
+
+  it("counts a retired build's worker draining a live sandbox against its host, until the sandbox ends", () => {
+    const r = doc('r', hash('r'), 0);
+    const retired: TemplateDoc = {
+      ...r,
+      builds: [{ ...r.builds[0]!, status: 'retired', leases: [] }],
+    };
+    const docs = [retired, doc('a', hash('a'), 1)];
+    const hosts = [
+      {
+        id: 'h1',
+        holds: { [hash('r')]: 'r', [hash('a')]: 'a' },
+        activeLimit: 1,
+        running: [hash('r')],
+      },
+    ];
+    // A sandbox still runs on the retired build's worker: it drains, and keeps h1's one slot.
+    const draining = place(docs, hosts, 0, new Set(['w_r']));
+    expect(draining.used.get('h1')).toBe(1);
+    expect(draining.placed.has(hash('r'))).toBe(false);
+    expect(draining.unplaced.get(hash('a'))).toBe('no_slot');
+    // Once the sandbox ends, the slot is free.
+    const ended = place(docs, hosts, 0, new Set());
+    expect(ended.placed.get(hash('a'))).toBe('h1');
+  });
+
+  it("counts an admin-rejected build's worker draining a live sandbox, as a retired one's", () => {
+    const r = doc('r', hash('r'), 0);
+    const rejected = (rule: string): TemplateDoc => ({
+      ...r,
+      builds: [
+        {
+          ...r.builds[0]!,
+          status: 'rejected',
+          leases: [],
+          reason: { message: 'broken', rule, step: 'rejected' },
+        },
+      ],
+    });
+    const hosts = [
+      {
+        id: 'h1',
+        holds: { [hash('r')]: 'r', [hash('a')]: 'a' },
+        activeLimit: 1,
+        running: [hash('r')],
+      },
+    ];
+    const busy = new Set(['w_r']);
+    const draining = place([rejected('admin'), doc('a', hash('a'), 1)], hosts, 0, busy);
+    expect(draining.used.get('h1')).toBe(1);
+    expect(draining.unplaced.get(hash('a'))).toBe('no_slot');
+    expect(place([rejected('admin'), doc('a', hash('a'), 1)], hosts, 0).placed.get(hash('a'))).toBe(
+      'h1',
+    );
   });
 });
 
