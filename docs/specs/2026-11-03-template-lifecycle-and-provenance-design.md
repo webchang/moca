@@ -377,6 +377,8 @@ the subject holds active at once). An activation over the subject's `active` quo
 subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded` (as
 built: refused, `429 quota_exceeded` with `quota: active`; see §6.3). A
 create over `templates` or `buildsQueued` is `429 quota_exceeded` with `Retry-After` for the latter.
+The quota is read and the build written under one lock per subject, so concurrent creates for
+different ids never pass one check together.
 Build claims take subjects in turn, so one subject's batch of 50 does not hold every slot.
 
 ### 6.3 Aging and replacement (A16)
