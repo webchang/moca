@@ -544,6 +544,24 @@ remove_read_ahead() {
   systemctl daemon-reload || true
 }
 
+# check_template_record WORKER_ID: when template-build.sh wrote a record for the snapshot
+# ($SBX_SRV/templates/<snapshot>.json), the worker is wired to it (SH_TEMPLATE_RECORD and
+# SANDBOX_TEMPLATE, below), so it checks the record against its snapshot at every start. The record
+# must be a template record and name this worker: a bundle of another worker is refused here, before
+# anything is written or systemd is touched, rather than left to crash-loop. No record (a snapshot
+# built without template-build.sh): no check, as before.
+check_template_record() {
+  local rec="$SBX_SRV/templates/$SNAPSHOT.json" tid worker
+  [[ -e "$rec" ]] || return 0
+  command -v jq >/dev/null || die "needs jq on PATH to read the template record $rec"
+  [[ "$(jq -r '.schema // empty' "$rec" 2>/dev/null)" == moca-sbx-template/1 ]] ||
+    die "$rec is not a template record (schema moca-sbx-template/1, from template-build.sh)"
+  tid="$(jq -r '.id // empty' "$rec")" worker="$(jq -r '.worker // empty' "$rec")"
+  [[ "$tid" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "$rec has no valid template id"
+  [[ "$worker" == "$1" ]] ||
+    die "the template record $rec is for worker ${worker:-<none>}, not this bundle's $1: pass the bundle of $worker, or the snapshot of $1"
+}
+
 # validate_worker reads and checks the bundle and the flags, setting W_ID, W_ADDR, W_TOK, W_IDLE,
 # W_IMAGE_MB and (check_snapshot_ram) W_GUEST_MB. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
 validate_worker() {
@@ -572,6 +590,7 @@ validate_worker() {
   check_snapshot_ca
   check_snapshot_ram
   check_jail_path "$id"
+  check_template_record "$id"
   W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb"
 }
 

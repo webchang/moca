@@ -124,6 +124,21 @@ grep -qx 'SANDBOX_TEMPLATE=py312' "$B" || fail "$B: SANDBOX_TEMPLATE is not the 
 ! grep -q '^SANDBOX_TEMPLATE=' "$A" || fail "$A: SANDBOX_TEMPLATE set with no record"
 pass "two workers: 0600 env files, own slice, jail and workspace root, the bundle's idle and image size, the template record and its id as SANDBOX_TEMPLATE when there is one"
 
+# A record for another worker, or a file that is not a template record, is refused before anything
+# is written or systemd is touched (rather than left to crash-loop at the worker's own check).
+cp "$MOCK_LOG" "$TMP/mock.kept"; : >"$MOCK_LOG"
+! bash "$INSTALL" "$(bundle sbx_other)" --snapshot py312 >"$TMP/out" 2>&1 || fail "installed another worker's bundle on a recorded snapshot"
+grep -q 'is for worker sbx_py312, not this bundle' "$TMP/out" || fail "the record refusal does not name both workers: $(cat "$TMP/out")"
+[[ ! -e "$SBX_ENV_DIR/workers/sbx_other.env" ]] && ! grep -q systemctl "$MOCK_LOG" || fail 'wrote or touched systemd before refusing the record'
+cp "$SBX_SRV/templates/py312.json" "$TMP/py312.json.kept"
+printf '{"schema":"other/1"}\n' >"$SBX_SRV/templates/py312.json"
+! bash "$INSTALL" "$(bundle sbx_py312)" --snapshot py312 >"$TMP/out" 2>&1 || fail 'accepted a record of another schema'
+grep -q 'is not a template record' "$TMP/out" || fail 'the schema refusal does not say why'
+! grep -q systemctl "$MOCK_LOG" || fail 'touched systemd before refusing a record of another schema'
+cp "$TMP/py312.json.kept" "$SBX_SRV/templates/py312.json"
+cat "$TMP/mock.kept" "$MOCK_LOG" >"$TMP/mock.both" && cp "$TMP/mock.both" "$MOCK_LOG"
+pass "a template record for another worker, or not a template record, is refused before anything is written"
+
 # The jail is keyed by a short digest of the worker id, so the longest worker id SBX0 can have
 # (a 31-character template) still fits the VMs' API socket paths; too long a SBX_SRV is refused.
 LONG=sbx_scikit_learn_scikit_learn_13439_96d81f0b74e2
