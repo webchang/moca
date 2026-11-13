@@ -18,6 +18,8 @@ added or removed.
   would change nothing.
 - A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from the settings and any
   role); enrolling a subject the settings enroll writes nothing (`record: null`).
+- A grant's `until` is at most 366 days ahead (`400 invalid_request` beyond), so a value in epoch
+  milliseconds is refused rather than read as a grant that never lapses.
 
 ### 1.13.0
 

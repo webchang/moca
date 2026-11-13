@@ -181,7 +181,7 @@ adds to them without a `setup.sh` run (an API-granted admin can't change access:
 ```bash
 mocactl sbx admin subjects                                   # who is enrolled, and how
 mocactl sbx admin subjects enroll github:<id>                # or unenroll
-mocactl sbx admin subjects grant github:<id> --until 1h      # a temporary admin: lapses by itself
+mocactl sbx admin subjects grant github:<id> --until 1h      # a temporary admin: lapses by itself (365d at most)
 mocactl sbx admin subjects revoke github:<id>
 ```
 

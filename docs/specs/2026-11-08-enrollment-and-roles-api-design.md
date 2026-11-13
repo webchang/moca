@@ -52,7 +52,9 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
   bootstrap: say it in every answer.
 - **Roles are evaluated per request** from the store, plus the bootstrap list, not only at token issue.
   A revoked admin loses the role at its next request. Token claims keep `roles` for display only.
-- **An admin grant may carry an expiry** (`until`, epoch seconds). Past it, the role is no longer
+- **An admin grant may carry an expiry** (`until`, epoch seconds, at most 366 days ahead, so a value
+  in milliseconds is refused rather than read as a date that never comes; mocactl stops at 365 days,
+  leaving a day for a client clock that runs ahead of the server's). Past it, the role is no longer
   evaluated as held. The store keeps the grant, and the first request that sees it lapsed writes a
   `role` record (`expired`) once, as the janitor's sweep does for an expired sandbox.
 - **Only the settings' admins change access.** Enrolling, unenrolling, granting and revoking need an
