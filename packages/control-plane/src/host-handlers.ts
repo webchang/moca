@@ -16,6 +16,7 @@ import {
 import { isEnrolledForSandbox } from './sandbox-config.js';
 import { isLive, type SandboxRecord } from './sandbox-store.js';
 import {
+  EGRESS_DROP_REPORT_MAX,
   EGRESS_DROP_WINDOW_S,
   EGRESS_GRACE_S,
   EGRESS_POST_MAX,
@@ -545,7 +546,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     for (const raw of b.events) {
       const o = asRecord(raw);
       if (raw === o && o.decision === 'audit_dropped' && !o.sid) {
-        const n = nonNeg(o.dropped) ?? 0;
+        const n = Math.min(nonNeg(o.dropped) ?? 0, EGRESS_DROP_REPORT_MAX);
         const t = eventSeconds(o, nowS);
         dropped += n;
         for (const r of mine)

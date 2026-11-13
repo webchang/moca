@@ -8,9 +8,10 @@ import { canonicalJson } from './provenance.js';
  * internal/egress/audit.go `Event`) as they are; each event whose `sid` is a sandbox's workspace
  * key is appended, in arrival order, to that sandbox's log.
  *
- * What is stored is the event exactly as the proxy wrote it, as one canonical JSON line
- * (provenance.ts's canonicalJson): an event naming any field the proxy's Event does not is refused,
- * never trimmed, so nothing reaches the log that the proxy did not log.
+ * What is stored is the event's fields and values as the proxy wrote them, as one canonical JSON
+ * line (provenance.ts's canonicalJson; the bytes may differ from the proxy's, e.g. in escaping): an
+ * event naming any field the proxy's Event does not is refused, never trimmed, so nothing reaches
+ * the log that the proxy did not log.
  *
  * The log's digest is `sha256:` + the hex sha256 of its NDJSON export: every stored line, in
  * arrival order, each followed by one `\n` (the empty log's is the sha256 of no bytes). It is
@@ -83,6 +84,13 @@ export const EGRESS_GRACE_S = 600;
  * incomplete, never the reverse.
  */
 export const EGRESS_DROP_WINDOW_S = 60;
+/**
+ * One `audit_dropped` report's count is taken up to this many (a larger one counts as this many):
+ * the charge goes to every sandbox in the window, so one malformed report must not write a huge
+ * count into all of them, nor overflow a counter (Redis HINCRBY) and fail the whole post. A log so
+ * charged is incomplete either way.
+ */
+export const EGRESS_DROP_REPORT_MAX = 1_000_000;
 const MAX_STRING = 4096;
 const MAX_LINE = 8192;
 
@@ -187,6 +195,13 @@ export interface EgressStore {
 }
 
 export const ENTRY_ID_RE = /^[0-9]{1,20}-[0-9]{1,20}$/;
+
+/** Stream ids (`<ms>-<seq>`) in Redis's order: by ms, then seq, each a 64-bit number. */
+export function compareEntryIds(a: string, b: string): number {
+  const [am, as] = a.split('-').map(BigInt) as [bigint, bigint];
+  const [bm, bs] = b.split('-').map(BigInt) as [bigint, bigint];
+  return am !== bm ? (am < bm ? -1 : 1) : as === bs ? 0 : as < bs ? -1 : 1;
+}
 const PAGE = 1000;
 
 export interface EgressSummary {
@@ -346,10 +361,11 @@ export class MemoryEgressStore implements EgressStore {
     return a;
   }
 
+  /** As Redis XRANGE `(after`: the entries whose id is after `after` in stream-id order. */
   async page(id: string, after: string | null, limit: number) {
     const es = this.logs.get(id)?.entries ?? [];
-    const from = after === null ? 0 : es.findIndex((e) => e.id === after) + 1;
-    return es.slice(from, from + limit);
+    const from = after === null ? 0 : es.findIndex((e) => compareEntryIds(e.id, after) > 0);
+    return from < 0 ? [] : es.slice(from, from + limit);
   }
 
   async meta(id: string) {
