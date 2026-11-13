@@ -2643,7 +2643,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
+          description: '`not_enrolled`, or `forbidden`: not an admin'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2700,13 +2700,13 @@ paths:
                   before: { type: [string, 'null'] }
                   record: { type: [string, 'null'] }
         '400':
-          description: '`invalid_request`: a malformed or unenrolled subject, or a declared template'
+          description: '`invalid_request`: a malformed or unenrolled subject (a declared template is handed over, `before: null`)'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
+          description: '`not_enrolled`, or `forbidden`: not an admin'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2898,7 +2898,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`not_enrolled`, or `forbidden`: not an admin, or (a change) not an admin named in the settings'
+          description: '`not_enrolled`, or `forbidden`: not an admin'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3665,8 +3665,8 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
   /v1/sandboxes:
     description: |
-      Sandbox service control planes only (`SH_ROUTE_PROFILE=sandbox`); a MOCA control plane answers
-      404 (SBX0 §4.1).
+      Sandbox service and combined control planes (`SH_ROUTE_PROFILE=sandbox` or `combined`); a
+      harness-only control plane answers 404 (SBX0 §4.1).
     post:
       operationId: createSandbox
       summary: Create a sandbox

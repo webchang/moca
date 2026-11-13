@@ -2,8 +2,11 @@
 
 - **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); implemented (merged 6b4ce998);
   the control plane **deployed** on both ykt3 namespaces 2026-11-09 (image 2810c77f); the host agent's
-  shipping installed since the guide window (2026-11-09) but **unverified live**: moca-egress was off at
-  every window since, so it shipped nothing (register G42). §3-§5 describe the build.
+  shipping installed since the guide window (2026-11-09) and **verified live** at the G49 window
+  (2026-11-11): with moca-egress started for one egress template, the host agent shipped each of two
+  sandboxes' events (an allowed host reached, another refused), the control plane served them, and each
+  log verified offline against its sandbox's end record (`verify-provenance.py --egress`; register
+  G42). §3-§5 describe the build.
 - **Date:** 2026-11-08
 - **Asked by:** the user, 2026-11-08: "per-sandbox egress records available through Moca API
   operations … a key requirement for Moca". A benchmark grader voids a rep for a download its rules
@@ -76,7 +79,7 @@ provenance.
 
 - **Store, in the control plane:**
   - **Where:** Redis (where the sandbox records live): a stream `sh:sbx:egress:<sandboxId>` (one
-    canonical line per event, capped at 50,000), a hash `…:meta` (drop counts, sealed), and a key
+    canonical line per event, capped at 10,000 per sandbox and 200,000 across all logs), a hash `…:meta` (drop counts, sealed), and a key
     per host (`sh:sbx:egress:host:<host>`, its last cursor, for replays). Kept as long as the
     sandbox record: its end plus the sandbox retention (`SH_SANDBOX_RETENTION_SECONDS`, 14 days).
   - **Who:** an event is stored only when its `sid` is the workspace key of a sandbox on a worker of
@@ -85,7 +88,7 @@ provenance.
   - `GET /v1/sandboxes/{id}/egress?after=<next>&limit=N` (1-1000, default 100), for whoever may read
     the sandbox (its owner or an admin), gives `{events, next, summary}`;
   - `summary`: `byHost` (count, decisions, bytes up and down per destination host), `total`,
-    `dropped`, `droppedBy` (`proxy`, `cap`, `invalid`), `complete`, `sealed`, `sha256`.
+    `dropped`, `droppedBy` (`proxy`, `cap`, `budget`, `invalid`), `complete`, `sealed`, `sha256`.
 - **The digest:** `sha256:` and the hex sha256 of the NDJSON export: each stored event's canonical
   JSON (the provenance canonicalization) followed by one newline, in arrival order.
 - **Provenance:** the sandbox's `terminated` record (deleted or expired) gains

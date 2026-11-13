@@ -844,11 +844,13 @@ The two `HOME`s are two enrolled users' logins (§13, or `mint-login.sh`, §4). 
 in its own template's and anything else in the others'. `SBX_CHECK_EXEC=0` checks the control plane
 alone, before any worker is installed. `--help` lists every input and check.
 
-## 15. The template host agent (preview)
+## 15. The template host agent
 
-> **Preview, not yet installed by `install-host.sh`.** The self-serve template build of the
-> [template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md)
-> §6.1; not proven on a KVM host yet.
+The self-serve template build of the
+[template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+§6.1. It has run on the KVM host at every window since window 1 (2026-11-04; the spec's §10.1 and
+the register's later windows). `install-host.sh` does not install it: install its units by hand, as
+below.
 
 `deploy/sbx/host-agent.sh --once` is one poll of a KVM host's agent. It reports what the host holds,
 claims queued template builds (clients create them with `POST /v1/templates`), runs

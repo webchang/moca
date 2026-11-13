@@ -870,9 +870,10 @@ On a deployment with the template store (the combined control plane, image `87b0
   capture is `{error}` and does not fail the turn. Each turn's patch is the whole end state, so a
   client takes the last turn's. Extract it with `jq -j` (shell `$(…)` drops the trailing newline, and
   the checksum then differs).
-- **Creating the session for `ID@build`:** today `mocactl run --option sandboxTemplate=` accepts
-  only the deployment's declared ids, and refuses `ID@sha256:…` before sending anything (register
-  G37). Create the session through the API, then run it:
+- **Creating the session for `ID@build`:** `mocactl run --option sandboxTemplate=ID@sha256:<build>`
+  sends a value that is not among the deployment's declared ids as given, and the control plane
+  resolves it (`ID`, `ID:tag` or `ID@sha256:…`; register G37, fixed in ff683b15). Or create the
+  session through the API, then run it:
 
   ```bash
   curl -sS -X POST -H @<header file with your api token> -H 'Content-Type: application/json' --data '{"sandbox": {"template": "django-django-11133@sha256:<build>"}, "model": "<model id>", "credentials": {"inference": "<name>"}}' https://sbx-api.example.com/v1/sessions

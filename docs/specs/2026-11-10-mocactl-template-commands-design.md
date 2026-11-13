@@ -197,8 +197,9 @@ departs from §3, and why:
   the inputs decide: the gate record passed and is for this image (X1, X1.image, X1.offline),
   egress off (X11), commits refused with `skip_git_identity_check` (X12), `probe_status` (X14), the
   exact size (X15). The trust of the record (X1.trusted, the self-attested scope) and quotas stay
-  the server's. Its two id and image rules are named `M7.spec_id` and `M7.spec_image` (the
-  control plane names no such rule today: it ignores the spec's own id and image). `base` with a
+  the server's. Its two id and image rules are named `M7.spec_id` and `M7.spec_image`, as the
+  control plane's are (`template-policy.ts`, c918b57d: a spec that names a different id or image
+  than the create's is refused). `base` with a
   gate record is a local refusal, `gate.profile`.
 - **`create --seed` checks HEAD only when the build's spec names `baseline_commit`**: the spec
   schema has no head field today (image-factory's records carry `baseline_commit` beside the

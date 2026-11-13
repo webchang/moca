@@ -324,8 +324,9 @@ SBX0 §8.3). It has two jobs:
 
 - **Build** (self-serve, new in 0.4): it claims `queued` builds and runs `template-build.sh` on them,
   as an operator does today, then installs the worker (`install-host.sh`) without starting it. A build
-  is claimed only when the host's free disk stays above its floor after one more snapshot (the
-  `template-build.sh` refusal at 60 G, measured 2026-11-01), counting the disk retained workspaces
+  is claimed only when the host's free disk stays above its floor after one more snapshot (the host
+  agent's claim floor `SBX_DISK_FLOOR_GB`, 60 G by default; `template-build.sh`'s own refusal,
+  `SBX_MIN_FREE_GB`, defaults to 50 G; measured 2026-11-01), counting the disk retained workspaces
   may still grow to (each session's sparse workspace, up to `workspace_mb`, kept until
   `SH_WORKSPACE_IDLE`: what filled bm1 in TB, register W8), and at most `buildConcurrency` at a time
   (default 1). The build log is streamed in `logEntries` (§4); the build record follows (§7).
@@ -417,8 +418,9 @@ wait; autobench-moca's runner can do either.
 `POST /v1/sandboxes` on a registered build that is not `active` takes the caller's lease (as
 `activate`, recorded with `reason: first_use`; its refusals `no_active_slot`, `template_unavailable`
 and `quota_exceeded` answer as they would) and answers `409 template_not_active` with `readiness`
-and `Retry-After: 30`; `activate: false` starts nothing. No sandbox record is kept while waiting,
-so a wait never uses the live-sandbox cap. Without host agents nothing changes. `mocactl sbx create`
+and `Retry-After`: the start line's estimate when the host reports a measured start time (an
+`activating` build in the host's start line; register G43), else 30 s; `activate: false` starts
+nothing. No sandbox record is kept while waiting, so a wait never uses the live-sandbox cap. Without host agents nothing changes. `mocactl sbx create`
 and `sbx up` retry it for up to 10 minutes, saying why. **Sessions (Moca Pi)** take the same gate
 where a template store exists (combined control plane increment 4, 557c4d26): `POST /v1/sessions`
 resolves `sandbox.template` through the catalog, `sandbox.activate: false` starts nothing, and

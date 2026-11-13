@@ -10,7 +10,8 @@ import type { TokenClaims } from './token.js';
  * The deployment's settings stay the bootstrap and are never edited here: a subject on
  * SH_ALLOWED_SUBJECTS cannot be unenrolled, and one on SH_ADMIN_SUBJECTS cannot lose the role
  * (`409 bootstrap_subject`), so the deployment can always recover. Any admin, bootstrap or
- * API-granted, may grant admin (§6, decision 1); a grant may carry an expiry (decision 4).
+ * API-granted, may list the subjects; only an admin named in SH_ADMIN_SUBJECTS (settingsAdmin)
+ * enrolls, unenrolls, grants or revokes admin. A grant may carry an expiry (decision 4).
  */
 
 function admin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: MembersStore } {
