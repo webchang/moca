@@ -7,7 +7,14 @@ import { HostRegistry } from '../src/host-handlers.js';
 import { ProvenanceStore, sha256Hex, verifyExport } from '../src/provenance.js';
 import { FileTemplateCatalog } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
-import { checkCreate, DEFAULT_POLICY, registryOf, type Policy } from '../src/template-policy.js';
+import {
+  checkCreate,
+  DEFAULT_POLICY,
+  policyProblems,
+  PROFILE_RULES,
+  registryOf,
+  type Policy,
+} from '../src/template-policy.js';
 import { admin, alice, bob, codeOf, ctx, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
 
 // The repository's own worked example: a SWE-bench spec and its image-factory gate record.
@@ -422,6 +429,27 @@ describe('policy and quota routes', () => {
       'github:admin',
       admin.sub,
     ]);
+  });
+
+  it('PUT /v1/policy refuses a rule id no check acts on, and an exact envelope not of whole numbers', () => {
+    const bench = DEFAULT_POLICY.profiles.benchmark!;
+    const withBench = (b: unknown) => ({
+      ...DEFAULT_POLICY,
+      profiles: { ...DEFAULT_POLICY.profiles, benchmark: b },
+    });
+    expect(policyProblems(DEFAULT_POLICY)).toEqual([]);
+    for (const requires of [['X13'], ['x11'], [1]])
+      expect(policyProblems(withBench({ ...bench, requires })).join()).toMatch(/requires/);
+    for (const exact of [
+      { guestMb: '4096', vcpus: 2 },
+      { guestMb: 4096 },
+      { guestMb: 0, vcpus: 2 },
+      null,
+    ])
+      expect(
+        policyProblems(withBench({ ...bench, envelope: { ...bench.envelope, exact } })).join(),
+      ).toMatch(/exact/);
+    expect(PROFILE_RULES).toEqual(DEFAULT_POLICY.profiles.benchmark!.requires);
   });
 
   it("GET /v1/quota shows the limits and the caller's use", async () => {

@@ -40,6 +40,10 @@ added or removed.
   components, then `@sha256:<64 hex>`, at most 255 characters before the `@`. A tag beside the
   digest is refused, and so are references such as `Images/x`, `-x`, `a//b` or `../x`. Registry
   hosts compare case-insensitively (`allowedRegistries` and the image's host).
+- `PUT /v1/policy` refuses a profile `requires` id outside X1, X10, X11, X12, X14, X15 (the ids
+  the check acts on) and an `envelope.exact` that is not two positive whole numbers. A stored policy
+  naming an unknown id, or with such an `exact`, fails closed when read, until an admin sets a
+  valid one: read `GET /v1/policy` and fix it before upgrading.
 
 ### 1.13.0
 

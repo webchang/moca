@@ -229,6 +229,8 @@ export {
 export {
   DEFAULT_POLICY,
   POLICY_SCHEMA,
+  PROFILE_RULES,
+  TEMPLATE_ID_RE,
   checkCreate,
   policyDigest,
   policyProblems,
