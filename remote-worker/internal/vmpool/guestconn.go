@@ -39,8 +39,8 @@ func runOverConn(ctx context.Context, rw io.ReadWriteCloser, c Command, out Sink
 
 	// The whole command travels in ONE request frame, which the guest bounds at
 	// ga.MaxFrame. Refused here, before anything is sent: writing nothing and then
-	// waiting for the guest's answer hung the Exec until the caller's own deadline
-	// (register G26). Stdin has no such bound; it is split across frames below. This
+	// waiting for the guest's answer hung the Exec until the caller's own deadline.
+	// Stdin has no such bound; it is split across frames below. This
 	// comes after the deferred close: this function owns rw, so a refused command still
 	// closes it (the guest's read then ends, and the worker keeps no descriptor for it).
 	req, err := json.Marshal(guestRequest(c, cap, now))
