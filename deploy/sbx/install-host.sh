@@ -4,6 +4,7 @@
 #
 #   sudo deploy/sbx/install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress]
 #   sudo deploy/sbx/install-host.sh --uninstall WORKER_ID [--keep-shared]
+#   sudo deploy/sbx/install-host.sh --uninstall-shared
 #   sudo deploy/sbx/install-host.sh --janitor JANITOR_BUNDLE_DIR
 #   sudo deploy/sbx/install-host.sh --uninstall-janitor
 #   sudo deploy/sbx/install-host.sh --egress EGRESS_BUNDLE_DIR | --uninstall-egress | --egress-ca-out
@@ -47,7 +48,10 @@
 # --keep-shared removes only the worker's own files, even for the last worker: the shared units,
 # moca-egress and its credential injection stay for the next worker (the host agent's removal of a
 # retired build runs it so, so a client's retire never takes a host's egress setup). A plain
-# --uninstall of the same id afterwards removes them, once no worker is left.
+# --uninstall of the same id afterwards removes them, once no worker is left; so does
+# --uninstall-shared, which takes no id: it removes what the manifest lists as shared (the template
+# unit, sbx.slice, the read-ahead with its recorded value written back, and moca-egress), and is
+# refused while the manifest still names a worker.
 #
 # --egress takes deploy/sbx/.generated/egress (egress.env, egress.token [+ api-ca.crt]) and turns on
 # credential injection in the moca-egress this script installed (spec §6.2; refused beside a
@@ -85,6 +89,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SBX_LIBEXEC_DIR:=/usr/local/libexec}"
 : "${SBX_ATTACH_TIMEOUT:=120}"
 : "${SBX_ATTACH_SETTLE:=5}"
+: "${SBX_MOUNTINFO:=/proc/self/mountinfo}" # the mount table remove_legacy_jail checks
 : "${SBX_BIN_DIR:=/usr/local/bin}"
 # The worker binary the template unit runs: SBX0's own build, never deploy/microvm's /usr/local/bin
 # one (see the header).
@@ -110,7 +115,7 @@ die() { echo "deploy/sbx/install-host.sh: $*" >&2; exit 1; }
 
 env_value() { (grep -E "^$1=" "$2" 2>/dev/null || true) | tail -1 | cut -d= -f2-; }
 
-BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' KEEP_SHARED='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS='' EGRESS_BUNDLE='' UNINSTALL_EGRESS='' EGRESS_CA_OUT=''
+BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' KEEP_SHARED='' UNINSTALL_SHARED='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS='' EGRESS_BUNDLE='' UNINSTALL_EGRESS='' EGRESS_CA_OUT=''
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -118,6 +123,7 @@ parse_args() {
     --budget-mb) [[ $# -ge 2 ]] || die '--budget-mb needs a value'; BUDGET_MB="$2"; shift 2 ;;
     --uninstall) [[ $# -ge 2 ]] || die '--uninstall needs a worker id'; UNINSTALL="$2"; shift 2 ;;
     --keep-shared) KEEP_SHARED=1; shift ;;
+    --uninstall-shared) UNINSTALL_SHARED=1; shift ;;
     --janitor) [[ $# -ge 2 ]] || die '--janitor needs the janitor bundle directory'; JANITOR="$2"; shift 2 ;;
     --uninstall-janitor) UNINSTALL_JANITOR=1; shift ;;
     --no-egress) NO_EGRESS=1; shift ;;
@@ -157,7 +163,15 @@ remove_legacy_jail() {
     log "left in place: $old (named like a current jail; remove it by hand if it is $1's old one)"
     return 0
   fi
-  rm -rf -- "$old"
+  # A mount under it (a VM's chroot left mounted) is never recursed into: the jail is left, and GNU
+  # rm also stays on its file system.
+  if [[ -r "$SBX_MOUNTINFO" ]] && awk -v p="$old/" 'index($5 "/", p) == 1 { f = 1 } END { exit !f }' "$SBX_MOUNTINFO"; then
+    log "left in place: $old (a file system is mounted under it; unmount it, then remove it by hand)"
+    return 0
+  fi
+  local one=()
+  ! rm --one-file-system -f -- "$old/.sbx-rm-probe" 2>/dev/null || one=(--one-file-system)
+  rm -rf ${one[@]+"${one[@]}"} -- "$old"
   log "removed $old (this worker's jail from before the jail path was keyed by a digest of the id)"
 }
 
@@ -885,14 +899,27 @@ uninstall_worker() {
   log "left in place: $SBX_SRV/workspaces/$id and $(jail_dir "$id") (workspace data; remove by hand when no sandbox needs it)"
 }
 
+# uninstall_shared: what --keep-shared left once the last worker went (the host agent's removals
+# leave it so). Refused while the manifest names a worker, so it never takes units a worker runs on.
+uninstall_shared() {
+  local left
+  [[ -f "$SBX_ENV_DIR/manifest" ]] || { log "no manifest in $SBX_ENV_DIR: nothing installed here to remove"; return 0; }
+  left="$(sed -n 's/^worker sbx-worker@\([^ ]*\) .*/\1/p' "$SBX_ENV_DIR/manifest" | tr '\n' ' ')"
+  [[ -z "$left" ]] || die "workers are still installed (${left% }): --uninstall each, then --uninstall-shared"
+  remove_shared_units
+  systemctl daemon-reload
+  log "removed the shared units, read-ahead and moca-egress this script installed (no SBX0 worker left on this host)"
+}
+
 main() {
   parse_args "$@"
   [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root'
   local modes=0 m
-  for m in "$BUNDLE" "$UNINSTALL" "$JANITOR" "$UNINSTALL_JANITOR" "$EGRESS_BUNDLE" "$UNINSTALL_EGRESS" "$EGRESS_CA_OUT"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
-  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --janitor, --uninstall-janitor, --egress, --uninstall-egress or --egress-ca-out at a time'
+  for m in "$BUNDLE" "$UNINSTALL" "$UNINSTALL_SHARED" "$JANITOR" "$UNINSTALL_JANITOR" "$EGRESS_BUNDLE" "$UNINSTALL_EGRESS" "$EGRESS_CA_OUT"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
+  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --uninstall-shared, --janitor, --uninstall-janitor, --egress, --uninstall-egress or --egress-ca-out at a time'
   [[ -z "$KEEP_SHARED" || -n "$UNINSTALL" ]] || die '--keep-shared goes with --uninstall'
   if [[ -n "$UNINSTALL" ]]; then uninstall_worker "$UNINSTALL"; return; fi
+  if [[ -n "$UNINSTALL_SHARED" ]]; then uninstall_shared; return; fi
   if [[ -n "$UNINSTALL_JANITOR" ]]; then uninstall_janitor; return; fi
   if [[ -n "$JANITOR" ]]; then install_janitor; return; fi
   if [[ -n "$EGRESS_CA_OUT" ]]; then
@@ -913,7 +940,7 @@ main() {
   if [[ -n "$EGRESS_BUNDLE" ]]; then install_egress_credentials; return; fi
   valid_read_ahead "$SBX_READ_AHEAD_KB" ||
     die "SBX_READ_AHEAD_KB='$SBX_READ_AHEAD_KB' must be a whole number of KiB from 0 (leave the device alone) to 16384"
-  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID [--keep-shared] | --janitor DIR | --uninstall-janitor | --egress DIR | --uninstall-egress | --egress-ca-out'
+  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID [--keep-shared] | --uninstall-shared | --janitor DIR | --uninstall-janitor | --egress DIR | --uninstall-egress | --egress-ca-out'
   validate_worker
   [[ -n "$NO_EGRESS" ]] || install_egress
   install_units

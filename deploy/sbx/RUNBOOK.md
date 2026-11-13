@@ -933,8 +933,9 @@ never stops a worker with live sandboxes. It also removes what the control plane
 retired build, or one an admin rejected): it stops the worker, runs `install-host.sh --uninstall
 <worker> --keep-shared` (the worker's own files only: even the host's last worker leaves the shared
 units, `moca-egress` and its credential injection for the next worker, so a client's retire never
-undoes an operator's `--egress`; a plain `--uninstall` of that worker removes them once no worker is
-left), deletes the snapshot and its template record, and reports `removed`; only a build its own template
+undoes an operator's `--egress`; once no worker is left, `install-host.sh --uninstall-shared`, with no id,
+removes them and writes the snapshot device's recorded read-ahead back: run it before removing `/etc/sbx`, or the
+record is lost and the read-ahead unit keeps setting the value at boot), deletes the snapshot and its template record, and reports `removed`; only a build its own template
 record matches (the build id and the worker), never a running worker. It starts only **installed** workers: install a new
 template's worker as in §5 (its relay token comes from `setup.sh`; the record's id becomes its
 `SANDBOX_TEMPLATE`, the label Moca Pi sessions select by); until then the agent reports

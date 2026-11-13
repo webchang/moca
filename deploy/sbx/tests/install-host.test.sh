@@ -181,6 +181,19 @@ bash "$INSTALL" --uninstall sbx_unin >"$TMP/out" 2>&1 || fail 'uninstall over a 
 grep -qF "removed $SBX_SRV/jail/sbx_unin " "$TMP/out" || fail "the uninstall does not say it removed the legacy jail: $(cat "$TMP/out")"
 [[ "$(cat "$SBX_SRV/workspaces/sbx_unin/ws.img")" == DATA ]] || fail 'the uninstall took the workspace file'
 [[ -d "$SBX_SRV/jail/sbx_py312" ]] || fail "the uninstall removed another worker's legacy jail"
+# A legacy jail with a file system mounted under it is left, and said so: never recursed into.
+bash "$INSTALL" "$(bundle sbx_mnt)" --snapshot default >"$TMP/out" 2>&1 || fail 'install sbx_mnt'
+legacy_jail sbx_mnt
+printf '36 25 0:32 / %s rw - tmpfs tmpfs rw\n' "$SBX_SRV/jail/sbx_mnt/firecracker/vm-1/root" >"$TMP/mountinfo"
+SBX_MOUNTINFO="$TMP/mountinfo" bash "$INSTALL" --uninstall sbx_mnt >"$TMP/out" 2>&1 || fail 'uninstall over a mounted legacy jail'
+[[ -d "$SBX_SRV/jail/sbx_mnt" ]] || fail 'removed a legacy jail with a mount under it'
+grep -qF "left in place: $SBX_SRV/jail/sbx_mnt (a file system is mounted under it" "$TMP/out" || fail "the mounted jail's message is missing: $(cat "$TMP/out")"
+# A mount beside it (a longer id sharing the prefix) does not hold it.
+printf '36 25 0:32 / %s rw - tmpfs tmpfs rw\n' "$SBX_SRV/jail/sbx_mnt2/x" >"$TMP/mountinfo"
+bash "$INSTALL" "$(bundle sbx_mnt)" --snapshot default >"$TMP/out" 2>&1 || fail 'reinstall sbx_mnt'
+SBX_MOUNTINFO="$TMP/mountinfo" bash "$INSTALL" --uninstall sbx_mnt >"$TMP/out" 2>&1 || fail 'uninstall sbx_mnt beside a mount'
+[[ ! -e "$SBX_SRV/jail/sbx_mnt" ]] || fail "a mount under another path kept sbx_mnt's legacy jail"
+pass 'a legacy jail with a file system mounted under it is left in place and said so; a mount beside it is not'
 # An id shaped like a current jail's name could be another worker's jail: left, and said so.
 mkdir -p "$SBX_SRV/jail/j0123456789ab/firecracker"
 bash "$INSTALL" --uninstall j0123456789ab >"$TMP/out" 2>&1 || fail 'uninstall j0123456789ab'
@@ -800,6 +813,14 @@ echo 128 >"$DISK/queue/read_ahead_kb" # a reboot
 [[ "$(cat "$DISK/queue/read_ahead_kb")" == 1024 ]] || fail 'the boot run did not set the value'
 pass 'a re-run rewrites the unit, keeps the first recorded value; the unit'"'"'s command sets it again after a reboot'
 
+# --uninstall-shared is refused while a worker is installed, naming it, and changes nothing.
+: >"$MOCK_LOG"
+! bash "$INSTALL" --uninstall-shared >"$TMP/out" 2>&1 || fail '--uninstall-shared accepted with sbx_ra installed'
+grep -qF 'workers are still installed (sbx_ra)' "$TMP/out" || fail "the refusal does not name sbx_ra: $(cat "$TMP/out")"
+! grep -q systemctl "$MOCK_LOG" && [[ -e "$RAU" && "$(cat "$DISK/queue/read_ahead_kb")" == 1024 ]] || fail 'a refused --uninstall-shared changed something'
+! bash "$INSTALL" --uninstall-shared --uninstall sbx_ra >"$TMP/out" 2>&1 || fail '--uninstall-shared accepted with --uninstall'
+pass '--uninstall-shared is refused while a worker is installed, and with another mode'
+
 # The last uninstall writes the recorded value back and removes the unit, helper and record.
 : >"$MOCK_LOG"
 bash "$INSTALL" --uninstall sbx_ra >"$TMP/out" 2>&1 || fail 'the last uninstall with read-ahead'
@@ -808,6 +829,21 @@ grep -qx 'systemctl disable --now sbx-read-ahead.service' "$MOCK_LOG" || fail 's
 [[ ! -e "$RAU" && ! -e "$RAO" && ! -e "$RAH" ]] || fail 'the last uninstall left a read-ahead file'
 [[ ! -s "$EM" ]] || fail "the manifest is not empty after the last uninstall: $(cat "$EM")"
 pass 'the last uninstall restores the recorded value, disables and removes the unit, helper and record'
+
+# The host agent's removal (--keep-shared) keeps the read-ahead with the last worker; --uninstall-shared,
+# with no id, then restores the recorded value and removes the rest.
+bash "$INSTALL" "$(bundle sbx_ra)" --snapshot default >"$TMP/out" 2>&1 || fail 'reinstall sbx_ra'
+bash "$INSTALL" --uninstall sbx_ra --keep-shared >"$TMP/out" 2>&1 || fail 'the last uninstall with --keep-shared'
+[[ "$(cat "$DISK/queue/read_ahead_kb")" == 512 && -e "$RAU" && "$(cat "$RAO")" == 128 ]] || fail '--keep-shared did not keep the read-ahead'
+: >"$MOCK_LOG"
+bash "$INSTALL" --uninstall-shared >"$TMP/out" 2>&1 || fail '--uninstall-shared with no worker left'
+[[ "$(cat "$DISK/queue/read_ahead_kb")" == 128 ]] || fail "--uninstall-shared did not restore 128: $(cat "$DISK/queue/read_ahead_kb")"
+[[ ! -e "$RAU" && ! -e "$RAO" && ! -e "$RAH" && ! -e "$SBX_UNIT_DIR/sbx-worker@.service" && ! -e "$SBX_UNIT_DIR/sbx.slice" ]] ||
+  fail '--uninstall-shared left a shared unit or read-ahead file'
+[[ ! -s "$EM" ]] || fail "the manifest is not empty after --uninstall-shared: $(cat "$EM")"
+grep -qx 'systemctl daemon-reload' "$MOCK_LOG" || fail '--uninstall-shared did not reload systemd'
+bash "$INSTALL" --uninstall-shared >"$TMP/out" 2>&1 || fail 'a second --uninstall-shared'
+pass '--keep-shared keeps the read-ahead with the last worker; --uninstall-shared then restores it and removes the shared units; a second run is a no-op'
 
 # One of two workers going leaves it; a dm device has its own queue.
 export MOCK_FINDMNT_MAJMIN=253:0
