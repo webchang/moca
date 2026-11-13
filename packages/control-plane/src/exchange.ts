@@ -129,7 +129,10 @@ export function sessionTemplate(
  * a self-serve template is in no env list, and each build carries its own seed, lifecycle spec
  * §3.2), else the declared one (sessionTemplate). The build is the session's, never the newest. A
  * build with no seed (or an empty one) sends none, even if the env list declares one: the build is
- * what the session runs. A store that cannot answer falls back to the declared seed.
+ * what the session runs. A store that cannot answer FAILS CLOSED, as sessionTemplate does: the
+ * exchange refuses (internal_error, or the store's own CpError), never a turn on a workspace
+ * without its build's seed. Only a template or build the store does not hold falls back to the
+ * declared seed.
  */
 export async function sessionSeed(
   rec: SessionRecord,
@@ -138,7 +141,17 @@ export async function sessionSeed(
   if (!rec.sandboxTemplate) return undefined;
   const build = rec.sandboxBuildId;
   if (build?.startsWith('sha256:') && deps.templates) {
-    const doc = await deps.templates.get(rec.sandboxTemplate).catch(() => null);
+    let doc: Awaited<ReturnType<NonNullable<CpDeps['templates']>['get']>>;
+    try {
+      doc = await deps.templates.get(rec.sandboxTemplate);
+    } catch (err) {
+      if (err instanceof CpError) throw err;
+      console.error(
+        `[control-plane] template store read failed for session ${rec.sessionId}: ` +
+          `${(err as Error)?.message ?? String(err)}`,
+      );
+      throw new CpError('internal_error', "the template store could not read the session's build");
+    }
     const b = doc?.builds.find((x) => x.buildId === build);
     if (b) return b.spec.seed?.trim() ? { seed: b.spec.seed, source: 'build' } : undefined;
   }
@@ -421,6 +434,11 @@ export async function exchangeCredential(
     refuseMisdirectedSecret(resolved, rec.sessionId);
   }
 
+  // Before the audit, as everything that can refuse is: a store that cannot answer for the seed
+  // refuses the exchange (sessionSeed), so no credential is recorded as issued and then withheld.
+  const template = sessionTemplate(rec, deps.config.sessionTemplates);
+  const seed = template ? await sessionSeed(rec, deps) : undefined;
+
   const exchangeEntry = {
     subject: rec.owner,
     sessionId: rec.sessionId,
@@ -445,10 +463,8 @@ export async function exchangeCredential(
   }
 
   const tier = sessionTier(rec, deps.config.sandboxTiers);
-  const template = sessionTemplate(rec, deps.config.sessionTemplates);
   // A turn of a session pinned to a build keeps that build's worker running between turns.
   if (template) await holdPinnedWorker(rec, deps);
-  const seed = template ? await sessionSeed(rec, deps) : undefined;
   return {
     mode,
     anthropicAuthToken: mode === 'placeholder' ? placeholderFor(rec.owner) : secretValue,

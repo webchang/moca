@@ -121,7 +121,9 @@ leaf fails with `SandboxPoolEmptyError`, which names no template.
 **Where the seed comes from** (2026-11-06): on a deployment with a template store (the combined
 control plane), a session pinned to a `sha256:` build gets **that build's own `spec.seed`**, which
 every build carries (lifecycle spec §3.2), so a self-serve template, which is in no env list, is
-seeded too; a build with no seed sends none. Otherwise the seed is the declared one in
+seeded too; a build with no seed sends none. A store that cannot be read for that build refuses the
+exchange (the data plane retries it), never a turn on an unseeded workspace; only a template or
+build the store does not hold falls back. Otherwise the seed is the declared one in
 `SH_SANDBOX_TEMPLATES`. The exchange sends `sandboxSeedSource` (`build` or `declared`) with the
 seed, and the turn's `sandbox.seed` reports it (`{source, buildId}`), so a client can check that
 its workspace was seeded from the build it pinned.
