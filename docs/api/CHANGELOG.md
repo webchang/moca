@@ -96,6 +96,10 @@ added or removed.
 - `409 no_active_slot`'s `Retry-After` is the seconds until the soonest a build placed on one of
   this build's holders loses its last live lease (when its slot frees), not the earliest end of any
   lease in the catalog; 60 when no lease gives that time.
+- Activation on first use takes the lease only when the caller holds no live lease on the build: a
+  retry under its own lease is answered `409 template_not_active` with the readiness and
+  `Retry-After`, and writes nothing (no renewal, no new `activate` record per retry). Another
+  subject's first use still takes its own lease.
 
 ### 1.13.0
 
