@@ -231,8 +231,18 @@ components:
       type: object
       required: [templates, buildsQueued, active]
       properties:
-        templates: { type: integer, minimum: 0 }
-        buildsQueued: { type: integer, minimum: 0 }
+        templates:
+          type: integer
+          minimum: 0
+          description: >-
+            templates a subject owns with a build registered or on its way there (a template whose
+            builds all failed, were cancelled or retired is not counted)
+        buildsQueued:
+          type: integer
+          minimum: 0
+          description: >-
+            builds of a subject's templates not yet built (queued, building or probing), charged to
+            the template's owner
         active: { type: integer, minimum: 0 }
     PolicyView:
       type: object
@@ -2834,6 +2844,8 @@ paths:
       operationId: getQuota
       summary: The caller's template quotas and use (§6.2), and the live-sandbox cap
       description: |
+        `templates.used` counts the templates owned with a build registered or on its way there;
+        `buildsQueued.used` the builds queued, building or probing, charged to the template's owner.
         `active.used` counts the builds the caller holds a live lease on (§6.3). On the sandbox
         profile, `sandboxes` is SBX0's per-subject cap on live sandboxes (`SH_SANDBOX_MAX_PER_SUBJECT`)
         and the caller's live ones (register G27); absent elsewhere. Needs SH_PROVENANCE_DIR.

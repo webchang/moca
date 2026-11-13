@@ -84,9 +84,9 @@ export const quotaFor = (pol: Policy, subject: string): Quota =>
   pol.quotaBySubject?.[subject] ?? pol.quota;
 
 export interface Quota {
-  /** Templates a subject owns (not retired). */
+  /** Templates a subject owns with a build registered or on its way there. */
   templates: number;
-  /** Builds of a subject's queued or building at once. */
+  /** Builds of a subject's not yet built (queued, building or probing) at once. */
   buildsQueued: number;
   /** Templates a subject holds active at once. */
   active: number;

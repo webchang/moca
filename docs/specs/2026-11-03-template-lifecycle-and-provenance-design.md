@@ -372,8 +372,10 @@ templates' budgets (measured on bm1: ~26 SWE-bench templates by disk, ~36 worker
 guard.
 
 **Per subject** (new in 0.4, A22): quotas an admin sets, with a deployment default:
-`templates` (owned, not retired), `buildsQueued` (queued or building at once), `active` (templates
-the subject holds active at once). An activation over the subject's `active` quota replaces that
+`templates` (owned with a build registered or on its way there, so one whose builds all failed,
+were cancelled or retired holds no slot), `buildsQueued` (queued, building or probing at once,
+charged to the template's owner even when an admin adds the build), `active` (templates the
+subject holds active at once). An activation over the subject's `active` quota replaces that
 subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded` (as
 built: refused, `429 quota_exceeded` with `quota: active`; see §6.3). A
 create over `templates` or `buildsQueued` is `429 quota_exceeded` with `Retry-After` for the latter.

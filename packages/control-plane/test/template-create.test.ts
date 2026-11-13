@@ -293,6 +293,31 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     expect(other.extra).toEqual({ quota: 'templates' });
   });
 
+  it('counts a probing build as queued, and charges an admin-added build to the owner', async () => {
+    const d = stored({ ...benchmarkPolicy, quota: { templates: 10, buildsQueued: 1, active: 1 } });
+    await create(d);
+    await d.templates!.update!(ID, async (cur) => ({
+      ...cur!,
+      builds: cur!.builds.map((b) => ({ ...b, status: 'probing' as const })),
+    }));
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.buildsQueued.used).toBe(1);
+    const more = (principal: typeof alice) =>
+      HANDLERS.createTemplateBuild!(
+        ctx({
+          principal,
+          params: { id: ID },
+          body: body({ spec: { ...spec, description: 'another build' } }),
+        }),
+        d,
+      );
+    expect((await more(alice).catch((x) => x)).extra).toEqual({ quota: 'buildsQueued' });
+    // The admin's build of alice's template is alice's: refused on her quota, not the admin's.
+    expect((await more(admin).catch((x) => x)).extra).toEqual({ quota: 'buildsQueued' });
+    const qa = (await HANDLERS.getQuota!(ctx({ principal: admin }), d)).body as Body;
+    expect(qa.buildsQueued.used).toBe(0);
+  });
+
   it('holds the quotas under concurrent creates for different ids', async () => {
     const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
     const ids = ['par-a', 'par-b', 'par-c'];
@@ -502,5 +527,23 @@ describe('tracing (§9)', () => {
     expect(rec?.worker).toBe('sbx_tr_old');
     expect(await codeOf(() => mk('tr:nope'))).toBe('unknown_template');
     expect(await codeOf(() => mk(`tr@sha256:${'0'.repeat(64)}`))).toBe('unknown_template');
+  });
+});
+
+describe('the templates quota after a cancel (§6.2)', () => {
+  const cancel = (d: TestDeps, build: string, principal = alice) =>
+    HANDLERS.cancelTemplateBuild!(ctx({ principal, params: { id: ID, build } }), d);
+  const handleOf = (r: { body: unknown }) => ((r.body as Body).build as string).split('/').pop()!;
+
+  it('frees the template slot of a template whose only build was cancelled', async () => {
+    const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
+    const h = handleOf(await create(d));
+    expect((await create(d, body({ id: 'other-template' })).catch((x) => x)).extra).toEqual({
+      quota: 'templates',
+    });
+    await cancel(d, h);
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.templates.used).toBe(0);
+    expect((await create(d, body({ id: 'other-template' }))).status).toBe(202);
   });
 });
