@@ -16,7 +16,8 @@ import type { SandboxApiClient, SbxDiscovery, SbxQuota, SbxSandbox, SbxSubject }
 
 /**
  * `mocactl sbx`'s exit codes (SBX0 §6.1), as `mocactl auth token`'s beyond 0 and 2; 5 when a wait
- * (`templates follow`, `activate --wait`, `retire --wait`) ran out of time (mocactl templates spec §3.7).
+ * (`templates follow`, `activate --wait`, `retire --wait`) ran out of time (mocactl templates spec §3.7); 130 when Ctrl-C stopped it, as `sbx run` and
+ * `sbx rm`.
  */
 export const SBX_EXIT = {
   ok: 0,
@@ -25,6 +26,7 @@ export const SBX_EXIT = {
   loginRequired: 3,
   unreachable: 4,
   timedOut: 5,
+  interrupted: 130,
 } as const;
 
 export interface SbxCtx {

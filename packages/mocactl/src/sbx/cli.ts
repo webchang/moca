@@ -98,8 +98,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  and why it waits (queued at N, no slot, memory, graced)
   mocactl sbx templates follow ID [--build BUILD] [--timeout S] [--json]
                                                  poll a build (default: the newest) until registered,
-                                                 failed, rejected or cancelled; exit 0 only on registered
-                                                 (S default 3600)
+                                                 failed, rejected or cancelled; exit 0 only on
+                                                 registered, 1 on any other end, 5 past S (default
+                                                 3600), 130 on Ctrl-C (the build goes on)
   mocactl sbx templates cancel ID --build BUILD [--json]
                                                  withdraw a queued, building or probing build
   mocactl sbx templates activate ID [--build BUILD] [--lease S] [--wait [--timeout S]] [--json]
@@ -224,7 +225,8 @@ ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json. T
 comes from --control-plane-url, MOCACTL_SBX_URL, the bound sandbox's, the one remembered at
 login, or the login's own (a login minted by an operator); an admin write needs one of the first
 two. The login is kept apart from \`mocactl login\`'s, so both can be active at once.
-exit: 0 ok, 1 failed, 2 usage, 3 log in first, 4 control plane unreachable, 5 a wait timed out`;
+exit: 0 ok, 1 failed, 2 usage, 3 log in first, 4 control plane unreachable, 5 a wait timed out,
+130 interrupted (Ctrl-C)`;
 
 export interface SbxDeps {
   signal?: AbortSignal;

@@ -480,6 +480,36 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
     );
   });
 
+  it('many creates: Ctrl-C during the wait for a queue slot is exit 130, and posts nothing more', async () => {
+    const f = files({
+      'a.json': SPEC,
+      'b.json': { ...SPEC, id: 'my-python-2' },
+      'c.json': { ...SPEC, id: 'my-python-3' },
+    });
+    const w = world({
+      'POST /v1/templates': () => ({
+        status: 429,
+        body: { error: 'quota_exceeded', message: 'at most 1', quota: 'buildsQueued' },
+        headers: { 'retry-after': '20' },
+      }),
+    });
+    const ac = new AbortController();
+    const argv = ['templates', 'create', '--spec', f['a.json']!, '--spec', f['b.json']!];
+    expect(
+      await w.run([...argv, '--spec', f['c.json']!], {
+        signal: ac.signal,
+        sleep: async () => ac.abort(),
+      }),
+    ).toBe(130);
+    expect(w.cp.calls.filter((c) => c.method === 'POST')).toHaveLength(1);
+    expect(w.err()).toContain('sbx: interrupted (exit 130)');
+    expect(w.err()).not.toContain('over your buildsQueued quota');
+    // Interrupted before the first POST: none is sent.
+    const before = w.cp.calls.length;
+    expect(await w.run(argv, { signal: ac.signal })).toBe(130);
+    expect(w.cp.calls.length).toBe(before);
+  });
+
   it('show: a template and its builds, or one build, with readiness and why', async () => {
     const w = world({
       'GET /v1/templates/my-python': () => ({
@@ -567,6 +597,24 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
     ).toBe(5);
     expect(w.clock.slept).toEqual([5000, 5000, 2000]);
     expect(w.err()).toContain('timed out after 12 s');
+  });
+
+  it('follow: Ctrl-C is exit 130, not a failed build', async () => {
+    const w = world({
+      [`GET ${BUILD_PATH}`]: () => ({
+        status: 200,
+        body: build({ status: 'building', readiness: null }),
+      }),
+    });
+    const ac = new AbortController();
+    expect(
+      await w.run(['templates', 'follow', 'my-python', '--build', HANDLE], {
+        signal: ac.signal,
+        sleep: async () => ac.abort(),
+      }),
+    ).toBe(130);
+    expect(w.err()).toContain('sbx: interrupted (exit 130)');
+    expect(w.out()).toBe('');
   });
 
   it('cancel: posts the cancel, and reports a build past cancelling', async () => {
