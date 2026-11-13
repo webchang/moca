@@ -52,8 +52,8 @@ export interface Policy {
   defaultProfile: string;
   /**
    * Registry hosts an image may come from (the first path component of `repository@sha256:...`).
-   * A reference with no host (`image-factory/moca-microvm@...`) is the build host's default
-   * registry, allowed as `<default>`. Closes G2's allowlist part.
+   * A reference with no host (`images/moca-microvm@...`) is the build host's default
+   * registry, allowed as `<default>`. Hosts compare case-insensitively.
    */
   allowedRegistries: string[];
   /**
@@ -153,7 +153,40 @@ export function gateFloorCheckedOffline(gate: Record<string, unknown>): boolean 
 
 /** The template id rule (M7); refused past 31 characters, never truncated. */
 export const TEMPLATE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-const IMAGE_RE = /^[^\s@]+@sha256:[0-9a-f]{64}$/;
+
+/**
+ * An image reference pinned by digest, in the distribution reference grammar: an optional
+ * `host[:port]/` (a first component with a `.` or a `:`, or `localhost`), then lowercase path
+ * components `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*` separated by `/`, then `@sha256:<64 hex>`.
+ * No tag: `name:tag@sha256:…` is refused, since the digest alone names the image and the reuse
+ * key compares references as sent. Anything else (`Images/x`, `-x`, `a//b`, `../x`, control
+ * characters) is refused here, before the build host would refuse it, and a path never starts
+ * with `-`, so it is never read as an option by the host's tools.
+ */
+const DOMAIN_RE =
+  /^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?$/;
+const PATH_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+
+/** Splits a reference into its first component and the rest when the first is a registry host. */
+function splitHost(name: string): [string | undefined, string[]] {
+  const parts = name.split('/');
+  const first = parts[0] ?? '';
+  if (parts.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost'))
+    return [first, parts.slice(1)];
+  return [undefined, parts];
+}
+
+/** Whether `image` is a well-formed reference pinned by digest (M1); see DOMAIN_RE above. */
+export function isPinnedImage(image: string): boolean {
+  const at = image.indexOf('@');
+  if (at < 0 || !DIGEST_RE.test(image.slice(at + 1))) return false;
+  const name = image.slice(0, at);
+  if (name.length > 255) return false;
+  const [host, path] = splitHost(name);
+  if (host !== undefined && !DOMAIN_RE.test(host)) return false;
+  return path.length > 0 && path.every((c) => PATH_COMPONENT_RE.test(c));
+}
 
 export interface CreateInput {
   id: string;
@@ -225,7 +258,9 @@ function sortKeys(v: unknown): unknown {
  * ever merging it with the build host's default registry.
  */
 export function registryOf(image: string): string {
-  const r = registryHostOf(image);
+  const [host] = splitHost(image.split('@')[0] ?? '');
+  // A host name is case-insensitive: `GHCR.io` is `ghcr.io`.
+  const r = host === undefined ? '<default>' : host.toLowerCase();
   return r === 'index.docker.io' ? 'docker.io' : r;
 }
 
@@ -241,7 +276,7 @@ function registryHostOf(image: string): string {
  * The repository path of an image reference: without its registry host, its digest and any tag.
  * On Docker Hub (`docker.io`) a one-segment name is an official image, `library/<name>`, as Docker
  * reads it. Paths compare as given otherwise (registries are case-sensitive for paths only in
- * lowercase form, which IMAGE_RE's reference already is).
+ * lowercase form, which M1's reference grammar already requires).
  */
 export function repositoryOf(image: string): string {
   const name = image.split('@')[0] ?? '';
@@ -296,17 +331,19 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     TEMPLATE_ID_RE.test(input.id ?? ''),
     `id must match ${TEMPLATE_ID_RE} (refused, never truncated)`,
   );
+  const pinned = typeof input.image === 'string' && isPinnedImage(input.image);
   rule(
     'M1',
-    IMAGE_RE.test(input.image ?? ''),
-    'image must be pinned as repository@sha256:<64 hex>',
+    pinned,
+    'image must be pinned by digest, [host[:port]/]path@sha256:<64 hex> (lowercase path, no tag)',
   );
+  const allowed = policy.allowedRegistries.map((r) => r.toLowerCase());
   rule(
     'registry',
-    IMAGE_RE.test(input.image ?? '') && policy.allowedRegistries.includes(registryOf(input.image)),
-    `image registry ${IMAGE_RE.test(input.image ?? '') ? registryOf(input.image) : '?'} is not allowed (policy allowedRegistries)`,
+    pinned && allowed.includes(registryOf(input.image)),
+    `image registry ${pinned ? registryOf(input.image) : '?'} is not allowed (policy allowedRegistries)`,
   );
-  if (IMAGE_RE.test(input.image ?? '')) {
+  if (pinned) {
     const reg = registryOf(input.image);
     const list = policy.allowedRepositories?.[reg];
     if (list) {
@@ -433,9 +470,7 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     }
     rule('gate.json', gate !== null, 'gateRecord is not a JSON object');
   }
-  const digest = IMAGE_RE.test(input.image ?? '')
-    ? input.image.slice(input.image.indexOf('@') + 1)
-    : '';
+  const digest = pinned ? input.image.slice(input.image.indexOf('@') + 1) : '';
   // X10 applies whenever the spec names a gate record, whatever the profile, and so does X1's
   // check of that record (it passed, and is for this image): the build tool's --gate-record
   // refuses both, so the control plane refuses them first. A gate record sent at all is checked

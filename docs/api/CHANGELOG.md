@@ -36,6 +36,10 @@ added or removed.
   refused: a client sends a gate record showing commits refused (X5: `agent_can_commit: "no"`,
   `git_identity: "none"`), or drops the skip, and the build host's git identity check then needs git
   with an identity in the image.
+- M1 takes the distribution reference grammar: an optional `host[:port]/`, then lowercase path
+  components, then `@sha256:<64 hex>`, at most 255 characters before the `@`. A tag beside the
+  digest is refused, and so are references such as `Images/x`, `-x`, `a//b` or `../x`. Registry
+  hosts compare case-insensitively (`allowedRegistries` and the image's host).
 
 ### 1.13.0
 
