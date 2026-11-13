@@ -985,6 +985,23 @@ describe('retire (§5.1)', () => {
     expect(b.heldBy).toBe(null);
   });
 
+  it('stops a running worker of a retired build on a host with no grace, then removes it', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    const before = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
+    expect(before.run).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+    // Its worker runs (leased, started); the retire drops the lease. The agent skips the removal
+    // of a running worker, so without `stop` it would never be stopped, nor removed.
+    await retire(d, 't1');
+    const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
+    expect(w.run).toEqual([]);
+    expect(w.stop).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+    expect(w.remove).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
+  });
+
   it('asks the holding host to remove a retired build, and records the removal', async () => {
     const d = await setup();
     attachedNow = [];
@@ -995,7 +1012,8 @@ describe('retire (§5.1)', () => {
     const w = (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
     expect(w.remove).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     expect(w.run).toEqual([]);
-    expect(w.stop).toEqual([]);
+    // Listed in `stop` too (no grace here): a running worker is stopped before its removal.
+    expect(w.stop).toEqual([{ template: 't1', buildId: hash('1'), worker: 'sbx_t1' }]);
     // Another host, not holding it, is asked for nothing.
     await inventory(d, 'host-2', {}, 2);
     expect(((await HANDLERS.hostWanted!(asHost('host-2'), d)).body as Body).remove).toEqual([]);

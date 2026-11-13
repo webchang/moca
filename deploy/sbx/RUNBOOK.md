@@ -1049,9 +1049,9 @@ template used again soon is warm (no memory-file read at all).
   calls. `attached` and `refused` are written as `activate`, `detached` as `deactivate` and `removed`
   as `retire`, each with subject `host:<id>` and the report in `body.event`. So a reader counting a
   client's releases or activations filters on the subject (or on `body.event` being absent).
-- **A retire or a reject ends the grace at once:** the build leaves `run`, and on a host with a grace
-  the wanted answer lists it in `stop` beside `remove`, so the agent stops the worker and removes the
-  build in the same poll. Removal is never held for a grace.
+- **A retire or a reject ends the grace at once:** the build leaves `run`, and on every host (with a
+  grace or not) the wanted answer lists it in `stop` beside `remove`, so the agent stops a running
+  worker and removes the build in the same poll. Removal is never held for a grace.
 - **What you see:** the agent's summary line gains `"graced":<n>` when it keeps any; the hosts block
   of `GET /v1/templates` shows `idleGraceSeconds` and `graced` (a count) per host with a grace; a
   graced build reads `deactivating` with `graced: true` and `gracedUntil` (epoch seconds).

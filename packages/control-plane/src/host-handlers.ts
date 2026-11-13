@@ -880,8 +880,8 @@ export const HOST_HANDLERS: Record<string, Handler> = {
  * The wanted answer (§6.3), for GET /v1/hosts/{host}/wanted. `grace`: the host has an idle grace
  * (register G43): its graced builds stay in `run` and are listed in `graced`; a graced worker
  * displaced for a wanted build is re-checked for a lease at stop time, under the activation lock
- * (so a lease being taken is written, or not yet begun); and a retired build is listed in `stop`
- * beside `remove`, so a graced worker's removal is not held for its grace.
+ * (so a lease being taken is written, or not yet begun). A retired build is listed in `stop`
+ * beside `remove` on every host, so its running worker is stopped before its removal.
  */
 async function wantedAnswer(
   deps: CpDeps,
@@ -919,11 +919,11 @@ async function wantedAnswer(
         // own entries decide whether its worker runs), never stopped or removed for this one.
         if (shared(b)) continue;
         if (b.worker && !busy.has(b.worker)) {
+          // Listed in `stop` too, with or without a grace: the agent stops it if its unit runs,
+          // before the removal in the same run (which skips a running worker). A retire also ends
+          // a grace at once, so a graced worker's removal is never held for it.
+          stop.push(entry);
           remove.push(entry);
-          // A retire ends the grace at once (G43): on a host with a grace, its worker is listed in
-          // `stop` too (the agent stops it only if its unit runs, before the removal, in the same
-          // run), so a graced worker's removal is never held for the grace.
-          if (grace) stop.push(entry);
         }
         continue;
       }
