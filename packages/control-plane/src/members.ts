@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { open as openFile, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { open as openFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ProvenanceStore } from './provenance.js';
 
@@ -10,10 +10,12 @@ import type { ProvenanceStore } from './provenance.js';
  * control plane's template store directory beside policy.json, and each change is a record on the
  * `members` provenance stream.
  *
- * Roles are evaluated PER REQUEST from the bootstrap lists and this store (`rolesNow`), not taken
- * from a token's claims, so a grant, a revoke or a lapsed `until` takes effect at the subject's next
- * request. Reads come from an in-memory copy, re-read only when the file's mtime changes, so the
- * per-request evaluation costs one stat at most.
+ * Roles are evaluated PER REQUEST from the bootstrap lists and this store (`membershipNow`), not
+ * taken from a token's claims, so a grant, a revoke or a lapsed `until` takes effect at the subject's
+ * next request. Reads come from an in-memory copy, re-read only when the file's inode, size or mtime
+ * changes, so the per-request evaluation costs one open and fstat of the file, none for an admin
+ * named in the settings. A subject the settings name is still answered when the file can't be read
+ * (the settings stay the recovery path); anyone else fails closed.
  */
 
 export const ADMIN = 'admin';
@@ -24,6 +26,9 @@ export const ADMIN = 'admin';
  * "temporary" admin that never lapses. For a longer grant, give none (no expiry) and revoke it.
  */
 export const MAX_GRANT_SECONDS = 366 * 86_400;
+
+/** The settings-only fallback warns at most this often per process, with the count since the last. */
+const FALLBACK_WARN_EVERY_S = 60;
 
 export interface RoleGrant {
   role: typeof ADMIN;
@@ -70,12 +75,23 @@ export interface Bootstrap {
   admins: readonly string[];
 }
 
+/**
+ * A file version's identity for the cache: an out-of-process edit within the mtime's granularity
+ * still moves the inode (a replace) or, mostly, the size.
+ */
+const statKey = (st: { ino: number; size: number; mtimeMs: number }): string =>
+  `${st.ino}:${st.size}:${st.mtimeMs}`;
+
 export class MembersStore {
   private readonly path: string;
   private readonly provenance: ProvenanceStore;
   private pending: Promise<unknown> = Promise.resolve();
   private cache: MembersDoc = { members: {} };
-  private cacheMtimeMs = -1;
+  /** Answers from the settings alone since the last warning, and when that warning was logged. */
+  private fallbacks = 0;
+  private fallbackWarnedAtS = Number.NEGATIVE_INFINITY;
+  /** The cached version's inode, size and mtime: any one moving means another file. */
+  private cacheKey = '';
   readonly bootstrap: Bootstrap;
 
   constructor(opts: { dir: string; provenance: ProvenanceStore; bootstrap: Bootstrap }) {
@@ -90,35 +106,49 @@ export class MembersStore {
     return next;
   }
 
-  /** The store as on disk, through the cache (re-read when the file's mtime moved). */
+  /**
+   * The store as on disk, through the cache (re-read when the file's inode, size or mtime moved). The
+   * stat and the bytes come from ONE open file: the file is replaced by rename, so the handle always
+   * reads the version whose stat it reported, never a newer one swapped in between a check and a read.
+   */
   async doc(): Promise<MembersDoc> {
-    let mtimeMs: number;
+    let fh;
     try {
-      mtimeMs = (await stat(this.path)).mtimeMs;
+      fh = await openFile(this.path, 'r');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         this.cache = { members: {} };
-        this.cacheMtimeMs = -1;
+        this.cacheKey = '';
         return this.cache;
       }
       throw err;
     }
-    if (mtimeMs !== this.cacheMtimeMs) {
-      const parsed = JSON.parse(await readFile(this.path, 'utf8')) as MembersDoc;
-      if (!parsed || typeof parsed.members !== 'object') throw new Error('members.json is invalid');
-      this.cache = parsed;
-      this.cacheMtimeMs = mtimeMs;
+    try {
+      const key = statKey(await fh.stat());
+      if (key !== this.cacheKey) {
+        const parsed = JSON.parse(await fh.readFile('utf8')) as MembersDoc;
+        if (!parsed || typeof parsed.members !== 'object')
+          throw new Error('members.json is invalid');
+        this.cache = parsed;
+        this.cacheKey = key;
+      }
+    } finally {
+      await fh.close();
     }
     return this.cache;
   }
 
   private async write(doc: MembersDoc): Promise<void> {
     const tmp = `${this.path}.${randomUUID()}.tmp`;
+    let key: string;
     try {
       const fh = await openFile(tmp, 'wx', 0o600);
       try {
         await fh.writeFile(JSON.stringify(doc));
         await fh.sync();
+        // The file's own inode, size and mtime, from its handle: rename keeps them, so they are what
+        // doc() will see.
+        key = statKey(await fh.stat());
       } finally {
         await fh.close();
       }
@@ -128,7 +158,7 @@ export class MembersStore {
       throw err;
     }
     this.cache = doc;
-    this.cacheMtimeMs = (await stat(this.path)).mtimeMs;
+    this.cacheKey = key;
   }
 
   /**
@@ -163,7 +193,50 @@ export class MembersStore {
    */
   async rolesNow(subject: string, nowS: number): Promise<string[]> {
     if (this.bootstrap.admins.includes(subject)) return [ADMIN];
-    const m = (await this.doc()).members[subject];
+    return this.storeRoles(subject, (await this.doc()).members[subject], nowS);
+  }
+
+  /**
+   * The subject's roles and the store's own enrollment now, for the per-request evaluation, from ONE
+   * read of the store. An admin named in the settings is answered from the settings without reading
+   * the file at all. A subject on the allow list is answered from the settings (no API role, no
+   * store enrollment; the allow list still enrolls it) when the file can't be read, with a warning
+   * at most once a minute (`nowS` is the clock) carrying the count of such answers since the last,
+   * so a damaged members.json never locks out the settings' subjects and never floods the log.
+   * Anyone else fails closed: the read's error propagates.
+   */
+  async membershipNow(
+    subject: string,
+    nowS: number,
+  ): Promise<{ roles: string[]; enrolled: boolean }> {
+    if (this.bootstrap.admins.includes(subject)) return { roles: [ADMIN], enrolled: false };
+    let doc: MembersDoc;
+    try {
+      doc = await this.doc();
+    } catch (err) {
+      if (!this.bootstrap.allowed.includes(subject)) throw err;
+      this.fallbacks += 1;
+      if (nowS - this.fallbackWarnedAtS >= FALLBACK_WARN_EVERY_S) {
+        const why = (err as NodeJS.ErrnoException).code ?? (err as Error).name;
+        console.warn(
+          `[control-plane] members.json can't be read (${why}): ${subject} answered from the settings alone ` +
+            `(${this.fallbacks} such answer(s) since the last warning)`,
+        );
+        this.fallbackWarnedAtS = nowS;
+        this.fallbacks = 0;
+      }
+      return { roles: [], enrolled: false };
+    }
+    const m = doc.members[subject];
+    return { roles: await this.storeRoles(subject, m, nowS), enrolled: m?.enrolled === true };
+  }
+
+  /** A store grant's roles now; a grant first seen lapsed has its `expired` record written once. */
+  private async storeRoles(
+    subject: string,
+    m: Member | undefined,
+    nowS: number,
+  ): Promise<string[]> {
     const g = m?.roles.find((r) => r.role === ADMIN);
     if (!g) return [];
     if (g.until === undefined || g.until > nowS) return [ADMIN];
@@ -174,13 +247,6 @@ export class MembersStore {
   /** Whether the store (not the allow list) enrolls the subject. */
   async storeEnrolled(subject: string): Promise<boolean> {
     return (await this.doc()).members[subject]?.enrolled === true;
-  }
-
-  /** Whether the subject is enrolled: the allow list, the store, or an admin by either route. */
-  async enrolledNow(subject: string, nowS: number): Promise<boolean> {
-    if (this.bootstrap.allowed.includes(subject)) return true;
-    if ((await this.doc()).members[subject]?.enrolled) return true;
-    return (await this.rolesNow(subject, nowS)).includes(ADMIN);
   }
 
   private recordExpiry(subject: string, nowS: number): Promise<string | null> {

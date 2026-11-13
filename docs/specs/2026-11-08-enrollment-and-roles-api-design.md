@@ -113,10 +113,16 @@ acted through the API, and it removed the admin by `setup.sh` again: two cluster
 ## 8. As built (0b88a829, 49c98a85)
 
 - **The store:** `members.json` beside `policy.json` (`packages/control-plane/src/members.ts`), read
-  through an in-memory copy refreshed when the file's mtime changes.
-- **Per request:** the router (`server.ts`) replaces a verified token's `roles` with
-  `MembersStore.rolesNow` and sets `enrolled` from the store. The device login, the test-user login,
-  the refresh, the egress owner check and the owner transfer use the same evaluation
+  through an in-memory copy refreshed when the file's inode, size or mtime changes, so the per-request
+  evaluation costs one `open` and `fstat` of the file (a parse only when it changed), and none for an
+  admin named in the settings.
+- **Per request:** the router (`server.ts`) replaces a verified token's `roles` with the subject's
+  roles now and sets `enrolled` from the store, both from one read (`MembersStore.membershipNow`). If
+  `members.json` can't be read (damaged by hand, a bad restore, an I/O error), the settings' subjects
+  are still answered from the settings (a warning is logged at most once a minute, with the count
+  since the last, and an API grant or store enrollment doesn't count until it is fixed); everyone
+  else fails closed. The device login, the test-user login, the refresh, the egress owner check and
+  the owner transfer use the same evaluation
   (`membershipNow`, `handler-util.ts`). Without a store (no `SH_PROVENANCE_DIR`), the token's claims
   stand, as before.
 - **Routes** (`member-handlers.ts`), on both route profiles like the other admin routes. With no
