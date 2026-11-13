@@ -534,7 +534,10 @@ M7 (the spec well formed, the id rule), M8, M9 for `benchmark`, X10-X12 and X15 
 gate record, the image pinned by digest (M1) **from an allowed registry** (new; closes G2's
 allowlist part) and, where the policy lists repositories for that registry (`allowedRepositories`), from
 one of them (rule `registry.repository`; whole path segments, `prefix/*` for a prefix), and the caller's
-quota (§6.2). A registry with no list allows every repository it serves. A refusal is `422 policy_refused {rule, message}` and
+quota (§6.2). Whatever the profile, X10 applies whenever the spec names a gate record (with X1's
+check of that record, or of any gate record sent: it passed, and is for this image; only
+`X1.trusted` is the profile's), and X12 whenever the spec skips the git identity check (a skip with
+no gate record showing commits refused is refused). A registry with no list allows every repository it serves. A refusal is `422 policy_refused {rule, message}` and
 a `check` record; nothing is queued.
 
 ### 8.2 At build and registration

@@ -29,6 +29,13 @@ added or removed.
   with both is refused `422 policy_refused` (`M7.guest`), even when equal; the alias is stored as
   `guest_ram_mb`, the key the build reads, in the `create` record, the build's request and the reuse
   key.
+- Under every profile, a create whose spec names a gate record (`source_record_digest`), or that
+  sends one, is refused unless that record passed (`X1`) and is for this image (`X1.image`); only
+  `X1.trusted` stays a profile requirement. `X12` refuses any `skip_git_identity_check: true` that
+  no gate record showing commits refused backs. Upgrade note: on `base` an unbacked skip is now
+  refused: a client sends a gate record showing commits refused (X5: `agent_can_commit: "no"`,
+  `git_identity: "none"`), or drops the skip, and the build host's git identity check then needs git
+  with an identity in the image.
 
 ### 1.13.0
 
