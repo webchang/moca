@@ -2106,7 +2106,9 @@ paths:
         subject (harness profile). Needs SH_PROVENANCE_DIR (else `400 invalid_request`). The create
         is checked against the deployment's policy (GET /v1/policy) before anything is queued: a
         refusal is `422 policy_refused` with `rule`, the gating rule's id (governance
-        GATING-RULES.md), and is recorded. Ids are unique per deployment: another subject's id is
+        GATING-RULES.md), and a `check` record on the template's stream when the template exists and
+        is the caller's (an admin's, adding a build); a refusal on a new id or another subject's is
+        only answered (a new id's in one audit line). Ids are unique per deployment: another subject's id is
         `409 template_exists` (`404 template_not_found` when it is private). Over a quota:
         `429 quota_exceeded` with `quota` (`templates` or `buildsQueued`). The build is queued for
         a host agent (deploy/sbx/host-agent.sh), which builds it and reports it; policy then registers

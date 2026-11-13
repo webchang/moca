@@ -44,6 +44,10 @@ added or removed.
   the check acts on) and an `envelope.exact` that is not two positive whole numbers. A stored policy
   naming an unknown id, or with such an `exact`, fails closed when read, until an admin sets a
   valid one: read `GET /v1/policy` and fix it before upgrading.
+- A refused create is recorded as a `check` provenance record only on an existing template's stream
+  the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
+  only answered, and one on an id no template holds writes one audit line instead
+  (`template_create_refused`, with the subject, `templateId` and the failed `rules`).
 
 ### 1.13.0
 

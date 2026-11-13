@@ -537,8 +537,11 @@ one of them (rule `registry.repository`; whole path segments, `prefix/*` for a p
 quota (§6.2). Whatever the profile, X10 applies whenever the spec names a gate record (with X1's
 check of that record, or of any gate record sent: it passed, and is for this image; only
 `X1.trusted` is the profile's), and X12 whenever the spec skips the git identity check (a skip with
-no gate record showing commits refused is refused). A registry with no list allows every repository it serves. A refusal is `422 policy_refused {rule, message}` and
-a `check` record; nothing is queued.
+no gate record showing commits refused is refused). A registry with no list allows every repository it serves. A refusal is `422 policy_refused {rule, message}` and,
+on an existing template's stream the caller may write (its own, or an admin's adding a build), a
+`check` record; a refusal on another subject's id is only answered, and one on an id no template
+holds leaves one audit line (`template_create_refused`) instead, so no subject opens provenance
+streams without bound. Nothing is queued.
 
 ### 8.2 At build and registration
 

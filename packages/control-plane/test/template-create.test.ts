@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -146,12 +146,15 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     });
   });
 
-  it('records a refusal as a check on the template stream, and queues nothing', async () => {
+  it("records a refusal on the caller's own template as a check, and queues nothing", async () => {
     const d = stored();
+    await create(d);
     await refusal(d, body({ spec: { ...spec, egress: true } }));
+    const t = (await d.templates!.get(ID))!;
+    expect(t.builds).toHaveLength(1);
     const chain = await d.provenance!.chain(`template/${ID}`);
-    expect(chain.map((r) => r.kind)).toEqual(['check']);
-    expect(chain[0].body).toMatchObject({ outcome: 'refused' });
+    expect(chain.map((r) => r.kind)).toEqual(['create', 'gate', 'check', 'check']);
+    expect(chain.at(-1)!.body).toMatchObject({ outcome: 'refused' });
   });
 
   it('X12 fails closed: skip_git_identity_check with a gate record that never measured the identity', async () => {
@@ -165,6 +168,38 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     expect(await refusal(d, body({ gateRecord: bytes }))).toEqual({
       code: 'policy_refused',
       rule: 'X12',
+    });
+  });
+
+  it("records a refusal on the caller's own id, never on a new id or another subject's", async () => {
+    const d = stored();
+    await create(d); // alice owns ID now
+    const len = async () => (await d.provenance!.chain(`template/${ID}`)).length;
+    const before = await len();
+    const bad = body({ image: 'docker.io/library/python:3.12' }); // refused: an unpinned image
+    // bob's refused create on alice's id answers as a refusal, and writes nothing to her stream.
+    await expect(create(d, bad, bob)).rejects.toMatchObject({ code: 'policy_refused' });
+    expect(await len()).toBe(before);
+    // alice's own refused create is recorded on her stream.
+    await expect(create(d, bad)).rejects.toMatchObject({ code: 'policy_refused' });
+    expect((await d.provenance!.chain(`template/${ID}`)).at(-1)).toMatchObject({
+      kind: 'check',
+      body: { outcome: 'refused' },
+    });
+    // A refusal on an id no template holds yet opens no stream: one audit line names it instead.
+    const audited = () =>
+      (d.streams.get('sh:cp:audit') ?? []).filter((r) => r.decision === 'template_create_refused');
+    expect(audited()).toEqual([]);
+    await expect(create(d, { ...bad, id: 'fresh-id' }, bob)).rejects.toMatchObject({
+      code: 'policy_refused',
+    });
+    expect(await d.provenance!.chain('template/fresh-id')).toEqual([]);
+    expect(audited()).toHaveLength(1);
+    expect(audited()[0]).toMatchObject({
+      subject: bob.sub,
+      templateId: 'fresh-id',
+      reason: 'policy_refused',
+      rules: 'M1,registry,X10,X1.image',
     });
   });
 
@@ -450,6 +485,23 @@ describe('policy and quota routes', () => {
         policyProblems(withBench({ ...bench, envelope: { ...bench.envelope, exact } })).join(),
       ).toMatch(/exact/);
     expect(PROFILE_RULES).toEqual(DEFAULT_POLICY.profiles.benchmark!.requires);
+  });
+
+  it('fails closed on a stored policy naming an unknown rule id, until an admin sets a valid one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-policy-'));
+    const provenance = new ProvenanceStore({ dir, now: () => NOW_MS });
+    const bad = {
+      ...DEFAULT_POLICY,
+      profiles: {
+        ...DEFAULT_POLICY.profiles,
+        benchmark: { ...DEFAULT_POLICY.profiles.benchmark!, requires: ['X13'] },
+      },
+    };
+    writeFileSync(join(dir, 'policy.json'), JSON.stringify({ policy: bad, record: 'sha256:x' }));
+    const store = new FilePolicyStore({ dir, provenance });
+    await expect(store.current()).rejects.toThrow(/policy.json is invalid: .*requires/);
+    await store.set(DEFAULT_POLICY, admin.sub);
+    expect((await store.current()).policy).toEqual(DEFAULT_POLICY);
   });
 
   it("GET /v1/quota shows the limits and the caller's use", async () => {
