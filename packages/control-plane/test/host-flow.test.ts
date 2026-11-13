@@ -79,14 +79,14 @@ const records = (over: { t?: Record<string, unknown>; s?: Record<string, unknown
 });
 
 async function claimAndBuild(d: TestDeps): Promise<string> {
-  const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 1 }), d)).body as Body;
+  const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
   return c.builds[0].build as string;
 }
 
 describe('the host agent flow (§6.1, §8.2)', () => {
   it('claims the queued build with what to build, then registers it on a matching built report', async () => {
     const d = await setup();
-    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 2 }), d)).body as Body;
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 2 }), d)).body as Body;
     expect(c.builds).toHaveLength(1);
     const job = c.builds[0];
     expect(job).toMatchObject({ template: ID, image: IMAGE });
@@ -96,21 +96,21 @@ describe('the host agent flow (§6.1, §8.2)', () => {
       guest_ram_mb: 4096,
       skip_git_identity_check: true,
     });
-    expect(job.gateRecord).toBe(`/v1/hosts/bm1/blobs/${GATE_SHA}`);
-    const blob = (await HANDLERS.hostBlob!(asHost('bm1', { digest: GATE_SHA }), d)).body as Body;
+    expect(job.gateRecord).toBe(`/v1/hosts/host-1/blobs/${GATE_SHA}`);
+    const blob = (await HANDLERS.hostBlob!(asHost('host-1', { digest: GATE_SHA }), d)).body as Body;
     expect(Buffer.from(blob.base64, 'base64').toString('utf8')).toBe(GATE);
 
     // Claimed builds are not handed out twice.
     expect(
-      ((await HANDLERS.hostClaimBuilds!(asHost('bm2', {}, { max: 1 }), d)).body as Body).builds,
+      ((await HANDLERS.hostClaimBuilds!(asHost('host-2', {}, { max: 1 }), d)).body as Body).builds,
     ).toEqual([]);
 
     for (const event of ['building', 'probing']) {
-      await HANDLERS.hostBuildReport!(asHost('bm1', { build: job.build }, { event }), d);
+      await HANDLERS.hostBuildReport!(asHost('host-1', { build: job.build }, { event }), d);
     }
     await HANDLERS.hostBuildLog!(
       asHost(
-        'bm1',
+        'host-1',
         { build: job.build },
         { entries: [{ step: 'probe', level: 'info', message: 'OK' }] },
       ),
@@ -118,7 +118,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     );
     const r = (
       await HANDLERS.hostBuildReport!(
-        asHost('bm1', { build: job.build }, { event: 'built', ...records() }),
+        asHost('host-1', { build: job.build }, { event: 'built', ...records() }),
         d,
       )
     ).body as Body;
@@ -166,7 +166,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     const build = await claimAndBuild(d);
     const r = (
       await HANDLERS.hostBuildReport!(
-        asHost('bm1', { build }, { event: 'built', ...records(over) }),
+        asHost('host-1', { build }, { event: 'built', ...records(over) }),
         d,
       )
     ).body as Body;
@@ -184,7 +184,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     const build = await claimAndBuild(d);
     await HANDLERS.hostBuildReport!(
       asHost(
-        'bm1',
+        'host-1',
         { build },
         { event: 'failed', step: 'probe', message: 'verify command exited 91' },
       ),
@@ -195,7 +195,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     expect(t.builds[0].status).toBe('failed');
     expect(
       await codeOf(() =>
-        HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d),
+        HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'built', ...records() }), d),
       ),
     ).toBe('invalid_request');
   });
@@ -203,7 +203,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
   it('lets the owner cancel a build the host is building, and refuses the host its later reports (G22)', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
-    await HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'building' }), d);
+    await HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'building' }), d);
     const cancel = (principal = alice, ref = build) =>
       HANDLERS.cancelTemplateBuild!(ctx({ principal, params: { id: ID, build: ref } }), d);
     expect(await codeOf(() => cancel(bob))).toBe('forbidden');
@@ -215,7 +215,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     // The host finishes anyway: its report is refused, so the build never registers.
     expect(
       await codeOf(() =>
-        HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d),
+        HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'built', ...records() }), d),
       ),
     ).toBe('invalid_request');
     // Once failed, it is not cancelled again; and a new create is not a reuse of it.
@@ -235,16 +235,69 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     expect(ex.records.some((r) => r.kind === 'build' && r.body.outcome === 'cancelled')).toBe(true);
   });
 
+  it('keeps a cancel that lands while a built report is being written (re-checked in the update)', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    await HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'building' }), d);
+    // Hold the report in its first blob write, after it has read the build as `building`.
+    const prov = d.provenance!;
+    const putBlob = prov.putBlob.bind(prov);
+    let entered!: () => void;
+    let release!: () => void;
+    const inBlob = new Promise<void>((r) => (entered = r));
+    const held = new Promise<void>((r) => (release = r));
+    prov.putBlob = async (buf: Buffer) => {
+      entered();
+      await held;
+      return putBlob(buf);
+    };
+    const report = HANDLERS.hostBuildReport!(
+      asHost('host-1', { build }, { event: 'built', ...records() }),
+      d,
+    );
+    await inBlob;
+    await HANDLERS.cancelTemplateBuild!(ctx({ principal: alice, params: { id: ID, build } }), d);
+    release();
+    expect(await codeOf(() => report)).toBe('invalid_request');
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds[0]).toMatchObject({ status: 'failed', reason: { step: 'cancelled' } });
+    expect(t.tags).toEqual({});
+    // No record says it was built or registered: the chain holds the cancel only.
+    const chain = await prov.chain(`template/${ID}`);
+    expect(chain.map((x) => x.kind)).toEqual(['create', 'gate', 'check', 'build']);
+    expect(chain.at(-1)!.body).toMatchObject({ outcome: 'cancelled' });
+  });
+
+  it('refuses a report with an unknown event, and a building report on a cancelled build', async () => {
+    const d = await setup();
+    const build = await claimAndBuild(d);
+    expect(
+      await codeOf(() =>
+        HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'done' }), d),
+      ),
+    ).toBe('invalid_request');
+    await HANDLERS.cancelTemplateBuild!(ctx({ principal: alice, params: { id: ID, build } }), d);
+    for (const event of ['building', 'probing', 'failed']) {
+      expect(
+        await codeOf(() => HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event }), d)),
+      ).toBe('invalid_request');
+    }
+    const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
+      .body as Body;
+    expect(t.builds[0]).toMatchObject({ status: 'failed', reason: { step: 'cancelled' } });
+  });
+
   it('refuses a report for a build another host claimed (a host reports only for itself)', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
     expect(
       await codeOf(() =>
-        HANDLERS.hostBuildReport!(asHost('bm2', { build }, { event: 'building' }), d),
+        HANDLERS.hostBuildReport!(asHost('host-2', { build }, { event: 'building' }), d),
       ),
     ).toBe('not_found');
     expect(
-      await codeOf(() => HANDLERS.hostBuildLog!(asHost('bm2', { build }, { entries: [] }), d)),
+      await codeOf(() => HANDLERS.hostBuildLog!(asHost('host-2', { build }, { entries: [] }), d)),
     ).toBe('not_found');
   });
 
@@ -270,7 +323,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
         d,
       );
     }
-    const c = (await HANDLERS.hostClaimBuilds!(asHost('bm1', {}, { max: 4 }), d)).body as Body;
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 4 }), d)).body as Body;
     expect(c.builds.map((b: Body) => b.template)).toEqual([ID, 'b-one', 'a-two', 'a-three']);
   });
 
@@ -278,7 +331,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     const d = await setup();
     await HANDLERS.hostInventory!(
       asHost(
-        'bm1',
+        'host-1',
         {},
         {
           holds: [{ template: ID, manifestHash: HASH }],
@@ -287,7 +340,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
       ),
       d,
     );
-    expect(d.hosts!.get('bm1')).toMatchObject({
+    expect(d.hosts!.get('host-1')).toMatchObject({
       holds: { [HASH]: ID },
       limits: { activeLimit: 24 },
     });
@@ -295,14 +348,14 @@ describe('the host agent flow (§6.1, §8.2)', () => {
 });
 
 describe('host authentication', () => {
-  const env = { SH_TEMPLATE_HOSTS: '[{"id":"bm1"}]', SH_HOST_TOKEN_BM1: 'f'.repeat(64) };
+  const env = { SH_TEMPLATE_HOSTS: '[{"id":"host-1"}]', SH_HOST_TOKEN_HOST_1: 'f'.repeat(64) };
   it('reads hosts and their tokens, refusing a bad id, a short token and a reused one', () => {
-    expect(templateHostsFromEnv(env)).toEqual([{ id: 'bm1', token: 'f'.repeat(64) }]);
+    expect(templateHostsFromEnv(env)).toEqual([{ id: 'host-1', token: 'f'.repeat(64) }]);
     expect(templateHostsFromEnv({})).toEqual([]);
-    expect(() => templateHostsFromEnv({ ...env, SH_HOST_TOKEN_BM1: 'short' })).toThrow(
-      /SH_HOST_TOKEN_BM1/,
+    expect(() => templateHostsFromEnv({ ...env, SH_HOST_TOKEN_HOST_1: 'short' })).toThrow(
+      /SH_HOST_TOKEN_HOST_1/,
     );
-    expect(() => templateHostsFromEnv({ SH_TEMPLATE_HOSTS: '[{"id":"BM1"}]' })).toThrow(
+    expect(() => templateHostsFromEnv({ SH_TEMPLATE_HOSTS: '[{"id":"HOST-1"}]' })).toThrow(
       /id must match/,
     );
     expect(() => templateHostsFromEnv(env, ['f'.repeat(64)])).toThrow(/must differ/);
@@ -321,7 +374,7 @@ describe('host authentication', () => {
       'hostWorkerReport',
     ]);
     for (const r of host) expect(r.path.startsWith('/v1/hosts/{host}/'), r.path).toBe(true);
-    expect(matchRoute('POST', '/v1/hosts/bm1/builds/claim', 'harness')?.route.operationId).toBe(
+    expect(matchRoute('POST', '/v1/hosts/host-1/builds/claim', 'harness')?.route.operationId).toBe(
       'hostClaimBuilds',
     );
   });
@@ -331,7 +384,10 @@ describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
   it('resolves the 202 handle after registration, the body naming the manifest hash', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
-    await HANDLERS.hostBuildReport!(asHost('bm1', { build }, { event: 'built', ...records() }), d);
+    await HANDLERS.hostBuildReport!(
+      asHost('host-1', { build }, { event: 'built', ...records() }),
+      d,
+    );
     const b = (
       await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build } }), d)
     ).body as Body;
@@ -342,7 +398,11 @@ describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
     const d = await setup();
     const build = await claimAndBuild(d);
     await HANDLERS.hostBuildReport!(
-      asHost('bm1', { build }, { event: 'built', ...records({ s: { hash_version: undefined } }) }),
+      asHost(
+        'host-1',
+        { build },
+        { event: 'built', ...records({ s: { hash_version: undefined } }) },
+      ),
       d,
     );
     const b = (
@@ -353,7 +413,7 @@ describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
     const d2 = await setup();
     const b2 = await claimAndBuild(d2);
     await HANDLERS.hostBuildReport!(
-      asHost('bm1', { build: b2 }, { event: 'failed', step: 'probe', message: 'exit 91' }),
+      asHost('host-1', { build: b2 }, { event: 'failed', step: 'probe', message: 'exit 91' }),
       d2,
     );
     const f = (

@@ -353,6 +353,11 @@ registered builds by manifest hash:
 Activation is a start and deactivation a stop: no file changes, no relay or control-plane restart.
 A stopped worker costs no memory. A build no host declares is `unavailable`.
 
+A report is accepted only for a build handed to that host, and a failed or cancelled build takes no
+more reports; the check is made again inside the template's update, with the report's records, so
+an owner's cancel that lands while a report is being written stands and no record says it
+registered.
+
 A host agent that is still running reports every build it claimed: `built`, or `failed` on any
 other way out. When it cannot carry on with a build it claimed (a gate record it cannot fetch or
 whose bytes do not match its sha256, a report not accepted, no template record or manifest after
