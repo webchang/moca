@@ -64,7 +64,10 @@ profile today get one rule each:
   ignores the field.
 - `/v1/credentials*` keeps the harness store and behaviour, and the sandbox `sandbox-egress` kind
   is accepted only when egress is configured (as on `sandbox`); that is the one place the two
-  rules meet, and it is a later increment (window runs use `--no-egress`).
+  rules meet, and it is a later increment (window runs use `--no-egress`). As on `sandbox`, two
+  `sandbox-egress` credentials of one subject never hold one destination (`destination_conflict`),
+  and `/v1/egress/credential` serves only an owner enrolled for sandboxes (`isEnrolledForSandbox`,
+  §3.2).
 
 ### 3.2 Who may call what
 
