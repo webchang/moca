@@ -594,7 +594,7 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
       const f = result.failed!;
       throw new CpError('policy_refused', f.message ?? f.rule, undefined, { rule: f.rule });
     }
-    // A self-attested create (G41 (c)) never makes its template deployment-visible.
+    // A self-attested create never makes its template deployment-visible.
     const selfAttestedCreate =
       result.gateTrust === 'self' && pol.profiles[result.profile]?.selfAttest === true;
     if (selfAttestedCreate && b.visibility === 'deployment')
