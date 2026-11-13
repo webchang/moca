@@ -585,12 +585,11 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   had not reached are not read.
 - **What is kept:** each event with its fields and values as the proxy wrote them (the agent decodes and
   re-encodes each one, so the bytes may differ, and the control plane stores its own canonical line), for as long as the sandbox record
-  (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`, about 3 MB), and all
-  logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
-  most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
-  back. Each post reads the length of every retained log, so its cost grows with the number of
-  sandboxes retained with a log: small at SBX0's scale. Redis refuses writes past its 200 MB
-  `maxmemory` (register G45, above), well clear of these.
+  (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events and 4 MiB of lines (`EGRESS_LOG_CAP`,
+  `EGRESS_LOG_BYTES`), and all logs together at most 64 MiB of lines (`EGRESS_TOTAL_BYTES`), kept as
+  a running total; the rest count as dropped. An expired log gives its share back. A post costs its
+  own events plus the logs whose expiry has passed (at most 500 per post), not the number of logs
+  retained. Redis refuses writes past its 200 MB `maxmemory` (above), clear of these.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is); the agent reads the journal with `--all`, so one up to 8 KiB is sent whole (without it journalctl prints a field over 4096 bytes as `null`). A journal entry whose message is not text (not UTF-8) cannot be read for its sandbox: the agent says so in an error line. A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
