@@ -403,7 +403,8 @@ Build claims take subjects in turn, so one subject's batch of 50 does not hold e
 - **Aging:** an `active` build idle longer than its host's `idleLimit` (§6.2) is moved to
   `deactivating` by the control plane, whoever activated it.
 - **Leases:** an activation is a **lease** held by its subject, with a length (`leaseSeconds`,
-  default the host's `idleLimit`, at most a day per grant) the client renews
+  default the largest `idleLimit` of the hosts that hold the build, clamped to 60-86400 s, else
+  3600 s; at most a day per grant; only an explicit `leaseSeconds` is range-checked) the client renews
   (`POST /v1/templates/{id}/activate` again) while it still needs the build, e.g. for the life of a
   batch; renewals have no cap (O14). A build under any unexpired lease is held:
   aging and replacement never take it, whether or not a session is live between reps.

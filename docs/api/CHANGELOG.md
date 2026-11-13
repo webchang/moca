@@ -54,6 +54,11 @@ added or removed.
   in between refuses the old owner's change. A create retries under the new owner's quota lock when
   a transfer lands between its read and its write. `PATCH /v1/templates/{id}` refuses a description
   holding a lone surrogate with `400 invalid_request`.
+- An activation's default lease is the largest `idleLimitSeconds` of the hosts that hold the build
+  (not of every host), or 3600 when none reports one, clamped to 60-86400: a host's idle limit
+  outside the range never refuses a request that named no lease. Only an explicit `leaseSeconds` is
+  range-checked, and one that is not a whole number is refused rather than replaced by the
+  default.
 - A refused create is recorded as a `check` provenance record only on an existing template's stream
   the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
   only answered, and one on an id no template holds writes one audit line instead
