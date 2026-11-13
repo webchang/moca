@@ -372,6 +372,26 @@ describe('templates create, build, show, follow, cancel (§3.2)', () => {
       ['templates', 'create', '--spec', f['spec.json']!, '--spec', f['a.json']!, '--id', 'x'],
       /--id and --image name one template/,
     );
+    // A gate record goes with one spec, and is sized before it is read.
+    writeFileSync(join(f.dir, 'gate.json'), '{}');
+    await usage(
+      [
+        'templates',
+        'create',
+        '--spec',
+        f['spec.json']!,
+        '--spec',
+        f['a.json']!,
+        '--gate-record',
+        join(f.dir, 'gate.json'),
+      ],
+      /--gate-record is one image's record: give one --spec with it/,
+    );
+    writeFileSync(join(f.dir, 'big.tar'), Buffer.alloc(1024 * 1024 + 1));
+    await usage(
+      ['templates', 'create', '--spec', f['spec.json']!, '--gate-record', join(f.dir, 'big.tar')],
+      /big\.tar is 1048577 bytes: a gate record is at most 1 MiB/,
+    );
     await usage(
       ['templates', 'build', 'my-python', '--spec', f['spec.json']!, '--id', 'x'],
       /--id only applies to templates create/,

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
 import { TOKEN_MARGIN_S, WORKSPACE } from '@moca/sandbox-client';
 import { ApiError } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
@@ -353,6 +353,9 @@ export async function cmdCancelBuild(c: SbxCtx, id: string, build: string): Prom
   }
 }
 
+/** The most a create's gate record may hold: the create routes take a body of at most 1 MiB. */
+export const GATE_RECORD_MAX_BYTES = 1024 * 1024;
+
 /** What a create reads from its files: one spec (or a gate record's `template` block). */
 export interface CreateInput {
   file: string;
@@ -362,18 +365,31 @@ export interface CreateInput {
 /**
  * Reads a create's inputs (§3.2): F is a spec, or a gate record whose `template` block is the spec.
  * The id and the image default to the spec's own; given, they must equal them (M7). The gate record
- * is read as text and must round-trip byte for byte, since its sha256 is what the policy trusts.
- * Returns the bodies, or the line saying why not.
+ * (with one spec only, at most GATE_RECORD_MAX_BYTES) is read as text and must round-trip byte for
+ * byte, since its sha256 is what the policy trusts. Returns the bodies, or the line saying why not.
  */
 export function readCreateInputs(
   files: string[],
   o: { id?: string; image?: string; profile?: string; visibility?: string; gateRecord?: string },
 ): CreateInput[] | string {
   let gateRecord: string | undefined;
+  // A gate record is one image's: it goes with one spec, not with each of several.
+  if (o.gateRecord !== undefined && files.length > 1)
+    return "--gate-record is one image's record: give one --spec with it";
   if (o.gateRecord !== undefined) {
     let raw: Buffer;
     try {
-      raw = readFileSync(o.gateRecord);
+      // Sized before it is read, through the one handle it is read from (so the size checked is the
+      // file read): a wrong file (an image tarball) is refused, not loaded.
+      const fd = openSync(o.gateRecord, 'r');
+      try {
+        const size = fstatSync(fd).size;
+        if (size > GATE_RECORD_MAX_BYTES)
+          return `--gate-record ${o.gateRecord} is ${size} bytes: a gate record is at most 1 MiB (the create's body limit)`;
+        raw = readFileSync(fd);
+      } finally {
+        closeSync(fd);
+      }
     } catch (err) {
       return `cannot read --gate-record ${o.gateRecord}: ${(err as Error).message}`;
     }

@@ -85,8 +85,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                [--visibility private|deployment] [--gate-record F] [--dry-run] [--json]
                                                  create a template (or a new build of your own) from a
                                                  spec, or from a gate record's template block; id and
-                                                 image default to the spec's; the gate record is sent
-                                                 byte for byte. Several --spec: one create each, waiting
+                                                 image default to the spec's; the gate record (one
+                                                 --spec, at most 1 MiB) is sent byte for byte.
+                                                 Several --spec: one create each, waiting
                                                  for a queue slot when your buildsQueued quota is full.
                                                  An id already yours: a new build of it (the same
                                                  inputs: that build, reused). --dry-run: reads the
