@@ -108,6 +108,34 @@ describe('the create rule', () => {
     expect(failed(create(`docker.io/library/python@${D}`, DEFAULT_POLICY))).toBe('registry');
   });
 
+  it.each([
+    ['a `..` segment', 'library/../evil/x'],
+    ['a `.` segment', 'library/./python'],
+    ['an empty segment', 'library//python'],
+    ['uppercase', 'Library/Python'],
+    ['a trailing slash', 'library/python/'],
+  ])(
+    'refuses an image path with %s before matching, where the registry lists repositories',
+    (_w, path) => {
+      // M1's reference grammar refuses it first, so the repository rule is never reached.
+      const p: Policy = { ...HUB, allowedRepositories: { 'docker.io': ['library/*'] } };
+      const r = create(`docker.io/${path}@${D}`, p);
+      expect(failed(r)).toBe('M1');
+      expect(r.results.map((x) => x.rule)).not.toContain('registry.repository');
+    },
+  );
+
+  it('reads a registry key in any case, as allowedRegistries does', () => {
+    const p: Policy = {
+      ...HUB,
+      allowedRegistries: ['<default>', 'Docker.IO'],
+      allowedRepositories: { 'Docker.IO': ['library/python'] },
+    };
+    expect(policyProblems(p)).toEqual([]);
+    expect(failed(create(`docker.io/library/python@${D}`, p))).toBeUndefined();
+    expect(failed(create(`docker.io/library/node@${D}`, p))).toBe('registry.repository');
+  });
+
   it('admits a prefix entry by whole segments', () => {
     const p: Policy = { ...HUB, allowedRepositories: { 'docker.io': ['library/*'] } };
     expect(failed(create(`docker.io/library/node@${D}`, p))).toBeUndefined();

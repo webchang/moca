@@ -56,6 +56,10 @@ added or removed.
   the template's owner; a claim is held unless its build failed, and two creates sending one
   untrusted record at once are serialized, so never both claim it. The `gate` record's `scope` is
   the template's owner (the submitter, except on an admin's build for another subject's template).
+- From a registry the policy lists repositories for (`allowedRepositories`), an image path outside
+  the entries' grammar (uppercase, or an empty, `.` or `..` segment) is refused (`registry.repository`,
+  saying the path is malformed) before it is matched, so the policy and the build host's puller read
+  one path the same way.
 
 ### 1.13.0
 
