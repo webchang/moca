@@ -757,6 +757,40 @@ describe('templates create --dry-run (§3.5)', () => {
     expect(w.err()).toContain('would be refused by policy rule M7.vcpus: spec.vcpus must be 1-32');
     expect(w.cp.calls.every((c) => c.method === 'GET' && c.path === '/v1/policy')).toBe(true);
   });
+
+  it("sanitizes the policy's text (a profile name, an envelope value) in what it prints", async () => {
+    const evil = 'ev\u001b[2Jil';
+    const gate = JSON.stringify({ gate: { passed: true }, image: { digest: IMAGE.split('@')[1] } });
+    const f = files({ 'spec.json': SPEC, 'gate.json': gate });
+    const w = world({
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({
+          profiles: {
+            [evil]: {
+              requires: [],
+              envelope: { maxGuestMb: '\u001b]0;title\u0007', maxVcpus: 8, maxWorkspaceMb: 16_384 },
+            },
+          },
+          defaultProfile: evil,
+        }),
+      }),
+    });
+    expect(
+      await w.run([
+        'templates',
+        'create',
+        '--spec',
+        f['spec.json']!,
+        '--gate-record',
+        f['gate.json']!,
+        '--dry-run',
+      ]),
+    ).toBe(1);
+    expect(w.err()).toContain('would be refused by policy rule envelope');
+    expect(w.err()).toContain("outside the evil profile's envelope");
+    expect(w.err()).not.toMatch(/[\u001b\u0007]/);
+  });
 });
 
 describe('templates activate, deactivate (§3.3)', () => {

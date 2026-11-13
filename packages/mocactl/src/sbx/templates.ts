@@ -451,11 +451,15 @@ export async function cmdDryRun(c: SbxCtx, inputs: CreateInput[]): Promise<numbe
     );
     if (c.json) c.io.out(JSON.stringify({ file, id: body.id, ...r }) + '\n');
     else if (!r.failed)
-      c.io.out(`${sanitizeRemote(body.id)}: passes the local checks (${r.profile})\n`);
-    for (const n of r.notes) c.io.err(`sbx: ${sanitizeRemote(body.id)}: ${n}`);
+      c.io.out(
+        `${sanitizeRemote(body.id)}: passes the local checks (${sanitizeRemote(r.profile)})\n`,
+      );
+    // The notes and messages carry the policy's text (profile names, envelope values) and the
+    // spec's: remote or file text, sanitized before it reaches a terminal.
+    for (const n of r.notes) c.io.err(`sbx: ${sanitizeRemote(body.id)}: ${sanitizeRemote(n)}`);
     if (r.failed) {
       c.io.err(
-        `sbx: ${sanitizeRemote(body.id)} (${sanitizeRemote(file)}): would be refused by policy rule ${r.failed.rule}: ${r.failed.message}`,
+        `sbx: ${sanitizeRemote(body.id)} (${sanitizeRemote(file)}): would be refused by policy rule ${sanitizeRemote(r.failed.rule)}: ${sanitizeRemote(r.failed.message ?? '')}`,
       );
       code = SBX_EXIT.failed;
     }

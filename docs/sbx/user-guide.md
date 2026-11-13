@@ -711,9 +711,12 @@ mocactl sbx templates follow my-python                         # exit 0 once reg
 - `--spec` is a spec file or a gate record (whose `template` block is the spec); the id and image
   are the spec's own (`--id`, `--image` must equal them). `--profile P` names a policy profile,
   `--gate-record F` sends its gate record byte for byte (a self-attested profile needs one).
-- `--dry-run` sends nothing: it names the policy rule a create would fail (`M7.id`, `M1`, `X10`, …)
-  and suggests `guest_ram_mb` over `guest_mb`, and `skip_git_identity_check` for a git-less image.
-  Whether the policy trusts a gate record, and your quotas, only the server decides.
+- `--dry-run` creates nothing: it reads the policy (`mocactl sbx policy`, so it needs your login and
+  the control plane, exit 3 or 4 without them) and names the policy rule a create would fail
+  (`M7.id`, `M1`, `X10`, …), and suggests `guest_ram_mb` over `guest_mb`, and
+  `skip_git_identity_check` for a git-less image. Whether the policy trusts a gate record, whether
+  the image's registry is allowed, and your quotas, only the server decides: its answer is still
+  the decision.
 - Several `--spec` make one create each. When your `buildsQueued` quota is full, the next waits for
   a slot ("N waiting for a queue slot") rather than failing. Ctrl-C stops it with exit 130: the
   specs not yet posted are not posted.
