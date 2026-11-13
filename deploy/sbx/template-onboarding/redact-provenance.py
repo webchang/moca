@@ -7,13 +7,16 @@
 --catalog-only redacts every catalog entry (catalog/*.json) and touches no provenance record: for
 text that reached only the catalog (a build's stored `log`, which no provenance record copies).
 
-STORE_DIR is the control plane's SH_PROVENANCE_DIR (records/, heads/, blobs/, catalog/). For the
-template's stream (`template/<id>`), every record whose canonical JSON matches a pattern is rewritten
-with each match replaced by `<redacted>`, and every LATER record of the stream is rewritten too, since
-its `prev` names the one before: digests change from the first redacted record on, and the stream's
-head moves to the new last record. The catalog entry's build `reason` and `log` are redacted the same
-way. The old record files are removed. A `redaction` note is appended to `<STORE_DIR>/redactions.log`
-(stream, the old and new head, how many records, when; never the matched text).
+STORE_DIR is the control plane's SH_PROVENANCE_DIR (records/, heads/, blobs/, and catalog/ when the
+template store shares the directory). For the template's stream (`template/<id>`), every record
+with a string value that matches a pattern is rewritten with each match replaced by `<redacted>`
+(keys are never rewritten, so a match only inside a key, or only across values in the canonical
+text, is not a hit), and every LATER record of the stream is rewritten too, since its `prev` names
+the one before: digests change from the first redacted record on, and the stream's head moves to
+the new last record. The template's catalog entry (catalog/<id>.json), if there is one, is redacted
+the same way. The old record files are removed, except a file the rewritten chain still names. A
+`redaction` note is appended to `<STORE_DIR>/redactions.log` (stream, the old and new head, how
+many records, when; never the matched text).
 
 Provenance records are append-only by design (template lifecycle spec §7.2): this tool is for removing
 data that must not be kept, a user's decision, and its use is itself recorded. An exported copy taken
@@ -95,7 +98,11 @@ def main(argv):
         return 2
     stream = f"template/{tid}"
     head_path = os.path.join(store, "heads", sha(stream.encode()) + ".json")
-    head = json.load(open(head_path))
+    if not os.path.exists(head_path):
+        print(f"stream {stream} has no head in {store}", file=sys.stderr)
+        return 2
+    with open(head_path) as f:
+        head = json.load(f)
     # Walk the chain from the head.
     chain, at = [], head["head"]
     while at:
@@ -107,12 +114,12 @@ def main(argv):
         chain.append(r)
         at = r["prev"]
     chain.reverse()
-    hits = [i for i, r in enumerate(chain) if any(p.search(canonical(r)) for p in pats)]
+    # A hit is a record the redaction changes, not a match in its canonical text: scrub() rewrites
+    # string values only, so a match inside a key, or across values, changes no byte.
+    hits = [i for i, r in enumerate(chain) if scrub(r, pats) != r]
     cat_path = os.path.join(store, "catalog", tid + ".json")
     doc = json.load(open(cat_path)) if os.path.exists(cat_path) else None
-    cat_hits = 0
-    if doc:
-        cat_hits = sum(1 for p in pats if p.search(json.dumps(doc)))
+    cat_hits = bool(doc) and scrub(doc, pats) != doc
     print(f"stream {stream}: {len(chain)} records, {len(hits)} match; catalog entry: {'matches' if cat_hits else 'clean'}")
     if not hits and not cat_hits:
         print("nothing to redact")
@@ -120,7 +127,7 @@ def main(argv):
     if not apply:
         print(f"would rewrite records from seq {hits[0] + 1 if hits else '-'} to {len(chain)}; run with --apply")
         return 0
-    old_head, prev, rewritten, old_files = head["head"], None, 0, []
+    old_head, prev, rewritten, old_files, keep = head["head"], None, 0, [], set()
     for i, r in enumerate(chain):
         if hits and i >= hits[0]:
             old_files.append(os.path.join(store, "records", (("sha256:" + sha(canonical(r).encode()))[7:]) + ".json"))
@@ -131,10 +138,12 @@ def main(argv):
         d = "sha256:" + sha(b)
         if hits and i >= hits[0]:
             write_atomic(os.path.join(store, "records", d[7:] + ".json"), b)
+            keep.add(os.path.join(store, "records", d[7:] + ".json"))
         prev = d
-    write_atomic(head_path, canonical({"stream": stream, "head": prev, "count": len(chain)}).encode())
+    if hits:
+        write_atomic(head_path, canonical({"stream": stream, "head": prev, "count": len(chain)}).encode())
     new_head = prev
-    keep = {os.path.join(store, "records", new_head[7:] + ".json")}
+    # Every file the rewritten chain names stays, even one whose bytes the redaction left as they were.
     for f in old_files:
         if f not in keep and os.path.exists(f):
             os.remove(f)
@@ -167,7 +176,7 @@ def catalog_only(store, rest):
         return 2
     cdir = os.path.join(store, "catalog")
     changed = 0
-    for name in sorted(os.listdir(cdir)):
+    for name in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if not name.endswith(".json"):
             continue
         path = os.path.join(cdir, name)

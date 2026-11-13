@@ -488,6 +488,14 @@ created before it have no `created` record.
   prove itself consistent; the kept head catches one that dropped its latest records). **Not built
   yet:** re-running each `check` against its policy, and matching a `build` record's manifest hash
   to a snapshot at hand.
+- **Redaction**, for data that must not be kept:
+  `deploy/sbx/template-onboarding/redact-provenance.py STORE_DIR TEMPLATE_ID --pattern RE [--apply]`
+  (control plane stopped) rewrites the matching records of one stream (a record matches where a
+  pattern changes one of its string values; keys are never rewritten) and every later one, moves the
+  head, and appends a note to `redactions.log` (counts and heads, never the matched text). With no
+  match it says so and changes nothing; every record file the rewritten chain names is kept.
+  `--catalog-only` redacts text only the template catalog keeps. Dry run by default. An export taken
+  before a redaction no longer verifies against the new head, by design.
 - **The workload plane only reports**: the host agent posts build logs, `build`, and
   `activate`/`deactivate` events. The control plane checks and records; it never trusts a report it
   cannot tie to its chain (a `build` report must answer a build it handed to that host).

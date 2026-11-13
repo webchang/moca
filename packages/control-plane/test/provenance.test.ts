@@ -489,3 +489,114 @@ describe.skipIf(!havePython)('verify-provenance.py --egress (G42)', () => {
     expect(runVerifier(doc, '--egress', SBX).status).toBe(2);
   });
 });
+
+// redact-provenance.py rewrites one template's stream from its first match on, moves the head, and
+// logs counts only; the store and both verifiers accept the result, and an older export no longer
+// matches the new head.
+const REDACT = resolve(__dirname, '../../../deploy/sbx/template-onboarding/redact-provenance.py');
+
+describe.skipIf(!havePython)('redact-provenance.py', () => {
+  const T = 'template/django-django-11133';
+  const redact = (...args: string[]) => {
+    const r = spawnSync('python3', [REDACT, ...args], { encoding: 'utf8' });
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  };
+
+  it('dry-runs by default, then rewrites the chain from the first match and moves the head', async () => {
+    const dir = freshDir();
+    const s = store(dir);
+    await onboard(s);
+    await s.append({
+      stream: T,
+      kind: 'use',
+      subject: 'policy',
+      body: { note: 'contains SECRET-TOKEN-1 by mistake' },
+    });
+    await s.append({ stream: T, kind: 'activate', subject: 'github:1002', body: {} });
+    const before = JSON.parse(JSON.stringify(await s.export([T]))) as ProvenanceExport;
+    const oldHead = (await s.head(T))!.head;
+
+    const dry = redact(dir, 'django-django-11133', '--pattern', 'SECRET-TOKEN-[0-9]+');
+    expect(dry.status).toBe(0);
+    expect(dry.out).toContain('6 records, 1 match');
+    expect((await s.head(T))!.head).toBe(oldHead);
+
+    const applied = redact(
+      dir,
+      'django-django-11133',
+      '--pattern',
+      'SECRET-TOKEN-[0-9]+',
+      '--apply',
+    );
+    expect(applied.status).toBe(0);
+    expect(applied.out).toContain('rewrote 2 records');
+    expect(applied.out).not.toContain('SECRET-TOKEN');
+
+    const again = store(dir);
+    const chain = await again.chain(T);
+    expect(chain.map((r) => r.kind)).toEqual([
+      'create',
+      'gate',
+      'build',
+      'check',
+      'use',
+      'activate',
+    ]);
+    expect(chain[4].body.note).toBe('contains <redacted> by mistake');
+    const newHead = (await again.head(T))!;
+    expect(newHead).toMatchObject({ count: 6 });
+    expect(newHead.head).not.toBe(oldHead);
+    for (const f of readdirSync(join(dir, 'records'))) {
+      expect(readFileSync(join(dir, 'records', f), 'utf8')).not.toContain('SECRET-TOKEN');
+    }
+    const log = readFileSync(join(dir, 'redactions.log'), 'utf8');
+    expect(JSON.parse(log)).toMatchObject({
+      stream: T,
+      old_head: oldHead,
+      new_head: newHead.head,
+      records_rewritten: 2,
+    });
+    expect(log).not.toContain('SECRET-TOKEN');
+
+    // The redacted store exports and verifies; the export taken before no longer matches its head.
+    const after = JSON.parse(JSON.stringify(await again.export([T]))) as ProvenanceExport;
+    expect(verifyExport(after).ok).toBe(true);
+    expect(runVerifier(after, '--head', `${T}=${newHead.head}`).status).toBe(0);
+    expect(verifyExport(before).ok).toBe(true);
+    expect(runVerifier(before, '--head', `${T}=${newHead.head}`).status).toBe(1);
+    // The chain continues from the new head.
+    expect(
+      (await again.append({ stream: T, kind: 'use', subject: 'policy', body: {} })).record,
+    ).toMatchObject({ seq: 7, prev: newHead.head });
+  });
+
+  it('counts a hit only where the redaction changes a value, and removes no record the chain names', async () => {
+    const dir = freshDir();
+    const s = store(dir);
+    await onboard(s);
+    const head = (await s.head(T))!.head;
+    const files = readdirSync(join(dir, 'records')).sort();
+    // A match only inside a key, and one only across a key and its value in the canonical text:
+    // the redaction rewrites string values, so neither changes a byte.
+    for (const pattern of ['manifest_hash', '"source":"image-factory"']) {
+      const r = redact(dir, 'django-django-11133', '--pattern', pattern, '--apply');
+      expect(r.status, pattern).toBe(0);
+      expect(r.out, pattern).toContain('0 match');
+      expect(r.out, pattern).toContain('nothing to redact');
+      expect(readdirSync(join(dir, 'records')).sort(), pattern).toEqual(files);
+      const again = store(dir);
+      expect((await again.head(T))!.head, pattern).toBe(head);
+      expect((await again.chain(T)).length, pattern).toBe(4);
+    }
+  });
+
+  it('says nothing to redact when nothing matches, and refuses a stream with no head', async () => {
+    const dir = freshDir();
+    await onboard(store(dir));
+    const none = redact(dir, 'django-django-11133', '--pattern', 'no-such-text', '--apply');
+    expect(none.status).toBe(0);
+    expect(none.out).toContain('nothing to redact');
+    expect(redact(dir, 'other-app', '--pattern', 'x').status).toBe(2);
+    expect(redact(dir, 'django-django-11133').status).toBe(2);
+  });
+});
