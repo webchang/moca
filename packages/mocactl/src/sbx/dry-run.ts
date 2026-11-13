@@ -12,8 +12,29 @@ import type { SbxPolicyView } from './api.js';
 
 /** The template id rule (M7), as the policy's TEMPLATE_ID_RE. */
 export const TEMPLATE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-/** An image pinned by digest, as the policy's IMAGE_RE: a tag or a `<64 hex>` placeholder fails it. */
-const IMAGE_RE = /^[^\s@]+@sha256:[0-9a-f]{64}$/;
+
+/**
+ * An image pinned by digest, as the policy's isPinnedImage (M1): the distribution reference
+ * grammar, an optional `host[:port]/`, lowercase path components, `@sha256:<64 hex>`, no tag.
+ */
+const DOMAIN_RE =
+  /^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?$/;
+const PATH_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+
+export function isPinnedImage(image: string): boolean {
+  const at = image.indexOf('@');
+  if (at < 0 || !DIGEST_RE.test(image.slice(at + 1))) return false;
+  const name = image.slice(0, at);
+  if (name.length > 255) return false;
+  const parts = name.split('/');
+  const first = parts[0] ?? '';
+  const hasHost =
+    parts.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost');
+  if (hasHost && !DOMAIN_RE.test(first)) return false;
+  const path = hasHost ? parts.slice(1) : parts;
+  return path.length > 0 && path.every((c) => PATH_COMPONENT_RE.test(c));
+}
 
 export interface DryRunInput {
   id: string;
@@ -59,18 +80,27 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
     TEMPLATE_ID_RE.test(input.id),
     `id must match ${TEMPLATE_ID_RE} (refused, never truncated)`,
   );
-  rule('M1', IMAGE_RE.test(input.image), 'image must be pinned as repository@sha256:<64 hex>');
+  const pinned = typeof input.image === 'string' && isPinnedImage(input.image);
+  rule(
+    'M1',
+    pinned,
+    'image must be pinned by digest, [host[:port]/]path@sha256:<64 hex> (lowercase path, no tag)',
+  );
   rule('M7.spec_id', s.id === undefined || s.id === input.id, "spec.id must be the create's id");
   rule(
     'M7.spec_image',
     s.image === undefined || s.image === input.image,
     "spec.image must be the create's image",
   );
-  const guest = s.guest_mb ?? s.guest_ram_mb;
+  // guest_ram_mb, or its alias guest_mb: never both, even equal.
+  const bothGuest = s.guest_mb !== undefined && s.guest_ram_mb !== undefined;
+  const guest = bothGuest ? undefined : (s.guest_ram_mb ?? s.guest_mb);
   rule(
     'M7.guest',
-    int(guest) && guest >= 128,
-    'spec.guest_mb must be a whole number of MiB, at least 128',
+    !bothGuest && int(guest) && guest >= 128,
+    bothGuest
+      ? 'spec takes guest_ram_mb or its alias guest_mb, not both'
+      : 'spec.guest_ram_mb (or guest_mb) must be a whole number of MiB, at least 128',
   );
   // G46: the policy reads either name, but template-build.sh reads only guest_ram_mb.
   if (s.guest_mb !== undefined && s.guest_ram_mb === undefined)
@@ -163,8 +193,11 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
     }
     rule('gate.json', gate !== null, 'gateRecord is not a JSON object');
   }
-  const digest = IMAGE_RE.test(input.image) ? input.image.slice(input.image.indexOf('@') + 1) : '';
-  if (s.source_record_digest !== undefined) {
+  const digest = pinned ? input.image.slice(input.image.indexOf('@') + 1) : '';
+  // X10, and X1's check of the record (it passed, and is for this image), apply under every
+  // profile whenever the spec names a gate record or one is sent.
+  const named = s.source_record_digest !== undefined;
+  if (named) {
     rule(
       'X10',
       s.source_record_digest === digest,
@@ -188,11 +221,13 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
   } | null;
   const commitsRefused =
     g?.observed?.testbed?.agent_can_commit === 'no' && g?.observed?.guest?.git_identity === 'none';
-  if (req.has('X1')) {
+  if (req.has('X1') || named || input.gateRecord !== undefined) {
     rule(
       'X1',
       g !== null && g.gate?.passed === true,
-      `the ${profileName} profile needs a gate record whose gate passed (X1): --gate-record FILE`,
+      req.has('X1')
+        ? `the ${profileName} profile needs a gate record whose gate passed (X1): --gate-record FILE`
+        : 'the gate record did not pass its gate (X1)',
     );
     rule(
       'X1.image',
@@ -216,14 +251,16 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
       s.egress === false,
       `a ${profileName} template has no network: spec.egress must be false (X11)`,
     );
-  if (s.skip_git_identity_check === true && g !== null)
+  // X12, under every profile: a skip of the git identity check needs a gate record showing
+  // commits refused.
+  if (s.skip_git_identity_check === true)
     rule(
       'X12',
       commitsRefused,
-      'skip_git_identity_check, but the gate record does not show commits refused (agent_can_commit no, git_identity none) (X12)',
+      g === null
+        ? 'skip_git_identity_check needs a gate record showing commits refused (X12): --gate-record FILE'
+        : 'skip_git_identity_check, but the gate record does not show commits refused (agent_can_commit no, git_identity none) (X12)',
     );
-  else if (req.has('X12') && s.skip_git_identity_check === true)
-    rule('X12', false, 'skip_git_identity_check needs a gate record showing commits refused (X12)');
   if (req.has('X14'))
     rule(
       'X14',
@@ -238,13 +275,11 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
       `a ${profileName} template is ${e.guestMb} MiB, ${e.vcpus} vCPUs (X15)`,
     );
   }
-  // §3.5: a profile that requires no gate (base) is created without one, a self profile with one.
-  // The server stores a record sent with base without checking it; the dry run says so instead.
-  if (profile && !req.has('X1'))
-    rule(
-      'gate.profile',
-      input.gateRecord === undefined,
-      `the ${profileName} profile takes no gate record: drop --gate-record, or name a self profile`,
+  // A profile that requires no gate (base) checks a record sent (it passed, for this image) but does
+  // not trust it: said, not refused, since the server admits it too.
+  if (profile && !req.has('X1') && input.gateRecord !== undefined)
+    notes.push(
+      `the ${profileName} profile requires no gate record (X1): it is checked and stored with the build, not trusted (a self profile trusts its owner's)`,
     );
   // G47: a build host whose build-snapshot.sh predates the fix fails a git-less image's identity check.
   if (Array.isArray(s.tools) && !s.tools.includes('git') && s.skip_git_identity_check !== true)

@@ -669,6 +669,35 @@ describe('templates create --dry-run (§3.5)', () => {
     const r = dryRun({ ...ok, spec: { ...rest, guest_mb: 4096 } }, pol);
     expect(r.failed).toBeUndefined();
     expect(r.notes.join('\n')).toContain('write spec.guest_ram_mb rather than guest_mb');
+    // A host with a port, in any case (hosts compare case-insensitively): M1 passes.
+    const hosted = `Registry.Example.com:5000/team/moca-microvm@${DIGEST}`;
+    const { image: _i, ...noImage } = SPEC;
+    expect(fails({ image: hosted, spec: noImage })).toBeUndefined();
+    expect(dryRun({ ...ok, spec: { ...SPEC, guest_mb: 4096 } }, pol).failed?.message).toBe(
+      'spec takes guest_ram_mb or its alias guest_mb, not both',
+    );
+  });
+
+  it('checks a gate record sent or named, and X12, under every profile', () => {
+    const rec = (o: object) =>
+      JSON.stringify({ gate: { passed: true }, image: { digest: DIGEST }, ...o });
+    // base: a record sent is checked (passed, for this image), not trusted.
+    expect(fails({ gateRecord: rec({ gate: { passed: false } }) })).toBe('X1');
+    expect(fails({ gateRecord: rec({ image: { digest: 'x' } }) })).toBe('X1.image');
+    expect(fails({ spec: { ...SPEC, source_record_digest: DIGEST } })).toBe('X10.record');
+    // X12: an unbacked skip of the git identity check is refused under base too.
+    const skip = { ...SPEC, skip_git_identity_check: true };
+    expect(fails({ spec: skip })).toBe('X12');
+    expect(dryRun({ ...ok, spec: skip }, pol).failed?.message).toMatch(/needs a gate record/);
+    expect(fails({ spec: skip, gateRecord: rec({}) })).toBe('X12');
+    expect(
+      fails({
+        spec: skip,
+        gateRecord: rec({
+          observed: { testbed: { agent_can_commit: 'no' }, guest: { git_identity: 'none' } },
+        }),
+      }),
+    ).toBeUndefined();
   });
 
   it.each([
@@ -676,6 +705,13 @@ describe('templates create --dry-run (§3.5)', () => {
     ['M7.id', { id: 'x'.repeat(32) }],
     ['M1', { image: 'team/moca-microvm:latest' }],
     ['M1', { image: 'team/moca-microvm@sha256:<64 hex>' }],
+    // The distribution reference grammar, as the server's: no tag, lowercase path, no empty part.
+    ['M1', { image: `team/moca-microvm:v1@${DIGEST}` }],
+    ['M1', { image: `Team/moca-microvm@${DIGEST}` }],
+    ['M1', { image: `team//moca-microvm@${DIGEST}` }],
+    ['M1', { image: `-team/moca-microvm@${DIGEST}` }],
+    ['M1', { image: `../moca-microvm@${DIGEST}` }],
+    ['M1', { image: `bad_host.example.com/moca-microvm@${DIGEST}` }],
     ['M7.spec_id', { id: 'other' }],
     ['M7.spec_image', { image: `team/other@sha256:${'f'.repeat(64)}` }],
     ['profile', { profile: 'nope' }],
@@ -685,6 +721,7 @@ describe('templates create --dry-run (§3.5)', () => {
 
   it.each([
     ['M7.guest', { guest_ram_mb: 64 }],
+    ['M7.guest', { guest_mb: 4096 }],
     ['M7.vcpus', { vcpus: 0 }],
     ['M7.workspace', { workspace_mb: 100 }],
     ['M7.home', { guest_home: '/home/x' }],
@@ -702,7 +739,7 @@ describe('templates create --dry-run (§3.5)', () => {
     expect(fails({ spec: { ...SPEC, ...change } })).toBe(rule);
   });
 
-  it('a self profile needs a gate record for this image, offline; base takes none', () => {
+  it('a self profile needs a gate record for this image, offline; base checks one sent, untrusted', () => {
     const self = { profile: 'benchmark-self' };
     const bench = {
       ...SPEC,
@@ -742,7 +779,12 @@ describe('templates create --dry-run (§3.5)', () => {
       }),
     ).toBe('X12');
     expect(fails({ ...self, spec: bench, gateRecord: 'not json' })).toBe('gate.json');
-    expect(fails({ gateRecord: gate({}) })).toBe('gate.profile');
+    // A record sent with a profile that requires none is admitted, and said to be untrusted.
+    const base = dryRun({ ...ok, gateRecord: gate({}) }, pol);
+    expect(base.failed).toBeUndefined();
+    expect(base.notes.join('\n')).toContain(
+      'the base profile requires no gate record (X1): it is checked and stored with the build, not trusted',
+    );
   });
 
   it('points a git-less spec at skip_git_identity_check (G47)', () => {
