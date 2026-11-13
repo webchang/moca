@@ -642,12 +642,15 @@ activation() {
   exec 9>&-
 }
 
-# Retired builds the control plane names for removal (§6.1 step 7). The snapshot is found from this
-# host's own template record whose manifest hash is the build id AND whose worker is the one named,
-# never from a path the control plane sends; nothing else is deleted. The worker is stopped and
-# uninstalled first (install-host.sh --uninstall, which keeps workspace data for the janitor); a
-# running worker is not removed (the control plane leaves out one with a live sandbox, and this
-# checks again). Each removal is reported `removed`, so the retire's chain shows it.
+# The retired builds the control plane names for removal (§6.1 step 7), after `stop` in the same run.
+# The snapshot is found from this host's own template record whose manifest hash is the build id AND
+# whose worker is the one named, never from a path the control plane sends; nothing else is deleted,
+# and a name no record matches deletes nothing. A running worker is not removed (the control plane
+# leaves out one with a live sandbox, and this checks again): it is skipped until it is stopped. The
+# worker is uninstalled first (install-host.sh --uninstall --keep-shared: its own files only, so
+# the last worker's removal leaves the shared units, moca-egress and its credential injection for
+# the next one; its workspace data stays for the janitor), then the snapshot directory and its
+# record go. Each removal is reported `removed`.
 removal() {
   local w b rec snap
   while IFS=$'\t' read -r w b; do
@@ -667,7 +670,7 @@ removal() {
       continue
     fi
     if [[ -f "$SBX_ENV_DIR/workers/$w.env" ]]; then
-      "$SBX_INSTALL_HOST" --uninstall "$w" >"$WORK/uninstall-$w.log" 2>&1 || { error "install-host.sh --uninstall $w failed"; continue; }
+      "$SBX_INSTALL_HOST" --uninstall "$w" --keep-shared >"$WORK/uninstall-$w.log" 2>&1 || { error "install-host.sh --uninstall $w failed"; continue; }
     fi
     rm -rf -- "${SBX_SRV:?}/snapshots/$snap"
     rm -f -- "$rec"

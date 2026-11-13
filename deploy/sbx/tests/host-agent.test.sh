@@ -427,7 +427,7 @@ grep -q 'install-host --uninstall' "$MOCK_LOG" && fail 'uninstalled a running wo
 # Stopped: uninstalled, its snapshot and record gone, reported removed; the other build untouched.
 rm -f "$TMP/state/active-sbx-worker@$W.service"; : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*
 bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the removal run failed'
-grep -q "install-host --uninstall $W" "$MOCK_LOG" || fail 'the worker was not uninstalled'
+grep -qx "install-host --uninstall $W --keep-shared" "$MOCK_LOG" || fail 'the worker was not uninstalled alone (--keep-shared)'
 [[ ! -e "$TMP/srv/snapshots/ret-1" && ! -e "$TMP/srv/templates/ret-1.json" ]] || fail 'the snapshot or its record is still there'
 [[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build it was not asked to'
 jq -e --arg h "$H" '.buildId == $h and .event == "removed"' "$TMP/state/POST_v1_hosts_bm1_workers_report" >/dev/null || fail 'the removal was not reported'
