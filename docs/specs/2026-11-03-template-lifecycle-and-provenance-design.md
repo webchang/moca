@@ -375,7 +375,8 @@ guard.
 
 **Per subject** (new in 0.4, A22): quotas an admin sets, with a deployment default:
 `templates` (owned with a build registered or on its way there, so one whose builds all failed,
-were cancelled or retired holds no slot), `buildsQueued` (queued, building or probing at once,
+were cancelled or retired holds no slot, and takes one again, checked like a new id, when it gets
+a new build), `buildsQueued` (queued, building or probing at once,
 charged to the template's owner even when an admin adds the build), `active` (templates the
 subject holds active at once). An activation over the subject's `active` quota replaces that
 subject's own least recently used activation (§6.3), or is refused with `409 quota_exceeded` (as

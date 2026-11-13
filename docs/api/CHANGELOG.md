@@ -22,7 +22,8 @@ added or removed.
   milliseconds is refused rather than read as a grant that never lapses.
 - The template quotas count what holds a slot: `templates` counts a template only while one of its
   builds is registered or on its way there (one whose builds all failed, were cancelled or retired
-  holds none), `buildsQueued` counts probing builds too, and a build an admin adds to another
+  holds none, and a new build of it is checked against the quota like a new id), `buildsQueued`
+  counts probing builds too, and a build an admin adds to another
   subject's template is charged to the template's owner. A create's quota check and write hold one
   lock per subject, so concurrent creates for different ids never pass one check together.
 - A template spec names its guest size once: `guest_ram_mb`, or its alias `guest_mb` alone. A spec
