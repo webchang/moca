@@ -1090,7 +1090,14 @@ describe('admin writes: read, write, compare (§3.6)', () => {
       'GET /v1/subjects': () => ({ status: 200, body: { subjects } }),
       'PUT /v1/subjects/github%3A9': () => ({
         status: 200,
-        body: { subject: 'github:9', enrolled: true, source: 'api', roles: [], record },
+        body: {
+          subject: 'github:9',
+          enrolled: true,
+          source: 'api',
+          storeEnrolled: true,
+          roles: [],
+          record,
+        },
       }),
     });
     expect(await w.run(['admin', 'subjects', 'enroll', 'github:9'])).toBe(0);
@@ -1101,7 +1108,9 @@ describe('admin writes: read, write, compare (§3.6)', () => {
     expect(w.err()).toContain(
       "github:9's enrollment was changed by someone else between read and write: not enrolled / already so / enrolled (api)",
     );
-    subjects = [{ subject: 'github:9', enrolled: true, source: 'api', roles: [] }];
+    subjects = [
+      { subject: 'github:9', enrolled: true, source: 'api', storeEnrolled: true, roles: [] },
+    ];
     expect(await w.run(['admin', 'subjects', 'enroll', 'github:9'])).toBe(0);
     expect(w.out()).toContain('(unchanged)');
   });
