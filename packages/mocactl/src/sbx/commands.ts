@@ -408,9 +408,17 @@ const quotaText = (q: SbxQuota | null | undefined) =>
     : 'the default';
 
 /**
+ * The counters of a quota, and nothing else: what a quota write sends as `?expect=`. The control
+ * plane refuses an expect with another key, and a deployment-wide quota stored through
+ * `PUT /v1/policy` (or by an older control plane) may carry one.
+ */
+const quotaCounters = (q: SbxQuota | null): SbxQuota | null =>
+  q && { templates: q.templates, buildsQueued: q.buildsQueued, active: q.active };
+
+/**
  * `sbx templates quota TARGET (--templates N --builds-queued N --active N | --clear)` (§5.2;
  * admins). Reads the current value first (`GET /v1/policy`), then writes it as a compare-and-set
- * (`?expect=` the value read): if another admin changed the quota in between, the control plane
+ * (`?expect=`, the counters read as percent-encoded JSON, `null` for no override): if another admin changed the quota in between, the control plane
  * writes nothing (`409 quota_changed`), and this reports the value now (exit 1). Prints old -> new
  * and the new policy's digest and record.
  */
@@ -430,7 +438,7 @@ export async function cmdSetQuota(
     const read = target === 'default' ? pol.quota : (pol.quotaBySubject?.[target] ?? null);
     let r: Awaited<ReturnType<typeof c.api.putQuota>>;
     try {
-      r = await c.api.putQuota(target, quota, read);
+      r = await c.api.putQuota(target, quota, quotaCounters(read));
     } catch (err) {
       if (!(err instanceof ApiError) || err.code !== 'quota_changed') throw err;
       const p2 = (await c.api.getPolicy()).policy;

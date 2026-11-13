@@ -1242,6 +1242,18 @@ describe('admin writes: read, write, compare (§3.6)', () => {
     ]);
   });
 
+  it('expects only the counters read, when the stored quota carries another key', async () => {
+    // A deployment-wide quota stored through PUT /v1/policy may hold a key the control plane's
+    // expect refuses; the command sends the counters alone.
+    const STORED = { ...OLD, note: 'set by hand' };
+    const w = world({
+      'GET /v1/policy': () => ({ status: 200, body: policyView({ quota: STORED }) }),
+      'PUT /v1/quota/default': () => quotaAnswer(STORED),
+    });
+    expect(await w.run(['templates', 'quota', 'default', ...QUOTA_ARGS.slice(3)])).toBe(0);
+    expect(w.cp.calls.at(-1)!.path).toBe(`/v1/quota/default${ifRead(OLD)}`);
+  });
+
   it('writes nothing when the quota changed after its read, and reports the value now (exit 1)', async () => {
     let reads = 0;
     const w = world({
