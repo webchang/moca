@@ -578,7 +578,7 @@ describe.skipIf(!havePython)('redact-provenance.py', () => {
     const files = readdirSync(join(dir, 'records')).sort();
     // A match only inside a key, and one only across a key and its value in the canonical text:
     // the redaction rewrites string values, so neither changes a byte.
-    for (const pattern of ['manifest_hash', '"source":"image-factory"']) {
+    for (const pattern of ['manifest_hash', '"kind":"gate"']) {
       const r = redact(dir, 'django-django-11133', '--pattern', pattern, '--apply');
       expect(r.status, pattern).toBe(0);
       expect(r.out, pattern).toContain('0 match');
