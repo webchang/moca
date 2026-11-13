@@ -356,7 +356,12 @@ A stopped worker costs no memory. A build no host declares is `unavailable`.
 A report is accepted only for a build handed to that host, and a failed or cancelled build takes no
 more reports; the check is made again inside the template's update, with the report's records, so
 an owner's cancel that lands while a report is being written stands and no record says it
-registered.
+registered. On `built` the control plane stores T and S byte for byte, writes a `build` record
+and the registration `check` (§8.2); a registered build's id becomes its manifest hash, and a
+template's first registered build takes the `default` tag. A build id names one build of a
+template: a build whose manifest hash another build of the template already has (the same image
+and spec created again under another profile or gate record, which the build finds already built)
+is rejected, rule `T.unique`, naming that build.
 
 A host agent that is still running reports every build it claimed: `built`, or `failed` on any
 other way out. When it cannot carry on with a build it claimed (a gate record it cannot fetch or
