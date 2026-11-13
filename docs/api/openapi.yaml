@@ -2908,8 +2908,10 @@ paths:
       description: |
         Template lifecycle spec §5.2. `subject` is `default` (the deployment default) or a subject
         (`github:<id>` or `oidc:<sub>`, an override); a body of `null` removes a subject's override, returning it to
-        the default. Each change is a policy change: a new `policy` record (the whole policy), whose
-        digest is answered, so the chain shows who set which quota when. Enforced at once.
+        the default. A quota holds `templates`, `buildsQueued` and `active` only: another key is
+        refused, so nothing else is kept in the policy. Each change is a policy change: a new `policy`
+        record (the whole policy), whose digest is answered, so the chain shows who set which quota
+        when. Enforced at once.
       security: [{ sessionToken: [] }]
       parameters:
         - { name: subject, in: path, required: true, schema: { type: string } }
@@ -2938,7 +2940,7 @@ paths:
                   policy: { type: string, description: the new policy's digest }
                   record: { type: string, description: the policy record written }
         '400':
-          description: '`invalid_request`: a bad target or quota, or no template store'
+          description: '`invalid_request`: a bad target or quota (also one with a key beyond the three), or no template store'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

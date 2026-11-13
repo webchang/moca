@@ -128,6 +128,7 @@ added or removed.
   rebuild.
 - **A retired or admin-rejected build is listed in `stop` beside `remove` on every host:** before, only on a host with an idle grace, so on a host without one a worker running when its build was retired was never stopped (the agent skips the removal of a running worker), nor removed.
 - **Two quota writes made together keep both changes:** `PUT /v1/quota/{subject}`'s read, change and write of the policy are now one step of the policy store, so two admins' writes for two subjects never drop each other's change while both answer 200.
+- **A quota holds the three counters only:** `PUT /v1/quota/{subject}` refuses a quota with a key beyond `templates`, `buildsQueued` and `active` (400 `invalid_request`) and stores a new object of those three; `PUT /v1/policy` refuses an override with another key too. A stored policy whose override carries another key no longer reads as valid (the policy read fails closed): rewrite the override before upgrading.
 
 ### 1.13.0
 

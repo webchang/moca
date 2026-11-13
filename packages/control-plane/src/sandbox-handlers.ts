@@ -2007,6 +2007,29 @@ export async function requireActive(
   );
 }
 
+/**
+ * A quota write's body (§5.2): exactly `templates`, `buildsQueued` and `active`, returned as a new
+ * object of those three, so nothing else the request carried reaches the policy. Their values are
+ * policyProblems' to judge.
+ */
+function quotaBody(v: unknown): Policy['quota'] {
+  const keys = ['templates', 'buildsQueued', 'active'] as const;
+  if (typeof v !== 'object' || v === null || Array.isArray(v))
+    throw new CpError('invalid_request', 'a quota is an object: templates, buildsQueued, active');
+  const extra = Object.keys(v).filter((k) => !(keys as readonly string[]).includes(k));
+  if (extra.length > 0)
+    throw new CpError(
+      'invalid_request',
+      `a quota holds only templates, buildsQueued, active (not ${extra.join(', ')})`,
+    );
+  const o = v as Record<string, unknown>;
+  return {
+    templates: o.templates,
+    buildsQueued: o.buildsQueued,
+    active: o.active,
+  } as Policy['quota'];
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
   activateTemplate: activate,
   deactivateTemplate: deactivate,
@@ -2055,7 +2078,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
         'invalid_request',
         `the quota's target is 'default' or a subject, ${MEMBER_SUBJECT_FORMS}`,
       );
-    const body = ctx.body;
+    // Stored as the three counters alone: a key beyond them is refused, never kept in the policy.
+    const body = ctx.body === null ? null : quotaBody(ctx.body);
     // The read, the change and the write are one step of the policy store (update), so a quota or
     // policy another admin writes meanwhile is never dropped by this write.
     let before: unknown;
