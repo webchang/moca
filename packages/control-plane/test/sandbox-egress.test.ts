@@ -41,7 +41,7 @@ const asHost = (host: string, body: unknown = {}, params: Record<string, string>
     host: string;
   };
 
-async function registered(d: TestDeps, id: string, h: string, worker: string, host = 'bm1') {
+async function registered(d: TestDeps, id: string, h: string, worker: string, host = 'host-1') {
   await HANDLERS.createTemplate!(
     ctx({ principal: alice, body: { id, image: IMAGE, spec: BASE_SPEC, profile: 'base' } }),
     d,
@@ -87,7 +87,7 @@ const inventory = (d: TestDeps, host: string, holds: Record<string, string>) =>
     d,
   );
 
-/** Two templates: t1 on bm1 (worker sbx_t1), t2 on bm2 (worker sbx_t2), both active. */
+/** Two templates: t1 on host-1 (worker sbx_t1), t2 on host-2 (worker sbx_t2), both active. */
 async function setup(over: Partial<Parameters<typeof makeDeps>[0]> = {}): Promise<TestDeps> {
   now = NOW_MS;
   const dir = mkdtempSync(join(tmpdir(), 'cp-egress-'));
@@ -107,10 +107,10 @@ async function setup(over: Partial<Parameters<typeof makeDeps>[0]> = {}): Promis
     ...over,
   });
   await d.policy!.set(DEFAULT_POLICY, 'github:admin');
-  await registered(d, 't1', hash('1'), 'sbx_t1', 'bm1');
-  await registered(d, 't2', hash('2'), 'sbx_t2', 'bm2');
-  await inventory(d, 'bm1', { [hash('1')]: 't1' });
-  await inventory(d, 'bm2', { [hash('2')]: 't2' });
+  await registered(d, 't1', hash('1'), 'sbx_t1', 'host-1');
+  await registered(d, 't2', hash('2'), 'sbx_t2', 'host-2');
+  await inventory(d, 'host-1', { [hash('1')]: 't1' });
+  await inventory(d, 'host-2', { [hash('2')]: 't2' });
   for (const t of ['t1', 't2'])
     await HANDLERS.activateTemplate!(ctx({ principal: alice, params: { id: t }, body: {} }), d);
   return d;
@@ -150,7 +150,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
   it("stores a sandbox's events exactly as the proxy wrote them, and refuses the rest", async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    const other = await create(d, 't2'); // on bm2's worker
+    const other = await create(d, 't2'); // on host-2's worker
     const e1 = ev(a.id);
     const e2 = ev(a.id, {
       method: 'GET',
@@ -164,7 +164,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
       credential: 'pypi-mirror',
       coalesced: 2,
     });
-    const r = await post(d, 'bm1', [e1, e2, ev('sbx-nobody'), ev(other.id), 'not an object']);
+    const r = await post(d, 'host-1', [e1, e2, ev('sbx-nobody'), ev(other.id), 'not an object']);
     expect(r).toMatchObject({ accepted: 2, refused: 3, capped: 0, invalid: 0, dropped: 0 });
     const page = (await read(d, a.id)).body as Body;
     expect(page.events).toEqual([e1, e2]);
@@ -183,14 +183,14 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
       dropped: 0,
       complete: true,
     });
-    // bm2's sandbox got nothing from bm1's post.
+    // host-2's sandbox got nothing from host-1's post.
     expect(((await read(d, other.id)).body as Body).summary.total).toBe(0);
   });
 
   it('never stores a field beyond the proxy Event: such an event is not stored, and counted as dropped', async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    const r = await post(d, 'bm1', [
+    const r = await post(d, 'host-1', [
       ev(a.id, { authorization: 'Bearer x' }),
       ev(a.id, { status: '200' }),
       ev(a.id, { via: 'someone-else' }),
@@ -231,7 +231,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
     await d.sandboxes!.markDeleted(a.id, nowS(), 3600);
     const other = { ...rec, id: 'sbx-' + 'f'.repeat(26), wsk: 'ws-anything', deletedAt: undefined };
     await d.sandboxes!.create(other, { perSubject: 9, total: 9, retentionS: 3600 }, nowS());
-    const r = await post(d, 'bm1', [ev('ws-anything'), ev(other.id)]);
+    const r = await post(d, 'host-1', [ev('ws-anything'), ev(other.id)]);
     expect(r).toMatchObject({ accepted: 1, refused: 1 });
     expect(((await read(d, other.id)).body as Body).events).toEqual([ev('ws-anything')]);
   });
@@ -239,11 +239,11 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
   it('is idempotent by (host, cursor): a retried post appends nothing', async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    const first = await post(d, 'bm1', [ev(a.id)], 'cur-1');
-    const again = await post(d, 'bm1', [ev(a.id)], 'cur-1');
+    const first = await post(d, 'host-1', [ev(a.id)], 'cur-1');
+    const again = await post(d, 'host-1', [ev(a.id)], 'cur-1');
     expect(again).toEqual(first);
     expect(((await read(d, a.id)).body as Body).summary.total).toBe(1);
-    await post(d, 'bm1', [ev(a.id)], 'cur-2');
+    await post(d, 'host-1', [ev(a.id)], 'cur-2');
     expect(((await read(d, a.id)).body as Body).summary.total).toBe(2);
   });
 
@@ -251,7 +251,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
     const d = await setup();
     const a = await create(d, 't1');
     const b2 = await create(d, 't1', bob);
-    const far = await create(d, 't2'); // bm2: not charged by bm1's report
+    const far = await create(d, 't2'); // host-2: not charged by host-1's report
     // One deleted long before the report: outside the window, not charged.
     const old = await create(d, 't1');
     await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: old.id } }), d);
@@ -269,7 +269,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
       decision: 'audit_dropped',
       dropped: 7,
     };
-    const r = await post(d, 'bm1', [drop]);
+    const r = await post(d, 'host-1', [drop]);
     expect(r).toMatchObject({ accepted: 0, refused: 0, dropped: 7 });
     for (const [id, p] of [
       [a.id, alice],
@@ -286,8 +286,8 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
     const d = await setup();
     const a = await create(d, 't1');
     const batch = Array.from({ length: 1000 }, () => ev(a.id));
-    for (let i = 0; i < EGRESS_LOG_CAP / 1000; i++) await post(d, 'bm1', batch);
-    const r = await post(d, 'bm1', batch.slice(0, 5));
+    for (let i = 0; i < EGRESS_LOG_CAP / 1000; i++) await post(d, 'host-1', batch);
+    const r = await post(d, 'host-1', batch.slice(0, 5));
     expect(r).toMatchObject({ accepted: 0, capped: 5 });
     const s = ((await read(d, a.id, { limit: '1' })).body as Body).summary;
     expect(s).toMatchObject({
@@ -302,29 +302,32 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
     const d = await setup();
     const a = await create(d, 't1');
     const b2 = await create(d, 't1', bob);
-    const far = await create(d, 't2'); // bm2's worker
+    const far = await create(d, 't2'); // host-2's worker
     const sids = async () =>
-      ((await HANDLERS.hostWanted!(asHost('bm1'), d)).body as Body).egressSids as string[];
+      ((await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body).egressSids as string[];
     expect(await sids()).toEqual([a.id, b2.id].sort());
     expect(await sids()).not.toContain(far.id);
     // Ended: still listed in the grace, then not; hostEgress agrees at each step.
     await HANDLERS.deleteSandbox!(ctx({ principal: bob, params: { id: b2.id } }), d);
     now += (EGRESS_GRACE_S - 1) * 1000;
     expect(await sids()).toContain(b2.id);
-    expect(await post(d, 'bm1', [ev(b2.id)])).toMatchObject({ accepted: 1, refused: 0 });
+    expect(await post(d, 'host-1', [ev(b2.id)])).toMatchObject({ accepted: 1, refused: 0 });
     now += 2000;
     expect(await sids()).toEqual([a.id]);
-    expect(await post(d, 'bm1', [ev(b2.id), ev(a.id)])).toMatchObject({ accepted: 1, refused: 1 });
+    expect(await post(d, 'host-1', [ev(b2.id), ev(a.id)])).toMatchObject({
+      accepted: 1,
+      refused: 1,
+    });
   });
 
   it('refuses a post with no cursor, or more than 1000 events', async () => {
     const d = await setup();
-    expect(await codeOf(() => HANDLERS.hostEgress!(asHost('bm1', { events: [] }), d))).toBe(
+    expect(await codeOf(() => HANDLERS.hostEgress!(asHost('host-1', { events: [] }), d))).toBe(
       'invalid_request',
     );
     expect(
       await codeOf(() =>
-        HANDLERS.hostEgress!(asHost('bm1', { events: Array(1001).fill({}), cursor: 'c' }), d),
+        HANDLERS.hostEgress!(asHost('host-1', { events: Array(1001).fill({}), cursor: 'c' }), d),
       ),
     ).toBe('invalid_request');
   });
@@ -334,7 +337,7 @@ describe('GET /v1/sandboxes/{id}/egress (G42)', () => {
   it('is for the owner and admins only, as GET /v1/sandboxes/{id}', async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    await post(d, 'bm1', [ev(a.id)]);
+    await post(d, 'host-1', [ev(a.id)]);
     expect(await codeOf(() => read(d, a.id, {}, bob))).toBe('sandbox_not_found');
     expect(((await read(d, a.id, {}, admin)).body as Body).events).toHaveLength(1);
   });
@@ -343,7 +346,7 @@ describe('GET /v1/sandboxes/{id}/egress (G42)', () => {
     const d = await setup();
     const a = await create(d, 't1');
     const events = Array.from({ length: 5 }, (_, i) => ev(a.id, { bytes_up: i }));
-    await post(d, 'bm1', events);
+    await post(d, 'host-1', events);
     const p1 = (await read(d, a.id, { limit: '2' })).body as Body;
     const p2 = (await read(d, a.id, { limit: '2', after: p1.next })).body as Body;
     const p3 = (await read(d, a.id, { limit: '2', after: p2.next })).body as Body;
@@ -374,7 +377,7 @@ describe("the sandbox's end record names its egress log (G42)", () => {
   it('on delete: egress {events, sha256, dropped, complete}; late events in the grace, then one egress record', async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    await post(d, 'bm1', [ev(a.id), ev(a.id, { host: 'cdn.example.com' })]);
+    await post(d, 'host-1', [ev(a.id), ev(a.id, { host: 'cdn.example.com' })]);
     await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: a.id } }), d);
     const nd1 = (await read(d, a.id, { format: 'ndjson' })).body as string;
     const [end] = await ends(d, a.id);
@@ -391,7 +394,7 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     });
     // A late event, inside the grace, is still taken.
     now += 30_000;
-    expect(await post(d, 'bm1', [ev(a.id, { decision: 'aborted' })])).toMatchObject({
+    expect(await post(d, 'host-1', [ev(a.id, { decision: 'aborted' })])).toMatchObject({
       accepted: 1,
     });
     const janitor = () =>
@@ -400,7 +403,7 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     expect(await ends(d, a.id)).toHaveLength(1); // not sealed yet
     now += EGRESS_GRACE_S * 1000;
     // Past the grace: refused, then sealed by the sweep, with one record naming the final log.
-    expect(await post(d, 'bm1', [ev(a.id)])).toMatchObject({ accepted: 0, refused: 1 });
+    expect(await post(d, 'host-1', [ev(a.id)])).toMatchObject({ accepted: 0, refused: 1 });
     await janitor();
     await janitor();
     const after = await ends(d, a.id);
@@ -413,10 +416,37 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     expect(((await read(d, a.id)).body as Body).summary.sealed).toBe(true);
   });
 
+  it('a sweep that fails before the seal leaves the log unsealed, and the next sweep records it', async () => {
+    const d = await setup();
+    const a = await create(d, 't1');
+    await post(d, 'host-1', [ev(a.id)]);
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: a.id } }), d);
+    now += 30_000;
+    await post(d, 'host-1', [ev(a.id, { decision: 'aborted' })]); // late: the end record named 1
+    now += EGRESS_GRACE_S * 1000;
+    const prov = d.provenance!;
+    const append = prov.append.bind(prov);
+    let fail = 1;
+    prov.append = async (r) => {
+      if ((r.body as Body).state === 'egress' && fail-- > 0) throw new Error('append failed');
+      return append(r);
+    };
+    const janitor = () =>
+      HANDLERS.janitorSandboxes!({ ...ctx({}), janitorAuthorized: true } as never, d);
+    await expect(janitor()).rejects.toThrow('append failed');
+    expect(((await read(d, a.id)).body as Body).summary.sealed).toBe(false);
+    await janitor();
+    await janitor();
+    const after = await ends(d, a.id);
+    expect(after).toHaveLength(2);
+    expect(after[1]!.body).toMatchObject({ state: 'egress', egress: { events: 2 } });
+    expect(((await read(d, a.id)).body as Body).summary.sealed).toBe(true);
+  });
+
   it('on expiry with nothing late: one end record, no egress record; a drop marks it incomplete', async () => {
     const d = await setup();
     const a = await create(d, 't1');
-    await post(d, 'bm1', [
+    await post(d, 'host-1', [
       ev(a.id),
       {
         time: iso(nowS()),
@@ -453,7 +483,7 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     const one = Buffer.byteLength(canonicalJson(ev('0'.repeat(32))));
     const d = await setup({ egress: new MemoryEgressStore({ cap: 10, budgetBytes: 3 * one }) });
     const a = await create(d, 't1');
-    expect(await post(d, 'bm1', [ev(a.id), ev(a.id), ev(a.id), ev(a.id)])).toMatchObject({
+    expect(await post(d, 'host-1', [ev(a.id), ev(a.id), ev(a.id), ev(a.id)])).toMatchObject({
       accepted: 3,
       overBudget: 1,
     });
@@ -463,7 +493,7 @@ describe("the sandbox's end record names its egress log (G42)", () => {
       egress: { events: 3, dropped: 1, droppedBy: { budget: 1 }, complete: false },
     });
     now += 30_000;
-    await post(d, 'bm1', [ev(a.id)]); // late, in the grace, and still over the budget
+    await post(d, 'host-1', [ev(a.id)]); // late, in the grace, and still over the budget
     now += EGRESS_GRACE_S * 1000;
     await HANDLERS.janitorSandboxes!({ ...ctx({}), janitorAuthorized: true } as never, d);
     const after = await ends(d, a.id);
@@ -479,6 +509,6 @@ describe("the sandbox's end record names its egress log (G42)", () => {
     await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: a.id } }), d);
     const [end] = await ends(d, a.id);
     expect(end!.body).not.toHaveProperty('egress');
-    expect(await post(d, 'bm1', [ev(a.id)])).toMatchObject({ accepted: 0, refused: 1 });
+    expect(await post(d, 'host-1', [ev(a.id)])).toMatchObject({ accepted: 0, refused: 1 });
   });
 });
