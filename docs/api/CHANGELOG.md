@@ -48,6 +48,12 @@ added or removed.
 - A tag is looked up as the template's own property everywhere (moving, removing, `id:tag`, the tag
   list), so a tag named like an `Object.prototype` member (`constructor`) is a tag like any other;
   `DELETE …/tags/{tag}` refuses a name outside the tag grammar with `400 invalid_request`.
+- Every template change (a tag moved or removed, an edit, an owner transfer, a cancelled build) is
+  stored only once its records are on the chain, and its owner's check is made again under the
+  template's lock: a record that fails to append refuses the change, and an owner transfer landing
+  in between refuses the old owner's change. A create retries under the new owner's quota lock when
+  a transfer lands between its read and its write. `PATCH /v1/templates/{id}` refuses a description
+  holding a lone surrogate with `400 invalid_request`.
 - A refused create is recorded as a `check` provenance record only on an existing template's stream
   the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
   only answered, and one on an id no template holds writes one audit line instead

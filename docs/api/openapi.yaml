@@ -2185,7 +2185,10 @@ paths:
               minProperties: 1
               properties:
                 visibility: { type: string, enum: [private, deployment] }
-                description: { type: string, maxLength: 1024 }
+                description:
+                  type: string
+                  maxLength: 1024
+                  description: no lone surrogate (a provenance record cannot hold one)
       responses:
         '200':
           description: changed (or already so)
@@ -2210,7 +2213,7 @@ paths:
                         before: { type: string }
                         record: { type: string }
         '400':
-          description: '`invalid_request`: no field, or a bad value'
+          description: '`invalid_request`: no field, or a bad value (a description holding a lone surrogate is one)'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -311,6 +311,63 @@ describe('edit description and visibility (§5.1)', () => {
   });
 });
 
+describe('every change is a record (§7.1)', () => {
+  it('refuses a description holding a lone surrogate, before anything is written', async () => {
+    const d = stored();
+    await registered(d);
+    const before = (await d.templates!.get(ID))!;
+    // JSON.parse('"\\ud800"') holds one: a body can carry it, a provenance record cannot.
+    const lone = JSON.parse('"half \\ud800 a pair"') as string;
+    expect(await codeOf(() => patch(d, { description: lone }))).toBe('invalid_request');
+    expect(await codeOf(() => patch(d, { visibility: 'private', description: lone }))).toBe(
+      'invalid_request',
+    );
+    expect(await d.templates!.get(ID)).toEqual(before);
+    expect((await chain(d)).some((x) => x.kind === 'visibility')).toBe(false);
+    // A whole pair (an emoji) is a string as any other.
+    expect((await patch(d, { description: 'ok \u{1f600}' })).status).toBe(200);
+  });
+
+  it('writes no change whose record fails to append', async () => {
+    const d = stored();
+    await registered(d, 2);
+    await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: alice,
+        params: { id: ID },
+        body: createBody({ spec: { ...spec, description: 'queued' } }),
+      }),
+      d,
+    );
+    const queued = (await d.templates!.get(ID))!.builds[0]!.handle!;
+    await move(d, { tags: ['stable'], build: hash('1') });
+    const doc = await d.templates!.get(ID);
+    const n = (await chain(d)).length;
+    const prov = d.provenance!;
+    const append = prov.append.bind(prov);
+    prov.append = () => Promise.reject(new Error('the chain is not writable'));
+    const changes: [string, () => Promise<unknown>][] = [
+      ['move', () => move(d, { tags: ['default', 'v2'], build: hash('2') })],
+      ['untag', () => untag(d, 'stable')],
+      ['edit', () => patch(d, { visibility: 'private', description: 'new' })],
+      ['transfer', () => transfer(d, ID, bob.sub)],
+      [
+        'cancel',
+        () =>
+          HANDLERS.cancelTemplateBuild!(
+            ctx({ principal: alice, params: { id: ID, build: queued } }),
+            d,
+          ),
+      ],
+    ];
+    for (const [what, run] of changes)
+      await expect(run(), what).rejects.toThrow('the chain is not writable');
+    prov.append = append;
+    expect(await d.templates!.get(ID)).toEqual(doc);
+    expect((await chain(d)).length).toBe(n);
+  });
+});
+
 describe('owner transfer (§5.2)', () => {
   it('an admin moves a template to another enrolled subject, who then owns its actions', async () => {
     const d = stored();
@@ -392,6 +449,122 @@ describe('owner transfer (§5.2)', () => {
         ),
       ),
     ).toBe('template_exists');
+  });
+
+  it("checks the owner again under the lock: a transfer meanwhile refuses the old owner's change", async () => {
+    const d = stored();
+    await registered(d, 2);
+    await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: alice,
+        params: { id: ID },
+        body: createBody({ spec: { ...spec, description: 'queued' } }),
+      }),
+      d,
+    );
+    const queued = (await d.templates!.get(ID))!.builds[0]!.handle!;
+    await move(d, { tags: ['stable'], build: hash('1') });
+    // Alice's read sees her template; an admin moves it to bob before her write takes the lock.
+    const stale = (await d.templates!.get(ID))!;
+    await transfer(d, ID, bob.sub);
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    cat.get = async (id) => (id === ID ? structuredClone(stale) : get(id));
+    const doc = await get(ID);
+    const n = (await chain(d)).length;
+    const changes: [string, () => Promise<unknown>][] = [
+      ['move', () => move(d, { tags: ['stable'], build: hash('2') })],
+      ['untag', () => untag(d, 'stable')],
+      ['edit', () => patch(d, { description: 'still mine' })],
+      [
+        'cancel',
+        () =>
+          HANDLERS.cancelTemplateBuild!(
+            ctx({ principal: alice, params: { id: ID, build: queued } }),
+            d,
+          ),
+      ],
+    ];
+    for (const [what, run] of changes) expect(await codeOf(run), what).toBe('forbidden');
+    cat.get = get;
+    expect(await get(ID)).toEqual(doc);
+    expect((await chain(d)).length).toBe(n);
+  });
+
+  it("charges an admin's new build to the owner it finds under the lock", async () => {
+    const d = stored();
+    await registered(d);
+    const stale = (await d.templates!.get(ID))!;
+    await transfer(d, ID, bob.sub);
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    let staleReads = 1;
+    cat.get = async (id) => (id === ID && staleReads-- > 0 ? structuredClone(stale) : get(id));
+    const build = () =>
+      HANDLERS.createTemplateBuild!(
+        ctx({
+          principal: admin,
+          params: { id: ID },
+          body: createBody({ spec: { ...spec, description: 'by an admin' } }),
+        }),
+        d,
+      );
+    // The first read names alice; the write finds bob, writes nothing, and runs again as bob's.
+    expect((await build()).status).toBe(202);
+    expect((await get(ID))!.builds.filter((x) => x.status === 'queued')).toHaveLength(1);
+    // An owner that changes on every read is refused after three tries, with nothing written.
+    staleReads = Infinity;
+    const n = (await chain(d)).length;
+    const doc = await get(ID);
+    expect(
+      await codeOf(() =>
+        HANDLERS.createTemplateBuild!(
+          ctx({
+            principal: admin,
+            params: { id: ID },
+            body: createBody({ spec: { ...spec, description: 'again' } }),
+          }),
+          d,
+        ),
+      ),
+    ).toBe('internal_error');
+    expect(await get(ID)).toEqual(doc);
+    expect((await chain(d)).length).toBe(n);
+  });
+
+  it("checks the new owner's templates quota again when a transfer lands before the write", async () => {
+    const d = stored();
+    await d.policy!.set({ ...policy, quota: { ...policy.quota, templates: 1 } }, admin.sub);
+    await registered(d);
+    await transfer(d, ID, bob.sub);
+    const cat = d.templates!;
+    // bob's one slot is taken by another template; the transferred one holds none (its build
+    // failed), so a new build of it must count against bob's templates quota.
+    const moved = (await cat.get(ID))!;
+    await cat.update!('bobs-other', async () => ({ ...structuredClone(moved), id: 'bobs-other' }));
+    await cat.update!(ID, async (cur) => ({
+      ...cur!,
+      builds: cur!.builds.map((x) => ({ ...x, status: 'failed' as const })),
+    }));
+    // The first read still names alice, who holds no slot and would pass.
+    const stale = { ...(await cat.get(ID))!, owner: alice.sub };
+    const get = cat.get.bind(cat);
+    let staleReads = 0;
+    cat.get = async (id) => (id === ID && staleReads++ === 0 ? structuredClone(stale) : get(id));
+    const doc = await get(ID);
+    const n = (await chain(d)).length;
+    const err = await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: admin,
+        params: { id: ID },
+        body: createBody({ spec: { ...spec, description: 'after the transfer' } }),
+      }),
+      d,
+    ).catch((x: unknown) => x);
+    expect(err).toMatchObject({ code: 'quota_exceeded', extra: { quota: 'templates' } });
+    expect(staleReads).toBeGreaterThan(1); // the stale read, then the retry's
+    expect(await get(ID)).toEqual(doc);
+    expect((await chain(d)).length).toBe(n);
   });
 
   it('refuses a non-admin, and a malformed or unenrolled subject', async () => {
