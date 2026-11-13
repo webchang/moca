@@ -1713,7 +1713,7 @@ check "the last resort is the old empty tmpfs" \
 check "no unconditional tmpfs over /var is left" \
   "$(printf '%s\n' "$init_text" | grep -cxF 'mount -t tmpfs tmpfs /var')" "0"
 check "the build makes the /.moca-var mount point and refuses one outside the tree" \
-  "$(asm="$(sed -n '/^assemble_rootfs() {/,/^}/p' "$SCRIPT")"; printf '%s' "$asm" | grep -cF '"$STAGE/rootfs-tree/.moca-var"'; printf '%s' "$asm" | grep -cF 'for d in sbin usr/local/bin .moca-var; do')" "$(printf '1\n1')"
+  "$(sed -n '/^assemble_rootfs() {/,/^}/p' "$SCRIPT" | grep -cxF '  for d in usr/local/bin sbin tmp var workspace .moca-var; do')" "1"
 check "check_var reads the probe file and writes /var, removing what it wrote" \
   "$([ "$(fn_body check_var | grep -cF 'echo x >/var/.moca-var-check && rm -f /var/.moca-var-check')" -ge 1 ] && echo yes || echo no)" "yes"
 check "check_var fails the build" "$([ "$(fn_body check_var | grep -cF 'exit 1')" -ge 1 ] && echo yes || echo no)" "yes"
@@ -1765,6 +1765,8 @@ EOI
     echo "STAGE='$w/stage'"
     echo "EGRESS_CA='$EGT/ca.crt'"
     fn_body validate_egress_ca
+    fn_body tree_dir_target
+    fn_body tree_write_target
     fn_body install_egress_ca
     echo 'install_egress_ca'
   } >"$w/run.sh"
@@ -1806,6 +1808,23 @@ check "tree with neither tool: install_egress_ca fails" "$([ "$(eg_harness none 
 check "neither tool: the message is the documented one" \
   "$(grep -cF -- '--egress-ca: the rootfs has neither update-ca-certificates nor update-ca-trust' "$w/out")" "1"
 
+# The CA directory, or a directory above it, as an absolute symlink out of the tree: the build
+# refuses, and the directory outside gains nothing.
+for kind in debian rhel; do
+  w="$EGT/link-$kind"; mkdir -p "$w/outside"
+  if [ "$kind" = debian ]; then link=usr/local/share; else link=etc/pki/ca-trust/source/anchors; fi
+  mkdir -p "$w/stage/rootfs-tree/$(dirname "$link")"
+  ln -s "$w/outside" "$w/stage/rootfs-tree/$link"
+  check "$kind: a CA directory linked out of the tree is refused" "$([ "$(eg_harness "$kind" "$w")" != 0 ] && echo yes || echo no)" "yes"
+  check "$kind: the refusal says so" "$(grep -c 'resolves outside the tree' "$w/out")" "1"
+  check "$kind: nothing is written outside the tree" "$(find "$w/outside" -mindepth 1 | wc -l | tr -d ' ')" "0"
+done
+w="$EGT/link-file"; mkdir -p "$w/stage/rootfs-tree/usr/local/share/ca-certificates"
+printf 'OUTSIDE\n' >"$w/outside.crt"
+ln -s "$w/outside.crt" "$w/stage/rootfs-tree/usr/local/share/ca-certificates/moca-egress.crt"
+check "debian: a CA file that is a symlink is refused" "$([ "$(eg_harness debian "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "debian: the file outside is untouched" "$(cat "$w/outside.crt")" "OUTSIDE"
+
 echo "== SBX0.2b: the CA file is validated before anything is staged"
 mkdir -p "$EGT/tmp1"
 out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/ca.key" 2>&1); rc=$?
@@ -1841,6 +1860,8 @@ for drift in real drifted; do
   {
     echo 'chroot() { local t="$1"; shift; local c="$1"; shift; "$t$c" "$@"; }'
     echo "STAGE='$w/stage'; EGRESS_CA='$EGT/ca.crt'"
+    fn_body tree_dir_target
+    fn_body tree_write_target
     fn_body install_egress_ca
     echo 'install_egress_ca'
   } >"$w/run.sh"
@@ -2000,7 +2021,7 @@ check "usage names --vcpus" "$(printf '%s' "$usage_text" | grep -c -- '--vcpus')
 check "by default the guest has 1 vCPU" "$(grep -c '^VCPUS=1$' "$SCRIPT")" "1"
 check "firecracker's machine-config takes the count" "$(grep -c 'vcpu_count\\":\$VCPUS' "$SCRIPT")" "1"
 check "no hardcoded vcpu_count is left" "$(grep -c 'vcpu_count\\":1' "$SCRIPT")" "0"
-check "cloud-hypervisor's --cpus takes the count" "$(grep -c -- '--cpus boot=\$VCPUS' "$SCRIPT")" "1"
+check "cloud-hypervisor's --cpus takes the count" "$(grep -c -- '--cpus "boot=\$VCPUS"' "$SCRIPT")" "1"
 check "the manifest records it" "$(grep -c '"vcpus": \$VCPUS,' "$SCRIPT")" "1"
 for bad in 0 33 two -1; do
   rc=0
@@ -2008,6 +2029,23 @@ for bad in 0 33 two -1; do
   check "--vcpus $bad is refused before any build step (exit 2)" "$rc" "2"
 done
 check "the refusal names the rule" "$(printf '%s' "$out" | grep -c 'from 1 to 32')" "1"
+
+echo "== the option checks match the whole value: an embedded newline is refused"
+# grep matches line by line, so a check written as printf | grep -Eq passed a value whose first line
+# was valid. Each of these values reaches init, a sed script, the VMM's config or the manifest.
+nl=$'\n'
+for case_ in "--guest-home|/tmp/home${nl}x" "--guest-home|/tmp/home${nl}touch /x" \
+  "--vcpus|4${nl},\"x\":1" "--vcpus|4${nl}" "--verify-timeout-s|60${nl}x"; do
+  opt="${case_%%|*}" val="${case_#*|}"
+  rc=0
+  bash "$SCRIPT" --kernel k --rootfs r --agent a --image i --verify-command true "$opt" "$val" >/dev/null 2>&1 || rc=$?
+  check "$opt with an embedded newline is refused before any build step (exit 2)" "$rc" "2"
+done
+check "no option is checked with grep any more" \
+  "$(sed -n '/^# The three option checks/,/^OUT=/p' "$SCRIPT" | grep -c 'grep -E')" "0"
+# shellcheck disable=SC2016 # the patterns are literal
+check "the HOME insertion is checked with or without --guest-home-gitconfig" \
+  "$(grep -B1 'grep -qx "export HOME=$GUEST_HOME"' "$SCRIPT" | head -1 | grep -c '^  if \[ -n "\$GUEST_HOME" \]; then$')" "1"
 
 echo "== assemble_rootfs never writes through the image's symlinks"
 # An image's /sbin/init is commonly an ABSOLUTE symlink (/lib/systemd/systemd); writing through it
@@ -2018,8 +2056,40 @@ check "init and agent are unlinked before they are written" \
 unlink_line=$(printf '%s\n' "$asm_body" | grep -n 'rm -f "$STAGE/rootfs-tree/sbin/init"' | cut -d: -f1)
 write_line=$(printf '%s\n' "$asm_body" | grep -n 'cat >"$STAGE/rootfs-tree/sbin/init"' | cut -d: -f1)
 check "the unlink comes before the write" "$([ "$unlink_line" -lt "$write_line" ] && echo yes || echo no)" "yes"
-check "sbin and usr/local/bin must resolve inside the tree" \
-  "$(printf '%s' "$asm_body" | grep -c 'refusing to write through it')" "1"
+check "every directory assemble_rootfs makes is checked by tree_dir_target" \
+  "$(printf '%s' "$asm_body" | grep -cxF '  for d in usr/local/bin sbin tmp var workspace .moca-var; do')" "1"
+check "assemble_rootfs runs no mkdir of its own (only tree_dir_target makes directories)" \
+  "$(printf '%s\n' "$asm_body" | grep -v '^\s*#' | grep -c 'mkdir -p "$STAGE/rootfs-tree/')" "0"
+# The loop itself, run from assemble_rootfs's own lines on scratch trees: a directory the build
+# makes, or one above it, as an absolute symlink out of the tree is refused BEFORE anything is
+# created through it.
+ad_harness() { # $1 = work dir
+  {
+    echo "STAGE='$1/stage'"
+    fn_body tree_dir_target
+    printf '%s\n' "$asm_body" | sed -n '/^  for d in usr\/local\/bin sbin tmp var workspace .moca-var; do$/,/^  done$/p'
+  } >"$1/run.sh"
+  bash "$1/run.sh" >"$1/out" 2>&1
+  echo $?
+}
+AD="$(mktemp -d "${TMPDIR:-/tmp}/bs-asmdir-test.XXXXXX")"
+w="$AD/plain"; mkdir -p "$w/stage/rootfs-tree/usr"
+check "a plain tree: the directories are made" "$(ad_harness "$w")" "0"
+check "a plain tree: all six exist" \
+  "$(cd "$w/stage/rootfs-tree" && for d in usr/local/bin sbin tmp var workspace .moca-var; do [ -d "$d" ] && echo y; done | wc -l | tr -d ' ')" "6"
+w="$AD/inside"; mkdir -p "$w/stage/rootfs-tree/usr/sbin"; ln -s usr/sbin "$w/stage/rootfs-tree/sbin"
+check "a symlink that stays inside the tree (sbin -> usr/sbin) is accepted" "$(ad_harness "$w")" "0"
+for link in usr/local sbin tmp var workspace .moca-var; do
+  w="$AD/link-$(printf '%s' "$link" | tr '/.' '__')"; mkdir -p "$w/outside" "$w/stage/rootfs-tree/$(dirname "$link")"
+  ln -s "$w/outside" "$w/stage/rootfs-tree/$link"
+  check "/$link linked out of the tree: refused" "$([ "$(ad_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+  check "/$link linked out of the tree: the refusal says so" "$(grep -c 'resolves outside the tree' "$w/out")" "1"
+  check "/$link linked out of the tree: nothing is created outside" "$(find "$w/outside" -mindepth 1 | wc -l | tr -d ' ')" "0"
+done
+w="$AD/dangling"; mkdir -p "$w/stage/rootfs-tree/usr"; ln -s "$AD/nowhere" "$w/stage/rootfs-tree/usr/local"
+check "a dangling absolute symlink is refused" "$([ "$(ad_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "a dangling absolute symlink: nothing is created at its target" "$([ -e "$AD/nowhere" ] && echo yes || echo no)" "no"
+rm -rf "$AD"
 # The mechanism itself, on a scratch tree: an absolute symlink is replaced, its target untouched.
 t="$(mktemp -d)"; mkdir -p "$t/host" "$t/tree/sbin"; printf 'HOST\n' >"$t/host/init"
 ln -s "$t/host/init" "$t/tree/sbin/init"
@@ -2126,6 +2196,8 @@ LT="$(mktemp -d "${TMPDIR:-/tmp}/bs-lease-test.XXXXXX")"
 id_harness() { # $1 = work dir; the tree's etc/passwd and etc/group are already there
   {
     echo "STAGE='$1/stage'"
+    fn_body tree_dir_target
+    fn_body tree_write_target
     fn_body add_sbx_identity
     echo 'add_sbx_identity'
   } >"$1/run.sh"
@@ -2157,6 +2229,44 @@ check "gid 7000 under another name: the message names it" "$(grep -cF 'staff7:x:
 check "gid 7000 under another name: passwd untouched" "$(grep -c '^sbx:' "$w/stage/rootfs-tree/etc/passwd")" "0"
 w="$LT/name"; id_tree "$w" $'sbx:x:1234:1234::/home/sbx:/bin/sh\n' $'root:x:0:\n'
 check "the name sbx under another uid: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+# The image's etc/passwd, etc/group or etc itself as an absolute symlink out of the tree: refused,
+# and the file outside untouched.
+for f in passwd group; do
+  w="$LT/link-$f"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\n' $'root:x:0:\n'
+  printf 'OUTSIDE\n' >"$w/outside"
+  rm -f "$w/stage/rootfs-tree/etc/$f"; ln -s "$w/outside" "$w/stage/rootfs-tree/etc/$f"
+  check "etc/$f linked out of the tree: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+  check "etc/$f linked out of the tree: the refusal says so" "$(grep -c "/etc/$f is a symlink" "$w/out")" "1"
+  check "etc/$f linked out of the tree: the file outside is untouched" "$(cat "$w/outside")" "OUTSIDE"
+done
+w="$LT/link-etc"; mkdir -p "$w/outside" "$w/stage/rootfs-tree"
+printf 'OUTSIDE\n' >"$w/outside/passwd"
+ln -s "$w/outside" "$w/stage/rootfs-tree/etc"
+check "etc linked out of the tree: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "etc linked out of the tree: the refusal says so" "$(grep -c 'resolves outside the tree' "$w/out")" "1"
+check "etc linked out of the tree: the file outside is untouched" "$(cat "$w/outside/passwd")" "OUTSIDE"
+check "etc linked out of the tree: nothing new outside" "$(find "$w/outside" -mindepth 1 | wc -l | tr -d ' ')" "1"
+# The etc/gitconfig append, run from assemble_rootfs's own lines.
+gc_harness() { # $1 = work dir
+  {
+    echo "STAGE='$1/stage'"
+    fn_body tree_dir_target
+    fn_body tree_write_target
+    sed -n '/^  tree_write_target etc\/gitconfig$/,/^GITCONFIG$/p' "$SCRIPT"
+  } >"$1/run.sh"
+  bash "$1/run.sh" >"$1/out" 2>&1
+  echo $?
+}
+# shellcheck disable=SC2016 # the pattern is literal
+check "assemble_rootfs checks etc/gitconfig right before appending to it" \
+  "$(sed -n '/^  tree_write_target etc\/gitconfig$/{n;p;}' "$SCRIPT" | grep -cF 'cat >>"$STAGE/rootfs-tree/etc/gitconfig"')" "1"
+w="$LT/gc-plain"; mkdir -p "$w/stage/rootfs-tree"
+check "a plain tree: the gitconfig append succeeds" "$(gc_harness "$w")" "0"
+check "a plain tree: the credential helper is there" "$(grep -c 'password=moca-placeholder' "$w/stage/rootfs-tree/etc/gitconfig")" "1"
+w="$LT/gc-link"; mkdir -p "$w/stage/rootfs-tree/etc"; printf 'OUTSIDE\n' >"$w/outside"
+ln -s "$w/outside" "$w/stage/rootfs-tree/etc/gitconfig"
+check "etc/gitconfig linked out of the tree: refused" "$([ "$(gc_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "etc/gitconfig linked out of the tree: the file outside is untouched" "$(cat "$w/outside")" "OUTSIDE"
 
 # check_lease_support, run against a stub guest_client printing each possible answer.
 ls_harness() { # $1 = work dir, $2 = what the guest prints

@@ -321,19 +321,26 @@ case "$VMM" in
     ;;
 esac
 
+# The three option checks match the WHOLE value with bash's [[ =~ ]], never grep: grep matches line
+# by line, so a value with an embedded newline passed when any one line did, and these values are
+# written into init (GUEST_HOME, through a sed script), the VMM's config and the manifest. The
+# patterns live in variables so bash 3.2 and 5 read them alike.
 # /tmp is the only writable tmpfs init mounts for every run (see assemble_rootfs), so a HOME
 # anywhere else would be read-only or vanish; the pattern keeps it one plain directory path.
-if [ -n "$GUEST_HOME" ] && ! printf '%s' "$GUEST_HOME" | grep -Eq '^/tmp(/[A-Za-z0-9._-]+)+$'; then
+guest_home_re='^/tmp(/[A-Za-z0-9._-]+)+$'
+vcpus_re='^([1-9]|[12][0-9]|3[0-2])$'
+verify_timeout_re='^[1-9][0-9]{0,4}$'
+if [ -n "$GUEST_HOME" ] && ! [[ "$GUEST_HOME" =~ $guest_home_re ]]; then
   echo "build-snapshot.sh: --guest-home must be a path under /tmp (e.g. /tmp/home), got '$GUEST_HOME'" >&2
   exit 2
 fi
 
-if ! printf '%s' "$VCPUS" | grep -Eq '^([1-9]|[12][0-9]|3[0-2])$'; then
+if ! [[ "$VCPUS" =~ $vcpus_re ]]; then
   echo "build-snapshot.sh: --vcpus must be an integer from 1 to 32, got '$VCPUS'" >&2
   exit 2
 fi
 
-if ! printf '%s' "$VERIFY_TIMEOUT_S" | grep -Eq '^[1-9][0-9]{0,4}$' || [ "$VERIFY_TIMEOUT_S" -gt 86400 ]; then
+if ! [[ "$VERIFY_TIMEOUT_S" =~ $verify_timeout_re ]] || [ "$VERIFY_TIMEOUT_S" -gt 86400 ]; then
   echo "build-snapshot.sh: --verify-timeout-s must be an integer from 1 to 86400, got '$VERIFY_TIMEOUT_S'" >&2
   exit 2
 fi
@@ -644,6 +651,45 @@ build_agent() {
 # ---------------------------------------------------------------------------
 # 3. assemble_rootfs
 # ---------------------------------------------------------------------------
+# tree_dir_target DIR: DIR is a directory under the staged tree that the build creates or writes
+# into on THIS host. The tree is an image's filesystem, so a path in it can be a symlink out of it
+# (an absolute one resolves on the build host). It exits 1 unless DIR resolves inside the tree,
+# checking the deepest part of it that exists BEFORE `mkdir -p` makes the rest (mkdir -p follows
+# symlinks, so making first would create directories on the build host and only then refuse), and
+# DIR itself once made.
+tree_dir_target() {
+  local dir="$1" tree probe real d
+  tree="$(cd -P "$STAGE/rootfs-tree" && pwd)"
+  probe="$dir"
+  while [ "$probe" != . ] && [ ! -e "$STAGE/rootfs-tree/$probe" ] && [ ! -L "$STAGE/rootfs-tree/$probe" ]; do
+    probe="$(dirname "$probe")"
+  done
+  for d in "$probe" "$dir"; do
+    if [ "$d" = "$dir" ]; then mkdir -p "$STAGE/rootfs-tree/$dir"; fi
+    real="$(cd -P "$STAGE/rootfs-tree/$d" 2>/dev/null && pwd)" || real="unresolvable"
+    case "$real/" in
+      "$tree"/*) ;;
+      *)
+        echo "build-snapshot.sh: the rootfs's /$d resolves outside the tree ($real); refusing to write /$dir through it" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# tree_write_target REL: REL is a file under the staged tree that the build writes or appends to on
+# THIS host (etc/passwd, etc/gitconfig, the egress CA). It exits 1 unless REL's directory passes
+# tree_dir_target and REL itself is not a symlink: its target is unknown, and appending through it
+# would write the build host's file.
+tree_write_target() {
+  local rel="$1"
+  tree_dir_target "$(dirname "$rel")"
+  if [ -L "$STAGE/rootfs-tree/$rel" ]; then
+    echo "build-snapshot.sh: the rootfs's /$rel is a symlink ($(readlink "$STAGE/rootfs-tree/$rel")); refusing to write through it" >&2
+    exit 1
+  fi
+}
+
 # Bakes the host's interception CA (public cert) into the STAGED tree using the tree's own
 # trust-store tool, then points the runtimes that ignore the system store at it via init.
 install_egress_ca() {
@@ -651,13 +697,13 @@ install_egress_ca() {
   if [ -x "$STAGE/rootfs-tree/usr/sbin/update-ca-certificates" ]; then
     ca_guest=/usr/local/share/ca-certificates/moca-egress.crt
     bundle=/etc/ssl/certs/ca-certificates.crt
-    mkdir -p "$STAGE/rootfs-tree/usr/local/share/ca-certificates"
+    tree_write_target "${ca_guest#/}"
     cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
     chroot "$STAGE/rootfs-tree" /usr/sbin/update-ca-certificates
   elif [ -x "$STAGE/rootfs-tree/usr/bin/update-ca-trust" ]; then
     ca_guest=/etc/pki/ca-trust/source/anchors/moca-egress.crt
     bundle=/etc/pki/tls/certs/ca-bundle.crt
-    mkdir -p "$STAGE/rootfs-tree/etc/pki/ca-trust/source/anchors"
+    tree_write_target "${ca_guest#/}"
     cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
     chroot "$STAGE/rootfs-tree" /usr/bin/update-ca-trust extract
   else
@@ -700,8 +746,10 @@ add_sbx_identity() {
   local etc="$STAGE/rootfs-tree/etc"
   local pw_line='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' gr_line='sbx-ws:x:7000:'
   local f clash
-  mkdir -p "$etc"
-  for f in passwd group; do [ -e "$etc/$f" ] || : >"$etc/$f"; done
+  for f in passwd group; do
+    tree_write_target "etc/$f"
+    [ -e "$etc/$f" ] || : >"$etc/$f"
+  done
   clash="$(awk -F: -v want="$pw_line" '($1 == "sbx" || $3 == "7000") && $0 != want' "$etc/passwd")"
   if [ -n "$clash" ]; then
     echo "build-snapshot.sh: the rootfs /etc/passwd already uses the name sbx or uid 7000 for another account; lease mode needs it as '$pw_line': $clash" >&2
@@ -731,26 +779,16 @@ assemble_rootfs() {
   # this build layers the agent and init onto. It is copied, never mutated in place,
   # so a failed build never corrupts the caller's base image.
   cp -a "$ROOTFS/." "$STAGE/rootfs-tree/"
-  mkdir -p "$STAGE/rootfs-tree/usr/local/bin" "$STAGE/rootfs-tree/sbin" \
-    "$STAGE/rootfs-tree/tmp" "$STAGE/rootfs-tree/var" "$STAGE/rootfs-tree/workspace" \
-    "$STAGE/rootfs-tree/.moca-var"
   # NEVER WRITE THROUGH THE IMAGE'S SYMLINKS. The tree is an image's filesystem, and paths in it
   # resolve on THIS host: Ubuntu-based images ship /sbin/init -> /lib/systemd/systemd (absolute), so
-  # writing "$tree/sbin/init" opened the BUILD HOST's systemd (found 2026-10-14 on a moca-microvm
-  # image: "Text file busy" stopped it only because that file was running; a host file that was not
-  # running would have been overwritten as root). So: the directories we write into must resolve
-  # inside the tree, and the files we write are unlinked first, which replaces a symlink rather than
-  # following it.
-  local tree_real d
-  tree_real="$(realpath -e "$STAGE/rootfs-tree")"
-  for d in sbin usr/local/bin .moca-var; do
-    case "$(realpath -e "$STAGE/rootfs-tree/$d")/" in
-      "$tree_real"/*) ;;
-      *)
-        echo "build-snapshot.sh: the rootfs's /$d resolves outside the tree ($(realpath -e "$STAGE/rootfs-tree/$d")); refusing to write through it" >&2
-        exit 1
-        ;;
-    esac
+  # writing "$tree/sbin/init" opened the BUILD HOST's systemd (seen on an Ubuntu-based image:
+  # "Text file busy" stopped it only because that file was running; a host file that was not
+  # running would have been overwritten as root). So: every directory the build makes or writes
+  # into must resolve inside the tree, checked before it is made (tree_dir_target), and the files we
+  # write are unlinked first, which replaces a symlink rather than following it.
+  local d
+  for d in usr/local/bin sbin tmp var workspace .moca-var; do
+    tree_dir_target "$d"
   done
   # check_var's probe: one regular file the image has under /var, a plain name (quoted into a
   # guest command), smallest path first so it is stable between builds. None: the check only writes.
@@ -863,6 +901,10 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
   elif [ -n "$GUEST_HOME" ]; then
     sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
 export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
+  fi
+  # Either way, the insertion must have landed (GUEST_HOME is one plain path, checked above, so it
+  # needs no quoting in init).
+  if [ -n "$GUEST_HOME" ]; then
     grep -qx "export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init" || {
       echo "build-snapshot.sh: could not add HOME=$GUEST_HOME to init" >&2
       exit 1
@@ -876,7 +918,7 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
   # (not the host's /etc) before mkfs. Appended, because the image may already carry an
   # /etc/gitconfig (the identity, see check_git_identity); the leading newline guards a
   # file that lacks a trailing one.
-  mkdir -p "$STAGE/rootfs-tree/etc"
+  tree_write_target etc/gitconfig
   cat >>"$STAGE/rootfs-tree/etc/gitconfig" <<'GITCONFIG'
 
 [credential]
@@ -2043,7 +2085,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --vsock "cid=3,socket=/vsock.sock" \
     --fs "tag=workspace,socket=/fs.sock" \
     --memory "size=${GUEST_RAM_MB}M,shared=on" \
-    --cpus boot=$VCPUS \
+    --cpus "boot=$VCPUS" \
     --console "file=/console.log" \
     --serial off \
     </dev/null >/dev/null 2>&1 &
@@ -2252,6 +2294,8 @@ verify_guest_command() {
     cloud-hypervisor) printf '%s\n' 'mountpoint -q /workspace || mount -t virtiofs workspace /workspace || exit 97' ;;
   esac
   printf 'cd /workspace || exit 97\n(\n%s\n) >/tmp/.verify-command.log 2>&1\n' "$VERIFY_COMMAND"
+  # Literal: the guest's shell expands these, not this one.
+  # shellcheck disable=SC2016
   printf '%s\n' 'rc=$?; tail -c 16384 /tmp/.verify-command.log; exit $rc'
 }
 
@@ -2270,6 +2314,8 @@ run_verify_command() {
 }
 
 verify_what() {
+  # Backticks as text: the log names the default command.
+  # shellcheck disable=SC2016
   if [ -n "$VERIFY_COMMAND" ]; then printf 'the --verify-command'; else printf '`true`'; fi
 }
 
