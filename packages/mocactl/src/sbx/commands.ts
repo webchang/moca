@@ -704,8 +704,9 @@ export async function cmdRm(c: SbxCtx, id: string, o: { goneOk?: boolean } = {})
 }
 
 /**
- * `sbx egress` (register G42): a sandbox's egress, as its KVM host's proxy logged it. Text: the
- * summary per host, then whether the log is complete and its digest. `--json`: every event and the
+ * `sbx egress`: a sandbox's egress, as its KVM host's proxy logged it. Text: the
+ * summary per host, then whether the log is complete, whether it is sealed (final: the control
+ * plane takes no more events, 600 s after the sandbox ended) and its digest. `--json`: every event and the
  * summary, read page by page. `--ndjson`: the log exactly as served, whose sha256 the summary and the
  * sandbox's end record name (verify-provenance.py --egress checks a saved copy).
  */
@@ -724,10 +725,22 @@ export async function cmdEgress(
       return SBX_EXIT.ok;
     }
     let page = await c.api.sandboxEgress(id, { limit: 1000 });
+    // The summary comes on the first page only (the control plane computes it once, there).
     const summary = page.summary;
+    if (!summary) {
+      c.io.err('sbx: the control plane sent no egress summary on the first page');
+      return SBX_EXIT.failed;
+    }
     if (c.json) {
       const events = [...page.events];
+      // A server that hands out a `next` it handed out before would loop forever: refused.
+      const seen = new Set<string>();
       while (page.next !== null) {
+        if (seen.has(page.next)) {
+          c.io.err("sbx: the control plane repeated an egress page's next; the log was not read");
+          return SBX_EXIT.failed;
+        }
+        seen.add(page.next);
         page = await c.api.sandboxEgress(id, { after: page.next, limit: 1000 });
         events.push(...page.events);
       }
@@ -738,17 +751,18 @@ export async function cmdEgress(
     for (const [host, h] of hosts) {
       const decisions = Object.entries(h.decisions)
         .sort(([a], [b]) => (a < b ? -1 : 1))
-        .map(([d, n]) => `${sanitizeRemote(d)} ${n}`)
+        .map(([d, n]) => `${sanitizeRemote(d)} ${num(n)}`)
         .join(', ');
       c.io.out(
-        `${sanitizeRemote(host || '-').padEnd(40)} ${String(h.count).padStart(6)}  ` +
-          `up ${h.bytesUp} B, down ${h.bytesDown} B  (${decisions})\n`,
+        `${sanitizeRemote(host || '-').padEnd(40)} ${num(h.count).padStart(6)}  ` +
+          `up ${num(h.bytesUp)} B, down ${num(h.bytesDown)} B  (${decisions})\n`,
       );
     }
     c.io.out(
-      `${summary.total} events; ` +
-        (summary.complete ? 'complete' : `INCOMPLETE: ${summary.dropped} dropped`) +
-        `; ${sanitizeRemote(summary.sha256)}\n`,
+      `${num(summary.total)} events; ` +
+        (summary.complete ? 'complete' : `INCOMPLETE: ${num(summary.dropped)} dropped`) +
+        sealedText(summary.sealed) +
+        `; ${sanitizeRemote(String(summary.sha256))}\n`,
     );
     return SBX_EXIT.ok;
   } catch (err) {
@@ -772,6 +786,10 @@ export async function cmdEgress(
 async function verifyEgress(c: SbxCtx, id: string): Promise<number> {
   const body = await c.api.sandboxEgressNdjson(id);
   const summary = (await c.api.sandboxEgress(id, { limit: 1 })).summary;
+  if (!summary) {
+    c.io.err('sbx: the control plane sent no egress summary on the first page');
+    return SBX_EXIT.failed;
+  }
   const sha256 = `sha256:${createHash('sha256').update(body).digest('hex')}`;
   let lines = 0;
   for (const b of body) if (b === 0x0a) lines += 1;

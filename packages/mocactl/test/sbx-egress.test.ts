@@ -53,8 +53,25 @@ describe('mocactl sbx egress (G42)', () => {
       /^files\.example\.com +1 {2}up 10 B, down 20 B {2}\(destination_denied 1\)\n/,
     );
     expect(out).toContain('pypi.example.com');
-    expect(out).toContain(`2 events; complete; ${SHA}\n`);
+    expect(out).toContain(`2 events; complete; open (not sealed yet); ${SHA}\n`);
     expect(cp.calls.map((c) => c.path)).toEqual([`${PATH}?limit=1000`]);
+  });
+
+  it('says sealed once the log is final, and nothing from a server that does not say', async () => {
+    const { home, env, io } = setup();
+    let sealed: boolean | undefined = true;
+    const cp = fakeCp({
+      [`GET ${PATH}`]: () => ({
+        status: 200,
+        body: { events: [], next: null, summary: { ...summary(), sealed } },
+      }),
+    });
+    expect(await sbxMain(['egress', SBX], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(io.outs.join('')).toContain(`2 events; complete; sealed; ${SHA}\n`);
+    io.outs.length = 0;
+    sealed = undefined;
+    expect(await sbxMain(['egress', SBX], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(io.outs.join('')).toContain(`2 events; complete; ${SHA}\n`);
   });
 
   it('says INCOMPLETE with the drop count', async () => {
@@ -66,7 +83,7 @@ describe('mocactl sbx egress (G42)', () => {
       }),
     });
     expect(await sbxMain(['egress', SBX], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    expect(io.outs.join('')).toContain('INCOMPLETE: 4 dropped');
+    expect(io.outs.join('')).toContain('INCOMPLETE: 4 dropped; open (not sealed yet); ');
   });
 
   it('--json reads every page, then prints the events and the summary', async () => {
@@ -85,6 +102,71 @@ describe('mocactl sbx egress (G42)', () => {
       `${PATH}?limit=1000`,
       `${PATH}?after=1-0&limit=1000`,
     ]);
+  });
+
+  it("--json takes the first page's summary (later pages carry null), and stops on a repeated next", async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      [`GET ${PATH}`]: (req) =>
+        req.path.includes('after=1-0')
+          ? { status: 200, body: { events: [E2], next: null, summary: null } }
+          : { status: 200, body: { events: [E1], next: '1-0', summary: summary() } },
+    });
+    expect(
+      await sbxMain(['egress', SBX, '--json'], env, io, { home, fetchImpl: cp.fetchImpl }),
+    ).toBe(0);
+    expect(JSON.parse(io.outs.join(''))).toEqual({ events: [E1, E2], summary: summary() });
+    io.outs.length = 0;
+    // A first page without its summary is an error, not a crash.
+    const bare = fakeCp({
+      [`GET ${PATH}`]: () => ({ status: 200, body: { events: [], next: null, summary: null } }),
+    });
+    expect(await sbxMain(['egress', SBX], env, io, { home, fetchImpl: bare.fetchImpl })).toBe(1);
+    expect(io.errs.join('\n')).toMatch(/no egress summary on the first page/);
+    const loop = fakeCp({
+      [`GET ${PATH}`]: () => ({
+        status: 200,
+        body: { events: [E1], next: '1-0', summary: summary() },
+      }),
+    });
+    expect(
+      await sbxMain(['egress', SBX, '--json'], env, io, { home, fetchImpl: loop.fetchImpl }),
+    ).toBe(1);
+    expect(io.errs.join('\n')).toMatch(/repeated an egress page's next/);
+    expect(io.outs.join('')).toBe('');
+    expect(loop.calls.filter((c) => c.path.startsWith(PATH))).toHaveLength(2);
+  });
+
+  it('prints a server number that is not a number as ?, never its text', async () => {
+    const { home, env, io } = setup();
+    const bad = '\u001b]0;x\u0007';
+    const cp = fakeCp({
+      [`GET ${PATH}`]: () => ({
+        status: 200,
+        body: {
+          events: [],
+          next: null,
+          summary: summary({
+            byHost: {
+              'a.example.com': {
+                count: bad,
+                decisions: { tunnel: bad },
+                bytesUp: bad,
+                bytesDown: 1,
+              },
+            },
+            total: bad,
+            dropped: bad,
+            complete: false,
+          }),
+        },
+      }),
+    });
+    expect(await sbxMain(['egress', SBX], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    const out = io.outs.join('');
+    expect(out).not.toContain('\u001b');
+    expect(out).toMatch(/a\.example\.com +\? {2}up \? B, down 1 B {2}\(tunnel \?\)\n/);
+    expect(out).toContain('? events; INCOMPLETE: ? dropped; ');
   });
 
   it('--ndjson prints the log byte for byte, so its sha256 is the summary digest', async () => {

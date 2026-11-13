@@ -70,7 +70,8 @@ export interface SbxTagsMoved {
 export interface SbxEgressPage {
   events: Record<string, unknown>[];
   next: string | null;
-  summary: SbxEgressSummary;
+  /** On the first page only (it reads the whole log); null on the pages after `after`. */
+  summary: SbxEgressSummary | null;
 }
 
 export interface SbxEgressSummary {
