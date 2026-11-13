@@ -29,7 +29,6 @@ const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf
 const { id: _id, image: _image, schema: _s, notes: _n, ...REST } = SPEC;
 const spec = {
   ...REST,
-  guest_mb: REST.guest_ram_mb,
   source_record_digest: undefined,
   skip_git_identity_check: false,
 };

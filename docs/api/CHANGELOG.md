@@ -25,6 +25,10 @@ added or removed.
   holds none), `buildsQueued` counts probing builds too, and a build an admin adds to another
   subject's template is charged to the template's owner. A create's quota check and write hold one
   lock per subject, so concurrent creates for different ids never pass one check together.
+- A template spec names its guest size once: `guest_ram_mb`, or its alias `guest_mb` alone. A spec
+  with both is refused `422 policy_refused` (`M7.guest`), even when equal; the alias is stored as
+  `guest_ram_mb`, the key the build reads, in the `create` record, the build's request and the reuse
+  key.
 
 ### 1.13.0
 

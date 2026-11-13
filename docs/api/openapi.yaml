@@ -118,7 +118,8 @@ components:
           type: object
           description: |
             the template spec template-build.sh reads (deploy/sbx/template-onboarding/ONBOARDING.md):
-            guest_mb (or guest_ram_mb), vcpus, workspace_mb?, egress, seed, probe, tools,
+            guest_ram_mb (or its alias guest_mb, never both: M7.guest; stored as guest_ram_mb), vcpus,
+            workspace_mb?, egress, seed, probe, tools,
             description, and optionally guest_home, skip_git_identity_check, guest_home_gitconfig,
             probe_status, source_record_digest
         profile: { type: string, description: a policy profile; the policy's default when absent }

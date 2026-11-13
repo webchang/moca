@@ -170,7 +170,9 @@ POST /v1/templates
 The spec is the same document `template-build.sh` reads today (`ONBOARDING.md`), plus
 `workspace_mb`, the size of the sandbox's `/workspace` image (default 2048, today's
 `SH_WORKSPACE_IMAGE_MB`; within the profile's envelope; register W11), which the worker serving the
-build applies; the image's gate
+build applies. The guest size is `guest_ram_mb`, the key the build tool reads; its alias
+`guest_mb` is accepted alone and stored as `guest_ram_mb`, and a spec with both is refused (M7), so
+the policy and the build never read two different sizes. The image's gate
 record, when given, is stored with the build and checked (§8). `POST /v1/templates/{id}/builds`
 starts a new build of an existing template (a new image or spec); same body, same answer. A build
 has a provisional handle (`b-…`) until it is built; then its `buildId` is its manifest hash and the

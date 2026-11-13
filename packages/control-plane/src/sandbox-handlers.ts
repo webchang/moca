@@ -27,6 +27,7 @@ import { activationLock } from './activation-lock.js';
 import { graceBusy, hostViewsOf } from './host-handlers.js';
 import {
   checkCreate,
+  normalizeSpec,
   policyDigest,
   policyProblems,
   quotaFor,
@@ -552,7 +553,8 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     );
   const now = seconds(deps);
   const handle = buildHandle(deps.newId());
-  const want = reuseKey(b.image as string, spec, result.profile, result.gateRecordSha256);
+  const built = normalizeSpec(spec);
+  const want = reuseKey(b.image as string, built, result.profile, result.gateRecordSha256);
   let reused: TemplateBuild | undefined;
   // The quota is the template's owner's: an admin adding a build to another's template uses the
   // owner's buildsQueued, not its own. The owner's lock is held around the check and the write
@@ -608,8 +610,9 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         subject: p.sub,
         body: {
           image: b.image as string,
-          // A round trip through JSON: what the client sent, as the wire carries it (no undefined).
-          spec: JSON.parse(JSON.stringify(spec)) as Record<string, unknown>,
+          // A round trip through JSON: what the client sent, as the wire carries it (no undefined),
+          // with the guest size under the key the build reads (normalizeSpec).
+          spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
           profile: result.profile,
           handle,
           ...(result.gateRecordSha256 ? { gate_record_sha256: result.gateRecordSha256 } : {}),
@@ -645,13 +648,13 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         status: 'queued',
         profile: result.profile,
         worker: '',
-        spec: buildSpec(spec),
+        spec: buildSpec(built),
         createdAt: now,
         queuedAtMs: deps.now(),
         provenance: created.digest,
         request: {
           image: b.image as string,
-          spec: JSON.parse(JSON.stringify(spec)) as Record<string, unknown>,
+          spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
           ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
         },
         ...(selfAttestedCreate ? { selfAttested: true } : {}),
@@ -664,7 +667,7 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
         visibility: selfAttestedCreate
           ? 'private'
           : ((b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment'),
-        description: String(spec.description ?? ''),
+        description: String(built.description ?? ''),
         tags: {},
         builds: [],
         createdAt: now,
@@ -753,7 +756,7 @@ function buildReuseKey(x: TemplateBuild): string | undefined {
 /** What a build keeps of its spec: the fields a client reads back (§4). */
 function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
   const n = (v: unknown) => (typeof v === 'number' ? v : undefined);
-  const guest = n(spec.guest_mb ?? spec.guest_ram_mb);
+  const guest = n(spec.guest_ram_mb); // normalizeSpec has put the alias guest_mb here
   return {
     ...(guest !== undefined ? { guest_mb: guest } : {}),
     ...(n(spec.vcpus) !== undefined ? { vcpus: n(spec.vcpus) } : {}),
