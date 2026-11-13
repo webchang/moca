@@ -129,6 +129,23 @@ keeps the `sandbox` profile.
   by template as before; only a pinned session refuses a worker without the label. So the worker
   rebuild must precede the first pinned Moca Pi session on a combined deployment, and nothing else
   depends on the order (on a `sandbox`-profile deployment, none).
+- **A pinned session keeps its worker while in use:** nothing else would. The first-use lease
+  runs out (by default after the hosts' idle limit, 3600 s), and an active build takes no lease for
+  a later session, so the host agent would stop the worker between turns and the next turn would
+  find none. So each turn's credential exchange keeps the build's worker for the hold, the same
+  length as a default lease, from that turn, as a live sandbox keeps its worker (`busyWorkers`): it
+  is not stopped while held, and keeps its slot. A hold keeps a worker that runs; it never starts
+  one, and never counts as a lease or against `quota.active`. Only the turns of a subject enrolled
+  for sandboxes hold (the rule first-use leases follow): a subject who is not enrolled has its turns
+  run on an active build while the worker is up, but they extend nothing, so they cannot keep a
+  build running after its owner and every lease holder have released it (deactivate, the host's
+  capacity). Queued turns carry no template in this deployment's exchange, so only interactive
+  turns hold. **Failure mode:** a session with no turn for longer than the hold (or across a
+  control-plane restart, which forgets the holds as it forgets host state until the next turn) can
+  find its worker stopped; its next turn is refused, and a subject not enrolled cannot start it
+  again. **Recovery:** an enrolled subject activates the template (`mocactl sbx templates activate
+ID --wait`, or `POST /v1/templates/{id}/activate`), and the session's turns run again once its
+  worker is attached; the session keeps its build, so nothing else changes.
 
 ### 3.5 Settings and stores
 

@@ -3575,7 +3575,10 @@ paths:
         `graced`; a retired or rejected build is listed in `stop` as well as `remove`, so its worker
         is stopped and removed in one poll, never held for a grace. A graced worker displaced for a
         wanted build is re-checked for a lease when the answer is made: a build leased since stays
-        in `run`.
+        in `run`. A worker with a live sandbox is never in `stop`, and neither is one a session
+        pinned to its build had a turn on within the hold, when the session's subject is enrolled
+        for sandboxes (combined control plane spec §3.4: the hosts' idle limit from that turn's
+        credential exchange).
       security: [{ hostToken: [] }]
       parameters:
         - { name: host, in: path, required: true, schema: { type: string } }
