@@ -121,7 +121,10 @@ quotas: the server decides those.
   write** without any control-plane change: it reads the current value first and shows it, writes,
   then compares the answer's `before` with what it read. If they differ it **fails loudly**
   (nonzero): "changed by someone else between read and write: <read> / <before> / <new>". That
-  doesn't prevent the race (decision 7 would), but it can't go unnoticed.
+  doesn't prevent the race (decision 7 would), but it can't go unnoticed. `templates quota` goes
+  further: its write is a compare-and-set (`PUT /v1/quota/{target}?expect=` the value read), so a
+  quota another admin changed in between is refused `409 quota_changed` with nothing written, and
+  the command reports the value now (exit 1).
 - **The issuer check:** mocactl refuses a login whose control plane or issuer doesn't match the
   command's target (a login for one deployment pointed at another), with a test.
 - **Later, named here so it isn't lost:** a user's request that an admin trust their self-attested

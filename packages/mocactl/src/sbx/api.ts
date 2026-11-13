@@ -337,10 +337,15 @@ export class SandboxApiClient extends ControlPlaneClient {
     return this.json('PUT', `/v1/templates/${encodeURIComponent(id)}/owner`, { body: { owner } });
   }
 
-  /** Set a subject's quota, or the default; null removes a subject's override (spec §5.2; admins). */
+  /**
+   * Set a subject's quota, or the default; null removes a subject's override (spec §5.2; admins).
+   * `expect`, when given, is the value read before: the control plane writes only if the target's
+   * quota is that now, else `409 quota_changed` with nothing written.
+   */
   putQuota(
     target: string,
     quota: SbxQuota | null,
+    expect?: SbxQuota | null,
   ): Promise<{
     target: string;
     quota: SbxQuota | null;
@@ -348,7 +353,10 @@ export class SandboxApiClient extends ControlPlaneClient {
     policy: string;
     record: string;
   }> {
-    return this.json('PUT', `/v1/quota/${encodeURIComponent(target)}`, { body: quota });
+    return this.json('PUT', `/v1/quota/${encodeURIComponent(target)}`, {
+      body: quota,
+      query: { expect: expect === undefined ? undefined : JSON.stringify(expect) },
+    });
   }
 
   /** Every enrolled subject, with its roles (enrollment and roles spec §4, register G38; admins). */

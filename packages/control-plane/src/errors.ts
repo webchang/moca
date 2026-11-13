@@ -39,6 +39,7 @@ export const CP_ERROR_CODES = [
   'template_not_active',
   'template_retired',
   'build_in_use',
+  'quota_changed',
   'self_attested',
   'bootstrap_subject',
   'self_revoke',
@@ -115,6 +116,9 @@ const STATUS: Record<CpErrorCode, number> = {
   template_retired: 410,
   // 409: a live sandbox still runs on the build; delete it (or let it end) and retry (§5.1).
   build_in_use: 409,
+  // 409: a quota write's `expect` is not the target's quota now (§5.2): another admin changed it
+  // since the client read it, and nothing was written. Read again, then write.
+  quota_changed: 409,
   self_attested: 409,
   bootstrap_subject: 409,
   self_revoke: 409,

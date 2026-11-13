@@ -465,7 +465,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
   it("sets a subject's quota or the default, and clears an override (admins, lifecycle §5.2)", async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
-      // §3.6: the value is read first, so its `before` can be compared.
+      // §3.6: the value is read first, then written as a compare-and-set of it.
       'GET /v1/policy': () => ({ status: 200, body: policyView() }),
       'PUT /v1/quota/github%3A9': (req) => ({
         status: 200,
@@ -498,9 +498,10 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
         opts,
       ),
     ).toBe(0);
+    // No override read: the write expects none (`?expect=null`).
     expect(cp.calls.at(-1)).toMatchObject({
       method: 'PUT',
-      path: '/v1/quota/github%3A9',
+      path: '/v1/quota/github%3A9?expect=null',
       body: { templates: 5, buildsQueued: 2, active: 1 },
     });
     expect(io.outs.join('')).toContain(

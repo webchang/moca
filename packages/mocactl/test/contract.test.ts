@@ -264,6 +264,8 @@ const CODES_USED = [
   'policy_refused',
   'async_quota_exhausted',
   'turn_not_cancellable',
+  // `sbx templates quota`: the write's compare-and-set found the quota changed (sbx/commands.ts).
+  'quota_changed',
 ];
 
 function responseSchema(op: any): any {

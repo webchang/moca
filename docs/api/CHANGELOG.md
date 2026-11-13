@@ -129,6 +129,7 @@ added or removed.
 - **A retired or admin-rejected build is listed in `stop` beside `remove` on every host:** before, only on a host with an idle grace, so on a host without one a worker running when its build was retired was never stopped (the agent skips the removal of a running worker), nor removed.
 - **Two quota writes made together keep both changes:** `PUT /v1/quota/{subject}`'s read, change and write of the policy are now one step of the policy store, so two admins' writes for two subjects never drop each other's change while both answer 200.
 - **A quota holds the three counters only:** `PUT /v1/quota/{subject}` refuses a quota with a key beyond `templates`, `buildsQueued` and `active` (400 `invalid_request`) and stores a new object of those three; `PUT /v1/policy` refuses an override with another key too. A stored policy whose override carries another key no longer reads as valid (the policy read fails closed): rewrite the override before upgrading.
+- **A quota write can be a compare-and-set:** `PUT /v1/quota/{subject}` takes an optional `?expect=` (JSON: the quota the client read, `null` for no override). When the target's quota is not that value now, nothing is written and the answer is the new code `409 quota_changed`. `mocactl sbx templates quota` sends the value it read and, on `quota_changed`, reads again and reports the value now (exit 1, nothing written), instead of finding the change only after its write had landed.
 
 ### 1.13.0
 

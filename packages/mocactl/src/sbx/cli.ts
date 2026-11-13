@@ -129,9 +129,9 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx templates quota TARGET --clear [--json]
                                                  set a subject's quota (TARGET github:<id> or
                                                  oidc:<sub>) or the default (TARGET default); --clear
-                                                 removes an override (admins only; prints old -> new,
-                                                 and fails if the value changed between its read and
-                                                 its write)
+                                                 removes an override (admins only; prints old -> new;
+                                                 writes only if unchanged since its read: exit 1,
+                                                 nothing written, if another admin changed it)
   mocactl sbx admin subjects [--json]            every enrolled subject and its roles (admins only)
   mocactl sbx admin subjects enroll|unenroll SUBJECT [--json]
                                                  enroll SUBJECT (github:<id> or oidc:<sub>) or unenroll

@@ -1216,8 +1216,12 @@ describe('admin writes: read, write, compare (§3.6)', () => {
     '1',
   ];
 
-  it('prints old -> new and the policy digest; a changed before fails loudly', async () => {
-    let before: unknown = { templates: 3, buildsQueued: 1, active: 1 };
+  // The compare-and-set's query: the value the command read.
+  const ifRead = (v: unknown) => `?${new URLSearchParams({ expect: JSON.stringify(v) })}`;
+  const OLD = { templates: 3, buildsQueued: 1, active: 1 };
+
+  it('prints old -> new and the policy digest, writing as a compare-and-set of the value read', async () => {
+    const before: unknown = OLD;
     const w = world({
       'GET /v1/policy': () => ({
         status: 200,
@@ -1234,15 +1238,35 @@ describe('admin writes: read, write, compare (§3.6)', () => {
     );
     expect(w.cp.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       'GET /v1/policy',
-      'PUT /v1/quota/github%3A9',
+      `PUT /v1/quota/github%3A9${ifRead(OLD)}`,
     ]);
-    before = { templates: 4, buildsQueued: 1, active: 1 };
+  });
+
+  it('writes nothing when the quota changed after its read, and reports the value now (exit 1)', async () => {
+    let reads = 0;
+    const w = world({
+      // The first read sees OLD; another admin then writes, so the second read sees theirs.
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({
+          quotaBySubject: { 'github:9': reads++ === 0 ? OLD : { ...OLD, templates: 4 } },
+        }),
+      }),
+      'PUT /v1/quota/github%3A9': () => ({
+        status: 409,
+        body: { error: 'quota_changed', message: "github:9's quota changed since it was read" },
+      }),
+    });
     expect(await w.run(QUOTA_ARGS)).toBe(1);
+    expect(w.cp.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /v1/policy',
+      `PUT /v1/quota/github%3A9${ifRead(OLD)}`,
+      'GET /v1/policy',
+    ]);
     expect(w.err()).toContain(
-      "github:9's quota was changed by someone else between read and write: templates 3, builds queued 1, active 1 / templates 4, builds queued 1, active 1 / templates 5, builds queued 2, active 1",
+      "nothing written: github:9's quota was changed by someone else after this command read it (read templates 3, builds queued 1, active 1, now templates 4, builds queued 1, active 1)",
     );
-    expect(await w.run([...QUOTA_ARGS, '--json'])).toBe(1);
-    expect(JSON.parse(w.out())).toMatchObject({ read: { templates: 3 }, before: { templates: 4 } });
+    expect(w.out()).toBe('');
   });
 
   it('a subject change: old -> new and its record; an answer the read contradicts fails loudly', async () => {
