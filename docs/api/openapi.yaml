@@ -2884,7 +2884,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [subject, templates, buildsQueued, active]
+                required: [subject, templates, buildsQueued, active, quotaSource]
                 properties:
                   subject: { type: string }
                   templates: { $ref: '#/components/schemas/LimitUse' }
