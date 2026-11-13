@@ -68,8 +68,14 @@ export interface TemplateBuild {
    */
   selfAttested?: boolean;
   /**
-   * Its gate record's offline facts (image-factory ec4b5a0): whether the floor was checked offline,
-   * and, from a `network_needed` contract, whether the offline run met it. Absent: no gate record.
+   * Created on a selfAttest profile with a gate record, trusted or not at create: a fact of its
+   * create. Such a build reads as self-attested whenever its record is not trusted NOW
+   * (attestationOf), so a trust removal narrows it whatever the order of events.
+   */
+  selfAttestProfile?: boolean;
+  /**
+   * Its gate record's offline facts: whether the floor was checked offline, and, from a
+   * `network_needed` contract, whether the offline run met it. Absent: no gate record.
    */
   gateFloor?: { checkedOffline: boolean; metOffline?: boolean };
   /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */

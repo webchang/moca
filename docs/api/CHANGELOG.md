@@ -49,6 +49,9 @@ added or removed.
   the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
   only answered, and one on an id no template holds writes one audit line instead
   (`template_create_refused`, with the subject, `templateId` and the failed `rules`).
+- A build made on a `selfAttest` profile with a gate record now stores `selfAttestProfile`, trusted
+  or not at create, and its `attestation` is `self` whenever its record is not trusted now: a trust
+  removal narrows such a build (its template private to its owner) whatever the order of events.
 
 ### 1.13.0
 

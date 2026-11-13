@@ -392,6 +392,26 @@ describe("promotion and removal of trust (G41 (c), the user's Q4 (i))", () => {
     expect((await resolveForUse(d, alice, 't-self')).buildId).toBe(HASH);
   });
 
+  it("narrows on removal another subject's build made on a selfAttest profile while the record was trusted", async () => {
+    const d = await setup();
+    const promoted = { ...(await d.policy!.current()).policy, trustedGateRecords: [SHA] };
+    await putPolicy(d, promoted);
+    // Trusted at create: no self-attestation, and the requested (default) deployment visibility.
+    expect((await create(d, body({ id: 't-bob' }), bob)).status).toBe(202);
+    await register(d, 't-bob', HASH);
+    expect((await view(d, 't-bob', alice)).visibility).toBe('deployment');
+    expect((await resolveForUse(d, alice, 't-bob')).buildId).toBe(HASH);
+    const r = (await putPolicy(d, { ...promoted, trustedGateRecords: [] })).body as Body;
+    expect(r.narrowed).toEqual([{ template: 't-bob', buildId: HASH }]);
+    const t = await view(d, 't-bob', bob);
+    expect(t).toMatchObject({ visibility: 'private', attestation: 'self' });
+    expect(t.builds[0].attestation).toBe('self');
+    expect(await codeOf(() => view(d, 't-bob', alice))).toBe('template_not_found');
+    expect(await codeOf(() => resolveForUse(d, alice, 't-bob'))).toBe('unknown_template');
+    // Its owner keeps using it, as decision (i) says.
+    expect((await resolveForUse(d, bob, 't-bob')).buildId).toBe(HASH);
+  });
+
   it('keeps every other policy field, quotaBySubject included, across a policy write', async () => {
     const d = await setup();
     const withOverride: Policy = {

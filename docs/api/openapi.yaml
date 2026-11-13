@@ -409,9 +409,10 @@ components:
           type: string
           enum: [deployment, self]
           description: |
-            register G41 (c), recomputed on every read from the current policy: `self` when the build
-            was created on a selfAttest profile with a gate record trustedGateRecords does not list;
-            `deployment` otherwise (a promotion or removal of the record changes it, nothing rewritten)
+            recomputed on every read from the current policy: `self` when the build was created on a
+            selfAttest profile with a gate record trustedGateRecords does not list now, whether or not
+            it was listed at create; `deployment` otherwise (a promotion or removal of the record
+            changes it, nothing rewritten)
         gateFloorCheckedOffline:
           type: [boolean, 'null']
           description: |
