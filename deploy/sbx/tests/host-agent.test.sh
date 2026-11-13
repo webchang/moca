@@ -36,14 +36,17 @@ done
 path="${url#https://cp.example.invalid}"
 [[ -z "$data" ]] || cp "$data" "$MOCK_STATE/$(printf '%s' "$method$path" | tr '/' '_')"
 case "$method $path" in
-"POST /v1/hosts/bm1/inventory") echo '{"host":"bm1","holds":0}' ;;
-"POST /v1/hosts/bm1/builds/claim") cat "$MOCK_STATE/claim-answer" ;;
-"GET /v1/hosts/bm1/blobs/"*) printf '{"sha256":"x","base64":"%s"}' "$(printf '%s' "$MOCK_GATE" | base64)" ;;
-"POST /v1/hosts/bm1/builds/"*/log) echo '{"appended":1}' ;;
-"POST /v1/hosts/bm1/builds/"*/report) echo '{"status":"registered","buildId":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}' ;;
-"GET /v1/hosts/bm1/wanted") cat "$MOCK_STATE/wanted-answer" ;;
-"POST /v1/hosts/bm1/workers/report") echo '{"recorded":"x"}' ;;
-"POST /v1/hosts/bm1/egress")
+"POST /v1/hosts/host-1/inventory") echo '{"host":"host-1","holds":0}' ;;
+"POST /v1/hosts/host-1/builds/claim") cat "$MOCK_STATE/claim-answer" ;;
+"GET /v1/hosts/host-1/blobs/"*) printf '{"sha256":"x","base64":"%s"}' "$(printf '%s' "$MOCK_GATE" | base64)" ;;
+"POST /v1/hosts/host-1/builds/"*/log) echo '{"appended":1}' ;;
+"POST /v1/hosts/host-1/builds/"*/report) echo '{"status":"registered","buildId":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}' ;;
+"GET /v1/hosts/host-1/wanted")
+  # wanted-later: the answer from a run's second read on (a sandbox created after the first).
+  if [[ -f "$MOCK_STATE/wanted-later" && -f "$MOCK_STATE/wanted-read" ]]; then cat "$MOCK_STATE/wanted-later"; else cat "$MOCK_STATE/wanted-answer"; fi
+  touch "$MOCK_STATE/wanted-read" ;;
+"POST /v1/hosts/host-1/workers/report") echo '{"recorded":"x"}' ;;
+"POST /v1/hosts/host-1/egress")
   # As the agent calls it: -o ANSWER -w '%{http_code}', no -f. egress-fail: no answer at all;
   # egress-status: answer with that status (400 with invalid_request, 404 not_found, else an error).
   [[ -n "$outf" && -n "$wfmt" && " $* " != *" -fsS "* ]] || { echo 'curl: egress posted without -o/-w' >&2; exit 2; }
@@ -103,21 +106,28 @@ printf 'install-host %s\n' "$*" >>"$MOCK_LOG"
 [[ "$1" == --uninstall ]] && rm -f "$SBX_ENV_DIR/workers/$2.env"
 MOCK
 # journalctl: logs its argv; answers -o json entries from $MOCK_STATE/journal (one JSON entry a line,
-# each with __CURSOR), after --after-cursor when given; a cursor no entry has is journalctl's
-# "Failed to seek to cursor" and exit 1, as a rotated-away cursor is. Exits 1 if anything else is asked.
+# each with __CURSOR), from --cursor or after --after-cursor when given. As journalctl (257) does: a
+# cursor it cannot parse (here: one with no digit) is "Failed to seek to cursor" and exit 1; a
+# well-formed one no entry has (vacuumed, or another machine's) falls back and prints every entry,
+# exit 0. Without --all, a MESSAGE over 4096 bytes is printed null. Exits 1 if anything else is asked.
 cat >"$TMP/bin/journalctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'journalctl %s\n' "$*" >>"$MOCK_LOG"
-after=''
+at='' after=''
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   [[ "${args[$i]}" == --after-cursor ]] && after="${args[$((i + 1))]}"
+  [[ "${args[$i]}" == --cursor ]] && at="${args[$((i + 1))]}"
 done
-[[ " $* " == *" -u moca-egress.service -o json --no-pager "* ]] || exit 1
+[[ " $* " == *" -u moca-egress.service -o json "* ]] || exit 1
+full() { if [[ " $* " == *" --all "* ]]; then cat; else
+  jq -c 'if (.MESSAGE | type) == "string" and (.MESSAGE | utf8bytelength) > 4096 then .MESSAGE = null else . end'; fi; }
+c="${at:-$after}"
+[[ -z "$c" || "$c" == *[0-9]* ]] || { echo 'Failed to seek to cursor: Invalid argument' >&2; exit 1; }
 [[ -f "$MOCK_STATE/journal" ]] || exit 0
-if [[ -z "$after" ]]; then cat "$MOCK_STATE/journal"; else
-  grep -qF "\"__CURSOR\":\"$after\"" "$MOCK_STATE/journal" || { echo 'Failed to seek to cursor: Invalid argument' >&2; exit 1; }
-  awk -v c="$after" 'seen { print } index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 }' "$MOCK_STATE/journal"
+if [[ -z "$c" ]] || ! grep -qF "\"__CURSOR\":\"$c\"" "$MOCK_STATE/journal"; then cat "$MOCK_STATE/journal" | full "$@"
+elif [[ -n "$at" ]]; then awk -v c="$c" 'index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 } seen { print }' "$MOCK_STATE/journal" | full "$@"
+else awk -v c="$c" 'seen { print } index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 }' "$MOCK_STATE/journal" | full "$@"
 fi
 MOCK
 # curl's egress answer: $MOCK_STATE/egress-fail makes the post fail, as an unreachable control plane.
@@ -127,7 +137,7 @@ mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
 (umask 077 && printf '%s' "$TOKEN" >"$TMP/token")
 export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/log" MOCK_STATE="$TMP/state" MOCK_TOKEN_FILE="$TMP/token" MOCK_GATE="$GATE"
-export SBX_API_URL=https://cp.example.invalid SBX_HOST_ID=bm1 SBX_HOST_TOKEN_FILE="$TMP/token" SBX_KERNEL="$TMP/kernel"
+export SBX_API_URL=https://cp.example.invalid SBX_HOST_ID=host-1 SBX_HOST_TOKEN_FILE="$TMP/token" SBX_KERNEL="$TMP/kernel"
 export SBX_SRV="$TMP/srv" SBX_ENV_DIR="$TMP" SBX_TEMPLATE_BUILD="$TMP/bin/template-build" SBX_DISK_FLOOR_GB=0
 export SBX_INSTALL_HOST="$TMP/bin/install-host"
 # The system root /proc and /sys/fs/cgroup are read from (register G39): a host of 16 GiB, 12 free.
@@ -148,7 +158,7 @@ job() { # job [GATE_SHA]: the claim answer, one build of the worked example
   jq -n --arg d "$DIGEST" --arg g "${1:-}" '{builds: [{template: "django-django-11133", build: "b-0123456789abcdef0123456789",
     image: ("image-factory/moca-microvm@sha256:" + $d),
     spec: {id: "django-django-11133", image: ("image-factory/moca-microvm@sha256:" + $d), guest_ram_mb: 4096}}
-    + (if $g == "" then {} else {gateRecord: ("/v1/hosts/bm1/blobs/sha256:" + $g)} end)]}' >"$TMP/state/claim-answer"
+    + (if $g == "" then {} else {gateRecord: ("/v1/hosts/host-1/blobs/sha256:" + $g)} end)]}' >"$TMP/state/claim-answer"
 }
 run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --once >"$TMP/out" 2>&1; }
 
@@ -156,12 +166,12 @@ run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --once >"$TMP/out" 
 job "$GATE_SHA"
 run || fail 'a good poll failed'
 grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'summary'
-R="$TMP/state/POST_v1_hosts_bm1_builds_b-0123456789abcdef0123456789_report"
+R="$TMP/state/POST_v1_hosts_host-1_builds_b-0123456789abcdef0123456789_report"
 jq -e '.event == "built" and (.templateRecord | fromjson | .manifest_hash == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   and (.manifest | fromjson | .hash_version == 2)' "$R" >/dev/null || fail 'the built report does not carry T and S as files'
 grep -q -- "--gate-record $TMP" "$MOCK_LOG" || grep -q -- '--gate-record /' "$MOCK_LOG" || fail 'the build was not given its gate record'
 grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
-jq -e '.limits.diskFloorGb == 0 and (.holds | length) == 0' "$TMP/state/POST_v1_hosts_bm1_inventory" >/dev/null || fail 'inventory'
+jq -e '.limits.diskFloorGb == 0 and (.holds | length) == 0' "$TMP/state/POST_v1_hosts_host-1_inventory" >/dev/null || fail 'inventory'
 pass 'a claimed build is built and reported built with its template record and manifest; the token stays in a 0600 header file'
 
 # 2. The next poll's inventory names the snapshot it now holds.
@@ -222,7 +232,7 @@ run || fail 'activation poll'
 grep -q 'systemctl start sbx-worker@sbx_t1.service' "$MOCK_LOG" || fail 'did not start the wanted, installed worker'
 grep -q 'systemctl start sbx-worker@sbx_t2.service' "$MOCK_LOG" && fail 'started a worker that is not installed'
 grep -q '"started":1' "$TMP/out" && grep -q '"agent":"refused","worker":"sbx_t2"' "$TMP/out" || fail 'start and refusal not reported'
-W="$TMP/state/POST_v1_hosts_bm1_workers_report"
+W="$TMP/state/POST_v1_hosts_host-1_workers_report"
 jq -e '.event == "refused" and .buildId == "sha256:2"' "$W" >/dev/null || fail 'the refusal was not reported to the control plane'
 printf '{"run":[],"stop":[{"worker":"sbx_t1","buildId":"sha256:1"}]}' >"$TMP/state/wanted-answer"
 run || fail 'stop poll'
@@ -261,7 +271,7 @@ exit 1
 MOCK
 chmod +x "$TMP/bin/template-build"
 run || fail 'the leaking poll failed'
-for f in "$R" "$TMP/state/POST_v1_hosts_bm1_builds_b-0123456789abcdef0123456789_log"; do
+for f in "$R" "$TMP/state/POST_v1_hosts_host-1_builds_b-0123456789abcdef0123456789_log"; do
   ! grep -qE 'amazonaws|123456789012|10\.1\.2\.3|https://' "$f" || fail "a registry host, account, IP or URL left the host in $(basename "$f")"
 done
 jq -e '.message | test("<registry>/image-factory/moca-microvm@sha256:")' "$R" >/dev/null || fail 'the redacted reason lost the image path'
@@ -270,7 +280,7 @@ grep -q 'amazonaws' "$TMP/srv/agent-logs/b-0123456789abcdef0123456789.log" || fa
 [[ "$(stat -c %a "$TMP/srv/agent-logs" 2>/dev/null || stat -f %Lp "$TMP/srv/agent-logs")" == 700 ]] || fail 'agent-logs is not 0700'
 pass 'a failed build reports redacted text only (no registry host, account, IP or URL); the full log stays on the host, root-only'
 
-# 9. With SBX_REGISTRY set, no build is claimed until the registry login exists (bm1, 2026-11-04).
+# 9. With SBX_REGISTRY set, no build is claimed until the registry login exists (host-1, 2026-11-04).
 job ''
 : >"$MOCK_LOG"
 SBX_REGISTRY=reg.example.invalid REGISTRY_AUTH_FILE="$TMP/auth.json" bash "$A" --once >"$TMP/out" 2>&1 || fail 'no-login poll failed'
@@ -329,7 +339,7 @@ printf '{"run":[{"worker":"sbx_t2","buildId":"sha256:2"}],"stop":[]}' >"$TMP/sta
 bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the wanted-only run failed'
 grep -q 'builds/claim' "$MOCK_LOG" && fail 'the wanted-only run claimed a build'
 grep -q '^build ' "$MOCK_LOG" && fail 'the wanted-only run built'
-grep -q 'hosts/bm1/inventory' "$MOCK_LOG" || fail 'the wanted-only run did not report the inventory'
+grep -q 'hosts/host-1/inventory' "$MOCK_LOG" || fail 'the wanted-only run did not report the inventory'
 grep -q 'systemctl start sbx-worker@sbx_t2.service' "$MOCK_LOG" || fail 'the wanted-only run did not start the wanted worker'
 rm -f "$TMP/state/active-sbx-worker@sbx_t2.service"; touch "$TMP/state/locked"; : >"$MOCK_LOG"
 bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the locked run failed'
@@ -431,9 +441,9 @@ bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the removal run failed'
 grep -qx "install-host --uninstall $W --keep-shared" "$MOCK_LOG" || fail 'the worker was not uninstalled alone (--keep-shared)'
 [[ ! -e "$TMP/srv/snapshots/ret-1" && ! -e "$TMP/srv/templates/ret-1.json" ]] || fail 'the snapshot or its record is still there'
 [[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build it was not asked to'
-jq -e --arg h "$H" '.buildId == $h and .event == "removed"' "$TMP/state/POST_v1_hosts_bm1_workers_report" >/dev/null || fail 'the removal was not reported'
+jq -e --arg h "$H" '.buildId == $h and .event == "removed"' "$TMP/state/POST_v1_hosts_host-1_workers_report" >/dev/null || fail 'the removal was not reported'
 grep -q '"removed":1' "$TMP/out" || fail 'the summary does not count the removal'
-jq -e '.holds | map(.manifestHash) | index("'"$H"'") == null' "$TMP/state/POST_v1_hosts_bm1_inventory" >/dev/null 2>&1 || true
+jq -e '.holds | map(.manifestHash) | index("'"$H"'") == null' "$TMP/state/POST_v1_hosts_host-1_inventory" >/dev/null 2>&1 || true
 # A name the control plane sends that this host's records do not match deletes nothing.
 jq -n --arg h "$OTHER" '{run: [], stop: [], remove: [{template: "keep", buildId: $h, worker: "sbx_wrong_1"}]}' >"$TMP/state/wanted-answer"
 : >"$MOCK_LOG"; bash "$A" --wanted-only >"$TMP/out" 2>&1 || true
@@ -510,7 +520,7 @@ EV2='{"time":"2026-11-08T12:00:01Z","via":"moca-egress","vm_id":"vm-1","sid":"sb
 # cursor's number (c12 -> 12), so entries are in journal order.
 entry() { jq -cn --arg c "$1" --arg m "$2" --arg t "${3:-${1#c}}" '{__CURSOR: $c, __MONOTONIC_TIMESTAMP: $t, _BOOT_ID: "b1", MESSAGE: $m, _SYSTEMD_UNIT: "moca-egress.service"}'; }
 { entry c1 "$EV"; entry c2 'moca-egress: serving 3 allowlist entries'; entry c3 "$EV2"; } >"$TMP/state/journal"
-egress_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts"; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
+egress_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/egress-posts" "$TMP/state/wanted-read"; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
 # Off: the unit is not active, even if it is enabled (a stopped proxy: nothing to ship).
 rm -f "$TMP/state/active-moca-egress.service" "$TMP/srv/egress.cursor" "$TMP/srv/egress.pending.json"
 touch "$TMP/state/enabled-moca-egress.service"
@@ -526,7 +536,7 @@ grep -Eq 'systemctl (start|stop|restart|enable|disable)[^@]*moca-egress' "$MOCK_
 rm -f "$TMP/state/enabled-moca-egress.service"
 touch "$TMP/state/active-moca-egress.service"
 egress_run || fail 'the egress run failed'
-grep -q 'journalctl -u moca-egress.service -o json --no-pager -b' "$MOCK_LOG" || fail 'the first read is not from this boot'
+grep -q 'journalctl -u moca-egress.service -o json --all --no-pager -b' "$MOCK_LOG" || fail 'the first read is not from this boot'
 jq -e --argjson a "$EV" --argjson b "$EV2" '.events == [$a, $b] and .cursor == "c3" and .oversized == []' "$TMP/state/egress-posts" >/dev/null ||
   fail 'the post does not carry exactly the proxy events and the last cursor'
 jq -e '[.events[] | keys[]] - ["time","via","vm_id","sid","sub","host","dial_addr","method","path","status","bytes_up","bytes_down","credential","decision","dropped","coalesced"] == []' \
@@ -534,7 +544,7 @@ jq -e '[.events[] | keys[]] - ["time","via","vm_id","sid","sub","host","dial_add
 [[ "$(<"$TMP/srv/egress.cursor")" == c3 ]] || fail 'the cursor is not the last entry'
 [[ "$(stat -c %a "$TMP/srv/egress.cursor" 2>/dev/null || stat -f %Lp "$TMP/srv/egress.cursor")" == 600 ]] || fail 'the cursor file is not 0600'
 [[ ! -e "$TMP/srv/egress.pending.json" ]] || fail 'the posted batch was kept'
-grep -q 'curl .*-H @.*/v1/hosts/bm1/egress' "$MOCK_LOG" || fail 'the post did not use the header file'
+grep -q 'curl .*-H @.*/v1/hosts/host-1/egress' "$MOCK_LOG" || fail 'the post did not use the header file'
 grep -q -- "$TOKEN" "$MOCK_LOG" "$TMP/out" && fail 'the token reached argv or output'
 grep -q 'pypi.example.com' "$TMP/out" && fail 'an egress event was printed'
 grep -q '"egress":"on","egressRead":3,"egressAccepted":2,"egressRefused":0,"egressSkipped":0,"egressRejected":0,"egressNotOurs":0' "$TMP/out" || fail 'the on summary'
@@ -567,7 +577,17 @@ BIG="$(jq -cn --argjson e "$EV" '$e + {path: ("/" + ("a" * 9000))}')"
 entry c1007 "$BIG" >>"$TMP/state/journal"
 egress_run || fail 'the oversized run failed'
 jq -e '.events == [] and .oversized == ["sbx-0123456789abcdef0123456789"]' "$TMP/state/egress-posts" >/dev/null || fail 'an oversized event'
-pass 'ships egress events as written, only with moca-egress active (enabled or not), never acting on it; batches of 1000; a failed post keeps the cursor and retries the same batch (G42)'
+# An event of 5 KiB (over journalctl's 4096-byte field limit without --all) is sent whole.
+MID="$(jq -cn --argjson e "$EV" '$e + {path: ("/" + ("b" * 5000))}')"
+entry c1008 "$MID" >>"$TMP/state/journal"
+egress_run || fail 'the 5 KiB run failed'
+jq -e --argjson m "$MID" '.events == [$m] and .oversized == []' "$TMP/state/egress-posts" >/dev/null || fail 'a 5 KiB event was not sent whole'
+# A MESSAGE that is not text (journalctl's array of bytes) is not sent, and is said.
+jq -cn '{__CURSOR: "c1009", __MONOTONIC_TIMESTAMP: "1009", _BOOT_ID: "b1", MESSAGE: [104, 255, 105], _SYSTEMD_UNIT: "moca-egress.service"}' >>"$TMP/state/journal"
+egress_run || fail 'the unreadable run failed'
+grep -q 'egress: 1 journal entries of moca-egress have a MESSAGE that is not text; not sent' "$TMP/out" || fail 'an unreadable MESSAGE was silent'
+[[ "$(<"$TMP/srv/egress.cursor")" == c1009 ]] || fail 'the cursor after an unreadable entry'
+pass 'ships egress events as written, only with moca-egress active (enabled or not), never acting on it; batches of 1000; a failed post keeps the cursor and retries the same batch'
 
 # 14. A 400 invalid_request (a batch the control plane will never take) is set aside, never retried
 #     forever: kept 0600 in egress.rejected/, the cursor past it, an error naming it; shipping goes on.
@@ -601,9 +621,10 @@ egress_run || fail 'the run after a rejection failed'
 jq -e '.cursor == "c3"' "$TMP/state/egress-posts" >/dev/null || fail 'shipping did not go on after a rejection'
 pass 'a 400 batch is kept in egress.rejected/ (0600) and passed; a 404 or 503 keeps it and retries (G42)'
 
-# 15. A rotated-away cursor: an error, the old cursor kept as egress.cursor.stale, a restart from this
-#     boot, and shipping goes on; entries already sent (at or before egress.mark) are not sent again.
-#     Without a mark, the restart re-sends, and says so.
+# 15. A stale cursor: one whose entry was rotated away (journalctl exits 0 for it and falls back, so the
+#     agent checks with --cursor first) or one journalctl cannot parse (exit 1). An error, the old cursor
+#     kept as egress.cursor.stale, a restart from this boot, and shipping goes on; entries already sent
+#     (at or before egress.mark) are not sent again. Without a mark, the restart re-sends, and says so.
 rm -f "$TMP/srv/egress.pending.json" "$TMP/srv/egress.cursor.stale" "$TMP/srv/egress.catchup" "$TMP/srv/egress.mark"
 { entry c10 "$EV"; entry c11 "$EV2"; } >"$TMP/state/journal"
 egress_run || fail 'the first run of 15 failed'
@@ -612,8 +633,10 @@ egress_run || fail 'the first run of 15 failed'
 { entry r10 "$EV" 10; entry r11 "$EV2" 11; entry r12 "$EV" 12; } >"$TMP/state/journal"
 egress_run || fail 'the rotated run failed'
 grep -q 'egress: the journal cursor is no longer valid; restarting from this boot' "$TMP/out" || fail 'no error for a rotated cursor'
+grep -q 'journalctl -u moca-egress.service -o json --all --no-pager --cursor c11' "$MOCK_LOG" || fail 'the cursor was not checked with --cursor'
+grep -q -- '--after-cursor c11' "$MOCK_LOG" && fail 'read after a stale cursor (journalctl falls back and re-reads)'
 [[ "$(<"$TMP/srv/egress.cursor.stale")" == c11 ]] || fail 'the old cursor was not kept'
-grep -q 'journalctl -u moca-egress.service -o json --no-pager -b' "$MOCK_LOG" || fail 'no restart from this boot'
+grep -q 'journalctl -u moca-egress.service -o json --all --no-pager -b' "$MOCK_LOG" || fail 'no restart from this boot'
 jq -s -e --argjson a "$EV" '(map(.events) | add) == [$a] and .[-1].cursor == "r12"' "$TMP/state/egress-posts" >/dev/null ||
   fail 'the restart re-sent entries already sent, or did not ship the new one'
 grep -q '"egressSkipped":2' "$TMP/out" || fail 'the skipped entries are not counted'
@@ -642,25 +665,47 @@ jq -e --argjson a "$EV" --argjson d "$DROP" '.events == [$a, $d] and .cursor == 
   fail 'the post is not exactly our event and the drop report'
 grep -q 'p6-session-0001\|api.example.com' "$TMP/state/egress-posts" "$TMP/out" && fail "another client's event left the host"
 grep -q '"egressRead":4,"egressAccepted":2,.*"egressNotOurs":2' "$TMP/out" || fail 'egressNotOurs is not counted'
-[[ "$(grep -c 'GET.*/v1/hosts/bm1/wanted\|/v1/hosts/bm1/wanted$' "$MOCK_LOG")" == 1 ]] || fail 'the wanted state was read twice'
+# A sid not in the list: the wanted state read again after the journal read (activation's and that one).
+[[ "$(grep -c '/v1/hosts/host-1/wanted' "$MOCK_LOG")" == 2 ]] || fail 'a batch with another sid did not read the wanted state again'
 [[ "$(<"$TMP/srv/egress.cursor")" == c4 ]] || fail 'the cursor after a filtered batch'
-# A run whose activation is skipped for the lock reads the wanted state once, for egress.
+# A run whose activation is skipped for the lock reads the wanted state once, for egress; a batch of
+# our sandbox's events only reads it no more.
 entry c5 "$EV" >>"$TMP/state/journal"
 touch "$TMP/state/locked-9" # the activation lock only
 egress_run || fail 'the locked egress run failed'
 rm -f "$TMP/state/locked-9"
-[[ "$(grep -c '/v1/hosts/bm1/wanted' "$MOCK_LOG")" == 1 ]] || fail 'a lock-skipped run did not read the wanted state once'
+[[ "$(grep -c '/v1/hosts/host-1/wanted' "$MOCK_LOG")" == 1 ]] || fail 'a lock-skipped run did not read the wanted state once'
 jq -e '.cursor == "c5"' "$TMP/state/egress-posts" >/dev/null || fail 'a lock-skipped run did not ship'
+# A sandbox created after activation's read of the wanted state: its first events are in the journal
+# read, its sid only in the second read. They are sent, not counted egressNotOurs.
+NEW=sbx-fedcba9876543210fedcba9876
+EVN="$(jq -c --arg s "$NEW" '.sid = $s' <<<"$EV")"
+entry c6 "$EVN" >>"$TMP/state/journal"
+printf '{"run":[],"stop":[],"egressSids":["%s","%s"]}' "$SID" "$NEW" >"$TMP/state/wanted-later"
+egress_run || fail 'the new-sandbox run failed'
+jq -e --argjson n "$EVN" '.events == [$n] and .cursor == "c6"' "$TMP/state/egress-posts" >/dev/null ||
+  fail "a new sandbox's first events were not sent"
+grep -q '"egressNotOurs":0' "$TMP/out" || fail "a new sandbox's events were counted egressNotOurs"
+# That second read failing: nothing sent, the cursor kept, an error line; the next run sends them.
+entry c7 "$(jq -c '.host = "files.example.com"' <<<"$EVN")" >>"$TMP/state/journal"
+printf x >"$TMP/state/wanted-later"
+egress_run || fail 'the failed-refresh run failed'
+[[ ! -e "$TMP/state/egress-posts" && "$(<"$TMP/srv/egress.cursor")" == c6 ]] || fail 'sent or moved the cursor without the second read'
+grep -q 'egress: the wanted state unreadable after the journal read; nothing sent, the cursor kept' "$TMP/out" || fail 'the failed second read is not said'
+printf '{"run":[],"stop":[],"egressSids":["%s","%s"]}' "$SID" "$NEW" >"$TMP/state/wanted-later"
+egress_run || fail 'the run after the failed refresh failed'
+jq -e '.cursor == "c7" and (.events | length) == 1' "$TMP/state/egress-posts" >/dev/null || fail 'the run after a failed second read did not send'
+rm -f "$TMP/state/wanted-later"
 # An older control plane: no egressSids, nothing sent, the cursor kept, an error line.
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
-entry c6 "$EV" >>"$TMP/state/journal"
+entry c8 "$EV" >>"$TMP/state/journal"
 egress_run || fail 'the no-egressSids run failed'
 [[ ! -e "$TMP/state/egress-posts" ]] && ! grep -q '^journalctl' "$MOCK_LOG" || fail 'sent or read without egressSids'
 grep -q 'the wanted state has no egressSids (a control plane older than openapi 1.7.0); nothing sent, the cursor kept' "$TMP/out" ||
   fail 'no error line for a missing egressSids'
-[[ "$(<"$TMP/srv/egress.cursor")" == c5 ]] || fail 'the cursor moved without egressSids'
+[[ "$(<"$TMP/srv/egress.cursor")" == c7 ]] || fail 'the cursor moved without egressSids'
 printf '{"run":[],"stop":[],"egressSids":["%s"]}' "$SID" >"$TMP/state/wanted-answer"
-pass 'ships only the wanted state egressSids events and drop reports, counts the rest egressNotOurs; nothing without egressSids (G42)'
+pass 'ships only the wanted state egressSids events (read again after the journal for an unknown sid) and drop reports, counts the rest egressNotOurs; nothing without egressSids'
 
 # 17. The time budget: no new batch after EGRESS_BUDGET_S (120 s; 5 s here, by the test copy below,
 #     with 3 s posts: SECONDS counts whole seconds, so the margins are wide),
@@ -710,7 +755,7 @@ memstat() { # anon shmem kernel file [kernel_split]: a memory.stat for m1's slic
 memstat 448 16 48 $((4096 + 3584))
 printf '{"run":[],"stop":[],"egressSids":[]}' >"$TMP/state/wanted-answer"
 mem_run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
-INV="$TMP/state/POST_v1_hosts_bm1_inventory"
+INV="$TMP/state/POST_v1_hosts_host-1_inventory"
 mem_run || fail 'the memory run failed'
 jq -e --arg h1 "$HM1" '.memory == {memTotalMib: 16384, memAvailableMib: 12288, memFloorMib: 4096, memPressureFull10: 0.25,
     memPressureLimit: 10, runningWorkers: ["sbx_m1"], vmCommittedMib: {sbx_m1: 512}, memfileMismatch: []}
@@ -765,7 +810,7 @@ grep -q '"agent":"error","why":"memfile mismatch: build '"$HM2"' (snapshot m2-sn
   fail 'the mismatch is not an error line'
 grep -q '"agent":"summary".*"memfileMismatch":1' "$TMP/out" || fail 'the summary does not count the mismatch'
 grep -q 'systemctl start sbx-worker@sbx_m2.service' "$MOCK_LOG" && fail 'started a build whose memory file does not match'
-jq -e --arg h "$HM2" '.event == "refused" and .buildId == $h and (.reason | startswith("memfile mismatch"))' "$TMP/state/POST_v1_hosts_bm1_workers_report" >/dev/null ||
+jq -e --arg h "$HM2" '.event == "refused" and .buildId == $h and (.reason | startswith("memfile mismatch"))' "$TMP/state/POST_v1_hosts_host-1_workers_report" >/dev/null ||
   fail 'the refusal was not reported'
 rm -f "$TMP/srv/snapshots/m2-snap/memfile"
 mem_run || fail 'the missing-memfile run failed'

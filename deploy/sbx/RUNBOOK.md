@@ -548,7 +548,10 @@ Paths are logged without query, fragment or userinfo, and an injected credential
 - **Only this host's sandboxes' events leave it.** The wanted state names them (`egressSids`: the
   workspace keys of the sandboxes on this host's workers, live or ended within 600 s); an event with
   any other `sid`, such as a Moca P6 session's on the same proxy, stays in the journal and is only
-  counted (`egressNotOurs`). The proxy's `audit_dropped` reports are sent. Against a control plane
+  counted (`egressNotOurs`). The list is read before the journal, so a batch with a `sid` not in it
+  (a sandbox created in between, at its first egress) reads the wanted state again, after the journal
+  read, before anything is left out; if that read fails, nothing is sent and the cursor stays. The
+  proxy's `audit_dropped` reports are sent. Against a control plane
   whose wanted state has no `egressSids` (older than openapi 1.7.0), the agent sends nothing and says
   so in an error line, keeping its cursor.
 - **A time budget:** a run starts no new batch 120 s after its egress step began, so slow posts never
@@ -568,21 +571,27 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   the error names the file (`egressRejected` in the summary). Its events are not in any sandbox's log:
   look at the file, and fix the agent or the control plane.
 - **A cursor the journal no longer has** (rotated away, or from another machine) is an error
-  (`the journal cursor is no longer valid; restarting from this boot`). The old cursor is kept as
+  (`the journal cursor is no longer valid; restarting from this boot`). journalctl itself does not
+  fail on one: it resumes at the nearest kept entry, or for another machine's cursor by time across
+  boots, with exit 0. So before its first read the agent checks that the cursor still names an
+  entry (`journalctl --cursor` starts at that entry); journalctl fails only on a cursor it cannot
+  parse, which is the same error. Entries rotated away before they were sent are lost with the
+  journal. The old cursor is kept as
   `/srv/sbx/egress.cursor.stale`, and shipping restarts from this boot's first entry. Entries already
   sent are skipped (`egressSkipped`), by `/srv/sbx/egress.mark` (the last sent entry's boot id and
   monotonic time): the control plane's replay check is by cursor, so it could not tell them apart.
   Without a mark, the restart re-sends this boot's entries, which the control plane stores twice; the
   agent says so in an error line (`no position mark`). Entries of an earlier boot that the old cursor
   had not reached are not read.
-- **What is kept:** each event exactly as the proxy wrote it, for as long as the sandbox record
+- **What is kept:** each event with its fields and values as the proxy wrote them (the agent decodes and
+  re-encodes each one, so the bytes may differ, and the control plane stores its own canonical line), for as long as the sandbox record
   (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`, about 3 MB), and all
   logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
   most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
   back. Each post reads the length of every retained log, so its cost grows with the number of
   sandboxes retained with a log: small at SBX0's scale. Redis refuses writes past its 200 MB
   `maxmemory` (register G45, above), well clear of these.
-- **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is). A log's `dropped` counts
+- **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is); the agent reads the journal with `--all`, so one up to 8 KiB is sent whole (without it journalctl prints a field over 4096 bytes as `null`). A journal entry whose message is not text (not UTF-8) cannot be read for its sandbox: the agent says so in an error line. A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
   record (`sandbox`, `state: terminated`) names `egress: {events, sha256, dropped, droppedBy, complete}`; if events
