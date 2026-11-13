@@ -556,7 +556,15 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       body: {
         buildId,
         event,
-        ...(event === 'removed' ? { buildRecord: await buildRecordOf(prov, doc.id, buildId) } : {}),
+        ...(event === 'removed'
+          ? {
+              buildRecord: await buildRecordOf(
+                prov,
+                doc.id,
+                doc.builds.find((x) => x.buildId === buildId && ok(x)) ?? { buildId },
+              ),
+            }
+          : {}),
         ...(reason ? { reason } : {}),
       },
     });

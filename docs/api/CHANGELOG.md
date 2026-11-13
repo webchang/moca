@@ -104,6 +104,20 @@ added or removed.
   the build stays in the host's `run` is not recorded again (`recorded: null`): the agent retries
   every 15 s, and the template's stream is append-only. A different reason, any other report for
   the build, or the build leaving the host's `run` starts a new episode, recorded again.
+- A retire and an admin's reject run their in-use check, their records and their catalog write
+  under the activation lock and the template's use lock, on the template as read under those
+  locks; an activation re-reads its build's status under the activation lock (a build retired since
+  is `410 template_retired`, one rejected `409 template_unavailable`), and a sandbox create stores
+  its sandbox under the template's use lock after one last status read (`410 template_retired`, or
+  `400 unknown_template` for a build no longer registered). So no lease, sandbox or `activate`
+  record lands on a build that a racing retire or reject ends, and no build is retired or rejected
+  under a sandbox. Creates on different templates do not wait on each other.
+- `build_in_use` is judged by build: a live sandbox counts for the build it resolved to, so a
+  sandbox on one build does not block retiring another build that shares its worker (a record
+  without a build id still counts for every build on its worker). Each `retire` or `reject` record
+  is written inside the catalog update, so a record that cannot be written leaves the build as it
+  was; its `buildRecord` is the build's `build` record matched by handle, so a build built and then
+  rejected cites it too.
 
 ### 1.13.0
 

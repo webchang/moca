@@ -84,13 +84,35 @@ async function registered(
   h: string,
   worker: string,
   principal = alice,
+  opts: { another?: boolean; vcpus?: number; sourceDigest?: string; status?: string } = {},
 ): Promise<void> {
-  await HANDLERS.createTemplate!(
-    ctx({ principal, body: { id, image: IMAGE, spec: BASE_SPEC, profile: 'base' } }),
-    d,
-  );
+  if (opts.another)
+    // Another build of an existing template, from the same image with another spec.
+    await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal,
+        params: { id },
+        body: { image: IMAGE, spec: { ...BASE_SPEC, vcpus: opts.vcpus ?? 2 }, profile: 'base' },
+      }),
+      d,
+    );
+  else
+    await HANDLERS.createTemplate!(
+      ctx({ principal, body: { id, image: IMAGE, spec: BASE_SPEC, profile: 'base' } }),
+      d,
+    );
   const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
-  const build = c.builds[0].build;
+  await reportBuilt(d, c.builds[0].build, id, h, worker, opts);
+}
+/** Reports build `build` of template `id` built with manifest hash `h`, as host-1. */
+async function reportBuilt(
+  d: TestDeps,
+  build: string,
+  id: string,
+  h: string,
+  worker: string,
+  opts: { vcpus?: number; sourceDigest?: string; status?: string } = {},
+): Promise<void> {
   const r = (
     await HANDLERS.hostBuildReport!(
       asHost(
@@ -111,15 +133,15 @@ async function registered(
             hash_version: 2,
             hash: h,
             guest_ram_mb: 4096,
-            vcpus: 2,
-            source_image_digest: DIGEST,
+            vcpus: opts.vcpus ?? 2,
+            source_image_digest: opts.sourceDigest ?? DIGEST,
           }),
         },
       ),
       d,
     )
   ).body as Body;
-  expect(r.status).toBe('registered');
+  expect(r.status).toBe(opts.status ?? 'registered');
 }
 /** A host's inventory: its holds, its activeLimit, and its memory or the builds it marks running. */
 const inventory = (
@@ -1056,6 +1078,227 @@ describe('retire (§5.1)', () => {
     const admin = { ...bob, roles: ['admin'] };
     expect((await retire(d, 't1', admin)).status).toBe(200);
   });
+
+  const sandbox = (d: TestDeps, template: string) =>
+    HANDLERS.createSandbox!(ctx({ principal: alice, body: { template } }), d);
+
+  it('judges build_in_use by build: a sandbox on another build of one worker does not block', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    // Two builds of t1 from one image, other specs: template-build.sh names both workers alike.
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't1', hash('2'), 'sbx_t1', alice, { another: true, vcpus: 4 });
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't1' }, 2);
+    await activate(d, 't1', alice, { build: hash('2') });
+    const sb = (await sandbox(d, `t1@${hash('2')}`)).body as Body;
+    expect(sb.id).toEqual(expect.any(String));
+    // The sandbox runs on build 2: build 1 retires, build 2 is refused.
+    expect((await retireBuild(d, 't1', hash('1'))).status).toBe(200);
+    expect(await refusal(() => retireBuild(d, 't1', hash('2')))).toBe('build_in_use');
+  });
+
+  it('judges build_in_use by worker for a sandbox record without a build id', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't1', hash('2'), 'sbx_t1', alice, { another: true, vcpus: 4 });
+    // A record from before builds were traced: no buildId, so its worker's every build is in use.
+    const nowS = Math.floor(now / 1000);
+    await d.sandboxes!.create(
+      {
+        id: 'sb-untraced',
+        owner: alice.sub,
+        tenant: '',
+        name: '',
+        template: 't1',
+        worker: 'sbx_t1',
+        wsk: '',
+        labels: {},
+        createdAt: nowS,
+        expiresAt: nowS + 3600,
+      },
+      { total: 10, perSubject: 10, retentionS: 60 },
+      nowS,
+    );
+    expect(await refusal(() => retireBuild(d, 't1', hash('1')))).toBe('build_in_use');
+    expect(await refusal(() => retireBuild(d, 't1', hash('2')))).toBe('build_in_use');
+  });
+
+  it('judges build_in_use on the template as read under the lock, not the request read', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // The retire's first read of t1 is from before build 2 existed.
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    const stale = (await get('t1'))!;
+    await registered(d, 't1', hash('2'), 'sbx_t1', alice, { another: true, vcpus: 4 });
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't1' }, 2);
+    await activate(d, 't1', alice, { build: hash('2') });
+    await sandbox(d, `t1@${hash('2')}`);
+    let first = true;
+    cat.get = async (id: string) => {
+      if (first) {
+        first = false;
+        return stale;
+      }
+      return get(id);
+    };
+    // Build 2 serves a live sandbox: the whole template is refused, and nothing is retired.
+    expect(await refusal(() => retire(d, 't1'))).toBe('build_in_use');
+    expect((await get('t1'))!.builds.map((x) => x.status)).toEqual(['registered', 'registered']);
+  });
+
+  it('a sandbox create that resolved the build before a retire is refused 410', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // The create reads the template (build registered), then the retire runs to its end before
+    // the create writes its sandbox record.
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    let race = true;
+    cat.get = async (id: string) => {
+      const doc = await get(id);
+      if (race) {
+        race = false;
+        await retire(d, 't1');
+      }
+      return doc;
+    };
+    expect(await refusal(() => sandbox(d, 't1'))).toBe('template_retired');
+    expect(await d.sandboxes!.listAll(Math.floor(now / 1000))).toEqual([]);
+  });
+
+  it('a sandbox create waits for a retire judging use, then is refused 410', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // The create arrives once the retire has read the live sandboxes (none), before it retires.
+    // Under the lock the create waits for the retire, then finds the build retired; without it,
+    // the sandbox would be written in between and run on a retired build.
+    const store = d.sandboxes!;
+    const listAll = store.listAll.bind(store);
+    let creating: Promise<unknown> | null = null;
+    let arm = false;
+    store.listAll = async (nowS: number) => {
+      const out = await listAll(nowS);
+      if (arm) {
+        arm = false;
+        creating = refusal(() => sandbox(d, 't1'));
+        await Promise.race([creating, new Promise((r) => setTimeout(r, 200))]);
+      }
+      return out;
+    };
+    arm = true;
+    expect((await retire(d, 't1')).status).toBe(200);
+    expect(await creating).toBe('template_retired');
+    expect(await listAll(Math.floor(now / 1000))).toEqual([]);
+  });
+
+  it('retires nothing when its retire record cannot be written; a retry retires it', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    const prov = d.provenance!;
+    const append = prov.append.bind(prov);
+    let fail = true;
+    prov.append = async (input) => {
+      if (input.kind === 'retire' && fail) throw new Error('the store is full');
+      return append(input);
+    };
+    await expect(retire(d, 't1')).rejects.toThrow('the store is full');
+    expect((await d.templates!.get('t1'))!.builds[0].status).toBe('registered');
+    fail = false;
+    const r = (await retire(d, 't1')).body as Body;
+    expect(r.builds[0].record).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(
+      (await prov.chain('template/t1')).filter((x) => x.kind === 'retire').map(recordDigestOf),
+    ).toEqual([r.builds[0].record]);
+  });
+
+  it('cites the build record of a build built and then rejected', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    // Built, then rejected at registration: its rootfs is not from the create's image.
+    await registered(d, 't1', hash('2'), 'sbx_t1', alice, {
+      another: true,
+      vcpus: 4,
+      sourceDigest: hash('f'),
+      status: 'rejected',
+    });
+    const x = (await d.templates!.get('t1'))!.builds.find((b) => b.status === 'rejected')!;
+    // A rejected build keeps its handle as its id; its build record names that handle.
+    expect(x.buildId).toBe(x.handle);
+    const chain = await d.provenance!.chain('template/t1');
+    const built = chain.find(
+      (r) =>
+        r.kind === 'build' &&
+        (r.body as Body).outcome === 'built' &&
+        (r.body as Body).handle === x.handle,
+    )!;
+    await retireBuild(d, 't1', x.handle!);
+    expect((await d.provenance!.chain('template/t1')).at(-1)).toMatchObject({
+      kind: 'retire',
+      body: { build: x.handle, buildRecord: recordDigestOf(built), from: 'rejected' },
+    });
+  });
+
+  it('an activation that resolved the build before a retire writes no lease onto it', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    // The activation reads the template (build registered), then the retire runs to its end
+    // before the activation takes its lease.
+    const cat = d.templates!;
+    const get = cat.get.bind(cat);
+    let race = true;
+    cat.get = async (id: string) => {
+      const doc = await get(id);
+      if (race) {
+        race = false;
+        await retire(d, 't1');
+      }
+      return doc;
+    };
+    expect(await refusal(() => activate(d, 't1'))).toBe('template_retired');
+    const b = (await get('t1'))!.builds[0];
+    expect(b).toMatchObject({ status: 'retired', leases: [] });
+    expect((await d.provenance!.chain('template/t1')).some((r) => r.kind === 'activate')).toBe(
+      false,
+    );
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.active.used).toBe(0);
+  });
+
+  it('a retire waits for an activation taking its lease, then drops that lease', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    // A retire arrives while the activation is between its checks and its lease write (its
+    // `activate` record is written first). Under the lock the retire waits for the lease, then
+    // drops it; without it, the retire would finish first and the lease land on a retired build.
+    const prov = d.provenance!;
+    const append = prov.append.bind(prov);
+    let retiring: Promise<unknown> | null = null;
+    prov.append = async (input) => {
+      const rec = await append(input);
+      if (input.kind === 'activate' && !retiring) {
+        retiring = retire(d, 't1');
+        await Promise.race([retiring, new Promise((r) => setTimeout(r, 200))]);
+      }
+      return rec;
+    };
+    expect((await activate(d, 't1')).status).toBe(200);
+    await retiring;
+    expect((await d.templates!.get('t1'))!.builds[0]).toMatchObject({
+      status: 'retired',
+      leases: [],
+    });
+  });
 });
 
 describe('tags (§3.2, §5.1)', () => {
@@ -1266,6 +1509,158 @@ describe('reject after the fact (§5.2)', () => {
     expect(await refusal(() => reject(d, 't1', hash('1'), admin, { reason: 'x' }))).toBe(
       'invalid_request',
     );
+  });
+
+  const sandbox = (d: TestDeps, template: string) =>
+    HANDLERS.createSandbox!(ctx({ principal: alice, body: { template } }), d);
+
+  it('a reject waits for an activation taking its lease, then drops that lease', async () => {
+    const d = await setup();
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    // A reject arrives while the activation is between its checks and its lease write: under the
+    // activation lock it waits for the lease, then drops it.
+    const prov = d.provenance!;
+    const append = prov.append.bind(prov);
+    let rejecting: Promise<unknown> | null = null;
+    prov.append = async (input) => {
+      const rec = await append(input);
+      if (input.kind === 'activate' && !rejecting) {
+        rejecting = reject(d, 't1', hash('1'), admin, { reason: 'broken' });
+        await Promise.race([rejecting, new Promise((r) => setTimeout(r, 200))]);
+      }
+      return rec;
+    };
+    expect((await activate(d, 't1')).status).toBe(200);
+    await rejecting;
+    expect((await d.templates!.get('t1'))!.builds[0]).toMatchObject({
+      status: 'rejected',
+      leases: [],
+    });
+    expect((await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body).toMatchObject({
+      active: { used: 0 },
+    });
+  });
+
+  for (const how of ['reject', 'retire'] as const) {
+    it(`a ${how} judges live use on the template as it is under its locks, not as first read`, async () => {
+      const d = await setup();
+      attachedNow = ['sbx_t1'];
+      await HANDLERS.createTemplate!(
+        ctx({
+          principal: alice,
+          body: { id: 't1', image: IMAGE, spec: BASE_SPEC, profile: 'base' },
+        }),
+        d,
+      );
+      const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
+      const cat = d.templates!;
+      const handle = (await cat.get('t1'))!.builds[0].handle!;
+      // The call's first read sees the build still building. Before it takes its locks, the build
+      // registers (taking its buildId) and a sandbox is created on it.
+      const get = cat.get.bind(cat);
+      let armed = true;
+      cat.get = async (id) => {
+        const doc = await get(id);
+        if (armed) {
+          armed = false;
+          expect(doc!.builds[0].status).not.toBe('registered');
+          await reportBuilt(d, c.builds[0].build, 't1', hash('1'), 'sbx_t1');
+          await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+          await activate(d, 't1');
+          expect((await sandbox(d, 't1')).status).toBe(201);
+        }
+        return doc;
+      };
+      const end = () =>
+        how === 'reject'
+          ? reject(d, 't1', handle, admin, { reason: 'broken' })
+          : HANDLERS.retireTemplateBuild!(
+              ctx({ principal: alice, params: { id: 't1', build: handle } }),
+              d,
+            );
+      expect(await refusal(end)).toBe('build_in_use');
+      expect((await get('t1'))!.builds[0]).toMatchObject({
+        status: 'registered',
+        buildId: hash('1'),
+      });
+      expect(await d.sandboxes!.listAll(NOW_MS / 1000)).toHaveLength(1);
+    });
+  }
+
+  for (const [how, code] of [
+    ['reject', 'unknown_template'],
+    ['retire', 'template_retired'],
+  ] as const) {
+    it(`a sandbox create that resolved the build before a ${how} stores nothing (${code})`, async () => {
+      const d = await setup();
+      attachedNow = ['sbx_t1'];
+      await registered(d, 't1', hash('1'), 'sbx_t1');
+      await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+      await activate(d, 't1');
+      // The create reads the build (registered); the build then ends, before the create stores
+      // its sandbox. Its last read, under the activation lock, sees that and stores nothing.
+      const cat = d.templates!;
+      const get = cat.get.bind(cat);
+      let armed = true;
+      cat.get = async (id) => {
+        const doc = await get(id);
+        if (armed) {
+          armed = false;
+          if (how === 'reject') await reject(d, 't1', hash('1'), admin, { reason: 'broken' });
+          else
+            await HANDLERS.retireTemplateBuild!(
+              ctx({ principal: alice, params: { id: 't1', build: hash('1') } }),
+              d,
+            );
+        }
+        return doc;
+      };
+      expect(await refusal(() => sandbox(d, 't1'))).toBe(code);
+      expect(await d.sandboxes!.listAll(NOW_MS / 1000)).toEqual([]);
+    });
+  }
+
+  it('creates on two templates do not wait on each other (the use lock is per template)', async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1', 'sbx_t2'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('2'), 'sbx_t2');
+    await inventory(d, 'host-1', { [hash('1')]: 't1', [hash('2')]: 't2' }, 4);
+    await activate(d, 't1');
+    await activate(d, 't2');
+    // t1's create is held inside its store write, under t1's use lock; t2's runs meanwhile.
+    const store = d.sandboxes!;
+    const create = store.create.bind(store);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    store.create = async (rec, ...rest) => {
+      if (rec.template === 't1') {
+        entered();
+        await held;
+      }
+      return create(rec, ...rest);
+    };
+    const first = sandbox(d, 't1');
+    await inside;
+    const second = await Promise.race([
+      sandbox(d, 't2').then((r) => r.status),
+      new Promise((r) => setTimeout(() => r('waited'), 1000)),
+    ]);
+    expect(second).toBe(201);
+    // A retire of t1 waits for t1's create, then sees its sandbox live.
+    const retiring = refusal(() =>
+      HANDLERS.retireTemplateBuild!(
+        ctx({ principal: alice, params: { id: 't1', build: hash('1') } }),
+        d,
+      ),
+    );
+    release();
+    expect((await first).status).toBe(201);
+    expect(await retiring).toBe('build_in_use');
   });
 });
 

@@ -31,7 +31,7 @@ import {
   type Placement,
   type StartQueue,
 } from './activation.js';
-import { activationLock } from './activation-lock.js';
+import { activationLock, templateUseLock } from './activation-lock.js';
 import { busyWorkers, freshHosts, hostViewsOf } from './host-handlers.js';
 import {
   checkCreate,
@@ -1019,6 +1019,17 @@ async function takeLeaseLocked(
   }
   const { policy: pol } = await policy.current();
   const docs = await cat.list();
+  // `target` was resolved before the lock; a retire, and an admin's reject after the fact, take the
+  // lock too, so this read is current. A build retired or rejected since is refused here (retired:
+  // template_retired; rejected, as any build no longer registered: template_unavailable), so no
+  // lease (none counting against the quota) is written onto it, and no `activate` record either.
+  const fresh = docs.find((d) => d.id === d0.id)?.builds.find((x) => x.buildId === target.buildId);
+  if (fresh?.status === 'retired')
+    throw new CpError('template_retired', `template '${d0.id}' build ${target.buildId} is retired`);
+  if (fresh?.status !== 'registered')
+    throw new CpError('template_unavailable', 'this build is no longer registered', undefined, {
+      readiness: 'unavailable',
+    });
   const held = docs
     .flatMap((d) => d.builds)
     .filter(
@@ -1252,6 +1263,57 @@ async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
  * Its records stay, and each retire is a `retire` record naming who did it. Idempotent: an already
  * retired build is answered as retired, with no second record.
  */
+/**
+ * Why each build is in use now (§5.1): a live sandbox runs on it. A retire is refused while any
+ * build it names is in use, so it never cuts off running work. A sandbox names the build it
+ * resolved to (`buildId`), so it counts for that build only: two builds of one template from one
+ * image can share a worker id, and a sandbox on one must not block retiring the other. A record
+ * from before builds were traced (no `buildId`) counts for every build on its worker.
+ */
+async function buildsInUse(
+  deps: CpDeps,
+  builds: TemplateBuild[],
+  nowS: number,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!deps.sandboxes) return out;
+  const busyBuilds = new Set<string>();
+  const legacyWorkers = new Set<string>();
+  for (const r of await deps.sandboxes.listAll(nowS)) {
+    if (!isLive(r, nowS)) continue;
+    if (r.buildId) busyBuilds.add(r.buildId);
+    else legacyWorkers.add(r.worker);
+  }
+  for (const x of builds)
+    if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
+      out.add(x.buildId);
+  return out;
+}
+
+/**
+ * A sandbox create's store write, under its template's use lock (templateUseLock), after one last
+ * read of its build's status: a retire or an admin's reject that took the lock first leaves the
+ * build ended, and the create is refused with nothing stored (`410 template_retired`; `400
+ * unknown_template` for a build no longer registered); one that comes after sees this sandbox live
+ * and is refused `409 build_in_use`. Without a template store nothing can end, and no lock is taken.
+ */
+async function createUnlessEnded<T>(
+  deps: CpDeps,
+  t: { id: string; buildId: string },
+  create: () => Promise<T>,
+): Promise<T> {
+  const cat = deps.templates;
+  if (!cat?.update) return create();
+  return templateUseLock(cat).run(t.id, async () => {
+    const b = (await cat.get(t.id))?.builds.find((x) => x.buildId === t.buildId);
+    if (b?.status === 'retired')
+      throw new CpError('template_retired', `template '${t.id}' build ${t.buildId} is retired`);
+    if (b?.status !== 'registered')
+      throw new CpError('unknown_template', 'no such template (GET /v1/templates lists them)');
+    return create();
+  });
+}
+
 async function retireBuilds(
   ctx: RequestCtx,
   deps: CpDeps,
@@ -1277,77 +1339,93 @@ async function retireBuilds(
     throw new CpError('invalid_request', 'a reject needs a reason: the rule found broken, and why');
   if (reason !== undefined && (typeof reason !== 'string' || reason.length > 1024))
     throw new CpError('invalid_request', 'reason must be a string of at most 1024 characters');
-  const nowS = seconds(deps);
-  const busy = new Set<string>();
-  if (deps.sandboxes) {
-    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
-  }
-  // A Moca Pi session pinned to the build is live use too: its next turn needs the worker. Read
-  // before the catalog update, so no session lookup runs inside it.
-  const pinned = new Set<string>();
-  if (deps.index?.hasActiveSessionOnBuild) {
-    for (const x of d0.builds.filter(which)) {
-      if (x.status !== 'retired' && (await deps.index.hasActiveSessionOnBuild(x.buildId)))
-        pinned.add(x.buildId);
-    }
-  }
   const done: TemplateBuild[] = [];
-  await cat.update(d0.id, async (cur) => {
-    const targets = cur!.builds.filter(which);
-    if (targets.length === 0)
-      throw new CpError('template_not_found', 'no such build of this template');
-    if (
-      mode === 'reject' &&
-      targets.some((x) => x.status !== 'registered' && x.status !== 'rejected')
-    )
-      throw new CpError('invalid_request', 'only a registered build is rejected after the fact');
-    const inUse = targets.find((x) => x.status !== 'retired' && x.worker && busy.has(x.worker));
-    if (inUse)
-      throw new CpError(
-        'build_in_use',
-        `build ${inUse.handle ?? inUse.buildId} still serves a live sandbox: delete it, then retire`,
-      );
-    const held = targets.find((x) => x.status !== 'retired' && pinned.has(x.buildId));
-    if (held)
-      throw new CpError(
-        'build_in_use',
-        `build ${held.handle ?? held.buildId} is pinned by an active session: delete it, then retire`,
-      );
-
-    const end = mode === 'reject' ? ('rejected' as const) : ('retired' as const);
-    done.push(...targets.filter((x) => x.status !== end && x.status !== 'retired'));
-    return {
-      ...cur!,
-      builds: cur!.builds.map((x) =>
-        done.includes(x)
-          ? {
-              ...x,
-              status: end,
-              leases: [],
-              ...(mode === 'reject'
-                ? { reason: { message: String(reason), rule: 'admin', step: 'rejected' } }
-                : {}),
-            }
-          : x,
-      ),
-    };
-  });
   const records = new Map<TemplateBuild, string>();
-  for (const x of done) {
-    const rec = await prov.append({
-      stream: `template/${d0.id}`,
-      kind: mode,
-      subject: p.sub,
-      body: {
-        build: x.handle ?? x.buildId,
-        ...(x.status === 'registered' ? { buildId: x.buildId } : {}),
-        buildRecord: await buildRecordOf(prov, d0.id, x.buildId),
-        from: x.status,
-        ...(typeof reason === 'string' ? { reason } : {}),
-      },
-    });
-    records.set(x, rec.digest);
-  }
+  // Under the activation lock, so an activation never writes a lease onto a build retired or
+  // rejected after it resolved the build: it re-reads the build's status under the same lock
+  // (takeLeaseLocked). And under this template's use lock, inside it (activation, then template),
+  // so a sandbox create on this template either is stored before the in-use check or sees the
+  // build ended (createUnlessEnded).
+  await activationLock(cat).run('activation', () =>
+    templateUseLock(cat).run(d0.id, async () => {
+      // Read from the template as it is now, under the locks: d0 was read before them, and a build
+      // it saw still building may have registered (taking its buildId, then a sandbox) while this
+      // waited. A build that registers after this read has no sandbox, and gets none while the use
+      // lock is held. Read before the catalog update, so no store lookup runs inside it.
+      const now = await cat.get(d0.id);
+      if (!now) throw new CpError('template_not_found', 'no such template');
+      const live = now.builds.filter((x) => which(x) && x.status !== 'retired');
+      const inUse = await buildsInUse(deps, live, seconds(deps));
+      // A Moca Pi session pinned to the build is live use too: its next turn needs the worker.
+      const pinned = new Set<string>();
+      if (deps.index?.hasActiveSessionOnBuild) {
+        for (const x of live)
+          if (await deps.index.hasActiveSessionOnBuild(x.buildId)) pinned.add(x.buildId);
+      }
+      await cat.update(d0.id, async (cur) => {
+        done.length = 0;
+        records.clear();
+        const targets = cur!.builds.filter(which);
+        if (targets.length === 0)
+          throw new CpError('template_not_found', 'no such build of this template');
+        if (
+          mode === 'reject' &&
+          targets.some((x) => x.status !== 'registered' && x.status !== 'rejected')
+        )
+          throw new CpError(
+            'invalid_request',
+            'only a registered build is rejected after the fact',
+          );
+        const busy = targets.find((x) => x.status !== 'retired' && inUse.has(x.buildId));
+        if (busy)
+          throw new CpError(
+            'build_in_use',
+            `build ${busy.handle ?? busy.buildId} still serves a live sandbox: delete it, then retire`,
+          );
+        const held = targets.find((x) => x.status !== 'retired' && pinned.has(x.buildId));
+        if (held)
+          throw new CpError(
+            'build_in_use',
+            `build ${held.handle ?? held.buildId} is pinned by an active session: delete it, then retire`,
+          );
+        const end = mode === 'reject' ? ('rejected' as const) : ('retired' as const);
+        done.push(...targets.filter((x) => x.status !== end && x.status !== 'retired'));
+        // Each record is written inside the update, as a host's build report writes its own: a
+        // record that cannot be written leaves the build as it was, so a retry ends it with its
+        // record, and no build is retired or rejected without one.
+        for (const x of done) {
+          const rec = await prov.append({
+            stream: `template/${d0.id}`,
+            kind: mode,
+            subject: p.sub,
+            body: {
+              build: x.handle ?? x.buildId,
+              ...(x.status === 'registered' ? { buildId: x.buildId } : {}),
+              buildRecord: await buildRecordOf(prov, d0.id, x),
+              from: x.status,
+              ...(typeof reason === 'string' ? { reason } : {}),
+            },
+          });
+          records.set(x, rec.digest);
+        }
+        return {
+          ...cur!,
+          builds: cur!.builds.map((x) =>
+            done.includes(x)
+              ? {
+                  ...x,
+                  status: end,
+                  leases: [],
+                  ...(mode === 'reject'
+                    ? { reason: { message: String(reason), rule: 'admin', step: 'rejected' } }
+                    : {}),
+                }
+              : x,
+          ),
+        };
+      });
+    }),
+  );
   if (done.length > 0)
     await auditBestEffort(
       deps,
@@ -2133,10 +2211,14 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       createdAt: now,
       expiresAt: now + cfg.lifetimeS,
     };
-    const outcome = await store.create(
-      rec,
-      { perSubject: cfg.maxPerSubject, total: cfg.maxTotal, retentionS: cfg.retentionS },
-      now,
+    // Stored under the template's use lock, after one last read of the build's status, so a
+    // retire or reject racing this create either sees it live or is seen by it (createUnlessEnded).
+    const outcome = await createUnlessEnded(deps, template, () =>
+      store.create(
+        rec,
+        { perSubject: cfg.maxPerSubject, total: cfg.maxTotal, retentionS: cfg.retentionS },
+        now,
+      ),
     );
     if (outcome === 'quota_subject') {
       throw new CpError('quota_exceeded', `at most ${cfg.maxPerSubject} live sandboxes per user`);

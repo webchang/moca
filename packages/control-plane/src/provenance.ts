@@ -136,21 +136,26 @@ export function sha256Hex(data: string | Buffer): string {
 }
 
 /**
- * The digest of a build's `build` record in a template's chain (§7.1), found by its manifest hash:
+ * The digest of a build's `build` record in a template's chain (§7.1), found by its handle, else
+ * its manifest hash:
  * what a check, a retire, a reject and a host's removal cite as `buildRecord`. Null for a build that
  * never produced one (imported, or retired before it was built).
  */
 export async function buildRecordOf(
   store: ProvenanceStore,
   template: string,
-  buildId: string,
+  build: { buildId: string; handle?: string },
 ): Promise<string | null> {
-  const r = (await store.chain(`template/${template}`)).find(
-    (x) =>
-      x.kind === 'build' &&
-      (x.body as { outcome?: string }).outcome === 'built' &&
-      (x.body as { manifest_hash?: string }).manifest_hash === buildId,
-  );
+  // Matched by the build's handle when it has one, so a build that was built and then rejected
+  // (its buildId stays its handle, not the manifest hash) still finds its record; by the manifest
+  // hash otherwise.
+  const r = (await store.chain(`template/${template}`)).find((x) => {
+    const body = x.body as { outcome?: string; handle?: string; manifest_hash?: string };
+    if (x.kind !== 'build' || body.outcome !== 'built') return false;
+    return build.handle !== undefined
+      ? body.handle === build.handle
+      : body.manifest_hash === build.buildId;
+  });
   return r ? recordDigest(r) : null;
 }
 
