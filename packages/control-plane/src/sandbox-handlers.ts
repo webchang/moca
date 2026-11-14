@@ -59,7 +59,6 @@ import {
   type SandboxView,
 } from './sandbox-store.js';
 import { mintSandboxToken, mintSetModeToken } from './sandbox-token.js';
-import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
 import type { TokenClaims } from './token.js';
 
 /**
