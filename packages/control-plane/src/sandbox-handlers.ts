@@ -850,7 +850,9 @@ function quotaLock(cat: TemplateCatalog): SubjectQueue {
 /**
  * One PUT /v1/policy at a time per policy store, within this process: its read, its widening check
  * and its write run as one step, so two PUTs never both start from the same policy. The store
- * serializes each call, not a read and a later write; a deployment runs one control plane.
+ * serializes each call, not a read and a later write; a deployment runs one control plane. A quota
+ * write (PUT /v1/quota/{subject}) takes the same lock, so it never lands between a PUT's read and
+ * its write.
  */
 const policyLocks = new WeakMap<PolicyStore, SubjectQueue>();
 function policyLock(store: PolicyStore): SubjectQueue {
@@ -2602,7 +2604,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     // policy another admin writes meanwhile is never dropped by this write.
     let before: unknown;
     let next!: Policy;
-    const { record } = await store.update((cur) => {
+    const change = (cur: Policy): Policy => {
       next = { ...cur, quotaBySubject: { ...(cur.quotaBySubject ?? {}) } };
       // A body without owned keeps the target's owned, if it has one.
       const keepOwned = (q: Policy['quota'], old: Policy['quota'] | undefined): Policy['quota'] =>
@@ -2628,7 +2630,11 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       const bad = policyProblems(next);
       if (bad.length) throw new CpError('invalid_request', bad.join('; '));
       return next;
-    }, p.sub);
+    };
+    // It also takes PUT /v1/policy's lock (policyLock): that PUT reads, checks and writes as
+    // separate store calls, and a quota written between its read and its write would be replaced,
+    // unseen, by the policy it sends.
+    const { record } = await policyLock(store).run('policy', () => store.update(change, p.sub));
     await auditBestEffort(deps, 'quota_set', subject, { subject: p.sub, decision: 'quota_set' });
     return {
       status: 200,
