@@ -44,6 +44,7 @@ import {
   TEMPLATE_ID_RE,
   type Policy,
   type PolicyStore,
+  type Profile,
 } from './template-policy.js';
 import {
   TEMPLATE_DOC_SCHEMA,
@@ -1937,12 +1938,56 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
 }
 
 /**
+ * How `next` accepts more than `cur`, as one profile: a rule dropped from `requires`, the offline
+ * gate no longer required, self-attestation (or its egress) turned on, an envelope bound raised or
+ * removed, or the exact size changed or removed. Empty: `next` accepts no more than `cur`.
+ */
+function profileWidens(cur: Profile, next: Profile): string[] {
+  const out: string[] = [];
+  const req = new Set(next.requires);
+  if (cur.requires.some((r) => !req.has(r))) out.push('requires');
+  // As checkCreate reads it: absent means the offline gate is required.
+  if (cur.requireOfflineGate !== false && next.requireOfflineGate === false)
+    out.push('requireOfflineGate');
+  if (cur.selfAttest !== true && next.selfAttest === true) out.push('selfAttest');
+  if (cur.selfAttestEgress !== true && next.selfAttestEgress === true) out.push('selfAttestEgress');
+  const a = cur.envelope;
+  const b = next.envelope;
+  if (
+    b.maxGuestMb > a.maxGuestMb ||
+    b.maxVcpus > a.maxVcpus ||
+    b.maxWorkspaceMb > a.maxWorkspaceMb ||
+    (a.exact !== undefined &&
+      (b.exact === undefined ||
+        b.exact.guestMb !== a.exact.guestMb ||
+        b.exact.vcpus !== a.exact.vcpus))
+  )
+    out.push('envelope');
+  return out;
+}
+
+/**
  * The policy fields a change widens: a gate record trusted that was not, a registry allowed that
- * was not, or a registry's repository list that gains an entry or is dropped (no list allows every
- * repository). Registries and their keys compare case-insensitively, as the policy reads them.
+ * was not, a registry's repository list that gains an entry or is dropped (no list allows every
+ * repository), a profile added or loosened (profileWidens), or a default profile that accepts more
+ * than the one it replaces. Registries and their keys compare case-insensitively, as the policy
+ * reads them. A profile removed, and every quota change, is not a widening.
  */
 function policyWidens(cur: Policy, next: Policy): string[] {
   const out: string[] = [];
+  for (const [name, n] of Object.entries(next.profiles)) {
+    const c = Object.hasOwn(cur.profiles, name) ? cur.profiles[name] : undefined;
+    if (!c) out.push(`profiles.${name} (new)`);
+    else for (const f of profileWidens(c, n)) out.push(`profiles.${name}.${f}`);
+  }
+  // Nothing ranks profiles: a new default must accept no more than the old one did.
+  if (next.defaultProfile !== cur.defaultProfile) {
+    const oldDefault = Object.hasOwn(cur.profiles, cur.defaultProfile)
+      ? cur.profiles[cur.defaultProfile]
+      : undefined;
+    const newDefault = next.profiles[next.defaultProfile]!;
+    if (!oldDefault || profileWidens(oldDefault, newDefault).length) out.push('defaultProfile');
+  }
   const trusted = new Set(cur.trustedGateRecords);
   if (next.trustedGateRecords.some((g) => !trusted.has(g))) out.push('trustedGateRecords');
   const lower = (xs: string[]) => new Set(xs.map((x) => x.toLowerCase()));

@@ -15,8 +15,11 @@ additive; without `SH_PROVENANCE_DIR` nothing changes.
   DELETE /v1/subjects/{subject}/roles/admin (grant, with an optional `until` in epoch seconds, at
   most 366 days ahead; revoke), on both route profiles. Any admin reads the list; only an admin named in
   `SH_ADMIN_SUBJECTS` changes it (`403 forbidden` otherwise). The same holds for a PUT /v1/policy
-  that widens the policy (a trusted gate record, a registry or a repository added): an admin by an
-  API grant may narrow it and change its quotas. Each change answers the subject with
+  that widens the policy (a trusted gate record, a registry or a repository added; a profile added
+  or loosened: a rule dropped from `requires`, `requireOfflineGate` off, `selfAttest` or
+  `selfAttestEgress` on, an envelope bound raised or removed, its `exact` size changed or removed;
+  or a `defaultProfile` that accepts more): an admin by an API grant may narrow it (a profile
+  removed is a narrowing) and change its quotas. Each change answers the subject with
   the `record` it wrote (null when nothing changed). With no store the routes answer
   `400 invalid_request`. A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from
   the settings and any role); enrolling a subject the settings enroll writes nothing

@@ -106,8 +106,13 @@ two cluster writes for one API call.
    goes beyond what the settings' admins choose. They stay the recovery path: they cannot be revoked
    through the API, and none can revoke itself. Widening what the template policy trusts is the same
    kind of act: a `PUT /v1/policy` that adds a trusted gate record, a registry, or a repository to a
-   registry's list (or drops the list) also needs a settings admin. An API-granted admin may still
-   narrow the policy and change its quotas.
+   registry's list (or drops the list) also needs a settings admin, and so does one that widens a
+   profile: a new profile; an existing one that drops a rule from `requires`, stops requiring the
+   offline gate (`requireOfflineGate` to false), turns on `selfAttest` or `selfAttestEgress`, raises
+   or removes an envelope bound, or changes or removes its `exact` size; or a `defaultProfile` that
+   accepts more than the one it replaces (nothing ranks profiles, so any new default that does not
+   meet every one of the old default's requires, flags and bounds). An API-granted admin may still
+   narrow the policy (removing a profile is a narrowing) and change its quotas.
 2. **Per-template roles:** none for now. The owner and the admins cover every case seen so far. A
    `maintainer` role (tags, builds, retire; no ownership transfer) can be added later without changing
    this design.

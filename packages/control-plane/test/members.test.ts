@@ -303,6 +303,120 @@ describe('the admin role (spec §3, §6)', () => {
     expect((await policy.current()).policy.trustedGateRecords).toEqual(base.trustedGateRecords);
   });
 
+  it("refuses an API-granted admin's policy change that adds or loosens a profile, or weakens the default", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const P = DEFAULT_POLICY.profiles;
+    const bench = P.benchmark!;
+    const base: Policy = {
+      ...DEFAULT_POLICY,
+      profiles: {
+        base: P.base!,
+        benchmark: bench,
+        'benchmark-self': P['benchmark-self']!,
+        'general-self': P['general-self']!,
+        strict: { ...bench, envelope: { ...bench.envelope, maxWorkspaceMb: 4096 } },
+      },
+      defaultProfile: 'benchmark',
+    };
+    await policy.set(base, ENV_ADMIN);
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const put = (p: TokenClaims, body: Policy) => call(d, 'putPolicy', p, {}, body);
+    const withProfile = (name: string, pr: Policy['profiles'][string]): Policy => ({
+      ...base,
+      profiles: { ...base.profiles, [name]: pr },
+    });
+    const env = bench.envelope;
+    const widenings: [string, Policy][] = [
+      [
+        'requires',
+        withProfile('benchmark', { ...bench, requires: bench.requires.filter((r) => r !== 'X11') }),
+      ],
+      ['requireOfflineGate', withProfile('benchmark', { ...bench, requireOfflineGate: false })],
+      ['selfAttest', withProfile('benchmark', { ...bench, selfAttest: true })],
+      [
+        'selfAttestEgress',
+        withProfile('benchmark-self', { ...P['benchmark-self']!, selfAttestEgress: true }),
+      ],
+      ['a raised bound', withProfile('benchmark', { ...bench, envelope: { ...env, maxVcpus: 4 } })],
+      [
+        'exact removed',
+        withProfile('benchmark', {
+          ...bench,
+          envelope: {
+            maxGuestMb: env.maxGuestMb,
+            maxVcpus: env.maxVcpus,
+            maxWorkspaceMb: env.maxWorkspaceMb,
+          },
+        }),
+      ],
+      [
+        'exact changed',
+        withProfile('benchmark', {
+          ...bench,
+          envelope: { ...env, exact: { guestMb: 2048, vcpus: 2 } },
+        }),
+      ],
+      ['a new profile', withProfile('extra', { ...bench })],
+      ['a weaker default', { ...base, defaultProfile: 'base' }],
+    ];
+    for (const [name, wider] of widenings) {
+      expect({ name, code: await codeOf(() => put(who(CAROL), wider)) }).toEqual({
+        name,
+        code: 'forbidden',
+      });
+      expect((await policy.current()).policy).toEqual(base);
+    }
+    const { 'general-self': _gone, ...withoutGeneralSelf } = base.profiles;
+    const narrowings: [string, Policy][] = [
+      ['requires added', withProfile('base', { ...P.base!, requires: ['X10'] })],
+      [
+        'requireOfflineGate on',
+        withProfile('general-self', { ...P['general-self']!, requireOfflineGate: true }),
+      ],
+      [
+        'selfAttestEgress off',
+        withProfile('general-self', { ...P['general-self']!, selfAttestEgress: false }),
+      ],
+      [
+        'selfAttest off',
+        withProfile('benchmark-self', { ...P['benchmark-self']!, selfAttest: false }),
+      ],
+      [
+        'a lowered bound',
+        withProfile('base', { ...P.base!, envelope: { ...P.base!.envelope, maxVcpus: 4 } }),
+      ],
+      [
+        'exact added',
+        withProfile('base', {
+          ...P.base!,
+          envelope: { ...P.base!.envelope, exact: { guestMb: 4096, vcpus: 2 } },
+        }),
+      ],
+      ['a profile removed', { ...base, profiles: withoutGeneralSelf }],
+      ['a stricter default', { ...base, defaultProfile: 'strict' }],
+    ];
+    for (const [name, narrower] of narrowings) {
+      expect({ name, status: (await put(who(CAROL), narrower)).status }).toEqual({
+        name,
+        status: 200,
+      });
+      expect((await policy.current()).policy).toEqual(narrower);
+      // A settings admin's widening (back to base) goes through.
+      expect((await put(who(ENV_ADMIN), base)).status).toBe(200);
+      expect((await policy.current()).policy).toEqual(base);
+    }
+    // And a settings admin's widening of each kind.
+    for (const [, wider] of widenings) {
+      expect((await put(who(ENV_ADMIN), wider)).status).toBe(200);
+      await put(who(ENV_ADMIN), base);
+    }
+  });
+
   it("never lets an API-granted admin's PUT built from an older policy restore trust a settings admin removed", async () => {
     const d = setup();
     const policy = new FilePolicyStore({
