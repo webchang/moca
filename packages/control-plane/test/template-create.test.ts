@@ -138,6 +138,10 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     ],
     ['both guest-size keys, even equal', { spec: { ...spec, guest_mb: 4096 } }, 'M7.guest'],
     ['an unknown profile', { profile: 'gold' }, 'profile'],
+    // A key every object inherits is not a profile: refused as unknown, never a 500.
+    ['a prototype key as the profile', { profile: 'constructor' }, 'profile'],
+    ['__proto__ as the profile', { profile: '__proto__' }, 'profile'],
+    ['toString as the profile', { profile: 'toString' }, 'profile'],
     [
       'a root identity into an image refusing commits',
       { spec: { ...spec, guest_home_gitconfig: true } },

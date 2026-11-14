@@ -196,6 +196,7 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Activation     | `POST /v1/templates/{id}/activate` and `/deactivate` (both route profiles); `GET /v1/hosts/{host}/wanted`, `POST /v1/hosts/{host}/workers/report` (a host's own bearer) (API 1.11.0)                    |
 | Egress records | `GET /v1/sandboxes/{id}/egress` (the owner or an admin; sandbox profile); `POST /v1/hosts/{host}/egress` (a host's own bearer) (API 1.14.0)                                                             |
 | Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.18.0)                                                                                          |
+| Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}[/roles/admin]` (enroll, unenroll; grant with an optional `until`, revoke): both route profiles (API 1.20.0)                                   |
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
@@ -261,11 +262,18 @@ snapshot (the wanted state's `remove`) and reports it, a `retire` record by `hos
 returns at once for a build no host holds (`heldBy` null or empty: no host agent stops its worker) and for a `shared`
 one (its snapshot or worker serves a build that is not retired, so its worker is kept running for that build).
 
+Who is enrolled and who is an admin (API 1.20.0, with a template store): the deployment's settings
+(`SH_ALLOWED_SUBJECTS`, `SH_ADMIN_SUBJECTS`) are the bootstrap, and admins add to them through `/v1/subjects`: any admin
+reads the list, only an admin named in `SH_ADMIN_SUBJECTS` changes it. Roles and enrollment are evaluated per request, so
+a grant, a revoke or a lapsed `until` takes effect at the subject's next request; a token's `roles` claim reports what
+held when it was minted. A subject is `github:<numeric id>` or `oidc:<provider sub>`, never `test:<n>`. See the
+[enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md).
+
 Another user's session returns 404, not 403. Control-plane error codes and statuses: 400
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`,
 `digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`, `model_unavailable`), 401 (`token_required`,
 `token_invalid`, `token_expired`, `unauthorized`), 403 `forbidden`, 404 (`session_not_found`, `config_bundle_not_found`,
-`credential_not_found`, `template_not_found`, `turn_not_found`), 409 (`template_exists`, `turn_not_cancellable`, `turn_not_claimable`, `no_active_slot`, `template_unavailable`, `template_not_active`, `build_in_use`), 410 (`device_code_expired`, `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429
+`credential_not_found`, `template_not_found`, `turn_not_found`), 409 (`template_exists`, `turn_not_cancellable`, `turn_not_claimable`, `no_active_slot`, `template_unavailable`, `template_not_active`, `build_in_use`, `bootstrap_subject`, `self_revoke`, `admin_granted`), 410 (`device_code_expired`, `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429
 (`quota_exceeded`, `bundle_quota_exceeded`, `async_quota_exhausted`), 500 `internal_error`, 501
 (`async_tenancy_unsupported`, `workload_runs_unavailable`), 502 `identity_provider_misconfigured`, 503
 (`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in

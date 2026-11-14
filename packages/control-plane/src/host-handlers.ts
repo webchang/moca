@@ -1,5 +1,5 @@
 import { CpError } from './errors.js';
-import { asRecord, seconds } from './handler-util.js';
+import { asRecord, membershipNow, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
@@ -267,7 +267,9 @@ export async function holdPinnedWorker(
   const hosts = deps.hosts;
   if (!hosts || !deps.templates || !build?.startsWith('sha256:')) return;
   try {
-    if (!isEnrolledForSandbox(rec.owner, deps.identity.rolesFor(rec.owner), deps.config)) return;
+    // The owner's roles and store enrollment now, as a request of theirs would be evaluated.
+    const m = await membershipNow(deps, rec.owner, deps.identity.rolesFor(rec.owner));
+    if (!isEnrolledForSandbox(rec.owner, m.roles, deps.config, m.enrolled)) return;
     const nowS = seconds(deps);
     let worker = hosts.sessionWorker(build, nowS);
     if (worker === undefined) {

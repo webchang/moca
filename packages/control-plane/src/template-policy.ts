@@ -345,7 +345,10 @@ export function checkCreate(
     results.push(passed ? { rule: id, passed } : { rule: id, passed, message });
   const s = input.spec ?? {};
   const profileName = input.profile ?? policy.defaultProfile;
-  const profile = policy.profiles[profileName];
+  // An own key only: a name like `constructor` or `__proto__` is not a profile.
+  const profile = Object.hasOwn(policy.profiles, profileName)
+    ? policy.profiles[profileName]
+    : undefined;
   rule(
     'profile',
     profile !== undefined,
