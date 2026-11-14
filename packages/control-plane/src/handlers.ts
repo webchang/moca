@@ -1083,7 +1083,8 @@ export const HANDLERS: Record<string, Handler> = {
         p,
         forUse,
         activateField !== false,
-        isEnrolledForSandbox(p.sub, p.roles ?? [], deps.config),
+        // The request's own enrollment (server.ts sets it per request, from the members store).
+        isEnrolledForSandbox(p.sub, p.roles ?? [], deps.config, p.enrolled === true),
       );
     }
 

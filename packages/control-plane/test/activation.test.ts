@@ -14,6 +14,7 @@ import {
 import { writeError } from '../src/errors.js';
 import { exchangeCredential } from '../src/exchange.js';
 import { HANDLERS } from '../src/handlers.js';
+import { MembersStore } from '../src/members.js';
 import {
   HOST_STALE_S,
   HostRegistry,
@@ -932,6 +933,90 @@ describe('activation on first use (§6.4)', () => {
     }
     expect(stopped(await wanted(3550))).toBe(false); // the lease still stands
     expect(stopped(await wanted(3700))).toBe(true); // no lease left, and no hold
+  });
+
+  // Enrollment through the API counts on combined as the allow list does, at each request.
+  const withMembers = (d: TestDeps) => {
+    const admin = { ...alice, sub: 'github:9', tenant: 'github:9', roles: ['admin'] };
+    const members = new MembersStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-act-members-')),
+      provenance: d.provenance!,
+      bootstrap: { allowed: [alice.sub], admins: [admin.sub] },
+    });
+    d.members = members;
+    const set = async (subject: string, enrolled: boolean) =>
+      enrolled
+        ? HANDLERS.enrollSubject!(
+            ctx({ principal: admin, params: { subject }, body: { enrolled: true } }),
+            d,
+          )
+        : HANDLERS.unenrollSubject!(ctx({ principal: admin, params: { subject } }), d);
+    // The router's per-request step (server.ts), for a handler called directly.
+    const asRequest = async (p: typeof alice) => ({
+      ...p,
+      ...(await members.membershipNow(p.sub, Math.floor(now / 1000))),
+    });
+    return { set, asRequest };
+  };
+
+  it('on combined, a session create by a subject enrolled through the API takes a lease', async () => {
+    const d = await setup();
+    d.config.routeProfile = 'combined';
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    const outsider = { ...alice, sub: 'github:5555', tenant: 'github:5555' } as typeof alice;
+    await seedCredential(d, outsider.sub);
+    const { set, asRequest } = withMembers(d);
+    await set(outsider.sub, true);
+    // Enrolled by the store, it starts the build itself, as an allow-listed subject would.
+    expect(
+      await refusal(async () =>
+        HANDLERS.createSession!(
+          ctx({ principal: await asRequest(outsider), body: { sandbox: { template: 't1' } } }),
+          d,
+        ),
+      ),
+    ).toMatchObject({ code: 'template_not_active', readiness: 'activating' });
+    expect((await leases(d, 't1')).map((l) => l.subject)).toEqual([outsider.sub]);
+  });
+
+  it("on combined, a turn holds the worker for a subject enrolled through the API, until it's unenrolled", async () => {
+    const d = await setup();
+    d.config.routeProfile = 'combined';
+    attachedNow = [];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    const outsider = { ...alice, sub: 'github:5555', tenant: 'github:5555' } as typeof alice;
+    await seedCredential(d, outsider.sub);
+    d.config.sessionTokenTtlSeconds = 86_400;
+    const { set, asRequest } = withMembers(d);
+    await set(outsider.sub, true);
+    await activate(d, 't1', alice);
+    attachedNow = ['sbx_t1'];
+    const r = await HANDLERS.createSession!(
+      ctx({ principal: await asRequest(outsider), body: { sandbox: { template: 't1' } } }),
+      d,
+    );
+    expect(r.status).toBe(201);
+    const tok = (r.body as Body).token as string;
+    const t0 = now;
+    const wanted = async (atS: number) => {
+      now = t0 + atS * 1000;
+      await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2, [hash('1')]);
+      return (await HANDLERS.hostWanted!(asHost('host-1'), d)).body as Body;
+    };
+    const stopped = (w: Body) => w.stop.some((x: Body) => x.buildId === hash('1'));
+    // Enrolled: a turn shortly before the leases end holds the worker past them.
+    now = t0 + 3000 * 1000;
+    await exchangeCredential(tok, d);
+    expect(stopped(await wanted(4000))).toBe(false);
+    // Unenrolled: its next turn runs but extends nothing, so the worker stops when the hold ends.
+    await set(outsider.sub, false);
+    now = t0 + 6000 * 1000;
+    expect(await exchangeCredential(tok, d)).toMatchObject({ sandboxBuildId: hash('1') });
+    expect(stopped(await wanted(6500))).toBe(false);
+    expect(stopped(await wanted(6700))).toBe(true);
   });
 
   it('takes no lease for a session create that another check refuses', async () => {
