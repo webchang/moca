@@ -764,6 +764,18 @@ function quotaLock(cat: TemplateCatalog): SubjectQueue {
   return q;
 }
 
+/**
+ * One PUT /v1/policy at a time per policy store, within this process: its read, its widening check
+ * and its write run as one step, so two PUTs never both start from the same policy. The store
+ * serializes each call, not a read and a later write; a deployment runs one control plane.
+ */
+const policyLocks = new WeakMap<PolicyStore, SubjectQueue>();
+function policyLock(store: PolicyStore): SubjectQueue {
+  let q = policyLocks.get(store);
+  if (!q) policyLocks.set(store, (q = new SubjectQueue()));
+  return q;
+}
+
 /** Thrown inside a create's write when the template changed owner since it was read. */
 const OWNER_MOVED = new Error('the template changed owner');
 
@@ -2045,37 +2057,44 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const store = policyStore(deps);
     const bad = policyProblems(ctx.body);
     if (bad.length) throw new CpError('invalid_request', bad.join('; '));
-    // Widening what the policy trusts is the same kind of act as widening access (enrollment and
-    // roles spec, decision 1): an admin by an API grant may narrow the policy and change its quotas,
-    // but adding a trusted gate record, a registry or a repository needs an admin named in the
-    // settings. Without a members store every admin is one.
-    const widened = policyWidens((await store.current()).policy, ctx.body as Policy);
-    if (widened.length && deps.members && !deps.members.bootstrap.admins.includes(p.sub))
-      throw new CpError(
-        'forbidden',
-        `widening ${widened.join(', ')} requires an admin named in the settings (SH_ADMIN_SUBJECTS)`,
+    // The check and the write are one step (policyLock): a PUT built from an older policy can't
+    // pass the widening check against it and then land after a settings admin's narrowing,
+    // re-adding the trust that removed.
+    const { policy, record, narrowed } = await policyLock(store).run('policy', async () => {
+      const before = (await store.current()).policy;
+      // Widening what the policy trusts is the same kind of act as widening access (enrollment and
+      // roles spec, decision 1): an admin by an API grant may narrow the policy and change its
+      // quotas, but adding a trusted gate record, a registry or a repository needs an admin named
+      // in the settings. Without a members store every admin is one.
+      const widened = policyWidens(before, ctx.body as Policy);
+      if (widened.length && deps.members && !deps.members.bootstrap.admins.includes(p.sub))
+        throw new CpError(
+          'forbidden',
+          `widening ${widened.join(', ')} requires an admin named in the settings (SH_ADMIN_SUBJECTS)`,
+        );
+      // Self-attestation: a record whose trust this removes narrows its deployment-visible
+      // templates to private on read. Name each narrowed build in the policy record, so nothing is
+      // silent. The policy itself is what the admin sent, every field kept as sent.
+      const was = new Set(before.trustedGateRecords);
+      const after = new Set((ctx.body as Policy).trustedGateRecords);
+      const narrowed: { template: string; buildId: string }[] = [];
+      if ([...was].some((g) => !after.has(g)) && deps.templates)
+        for (const d of await deps.templates.list())
+          if (effectiveVisibility(d, was) === 'deployment')
+            for (const x of d.builds)
+              if (
+                x.status === 'registered' &&
+                attestationOf(x, was) === 'deployment' &&
+                attestationOf(x, after) === 'self'
+              )
+                narrowed.push({ template: d.id, buildId: x.buildId });
+      const set = await store.set(
+        ctx.body as Policy,
+        p.sub,
+        narrowed.length ? { narrowed } : undefined,
       );
-    // Self-attestation: a record whose trust this removes narrows its deployment-visible templates
-    // to private on read. Name each narrowed build in the policy record, so nothing is silent. The
-    // policy itself is what the admin sent, every field kept as sent.
-    const before = new Set((await store.current()).policy.trustedGateRecords);
-    const after = new Set((ctx.body as Policy).trustedGateRecords);
-    const narrowed: { template: string; buildId: string }[] = [];
-    if ([...before].some((g) => !after.has(g)) && deps.templates)
-      for (const d of await deps.templates.list())
-        if (effectiveVisibility(d, before) === 'deployment')
-          for (const x of d.builds)
-            if (
-              x.status === 'registered' &&
-              attestationOf(x, before) === 'deployment' &&
-              attestationOf(x, after) === 'self'
-            )
-              narrowed.push({ template: d.id, buildId: x.buildId });
-    const { policy, record } = await store.set(
-      ctx.body as Policy,
-      p.sub,
-      narrowed.length ? { narrowed } : undefined,
-    );
+      return { ...set, narrowed };
+    });
     await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
     return {
       status: 200,

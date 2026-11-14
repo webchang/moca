@@ -303,6 +303,42 @@ describe('the admin role (spec §3, §6)', () => {
     expect((await policy.current()).policy.trustedGateRecords).toEqual(base.trustedGateRecords);
   });
 
+  it("never lets an API-granted admin's PUT built from an older policy restore trust a settings admin removed", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const G = `sha256:${'a'.repeat(64)}`;
+    const base: Policy = { ...DEFAULT_POLICY, trustedGateRecords: [G] };
+    await policy.set(base, ENV_ADMIN);
+    // CAROL's write is slow: without one step for the check and the write, the settings admin's
+    // removal lands between CAROL's check (against the policy with G) and CAROL's write (with G).
+    const set = policy.set.bind(policy);
+    policy.set = (async (pol: Policy, subject: string, extra?: Record<string, unknown>) => {
+      if (subject === CAROL) await new Promise((r) => setTimeout(r, 50));
+      return set(pol, subject, extra);
+    }) as typeof policy.set;
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const put = (p: TokenClaims, body: Policy) => call(d, 'putPolicy', p, {}, body);
+    // CAROL keeps G and changes a quota, from the policy she read; the settings admin removes G.
+    const carols = { ...base, quota: { ...base.quota, templates: base.quota.templates + 1 } };
+    const removal = { ...base, trustedGateRecords: [] };
+    // Whichever PUT takes the lock first, G is not restored: CAROL's lands before the removal, or
+    // is checked against the policy without G, and refused as a widening.
+    for (const carolFirst of [true, false]) {
+      await policy.set(base, ENV_ADMIN);
+      const puts = [() => put(who(CAROL), carols), () => put(who(ENV_ADMIN), removal)];
+      const [c, s] = carolFirst
+        ? await Promise.allSettled(puts.map((f) => f()))
+        : (await Promise.allSettled([puts[1]!(), puts[0]!()])).reverse();
+      expect(s!.status).toBe('fulfilled');
+      if (c!.status === 'rejected') expect((c!.reason as { code?: string }).code).toBe('forbidden');
+      expect((await policy.current()).policy.trustedGateRecords).toEqual([]);
+    }
+  });
+
   it('revokes at the next request, and refuses a non-admin', async () => {
     const d = setup();
     await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
