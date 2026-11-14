@@ -2,10 +2,11 @@
 
 Version: 0.2 (draft for review) — November 2026
 Status: Proposed. This file holds §1-§4, the template store and its read API (#736) and the
-self-serve create (#737), §5.1's retire (#749), §6.1, the host agent's builds (#741), §6.2-§6.4,
-activation (#742), §7, provenance (#730), and §8, policy (#737); the rest of §5 and §9-§12 (the
-owner's other actions and the admin's, tracing, validation, order of work, decisions) come with the
-issues that build them, and keep their numbers so a reference to a section stays valid.
+self-serve create (#737), §5.1-§5.2, the owner's and the admin's actions as built so far (#737,
+#747), retire (#749), and the quotas and reject after the fact (#748), §6.1, the host agent's builds
+(#741), §6.2-§6.4, activation (#742), §7, provenance (#730), and §8, policy (#737); the rest of §5,
+and §9-§12 (tracing, validation, order of work, decisions) come with the issues that build them, and
+keep their numbers so a reference to a section stays valid.
 Builds on: [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (templates on the sandbox
 profile, the host janitor).
 
@@ -284,17 +285,38 @@ need an enrolled subject or an admin (SBX0 §4.2); on `harness`, any logged-in s
 `harness` profile holds no sandbox records, so there `capacity.inUse` and `lastUsedAt` are null
 (unknown), not zero.
 
-## 5. Actions: the owner's, and the admin's
+## 5. The owner's and the admin's actions
+
+Every action below is an API call that writes a provenance record naming its subject, the new value
+and the one before (§7.1), and needs the template store (`SH_PROVENANCE_DIR`; without it the route
+answers `400 invalid_request`). All mount on both route profiles (§4.1). Sandboxes and sessions
+already created keep the build they were given.
 
 ### 5.1 The owner's (self-serve)
 
+**Built (#737, #747):** every route in this table. A caller who cannot see the template gets
+`404 template_not_found`, as on the reads; one who sees it but neither owns it nor is an admin gets
+`403 forbidden`.
+
+| Route                                                                                 | Who                                | Does                                                                                                                                          |
+| ------------------------------------------------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/templates` · `POST /v1/templates/{id}/builds`                               | any client; a new build: the owner | creates a template or a build (§4)                                                                                                            |
+| `POST /v1/templates/{id}/builds/{build}/cancel`                                       | the owner                          | a `queued`, `building` or `probing` build → `failed` (`cancelled`); a `build` record                                                          |
+| `POST /v1/templates/{id}/tags {tags, build}` · `DELETE /v1/templates/{id}/tags/{tag}` | the owner                          | moves tags onto a registered build, or removes a tag; removing one never deletes the build (adopted from E2B); a `tag` record per tag changed |
+| `PATCH /v1/templates/{id} {visibility, description}`                                  | the owner                          | changes them; a `visibility` record per field changed (`{field, value, before}`)                                                              |
+
+A tag move names the build by its build id or its handle, and only a registered build takes a tag.
+After it, `id:tag` (and the bare `id`, for `default`) resolves to the new build at the next creation
+(§3.2). `default` is moved, never removed: the bare `id` must resolve. A tag already on the build,
+or a field already at its value, changes nothing and writes no record. `private` hides the template
+from other subjects (a 404, as for an id that does not exist) and refuses their new use.
+
 **Retire (#749):** the template's owner, or an admin, retires a whole template or one build of it.
 
-| Route                                           | Does                                                                                |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `POST /v1/templates/{id}/retire {reason?}`      | every build not yet retired becomes `retired`                                       |
-| `DELETE /v1/templates/{id}/builds/{build}`      | one build, by its build id or handle, becomes `retired`; the template's others stay |
-| `POST /v1/templates/{id}/builds/{build}/cancel` | a `queued`, `building` or `probing` build becomes `failed` (`cancelled`) (#737)     |
+| Route                                      | Does                                                                                |
+| ------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `POST /v1/templates/{id}/retire {reason?}` | every build not yet retired becomes `retired`                                       |
+| `DELETE /v1/templates/{id}/builds/{build}` | one build, by its build id or handle, becomes `retired`; the template's others stay |
 
 - **Ends use for good.** A retired build's activation leases go, so it is no longer wanted: a host
   holding it is told to stop its worker (§6.3 `stop`). A sandbox create or an activation naming it,
@@ -355,6 +377,29 @@ Follow-up, not done here: retiring the build `default` points to could move `def
 newest registered build of the template, so a bare id keeps serving.
 
 ### 5.2 The admin's
+
+"Admin" is the existing `admin` role (`SH_ADMIN_SUBJECTS`, `packages/control-plane/src/identity.ts`).
+Admins do not approve builds; they set what policy allows and act where self-serve cannot:
+
+| Route                               | Does                                                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `PUT /v1/policy`                    | the policy profiles (§8): rules, envelope, registries, trusted gate-record sources; a new policy record |
+| every owner action, on any template | e.g. move another's tags, or make another's template private; the record names the admin                |
+| `PUT /v1/templates/{id}/owner`      | transfers ownership; also hands a declared template (no owner) to a subject; an `owner` record          |
+
+The new owner is a person's subject, `github:<numeric id>` or `oidc:<provider sub>` (never a
+synthetic `test:<n>`), and must be enrolled now (on the `sandbox` profile: `SH_ALLOWED_SUBJECTS`, or
+an admin). They get every owner action, and the quotas count the template as theirs from then on; a
+transfer to the current owner changes nothing.
+
+A template the deployment declared (imported once from `SH_SANDBOX_TEMPLATES` into an empty
+catalog, §3.1) has no owner, so its id blocks every self-serve create under it: `409
+template_exists`. An admin hands it to a subject with `PUT /v1/templates/{id}/owner` (an `owner`
+record with `before: null`); the subject then builds, tags and edits it like any template of theirs.
+The env list is not imported again, so a restart does not undo the transfer.
+
+Not covered here: whether a declared id should be claimable without an admin (a deployment with no
+admin cannot transfer), and per-template roles (a maintainer who may tag but not transfer).
 
 **Quotas and reject after the fact (#748):** an admin sets the quotas per subject, and withdraws a
 registered build that later turns out wrong.
@@ -678,17 +723,23 @@ a policy does not set it). Until an admin sets one, the default policy applies, 
 is recorded on first use, so every `check` cites a `policy` record that exists. `GET /v1/policy`
 shows it, its digest and its record.
 
-| Profile     | For                                                   | Requires, beyond the `base` rules                                                                                                                                                                                 |
-| ----------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base`      | any client's own image (a toolchain, a project's env) | Moca's rules M1, M7-M9 at create (M2-M4, M10-M17 on the build host); the image from an allowed registry; the size envelope                                                                                        |
-| `benchmark` | SWE-bench and the like                                | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
+| Profile          | For                                                   | Requires, beyond the `base` rules                                                                                                                                                                                 |
+| ---------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`           | any client's own image (a toolchain, a project's env) | Moca's rules M1, M7-M9 at create (M2-M4, M10-M17 on the build host); the image from an allowed registry; the size envelope                                                                                        |
+| `benchmark`      | SWE-bench and the like                                | a gate record that passed (X1), from a **trusted source** (§8.3), whose `source_record_digest` equals the image digest (X10); X11 (no network), X12 (commits refused), X14 (a measured probe), X15 (the envelope) |
+| `benchmark-self` | the same, on the creating subject's own gate record   | `benchmark`'s rules, with the record self-attested (§8.3): trusted for its submitter's own templates only, which stay private                                                                                     |
+| `general-self`   | general users whose sandboxes need a network          | `benchmark-self`'s without X11: the KVM host's allowlisted egress allowed                                                                                                                                         |
 
 ### 8.1 At create (in the control plane, before any build)
 
 The profile exists; M7 (the id rule and every spec field, including a spec `id` or `image` that
 differs from the create's: `M7.spec_id`, `M7.spec_image`), M8, M9; the image pinned by digest (M1)
 **from an allowed registry** (`allowedRegistries`; a reference with no host is the build host's
-default registry, `<default>`); the profile's size envelope; for `benchmark`, X1, X10-X12, X14 and
+default registry, `<default>`) and, where the policy lists repositories for that registry
+(`allowedRepositories`), from one of them (rule `registry.repository`; whole path segments,
+`prefix/*` for a prefix; the image's path held to the entries' grammar first, so no uppercase and no
+empty, `.` or `..` segment; a registry with no list allows every repository it serves); the profile's
+size envelope; for `benchmark`, X1, X10-X12, X14 and
 X15 from the spec and the gate record; whatever the profile, X10 whenever the spec names a gate
 record (with X1's check of that record, or of any gate record sent: it passed, and is for this
 image; only `X1.trusted` is the profile's) and X12 whenever the spec skips the git identity check
@@ -714,6 +765,12 @@ the record and compares its sha256 with the one the client sent. For the first v
 replaced by an admin-loaded copy of the source's records: the policy's `trustedGateRecords`, by
 sha256 (X1.trusted). Fetching is not built. A record that is not trusted is refused for `benchmark`;
 on `base` it may still be sent, and is stored and recorded with source `client`.
+
+A profile with `selfAttest` (`benchmark-self`, `general-self`) also accepts a record the policy does
+not list, from the creating subject, for that subject's own templates only: the build is
+self-attested, private, and recorded with source `self` until an admin lists the record. The
+[subject trust spec](2026-11-08-subject-trust-gate-records-design.md) holds its rules (X1.self.scope,
+X12.self, X1.self.egress, X1.offline) and what a trust removal does.
 
 ### 8.4 The instance-id mapping
 

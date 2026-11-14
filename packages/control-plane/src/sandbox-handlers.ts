@@ -7,8 +7,16 @@ import {
   seconds,
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import { MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
-import { buildRecordOf, canonicalJson, sha256Hex, type ProvenanceStore } from './provenance.js';
+import {
+  buildRecordOf,
+  canonicalJson,
+  LONE_SURROGATE_RE,
+  sha256Hex,
+  type AppendInput,
+  type ProvenanceStore,
+} from './provenance.js';
+import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
+import { isEnrolled, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
 import {
   hostManaged,
   liveLeases,
@@ -22,6 +30,7 @@ import { busyWorkers, freshHosts, hostViewsOf, liveSnapshots } from './host-hand
 import { SubjectQueue } from './subject-document.js';
 import {
   checkCreate,
+  DEFAULT_GATE_RECORD_SCHEMA,
   normalizeSpec,
   ownedSource,
   policyDigest,
@@ -56,7 +65,8 @@ import type { TokenClaims } from './token.js';
 /**
  * The sandbox resource's handlers (SBX0 spec §5.1), mounted on the `sandbox` route profile only,
  * and the template routes (template lifecycle spec §4: reads, self-serve create, cancel, the policy
- * and the quota; §6.3: activation leases), mounted on both.
+ * and the quota; §5.1-§5.2: tags, edits and owner transfer; §6.3: activation leases), mounted on
+ * both.
  * Only TYPES come from handlers.ts, which spreads this table into HANDLERS: a runtime import back
  * would be a module cycle.
  */
@@ -373,17 +383,55 @@ function catalog(deps: CpDeps): TemplateCatalog {
   return deps.templates ?? new MemoryTemplateCatalog(deps.config.sandbox?.templates ?? []);
 }
 
-const canSee = (d: TemplateDoc, p: TokenClaims): boolean =>
-  d.visibility === 'deployment' || d.owner === p.sub || isAdmin(p);
+/**
+ * The trust a build's gate record has NOW (self-attestation): `deployment` when its sha256 is in the
+ * current policy's trustedGateRecords, or the build names no gate record; `self` when it was
+ * created on a selfAttest profile with a record the policy does not (or no longer) trust, whether
+ * or not the record was trusted at create (`selfAttestProfile`; `selfAttested` implies it).
+ * Recomputed on every read, never stored, so an admin's promotion or removal needs no rewrite.
+ */
+export function attestationOf(
+  b: TemplateBuild,
+  trusted: ReadonlySet<string>,
+): 'deployment' | 'self' {
+  const g = b.request?.gateRecordSha256;
+  const onSelfProfile = b.selfAttestProfile === true || b.selfAttested === true;
+  return onSelfProfile && g !== undefined && !trusted.has(g) ? 'self' : 'deployment';
+}
+
+/**
+ * A template's visibility in effect (self-attestation): `private` whenever any of its registered
+ * builds is self-attested now, whatever is stored, so a record whose trust an admin removed narrows
+ * its templates on the next read. Otherwise the stored visibility.
+ */
+export function effectiveVisibility(
+  d: TemplateDoc,
+  trusted: ReadonlySet<string>,
+): 'private' | 'deployment' {
+  return d.visibility === 'deployment' &&
+    d.builds.some((b) => b.status === 'registered' && attestationOf(b, trusted) === 'self')
+    ? 'private'
+    : d.visibility;
+}
+
+/** The current policy's trusted gate records, or none on a deployment without a policy store. */
+async function trustedSet(deps: CpDeps): Promise<ReadonlySet<string>> {
+  return new Set(deps.policy ? (await deps.policy.current()).policy.trustedGateRecords : []);
+}
+
+const canSee = (d: TemplateDoc, p: TokenClaims, trusted: ReadonlySet<string>): boolean =>
+  effectiveVisibility(d, trusted) === 'deployment' || d.owner === p.sub || isAdmin(p);
 
 async function visibleTemplates(deps: CpDeps, p: TokenClaims): Promise<TemplateDoc[]> {
-  return (await catalog(deps).list()).filter((d) => canSee(d, p));
+  const trusted = await trustedSet(deps);
+  return (await catalog(deps).list()).filter((d) => canSee(d, p, trusted));
 }
 
 /** 404 for a template the caller cannot see, as for one that does not exist (no existence oracle). */
 async function visibleTemplate(deps: CpDeps, p: TokenClaims, id: string): Promise<TemplateDoc> {
   const d = await catalog(deps).get(id);
-  if (!d || !canSee(d, p)) throw new CpError('template_not_found', 'no such template');
+  if (!d || !canSee(d, p, await trustedSet(deps)))
+    throw new CpError('template_not_found', 'no such template');
   return d;
 }
 
@@ -410,6 +458,8 @@ interface ReadinessFacts {
   /** Whether a build's snapshot or worker a build that is not retired shares (liveSnapshots). */
   shared: (b: TemplateBuild) => boolean;
   nowS: number;
+  /** The current policy's trusted gate records (self-attestation: attestation and visibility in effect). */
+  trusted: ReadonlySet<string>;
 }
 
 /** The host views, or null on a deployment without host agents (no `heldBy` to report). */
@@ -417,6 +467,7 @@ const viewsOrNull = (deps: CpDeps, hosts: HostView[]): HostView[] | null =>
   hosts.length > 0 || deps.config.templateHosts?.length ? hosts : null;
 
 async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<ReadinessFacts> {
+  const trusted = await trustedSet(deps);
   const nowS = seconds(deps);
   const hosts = hostViewsOf(deps);
   // Every template, not only those the caller sees: sharing is judged across the catalog.
@@ -452,6 +503,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
       hosts: holders,
       shared,
       nowS,
+      trusted,
     };
   }
   const inUse = new Map<string, number>();
@@ -461,7 +513,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
     lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
   }
-  return { attached, inUse, lastUsed, placement, hosts: holders, shared, nowS };
+  return { attached, inUse, lastUsed, placement, hosts: holders, shared, nowS, trusted };
 }
 
 /**
@@ -525,6 +577,16 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
     handle: b.handle ?? b.buildId,
     // On failed or rejected: why, and the step or the rule (§4).
     reason: b.reason ?? null,
+    // Self-attestation: whether its gate record is trusted deployment-wide now, or only by its submitter.
+    attestation: attestationOf(b, f.trusted),
+    // Its gate's floor checked offline (gate.floor_checked_offline); null with no gate record, and
+    // true for a gate record created before the field (whose gates ran offline).
+    gateFloorCheckedOffline:
+      b.gateFloor?.checkedOffline ?? (b.request?.gateRecordSha256 ? true : null),
+    // Only from a network_needed gate: whether its offline run met the floor anyway.
+    ...(b.gateFloor?.metOffline !== undefined
+      ? { gateFloorMetOffline: b.gateFloor.metOffline }
+      : {}),
     ...(full ? { spec: b.spec } : {}),
   };
 }
@@ -537,7 +599,14 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
     description: d.description,
     tools: def?.spec.tools ?? [],
     owner: d.owner,
-    visibility: d.visibility,
+    // In effect: private while any registered build is self-attested.
+    visibility: effectiveVisibility(d, f.trusted),
+    // Self-attestation: `self` when any registered build is self-attested now.
+    attestation: d.builds.some(
+      (b) => b.status === 'registered' && attestationOf(b, f.trusted) === 'self',
+    )
+      ? 'self'
+      : 'deployment',
     onboarding: d.builds.some((b) => b.status === 'registered')
       ? 'registered'
       : (d.builds[0]?.status ?? null),
@@ -571,11 +640,12 @@ async function resolveForUse(
   const r =
     at >= 0 ? { build: ref.slice(at + 1) } : colon >= 0 ? { tag: ref.slice(colon + 1) } : {};
   const d = await catalog(deps).get(id);
-  const b = d && canSee(d, p) ? resolveBuild(d, r) : null;
+  const seen = d !== null && canSee(d, p, await trustedSet(deps));
+  const b = d && seen ? resolveBuild(d, r) : null;
   // A retired build, or a template whose every build is retired, is gone, not unknown (§5.1).
   if (
     d &&
-    canSee(d, p) &&
+    seen &&
     (b?.status === 'retired' ||
       (!b && d.builds.length > 0 && d.builds.every((x) => x.status === 'retired')))
   ) {
@@ -662,6 +732,25 @@ function quotaLock(cat: TemplateCatalog): SubjectQueue {
   return q;
 }
 
+/** Thrown inside a create's write when the template changed owner since it was read. */
+const OWNER_MOVED = new Error('the template changed owner');
+
+/**
+ * One create at a time per gate record sha256, per catalog, within this process: X1.self.scope's
+ * lookup (who already self-attested the record) and the create's write run as one step, so two
+ * subjects sending the same untrusted record at once can't both claim it. The catalog serializes
+ * its own writes per id the same way, in this process; a deployment runs one control plane.
+ */
+/** The build statuses that release a self-attested claim (X1.self.scope): ended without a template. */
+const CLAIM_RELEASED = new Set<TemplateBuild['status']>(['failed']);
+
+const gateClaimQueues = new WeakMap<TemplateCatalog, SubjectQueue>();
+function gateClaimQueue(cat: TemplateCatalog): SubjectQueue {
+  let q = gateClaimQueues.get(cat);
+  if (!q) gateClaimQueues.set(cat, (q = new SubjectQueue()));
+  return q;
+}
+
 /**
  * The shared body of both create routes. `existing`: true for POST /v1/templates/{id}/builds (the
  * template must exist and be the caller's), false for POST /v1/templates (a new id, or the
@@ -669,7 +758,7 @@ function quotaLock(cat: TemplateCatalog): SubjectQueue {
  */
 async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
   const p = requireEnrolled(ctx, deps);
-  const { cat, policy, prov } = writable(deps);
+  const { cat } = writable(deps);
   const b = asRecord(ctx.body);
   const id = existing ? (ctx.params.id ?? '') : typeof b.id === 'string' ? b.id.toLowerCase() : '';
   const spec = asRecord(b.spec);
@@ -686,7 +775,55 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
   if (b.visibility !== undefined && b.visibility !== 'private' && b.visibility !== 'deployment') {
     throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
   }
+  const gateSha = gateRecordBytes ? `sha256:${sha256Hex(gateRecordBytes)}` : undefined;
+  const admit = () => admitBuild(deps, existing, p, b, id, spec, gateRecordBytes, gateSha);
+  return gateSha ? gateClaimQueue(cat).run(gateSha, admit) : admit();
+}
+
+/** createBuild's checks and write, under the gate record's claim queue when it sends one. */
+async function admitBuild(
+  deps: CpDeps,
+  existing: boolean,
+  p: TokenClaims,
+  b: Record<string, unknown>,
+  id: string,
+  spec: Record<string, unknown>,
+  gateRecordBytes: Buffer | undefined,
+  gateSha: string | undefined,
+) {
+  const { cat, policy, prov } = writable(deps);
   const { policy: pol, record: policyRecord } = await policy.current();
+  // Self-attestation: the subject a self-attested record counts for is the template's owner (the
+  // gate record's `scope` and X1.self.scope's key alike). An admin adding a build to another
+  // subject's template attests for that owner; an imported template (owner null) has none, so a
+  // self-attested record is refused there (X1.trusted).
+  const prior = existing && isAdmin(p) ? await cat.get(id) : null;
+  const attester = prior && prior.owner !== p.sub ? prior.owner : p.sub;
+  // Who already self-attested this record (keyed by subject and sha256), from the catalog: a build
+  // self-attested at create (selfAttested) names its record's sha256, and its template the owner it
+  // counts for. A claim is made by an admitted self-attested create and held while its build is
+  // queued, building, probing, built, registered, rejected or retired (a real use, or an admin's
+  // decision). It is released when the build ends `failed`, which never admitted a template, so no
+  // one holds a published record with a build that fails. A refused create claims nothing.
+  const gateSelfSubmitters =
+    gateSha && !pol.trustedGateRecords.includes(gateSha)
+      ? [
+          ...new Set(
+            (await cat.list())
+              .filter(
+                (d) =>
+                  d.owner !== null &&
+                  d.builds.some(
+                    (x) =>
+                      x.selfAttested === true &&
+                      x.request?.gateRecordSha256 === gateSha &&
+                      !CLAIM_RELEASED.has(x.status),
+                  ),
+              )
+              .map((d) => d.owner as string),
+          ),
+        ]
+      : [];
   const result = checkCreate(
     {
       id,
@@ -694,8 +831,13 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
       spec,
       ...(typeof b.profile === 'string' ? { profile: b.profile } : {}),
       ...(gateRecordBytes ? { gateRecordBytes } : {}),
+      ...(attester ? { subject: attester } : {}),
+      gateSelfSubmitters,
     },
     pol,
+    deps.config.sandbox?.gateRecordSchema
+      ? { gateRecordSchema: deps.config.sandbox.gateRecordSchema }
+      : {},
   );
   const stream = `template/${id}`;
   const checkBody = {
@@ -732,6 +874,14 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
     const f = result.failed!;
     throw new CpError('policy_refused', f.message ?? f.rule, undefined, { rule: f.rule });
   }
+  // A self-attested create never makes its template deployment-visible.
+  const selfAttestedCreate =
+    result.gateTrust === 'self' && pol.profiles[result.profile]?.selfAttest === true;
+  if (selfAttestedCreate && b.visibility === 'deployment')
+    throw new CpError(
+      'self_attested',
+      'a self-attested template is private until an admin trusts its gate record (trustedGateRecords)',
+    );
   const now = seconds(deps);
   const handle = buildHandle(deps.newId());
   const built = normalizeSpec(spec);
@@ -739,116 +889,162 @@ async function createBuild(ctx: RequestCtx, deps: CpDeps, existing: boolean) {
   let reused: TemplateBuild | undefined;
   // The quota is the template's owner's: an admin adding a build to another's template uses the
   // owner's buildsQueued, not its own. The owner's lock is held around the check and the write
-  // (quotaLock). A template's owner never changes, so reading it before the lock is safe; a new id
-  // another subject takes meanwhile is refused inside, before any quota is read.
-  const charged = (await cat.get(id))?.owner ?? p.sub;
-  // The owner's quota: its admin-set override, else the deployment default (quotaFor).
-  const quota = quotaFor(pol, charged);
-  const doc = await quotaLock(cat).run(charged, () =>
-    cat.update(id, async (cur) => {
-      if (existing && !cur) throw new CpError('template_not_found', 'no such template');
-      if (cur && cur.owner !== p.sub && !(existing && isAdmin(p))) {
-        // 404 for a private template, 409 for a visible one: never an existence oracle for private.
-        throw cur.visibility === 'private' && !isAdmin(p)
-          ? new CpError('template_not_found', 'no such template')
-          : new CpError('template_exists', `template '${id}' belongs to another subject`);
-      }
-      // §3.2: the same inputs are the same build. One registered, or still on its way there, is
-      // answered instead of a second build (two creates would otherwise queue two builds that
-      // register under one manifest hash).
-      reused = cur?.builds.find((x) => REUSABLE.has(x.status) && buildReuseKey(x) === want);
-      if (reused) return cur!;
-      const u = await usage(cat, charged);
-      // A template takes a slot when it holds none yet: a new id, or one whose builds all failed,
-      // were cancelled or were retired (usage does not count it). Checking only new ids would let
-      // a subject bring such templates back past the quota.
-      const holdsSlot = cur?.builds.some((x) => REUSABLE.has(x.status)) ?? false;
-      if (!holdsSlot && u.templates >= quota.templates) {
-        throw new CpError(
-          'quota_exceeded',
-          `at most ${quota.templates} templates per subject`,
-          undefined,
-          { quota: 'templates' },
-        );
-      }
-      // A new id is one more document and stream for good: a create-then-cancel loop frees its
-      // templates and buildsQueued slots, never this one. The owner's: its override's, else the
-      // default's (quotaFor).
-      if (!cur && u.owned >= quota.owned) {
-        throw new CpError(
-          'quota_exceeded',
-          `at most ${quota.owned} template ids owned per subject, in any status`,
-          undefined,
-          { quota: 'owned' },
-        );
-      }
-      if (u.buildsQueued >= quota.buildsQueued) {
-        throw new CpError(
-          'quota_exceeded',
-          `at most ${quota.buildsQueued} builds queued per subject`,
-          undefined,
-          { quota: 'buildsQueued' },
-        );
-      }
-      if (gateRecordBytes) await prov.putBlob(gateRecordBytes);
-      const created = await prov.append({
-        stream,
-        kind: 'create',
-        subject: p.sub,
-        body: {
-          image: b.image as string,
-          // A round trip through JSON: what the client sent, as the wire carries it (no undefined),
-          // with the guest size under the key the build reads (normalizeSpec).
-          spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
-          profile: result.profile,
-          handle,
-          ...(result.gateRecordSha256 ? { gate_record_sha256: result.gateRecordSha256 } : {}),
-        },
-      });
-      if (result.gateRecordSha256) {
-        await prov.append({
-          stream,
-          kind: 'gate',
-          subject: p.sub,
-          body: {
-            record_sha256: result.gateRecordSha256,
-            // `trusted`: in trustedGateRecords. `client`: any other (a profile that does not require
-            // X1). The policy record in force names what the trust was at create, after any change.
-            source: result.gateTrusted ? 'trusted' : 'client',
-            policy: policyRecord,
-          },
-        });
-      }
-      await prov.append({ stream, kind: 'check', subject: 'policy', body: checkBody });
-      const build: TemplateBuild = {
-        buildId: handle,
-        handle,
-        status: 'queued',
-        profile: result.profile,
-        worker: '',
-        spec: buildSpec(built),
-        createdAt: now,
-        queuedAtMs: deps.now(),
-        provenance: created.digest,
-        request: {
-          image: b.image as string,
-          spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
-          ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
-        },
-      };
-      const base: TemplateDoc = cur ?? {
-        schema: TEMPLATE_DOC_SCHEMA,
-        id,
-        owner: p.sub,
-        visibility: (b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment',
-        description: String(built.description ?? ''),
-        tags: {},
-        builds: [],
-        createdAt: now,
-      };
-      return { ...base, builds: [build, ...base.builds] };
-    }),
-  );
+  // (quotaLock); a new id another subject takes meanwhile is refused inside, before any quota is
+  // read. The owner is read before the lock, and an admin's transfer (PUT …/owner) can move it in
+  // between: the write sees another owner, writes nothing, and the step runs again under the new
+  // owner's lock.
+  let doc: TemplateDoc | undefined;
+  for (let attempt = 1; !doc; attempt++) {
+    const charged = (await cat.get(id))?.owner ?? p.sub;
+    // The owner's quota: its admin-set override, else the deployment default (quotaFor).
+    const quota = quotaFor(pol, charged);
+    try {
+      doc = await quotaLock(cat).run(charged, () =>
+        cat.update(id, async (cur) => {
+          if (existing && !cur) throw new CpError('template_not_found', 'no such template');
+          if (cur && cur.owner !== p.sub && !(existing && isAdmin(p))) {
+            // 404 for a private template, 409 for a visible one: never an existence oracle for
+            // private.
+            throw cur.visibility === 'private' && !isAdmin(p)
+              ? new CpError('template_not_found', 'no such template')
+              : new CpError('template_exists', `template '${id}' belongs to another subject`);
+          }
+          // The owner charged is the one read before the lock; a transfer meanwhile runs it again.
+          if ((cur?.owner ?? p.sub) !== charged) throw OWNER_MOVED;
+          // A self-attested build on a template others can see would reach them on its owner's own
+          // gate (self-attestation): refused; the template must be private, or an admin trusts the
+          // record.
+          if (selfAttestedCreate && cur && cur.visibility === 'deployment')
+            throw new CpError(
+              'self_attested',
+              `template '${id}' is deployment-visible: it must be private before a self-attested build is added`,
+            );
+          // The record was checked as attested for `attester`; the template's owner must still be
+          // it (an admin's transfer meanwhile refuses the create, to be sent again).
+          if (selfAttestedCreate && (cur ? cur.owner : p.sub) !== attester)
+            throw new CpError(
+              'self_attested',
+              `template '${id}' changed owner during the create; send it again`,
+            );
+          // §3.2: the same inputs are the same build. One registered, or still on its way there,
+          // is answered instead of a second build (two creates would otherwise queue two builds
+          // that register under one manifest hash).
+          reused = cur?.builds.find((x) => REUSABLE.has(x.status) && buildReuseKey(x) === want);
+          if (reused) return cur!;
+          const u = await usage(cat, charged);
+          // A template takes a slot when it holds none yet: a new id, or one whose builds all
+          // failed, were cancelled or were retired (usage does not count it). Checking only new
+          // ids would let a subject bring such templates back past the quota.
+          const holdsSlot = cur?.builds.some((x) => REUSABLE.has(x.status)) ?? false;
+          if (!holdsSlot && u.templates >= quota.templates) {
+            throw new CpError(
+              'quota_exceeded',
+              `at most ${quota.templates} templates per subject`,
+              undefined,
+              { quota: 'templates' },
+            );
+          }
+          // A new id is one more document and stream for good: a create-then-cancel loop frees
+          // its templates and buildsQueued slots, never this one. The owner's: its override's, else
+          // the default's (quotaFor).
+          if (!cur && u.owned >= quota.owned) {
+            throw new CpError(
+              'quota_exceeded',
+              `at most ${quota.owned} template ids owned per subject, in any status`,
+              undefined,
+              { quota: 'owned' },
+            );
+          }
+          if (u.buildsQueued >= quota.buildsQueued) {
+            throw new CpError(
+              'quota_exceeded',
+              `at most ${quota.buildsQueued} builds queued per subject`,
+              undefined,
+              { quota: 'buildsQueued' },
+            );
+          }
+          if (gateRecordBytes) await prov.putBlob(gateRecordBytes);
+          const created = await prov.append({
+            stream,
+            kind: 'create',
+            subject: p.sub,
+            body: {
+              image: b.image as string,
+              // A round trip through JSON: what the client sent, as the wire carries it (no
+              // undefined), with the guest size under the key the build reads (normalizeSpec).
+              spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
+              profile: result.profile,
+              handle,
+              ...(result.gateRecordSha256 ? { gate_record_sha256: result.gateRecordSha256 } : {}),
+            },
+          });
+          if (result.gateRecordSha256) {
+            await prov.append({
+              stream,
+              kind: 'gate',
+              subject: p.sub,
+              body: {
+                record_sha256: result.gateRecordSha256,
+                // `trusted`: in trustedGateRecords. `self` (self-attestation): trusted only for the
+                // template owner's templates, on a selfAttest profile, which `scope` names (the
+                // submitter, or the owner an admin added the build for). `client`: any other (a profile
+                // that does not require X1). The policy record in force names what the trust was at
+                // create, after any later change.
+                source:
+                  result.gateTrust === 'trusted'
+                    ? 'trusted'
+                    : selfAttestedCreate
+                      ? 'self'
+                      : 'client',
+                ...(selfAttestedCreate ? { scope: attester } : {}),
+                policy: policyRecord,
+              },
+            });
+          }
+          await prov.append({ stream, kind: 'check', subject: 'policy', body: checkBody });
+          const build: TemplateBuild = {
+            buildId: handle,
+            handle,
+            status: 'queued',
+            profile: result.profile,
+            worker: '',
+            spec: buildSpec(built),
+            createdAt: now,
+            queuedAtMs: deps.now(),
+            provenance: created.digest,
+            request: {
+              image: b.image as string,
+              spec: JSON.parse(JSON.stringify(built)) as Record<string, unknown>,
+              ...(result.gateRecordSha256 ? { gateRecordSha256: result.gateRecordSha256 } : {}),
+            },
+            ...(selfAttestedCreate ? { selfAttested: true } : {}),
+            // On a selfAttest profile, the record's trust is the policy's at each read, not at create.
+            ...(result.gateRecordSha256 && pol.profiles[result.profile]?.selfAttest === true
+              ? { selfAttestProfile: true }
+              : {}),
+            ...(result.gateFloor ? { gateFloor: result.gateFloor } : {}),
+          };
+          const base: TemplateDoc = cur ?? {
+            schema: TEMPLATE_DOC_SCHEMA,
+            id,
+            owner: p.sub,
+            visibility: selfAttestedCreate
+              ? 'private'
+              : ((b.visibility as 'private' | 'deployment' | undefined) ?? 'deployment'),
+            description: String(built.description ?? ''),
+            tags: {},
+            builds: [],
+            createdAt: now,
+          };
+          return { ...base, builds: [build, ...base.builds] };
+        }),
+      );
+    } catch (err) {
+      if (err !== OWNER_MOVED) throw err;
+      if (attempt >= 3)
+        throw new CpError('internal_error', "the template's owner kept changing; retry the create");
+    }
+  }
   if (reused) {
     await auditBestEffort(deps, 'template_build_reused', id, {
       subject: p.sub,
@@ -928,6 +1124,20 @@ function buildSpec(spec: Record<string, unknown>): TemplateBuild['spec'] {
   };
 }
 
+/**
+ * A change's records (§7.1), appended inside the catalog's write, as create does: the write
+ * happens only after they are on the chain, so a change is never stored without its record. Every
+ * body is checked as canonical JSON before the first append, so a body the chain refuses refuses
+ * the change and writes nothing. A failed write after the appends leaves records of a change not
+ * stored, which a reader sees against the catalog; never the reverse. Returns their digests.
+ */
+async function appendRecords(prov: ProvenanceStore, inputs: AppendInput[]): Promise<string[]> {
+  for (const x of inputs) canonicalJson(x.body);
+  const digests: string[] = [];
+  for (const x of inputs) digests.push((await prov.append(x)).digest);
+  return digests;
+}
+
 /** The statuses an owner may cancel (§5.1): not yet built. */
 const CANCELLABLE = new Set<TemplateBuild['status']>(['queued', 'building', 'probing']);
 
@@ -937,15 +1147,12 @@ const CANCELLABLE = new Set<TemplateBuild['status']>(['queued', 'building', 'pro
  * further report from a build host, so it never registers.
  */
 async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
-  const p = requireEnrolled(ctx, deps);
-  const { cat, prov } = writable(deps);
-  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
-  if (d0.owner !== p.sub && !isAdmin(p))
-    throw new CpError('forbidden', "only the template's owner cancels its builds");
+  const { p, cat, prov, d0, own } = await ownTemplate(ctx, deps, 'cancels its builds');
   const ref = ctx.params.build ?? '';
   let cancelled: TemplateBuild | undefined;
-  await cat.update(d0.id, async (cur) => {
-    const x = cur!.builds.find((y) => y.handle === ref || y.buildId === ref);
+  await cat.update(d0.id, async (c) => {
+    const cur = own(c);
+    const x = cur.builds.find((y) => y.handle === ref || y.buildId === ref);
     if (!x) throw new CpError('template_not_found', 'no such build of this template');
     if (!CANCELLABLE.has(x.status))
       throw new CpError(
@@ -957,13 +1164,15 @@ async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
       status: 'failed',
       reason: { message: `cancelled by ${p.sub}`, step: 'cancelled' },
     };
-    return { ...cur!, builds: cur!.builds.map((y) => (y === x ? cancelled! : y)) };
-  });
-  await prov.append({
-    stream: `template/${d0.id}`,
-    kind: 'build',
-    subject: p.sub,
-    body: { handle: cancelled!.handle ?? cancelled!.buildId, outcome: 'cancelled' },
+    await appendRecords(prov, [
+      {
+        stream: `template/${d0.id}`,
+        kind: 'build',
+        subject: p.sub,
+        body: { handle: cancelled.handle ?? cancelled.buildId, outcome: 'cancelled' },
+      },
+    ]);
+    return { ...cur, builds: cur.builds.map((y) => (y === x ? cancelled! : y)) };
   });
   await auditBestEffort(deps, 'template_build_cancelled', d0.id, {
     subject: p.sub,
@@ -1319,6 +1528,24 @@ interface RetiredBuild {
 }
 
 /**
+ * The admin's actions on a template (§5.2), such as a reject after the fact: an admin only, on a
+ * template it can see (404 otherwise, as on the reads). An admin's right does not depend on the
+ * template's owner, so `own` under the lock checks only that the template still exists.
+ */
+async function adminTemplate(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  const w = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  if (!isAdmin(p))
+    throw new CpError('forbidden', 'rejecting a build after the fact requires the admin role');
+  const own = (d: TemplateDoc | null): TemplateDoc => {
+    if (!d) throw new CpError('template_not_found', 'no such template');
+    return d;
+  };
+  return { p, ...w, d0, own };
+}
+
+/**
  * Retire (§5.1): the owner, or an admin, retires a whole template (every build not yet retired) or
  * one build. A retired build is never used again (a sandbox or an activation naming it answers
  * `410 template_retired`) and its leases go, so it is no longer wanted: a host holding it is told
@@ -1338,16 +1565,11 @@ async function retireBuilds(
   which: (b: TemplateBuild) => boolean,
   mode: 'retire' | 'reject' = 'retire',
 ): Promise<{ templateId: string; subject: string; builds: RetiredBuild[] }> {
-  const p = requireEnrolled(ctx, deps);
-  const { cat, prov } = writable(deps);
-  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
-  if (mode === 'reject' ? !isAdmin(p) : d0.owner !== p.sub && !isAdmin(p))
-    throw new CpError(
-      'forbidden',
-      mode === 'reject'
-        ? 'rejecting a build after the fact requires the admin role'
-        : "only the template's owner, or an admin, retires it",
-    );
+  // Retire: the owner, or an admin; the owner's check is made on the template as read and again
+  // under its lock (ownerCheck), so a retire by an owner it was transferred away from meanwhile is
+  // refused. Reject: an admin only, whoever owns the template (adminTemplate).
+  const { p, cat, prov, d0, own } =
+    mode === 'reject' ? await adminTemplate(ctx, deps) : await ownTemplate(ctx, deps, 'retires it');
   const reason = asRecord(ctx.body).reason;
   if (mode === 'reject' && (typeof reason !== 'string' || !reason.trim()))
     throw new CpError('invalid_request', 'a reject needs a reason: the rule found broken, and why');
@@ -1374,10 +1596,11 @@ async function retireBuilds(
       const now = await cat.get(d0.id);
       if (!now) throw new CpError('template_not_found', 'no such template');
       const inUse = await buildsInUse(deps, now.builds.filter(which), seconds(deps));
-      await cat.update(d0.id, async (cur) => {
+      await cat.update(d0.id, async (c) => {
+        const cur = own(c);
         done.length = 0;
         records.clear();
-        const targets = cur!.builds.filter(which);
+        const targets = cur.builds.filter(which);
         if (targets.length === 0)
           throw new CpError('template_not_found', 'no such build of this template');
         if (mode === 'reject' && targets.some((x) => x.status !== 'registered' && !ended(x)))
@@ -1411,8 +1634,8 @@ async function retireBuilds(
           records.set(x.handle ?? x.buildId, rec.digest);
         }
         return {
-          ...cur!,
-          builds: cur!.builds.map((x) =>
+          ...cur,
+          builds: cur.builds.map((x) =>
             done.includes(x)
               ? mode === 'reject'
                 ? {
@@ -1604,6 +1827,296 @@ async function createUnlessEnded<T>(
   });
 }
 
+/**
+ * The owner's actions (§5.1): the template's owner, or an admin (every owner action is open to
+ * admins, on any template, §5.2). A caller who cannot see the template gets 404, as on the reads.
+ */
+async function ownTemplate(ctx: RequestCtx, deps: CpDeps, verb: string) {
+  const p = requireEnrolled(ctx, deps);
+  const w = writable(deps);
+  const trusted = await trustedSet(deps);
+  const own = (d: TemplateDoc | null): TemplateDoc => ownerCheck(d, p, verb, trusted);
+  const d0 = own(await catalog(deps).get(ctx.params.id ?? ''));
+  return { p, ...w, d0, own, trusted };
+}
+
+/**
+ * The owner's check on a document: 404 for one the caller cannot see (or none), 403 for one that
+ * is neither theirs nor an admin's to act on. `ownTemplate` makes it on the document as read, for
+ * an early answer; each write makes it again on the document under the template's lock, so an
+ * owner transfer (or a change to private) between the two is seen and the old owner's change
+ * refused.
+ */
+function ownerCheck(
+  d: TemplateDoc | null,
+  p: TokenClaims,
+  verb: string,
+  trusted: ReadonlySet<string>,
+): TemplateDoc {
+  if (!d || !canSee(d, p, trusted)) throw new CpError('template_not_found', 'no such template');
+  if (d.owner !== p.sub && !isAdmin(p))
+    throw new CpError('forbidden', `only the template's owner, or an admin, ${verb}`);
+  return d;
+}
+
+/**
+ * Tags (§3.2, §5.1): the owner, or an admin, moves tags onto a registered build without rebuilding;
+ * a reference `id:tag` (and `id` for `default`) then resolves to the new build for new sandboxes
+ * and sessions, and those already created keep theirs. Each tag that changes is a `tag` record with
+ * the new build and the one before (§7.1); a tag already on the build writes nothing.
+ */
+async function moveTemplateTags(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0, own } = await ownTemplate(ctx, deps, 'moves its tags');
+  const b = asRecord(ctx.body);
+  const tags = b.tags;
+  if (!Array.isArray(tags) || tags.length === 0 || tags.length > 16)
+    throw new CpError('invalid_request', 'tags must be a list of 1-16 tag names');
+  for (const t of tags)
+    if (typeof t !== 'string' || !TEMPLATE_ID_RE.test(t))
+      throw new CpError(
+        'invalid_request',
+        `tag '${String(t)}' must match ${TEMPLATE_ID_RE.source}`,
+      );
+  if (new Set(tags).size !== tags.length)
+    throw new CpError('invalid_request', 'a tag is listed twice');
+  const ref = typeof b.build === 'string' ? b.build : '';
+  const nowS = seconds(deps);
+  let buildId = '';
+  let moved: { tag: string; from: string | null }[] = [];
+  const records: Record<string, string> = {};
+  // The build is checked under the template's write lock, so it is still registered when tagged.
+  await cat.update(d0.id, async (c) => {
+    const cur = own(c);
+    moved = [];
+    const target = cur.builds.find((x) => x.buildId === ref || x.handle === ref);
+    if (!target) throw new CpError('template_not_found', 'no such build of this template');
+    if (target.status !== 'registered')
+      throw new CpError(
+        'invalid_request',
+        `the build is ${target.status}; only a registered build is tagged`,
+      );
+    buildId = target.buildId;
+    const next = { ...cur.tags };
+    const meta = { ...(cur.tagsMeta ?? {}) };
+    for (const t of tags as string[]) {
+      // An own property only: a tag such as `constructor` is not Object.prototype's.
+      const from = Object.hasOwn(next, t) ? next[t]! : null;
+      if (from === buildId) continue;
+      moved.push({ tag: t, from });
+      next[t] = buildId;
+      meta[t] = { at: nowS, by: p.sub };
+    }
+    const digests = await appendRecords(
+      prov,
+      moved.map((m) => ({
+        stream: `template/${d0.id}`,
+        kind: 'tag' as const,
+        subject: p.sub,
+        body: { tag: m.tag, buildId, before: m.from },
+      })),
+    );
+    moved.forEach((m, i) => (records[m.tag] = digests[i]!));
+    return { ...cur, tags: next, tagsMeta: meta };
+  });
+  if (moved.length > 0)
+    await auditBestEffort(deps, 'template_tags_moved', d0.id, {
+      subject: p.sub,
+      decision: 'template_tags_moved',
+    });
+  return {
+    status: 200,
+    body: {
+      templateId: d0.id,
+      subject: p.sub,
+      buildId,
+      // `before`: what the tag named until now (null: it is new); an unchanged tag names its build.
+      tags: (tags as string[]).map((t) => {
+        const m = moved.find((x) => x.tag === t);
+        return { tag: t, buildId, before: m ? m.from : buildId, record: records[t] ?? null };
+      }),
+    },
+  };
+}
+
+/**
+ * Remove a tag (§5.1): its build is never deleted and stays addressable by its build id. `default`
+ * is moved, never removed: the bare id must resolve. A `tag` record with `buildId: null`.
+ */
+async function removeTemplateTag(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0, own } = await ownTemplate(ctx, deps, 'removes its tags');
+  const tag = ctx.params.tag ?? '';
+  if (!TEMPLATE_ID_RE.test(tag))
+    throw new CpError('invalid_request', `tag '${tag}' must match ${TEMPLATE_ID_RE.source}`);
+  if (tag === 'default')
+    throw new CpError(
+      'invalid_request',
+      'the default tag is moved (POST …/tags), never removed: the bare id must resolve',
+    );
+  let before = '';
+  let record = '';
+  await cat.update(d0.id, async (c) => {
+    const cur = own(c);
+    const b = Object.hasOwn(cur.tags, tag) ? cur.tags[tag] : undefined;
+    if (b === undefined)
+      throw new CpError('template_not_found', `no tag '${tag}' on this template`);
+    before = b;
+    const next = { ...cur.tags };
+    const meta = { ...(cur.tagsMeta ?? {}) };
+    delete next[tag];
+    delete meta[tag];
+    [record] = await appendRecords(prov, [
+      {
+        stream: `template/${d0.id}`,
+        kind: 'tag',
+        subject: p.sub,
+        body: { tag, buildId: null, before },
+      },
+    ]);
+    return { ...cur, tags: next, tagsMeta: meta };
+  });
+  await auditBestEffort(deps, 'template_tag_removed', d0.id, {
+    subject: p.sub,
+    decision: 'template_tag_removed',
+  });
+  return {
+    status: 200,
+    body: { templateId: d0.id, subject: p.sub, tag, buildId: null, before, record },
+  };
+}
+
+type TemplateEdit = { field: 'visibility' | 'description'; value: string; before: string };
+
+/**
+ * Edit (§5.1): the owner, or an admin, changes a template's description or visibility. `private`
+ * hides it from other subjects (they get 404, as for an id that does not exist) and refuses their
+ * new use; their sandboxes and sessions already created keep running. Each field that changes is a
+ * `visibility` record (the field, the new value and the one before), so every edit is on the chain.
+ */
+async function updateTemplate(ctx: RequestCtx, deps: CpDeps) {
+  const { p, cat, prov, d0, own, trusted } = await ownTemplate(ctx, deps, 'edits it');
+  const b = asRecord(ctx.body);
+  if (b.visibility === undefined && b.description === undefined)
+    throw new CpError('invalid_request', 'nothing to change: send visibility or description');
+  if (b.visibility !== undefined && b.visibility !== 'private' && b.visibility !== 'deployment')
+    throw new CpError('invalid_request', "visibility must be 'private' or 'deployment'");
+  if (
+    b.description !== undefined &&
+    (typeof b.description !== 'string' || b.description.length > 1024)
+  )
+    throw new CpError('invalid_request', 'description must be a string of at most 1024 characters');
+  // A JSON body can carry a lone surrogate (`"\ud800"`), which a provenance record cannot hold.
+  if (typeof b.description === 'string' && LONE_SURROGATE_RE.test(b.description))
+    throw new CpError('invalid_request', 'description must not hold a lone surrogate');
+  const visibility = b.visibility as 'private' | 'deployment' | undefined;
+  const description = b.description as string | undefined;
+  let changes: TemplateEdit[] = [];
+  const records: Record<string, string> = {};
+  const after = await cat.update(d0.id, async (c) => {
+    const cur = own(c);
+    // Self-attestation (subject-trust spec §6): a template with a self-attested build, registered
+    // or on its way there, stays private until an admin trusts the record; refused as at create.
+    if (
+      visibility === 'deployment' &&
+      cur.visibility !== 'deployment' &&
+      cur.builds.some((x) => REUSABLE.has(x.status) && attestationOf(x, trusted) === 'self')
+    )
+      throw new CpError(
+        'self_attested',
+        'a self-attested template is private until an admin trusts its gate record (trustedGateRecords)',
+      );
+    changes = [];
+    if (visibility !== undefined && visibility !== cur.visibility)
+      changes.push({ field: 'visibility', value: visibility, before: cur.visibility });
+    if (description !== undefined && description !== cur.description)
+      changes.push({ field: 'description', value: description, before: cur.description });
+    const digests = await appendRecords(
+      prov,
+      changes.map((c) => ({
+        stream: `template/${d0.id}`,
+        kind: 'visibility' as const,
+        subject: p.sub,
+        body: { field: c.field, value: c.value, before: c.before },
+      })),
+    );
+    changes.forEach((c, i) => (records[c.field] = digests[i]!));
+    return {
+      ...cur,
+      ...(visibility !== undefined ? { visibility } : {}),
+      ...(description !== undefined ? { description } : {}),
+    };
+  });
+  if (changes.length > 0)
+    await auditBestEffort(deps, 'template_updated', d0.id, {
+      subject: p.sub,
+      decision: 'template_updated',
+    });
+  return {
+    status: 200,
+    body: {
+      templateId: d0.id,
+      subject: p.sub,
+      visibility: after.visibility,
+      description: after.description,
+      changes: changes.map((c) => ({ ...c, record: records[c.field]! })),
+    },
+  };
+}
+
+/**
+ * Transfer ownership (§5.2): an admin makes another enrolled subject the template's owner, for
+ * example when its creator leaves. The new owner gets every owner action, and the quotas count it
+ * as theirs from now on; sandboxes and sessions already made keep their own subjects. An `owner`
+ * record names the admin, the new owner and the one before.
+ *
+ * A template the deployment declared (imported from SH_SANDBOX_TEMPLATES, owner null) is handed to
+ * a subject the same way, `before: null`: its id otherwise blocks every self-serve create under it
+ * (`409 template_exists`). The import runs once, into an empty catalog, so a restart does not take
+ * it back.
+ */
+async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  if (!isAdmin(p))
+    throw new CpError('forbidden', 'transferring a template requires the admin role');
+  const { cat, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const owner = asRecord(ctx.body).owner;
+  if (typeof owner !== 'string' || !MEMBER_SUBJECT_RE.test(owner))
+    throw new CpError('invalid_request', `owner must be a subject, ${MEMBER_SUBJECT_FORMS}`);
+  // The new owner must be able to act on it: enrolled now (the allow list, or an admin).
+  if (!isEnrolled(owner, deps.identity.rolesFor(owner), deps.config))
+    throw new CpError(
+      'invalid_request',
+      `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS first`,
+    );
+  let before = null as string | null;
+  let record: string | null = null;
+  const trusted = await trustedSet(deps);
+  await cat.update(d0.id, async (cur) => {
+    if (!cur) throw new CpError('template_not_found', 'no such template');
+    before = cur.owner;
+    if (before === owner) return cur;
+    // Self-attestation (subject-trust spec §6): a subject's own gate record counts for that subject's
+    // own templates only, so a template with a self-attested build, registered or on its way there,
+    // is not handed to another subject until an admin trusts the record.
+    if (cur.builds.some((x) => REUSABLE.has(x.status) && attestationOf(x, trusted) === 'self'))
+      throw new CpError(
+        'self_attested',
+        "a self-attested template keeps its owner until an admin trusts its gate record (trustedGateRecords): the record counts for its submitter's own templates only",
+      );
+    [record] = await appendRecords(prov, [
+      { stream: `template/${d0.id}`, kind: 'owner', subject: p.sub, body: { owner, before } },
+    ]);
+    return { ...cur, owner };
+  });
+  if (owner !== before) {
+    await auditBestEffort(deps, 'template_owner_transferred', d0.id, {
+      subject: p.sub,
+      decision: 'template_owner_transferred',
+    });
+  }
+  return { status: 200, body: { templateId: d0.id, subject: p.sub, owner, before, record } };
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
   // The template reads (template lifecycle spec §4), on both route profiles (§4.1): on `harness`
   // requireEnrolled admits any logged-in subject. The worker id is deployment plumbing; a client
@@ -1624,7 +2137,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const tags = Object.entries(d.tags)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([tag, buildId]) => {
-        const m = d.tagsMeta?.[tag];
+        const m = d.tagsMeta && Object.hasOwn(d.tagsMeta, tag) ? d.tagsMeta[tag] : undefined;
         return { tag, buildId, assignedAt: m?.at ?? d.createdAt, assignedBy: m?.by ?? d.owner };
       });
     return { status: 200, body: { tags } };
@@ -1660,6 +2173,12 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   retireTemplateBuild,
   rejectTemplateBuild,
 
+  // The owner's and the admin's actions (§5.1-§5.2): tags, edits and owner transfer.
+  moveTemplateTags,
+  removeTemplateTag,
+  updateTemplate,
+  transferTemplateOwner,
+
   // Activation leases (§6.3): take or renew, and release.
   activateTemplate: activate,
   deactivateTemplate: deactivate,
@@ -1669,7 +2188,13 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   getPolicy: async (ctx, deps) => {
     requireEnrolled(ctx, deps);
     const { policy, record } = await policyStore(deps).current();
-    return { status: 200, body: { policy, digest: policyDigest(policy), record } };
+    // The general-gate schema rides along, so a client's dry run applies X1.offline as this
+    // deployment does.
+    const gateRecordSchema = deps.config.sandbox?.gateRecordSchema ?? DEFAULT_GATE_RECORD_SCHEMA;
+    return {
+      status: 200,
+      body: { policy, digest: policyDigest(policy), record, gateRecordSchema },
+    };
   },
 
   putPolicy: async (ctx, deps) => {
@@ -1678,9 +2203,37 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const store = policyStore(deps);
     const bad = policyProblems(ctx.body);
     if (bad.length) throw new CpError('invalid_request', bad.join('; '));
-    const { policy, record } = await store.set(ctx.body as Policy, p.sub);
+    // Self-attestation: a record whose trust this removes narrows its deployment-visible templates
+    // to private on read. Name each narrowed build in the policy record, so nothing is silent. The
+    // policy itself is what the admin sent, every field kept as sent.
+    const before = new Set((await store.current()).policy.trustedGateRecords);
+    const after = new Set((ctx.body as Policy).trustedGateRecords);
+    const narrowed: { template: string; buildId: string }[] = [];
+    if ([...before].some((g) => !after.has(g)) && deps.templates)
+      for (const d of await deps.templates.list())
+        if (effectiveVisibility(d, before) === 'deployment')
+          for (const x of d.builds)
+            if (
+              x.status === 'registered' &&
+              attestationOf(x, before) === 'deployment' &&
+              attestationOf(x, after) === 'self'
+            )
+              narrowed.push({ template: d.id, buildId: x.buildId });
+    const { policy, record } = await store.set(
+      ctx.body as Policy,
+      p.sub,
+      narrowed.length ? { narrowed } : undefined,
+    );
     await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
-    return { status: 200, body: { policy, digest: policyDigest(policy), record } };
+    return {
+      status: 200,
+      body: {
+        policy,
+        digest: policyDigest(policy),
+        record,
+        ...(narrowed.length ? { narrowed } : {}),
+      },
+    };
   },
 
   /**
