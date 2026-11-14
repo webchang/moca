@@ -476,12 +476,14 @@ function registrationResults(
 const REPORTABLE = new Set<TemplateBuild['status']>(['building', 'probing', 'built']);
 
 /**
- * The build ids and workers of every build that is not retired, in every template. A retired build
- * that shares either with one (the same snapshot built again, a twin in another template, a worker
- * id reused, or one worker id two builds from one image share) names a snapshot or worker still
- * needed: it is never stopped or removed for the retire (that build's own entries decide whether
- * the worker runs), its `removed` is refused, and it reports no capacity to wait out
- * (sandbox-handlers.ts buildBody).
+ * The build ids and workers of every build that is neither retired nor rejected, in every template.
+ * A retired or admin-rejected build that shares either with one (the same snapshot built again, a
+ * twin in another template, a worker id reused, or one worker id two builds from one image share)
+ * names a snapshot or worker still needed: it is never stopped or removed for the retire or the
+ * reject (that build's own entries decide whether the worker runs), a retired one's `removed` is
+ * refused, and it reports no capacity to wait out (sandbox-handlers.ts buildBody). A rejected build
+ * (by policy or by an admin) keeps nothing: a retired build that shares its snapshot only with one
+ * is removed as any retired build is, though the rejected build itself is never in `remove`.
  */
 export function liveSnapshots(docs: { builds: TemplateBuild[] }[]): (b: TemplateBuild) => boolean {
   const ids = new Set<string>();
@@ -676,7 +678,7 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     if (event === 'removed' && liveSnapshots(docs)(target)) {
       throw new CpError(
         'build_in_use',
-        'a build that is not retired shares this snapshot or worker; it is not removed',
+        'a build neither retired nor rejected shares this snapshot or worker; it is not removed',
       );
     }
     const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;

@@ -2152,6 +2152,47 @@ describe('reject after the fact (§5.2)', () => {
     expect((await d.provenance!.chain('template/t1')).length).toBe(n);
   });
 
+  it('removes a retired build whose snapshot only an admin-rejected build shares; that one is only stopped', async () => {
+    const d = await setup();
+    attachedNow = [];
+    // One snapshot (manifest hash) in two templates: t1's build is retired, t2's rejected by an
+    // admin. A rejected build needs the snapshot no more than a retired one (liveSnapshots), so it
+    // keeps neither from being stopped, nor t1's from being removed; t2's itself is never removed.
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await registered(d, 't2', hash('1'), 'sbx_t2');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    await HANDLERS.retireTemplate!(ctx({ principal: alice, params: { id: 't1' }, body: {} }), d);
+    await reject(d, 't2', hash('1'), { reason: 'broken' });
+    const e1 = { template: 't1', buildId: hash('1'), worker: 'sbx_t1' };
+    const e2 = { template: 't2', buildId: hash('1'), worker: 'sbx_t2' };
+    const w = await wanted(d, 'host-1');
+    expect(w.stop).toHaveLength(2);
+    expect(w.stop).toEqual(expect.arrayContaining([e1, e2]));
+    expect(w.remove).toEqual([e1]);
+    // The removal is t1's, and the host no longer holds the snapshot, for either build.
+    const r = await HANDLERS.hostWorkerReport!(
+      asHost('host-1', {}, { buildId: hash('1'), event: 'removed' }),
+      d,
+    );
+    expect((r.body as Body).recorded).toBe('removed');
+    expect((await d.provenance!.chain('template/t1')).at(-1)).toMatchObject({
+      kind: 'retire',
+      body: { event: 'removed' },
+    });
+    expect((await d.provenance!.chain('template/t2')).at(-1)).toMatchObject({ kind: 'reject' });
+    const held = async (id: string) =>
+      (
+        (
+          await HANDLERS.getTemplateBuild!(
+            ctx({ principal: alice, params: { id, build: hash('1') } }),
+            d,
+          )
+        ).body as Body
+      ).heldBy;
+    expect(await held('t1')).toEqual([]);
+    expect(await held('t2')).toEqual([]);
+  });
+
   it('never rejects under a live sandbox (409 build_in_use)', async () => {
     const d = await setup();
     attachedNow = ['sbx_t1'];

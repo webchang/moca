@@ -37,6 +37,9 @@ change is additive; the routes mount on both route profiles and need `SH_PROVENA
   Answers `{templateId, subject, build, buildId, record, status: rejected}`; idempotent
   (`record: null`). Refused `409 build_in_use` while a live sandbox runs on the build; any status
   but `registered` is `400 invalid_request`. Not reversible.
+- A rejected build (by policy or by an admin) keeps no snapshot or worker for a retired build that
+  shares it: the retired build is stopped and removed as any retired build is (no longer `shared`),
+  while the rejected build itself is only stopped.
 
 ## 1.20.0
 
