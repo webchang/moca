@@ -12,21 +12,19 @@ what each step records): [`governance/`](governance/README.md).
 
 ## In this folder
 
-The guide and the step list are here; the tools, the samples and their tests come with the units
-that implement them (#730 to #752), so they are named below rather than linked.
-
-| File                                             | What it is                                                                                                                                                      |
-| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`GUIDE.md`](GUIDE.md)                           | the guide: mental model, the flow, two worked examples, self-serve from your own image (§4b), update and retire, capacity, troubleshooting                      |
-| [`ONBOARDING.md`](ONBOARDING.md)                 | the short reference: the steps, the spec's fields, the tools' options                                                                                           |
-| [`governance/`](governance/README.md)            | the gating rules, the process, and where each is owned                                                                                                          |
-| `template-build.sh`                              | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record                                          |
-| `template-register.sh`                           | **operator machine:** record → `SBX_WORKERS` and the templates file (add, versioned update, `--retire`, `--remove`), then `setup.sh`                            |
-| `verify-provenance.py`                           | **anywhere, Python 3 only:** verifies a template provenance export offline (digests, chain, heads, cited gate records); `--head` compares a head kept elsewhere |
-| `examples/default.json`                          | sample spec 1: Moca's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                                                  |
-| `examples/django__django-11133.json`             | sample spec 2: a SWE-bench instance (an image builder's spec block, host-free image), template `django-django-11133`                                            |
-| `examples/django__django-11133.gate-record.json` | sample 2's gate record, from its image builder with the gate's test results removed, passed with `--gate-record`                                                |
-| `tests/`                                         | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                                              |
+| File                                                                                               | What it is                                                                                                                                                                                                                                         |
+| -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`GUIDE.md`](GUIDE.md)                                                                             | the guide: mental model, the flow, two worked examples, self-serve from your own image (§4b), update and retire, capacity, troubleshooting                                                                                                         |
+| [`ONBOARDING.md`](ONBOARDING.md)                                                                   | the short reference: the steps, the spec's fields, the tools' options                                                                                                                                                                              |
+| [`governance/`](governance/README.md)                                                              | the gating rules, the process, and where each is owned                                                                                                                                                                                             |
+| [`template-build.sh`](template-build.sh)                                                           | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record                                                                                                                             |
+| [`template-register.sh`](template-register.sh)                                                     | **operator machine:** record → `SBX_WORKERS` and the templates file (add, versioned update, `--retire`, `--remove`), then `setup.sh`                                                                                                               |
+| [`verify-provenance.py`](verify-provenance.py)                                                     | **anywhere, Python 3 only:** verifies a template provenance export offline (digests, chain, heads, cited gate records); `--head` compares a head kept elsewhere; `--egress SANDBOX_ID=FILE` checks a saved egress log against the sandbox's record |
+| [`redact-provenance.py`](redact-provenance.py)                                                     | **the control plane's store, offline (control plane stopped):** redacts text matching a pattern from one template's provenance stream and catalog entry (or `--catalog-only`), re-chaining the later records                                       |
+| [`examples/default.json`](examples/default.json)                                                   | sample spec 1: Moca's public sandbox image (`ghcr.io/rossoctl/moca-remote-worker`, pinned), template `default`                                                                                                                                     |
+| [`examples/django__django-11133.json`](examples/django__django-11133.json)                         | sample spec 2: a SWE-bench instance (an image builder's spec block, host-free image), template `django-django-11133`                                                                                                                               |
+| [`examples/django__django-11133.gate-record.json`](examples/django__django-11133.gate-record.json) | sample 2's gate record, from its image builder with the gate's test results removed, passed with `--gate-record`                                                                                                                                   |
+| [`tests/`](tests/)                                                                                 | `template-build.test.sh`, `template-register.test.sh`, and `examples.test.sh` (every sample passes the spec check)                                                                                                                                 |
 
 ## Related files elsewhere in the repository
 
@@ -34,15 +32,15 @@ These are part of the same flow but live with the code they belong to.
 
 **SBX0, the sandbox service the templates run on** (`deploy/sbx/`):
 
-| File                                       | Role in the flow                                                                                                        |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| [`../setup.sh`](../setup.sh)               | the cluster side: mints each worker's token and bundle; a template change restarts the control plane only               |
-| [`../install-host.sh`](../install-host.sh) | the KVM host: installs (or `--uninstall`s) a template's worker                                                          |
-| `../host-agent.sh`                         | the KVM host's template agent: builds queued templates, starts and stops their workers, removes retired builds          |
-| `../templates-check.sh`                    | the live check that a client gets the template it asked for, and that templates are isolated                            |
-| [`../README.md`](../README.md)             | installing SBX0                                                                                                         |
-| [`../RUNBOOK.md`](../RUNBOOK.md)           | operating it: §5 templates, [guest egress](../RUNBOOK.md#guest-egress), the template host agent, checking the templates |
-| [`../tests/`](../tests/)                   | the deploy scripts' tests (`install-host.test.sh`, `setup.test.sh`, …)                                                  |
+| File                                             | Role in the flow                                                                                                        |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| [`../setup.sh`](../setup.sh)                     | the cluster side: mints each worker's token and bundle; a template change restarts the control plane only               |
+| [`../install-host.sh`](../install-host.sh)       | the KVM host: installs (or `--uninstall`s) a template's worker                                                          |
+| [`../host-agent.sh`](../host-agent.sh)           | the KVM host's template agent: builds queued templates, starts and stops their workers, removes retired builds          |
+| [`../templates-check.sh`](../templates-check.sh) | the live check that a client gets the template it asked for, and that templates are isolated                            |
+| [`../README.md`](../README.md)                   | installing SBX0                                                                                                         |
+| [`../RUNBOOK.md`](../RUNBOOK.md)                 | operating it: §5 templates, [guest egress](../RUNBOOK.md#guest-egress), the template host agent, checking the templates |
+| [`../tests/`](../tests/)                         | the deploy scripts' tests (`install-host.test.sh`, `setup.test.sh`, …)                                                  |
 
 **Snapshots** (`deploy/microvm/`):
 
