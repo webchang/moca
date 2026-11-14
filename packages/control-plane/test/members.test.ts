@@ -34,7 +34,7 @@ const who = (sub: string, roles: string[] = []): TokenClaims =>
   ({ sub, tenant: sub, roles, scope: ['api'] }) as unknown as TokenClaims;
 
 let now = NOW_MS;
-function setup(profile: 'sandbox' | 'harness' = 'sandbox'): TestDeps & {
+function setup(profile: 'sandbox' | 'harness' | 'combined' = 'sandbox'): TestDeps & {
   members: MembersStore;
   provenance: ProvenanceStore;
 } {
@@ -504,6 +504,76 @@ describe('per-request evaluation from one read (spec §8)', () => {
       await expect(d.members.membershipNow(CAROL, nowS())).rejects.toThrow();
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+describe('a members.json of the wrong shape is refused as a corrupt one', () => {
+  for (const [name, content] of [
+    ['members null', '{"members": null}'],
+    ['members an array', '{"members": []}'],
+    [
+      'a member with no roles array',
+      `{"members": {"${CAROL}": {"subject": "${CAROL}", "enrolled": true, "since": 1, "by": "${ENV_ADMIN}"}}}`,
+    ],
+    [
+      'a role that is not a grant',
+      `{"members": {"${CAROL}": {"subject": "${CAROL}", "enrolled": true, "roles": ["admin"], "since": 1, "by": "${ENV_ADMIN}"}}}`,
+    ],
+  ] as const) {
+    it(`${name}: the settings' subjects are answered, everyone else fails closed, no TypeError`, async () => {
+      const d = setup();
+      const a = who(ENV_ADMIN);
+      await call(d, 'enrollSubject', a, { subject: CAROL }, { enrolled: true });
+      writeFileSync((d.members as unknown as { path: string }).path, content);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(await d.members.membershipNow(ALLOWED, nowS())).toEqual({
+          roles: [],
+          enrolled: false,
+        });
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('answered from the settings'));
+        // A request of an allow-listed subject is served, not a 500.
+        expect((await call(d, 'listTemplates', who(ALLOWED))).status).toBe(200);
+        await expect(d.members.membershipNow(CAROL, nowS())).rejects.toThrow(
+          'members.json is invalid',
+        );
+        await expect(d.members.membershipNow(DAVE, nowS())).rejects.toThrow(
+          'members.json is invalid',
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  }
+
+  it('through the router: an allow-listed subject is served, a store-only one is refused', async () => {
+    // Combined: its tokens carry the issuer the test signer mints under, and /v1/sandboxes is
+    // enrolled-only there.
+    const d = setup('combined');
+    await call(d, 'enrollSubject', who(ENV_ADMIN), { subject: CAROL }, { enrolled: true });
+    writeFileSync((d.members as unknown as { path: string }).path, '{"members": null}');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const server = createServer(buildHandler(d));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/sandboxes`;
+      const get = async (sub: string) =>
+        (
+          await fetch(url, {
+            headers: {
+              authorization: `Bearer ${d.signer.mint({ sub, tenant: sub, roles: [], scope: ['api'], ttlSeconds: 3600, now: nowS() })}`,
+            },
+          })
+        ).status;
+      expect(await get(ALLOWED)).toBe(200);
+      // As for an unparseable file: the store-only subject fails closed (the read error, a 500).
+      expect(await get(CAROL)).toBe(500);
+    } finally {
+      server.close();
+      warn.mockRestore();
+      err.mockRestore();
     }
   });
 });

@@ -82,6 +82,38 @@ export interface Bootstrap {
 const statKey = (st: { ino: number; size: number; mtimeMs: number }): string =>
   `${st.ino}:${st.size}:${st.mtimeMs}`;
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const isRoleGrant = (v: unknown): v is RoleGrant =>
+  isPlainObject(v) &&
+  v.role === ADMIN &&
+  (v.until === undefined || Number.isFinite(v.until)) &&
+  typeof v.by === 'string' &&
+  Number.isFinite(v.since) &&
+  (v.expiredRecorded === undefined || typeof v.expiredRecorded === 'boolean');
+
+const isMember = (subject: string, v: unknown): v is Member =>
+  isPlainObject(v) &&
+  v.subject === subject &&
+  typeof v.enrolled === 'boolean' &&
+  Array.isArray(v.roles) &&
+  v.roles.every(isRoleGrant) &&
+  Number.isFinite(v.since) &&
+  typeof v.by === 'string';
+
+/**
+ * Whether a parsed members.json has the shape every reader relies on: `members` a plain object,
+ * each entry a Member under its own subject, its `roles` an array of admin grants.
+ */
+export function isMembersDoc(v: unknown): v is MembersDoc {
+  return (
+    isPlainObject(v) &&
+    isPlainObject(v.members) &&
+    Object.entries(v.members).every(([subject, m]) => isMember(subject, m))
+  );
+}
+
 export class MembersStore {
   private readonly path: string;
   private readonly provenance: ProvenanceStore;
@@ -138,8 +170,10 @@ export class MembersStore {
       const key = statKey(await fh.stat());
       // The cache and its key are set together, synchronously, so a matching key means this cache.
       if (key === this.cacheKey) return this.cache;
-      const parsed = JSON.parse(await fh.readFile('utf8')) as MembersDoc;
-      if (!parsed || typeof parsed.members !== 'object') throw new Error('members.json is invalid');
+      const parsed: unknown = JSON.parse(await fh.readFile('utf8'));
+      // A document of the wrong shape is refused as a corrupt one is: the read fails, so
+      // membershipNow answers the settings' subjects from the settings and everyone else fails closed.
+      if (!isMembersDoc(parsed)) throw new Error('members.json is invalid');
       if (gen === this.writes) {
         this.cache = parsed;
         this.cacheKey = key;
