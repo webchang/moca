@@ -77,11 +77,13 @@ describe('the route table', () => {
         'DELETE /v1/subjects/{subject}',
         'PUT /v1/subjects/{subject}/roles/admin',
         'DELETE /v1/subjects/{subject}/roles/admin',
+        'POST /v1/hosts/{host}/egress',
         'POST /v1/sandboxes',
         'GET /v1/sandboxes',
         'GET /v1/sandboxes/{id}',
         'DELETE /v1/sandboxes/{id}',
         'POST /v1/sandboxes/{id}/token',
+        'GET /v1/sandboxes/{id}/egress',
         // Lease-mode spec §8.1-§8.2.
         'PUT /v1/sandboxes/{id}/mode',
         'POST /v1/sandboxes/{id}/mode-token',
