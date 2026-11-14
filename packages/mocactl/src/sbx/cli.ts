@@ -25,6 +25,8 @@ import {
   cmdLs,
   cmdRm,
   cmdSetQuota,
+  cmdSubjectChange,
+  cmdSubjects,
   cmdTagTemplate,
   cmdTemplates,
   cmdToken,
@@ -139,10 +141,10 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  runs on it, not undone (a new build is the way
                                                  back). --reason: kept in its record (not with
                                                  --build). --wait: until its worker has stopped
-                                                 (default 300 s; exit 5 on a timeout), at once for
-                                                 a build no host holds, or one whose worker a
-                                                 build not retired uses; waiting for
-                                                 its removal from every host comes with #743
+                                                 and every host has removed it (default 900 s;
+                                                 exit 5 on a timeout), at once for a build no
+                                                 host holds, or one whose worker a build not
+                                                 retired uses
   mocactl sbx templates quota TARGET --templates N --builds-queued N --active N [--owned N] [--json]
   mocactl sbx templates quota TARGET --clear [--json]
                                                  set a subject's template quotas (TARGET
@@ -158,6 +160,18 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  admin changed it in between
   mocactl sbx hosts [--json]                     per KVM host: active slots, start line, memory
                                                  headroom and floor, idle grace, disk
+  mocactl sbx admin subjects [--json]            every enrolled subject and its roles (admins only)
+  mocactl sbx admin subjects enroll|unenroll SUBJECT [--json]
+                                                 enroll SUBJECT (github:<id> or oidc:<sub>) or unenroll
+                                                 one enrolled through the API (the settings' lists
+                                                 stay; an admin named in the settings only)
+  mocactl sbx admin subjects grant SUBJECT [--until DURATION|EPOCH] [--json]
+  mocactl sbx admin subjects revoke SUBJECT [--json]
+                                                 grant or revoke the admin role; --until (e.g. 30m, 2h,
+                                                 1d, or epoch seconds; at most 365 days ahead) makes it
+                                                 lapse by itself (each
+                                                 change prints old -> new, and fails if the value
+                                                 changed between its read and its write)
   mocactl sbx create [--template ID[:TAG|@BUILD]] [--name N] [--label k=v ...] [--seed]
                      [--mode per-exec|lease|lease+processes] [--idle-timeout S] [--json]
                                                  create a sandbox (template: default); prints its id;
@@ -649,6 +663,7 @@ async function sbxMainWith(
         profile: { type: 'string' },
         'gate-record': { type: 'string' },
         'dry-run': { type: 'boolean' },
+        until: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -689,6 +704,7 @@ async function sbxMainWith(
     'egress',
     'quota',
     'policy',
+    'admin',
     'get',
     'mode',
     'reset',
@@ -936,6 +952,22 @@ async function sbxMainWith(
     io.err(`sbx: --build needs a build id (see mocactl sbx templates show ID)\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
+  const subjectAction =
+    command === 'admin' && arg === 'subjects' && extra.length > 0 ? extra[0] : undefined;
+  if (values.until !== undefined && subjectAction !== 'grant') {
+    io.err(`sbx: --until only applies to admin subjects grant\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  let until: number | undefined;
+  if (values.until !== undefined) {
+    until = parseUntil(values.until, Math.floor(Date.now() / 1000));
+    if (until === undefined) {
+      io.err(
+        `sbx: --until must be a duration (30m, 2h, 1d) or epoch seconds (not milliseconds) in the future, at most 365 days ahead (got '${sanitizeRemote(values.until)}')\n${SBX_USAGE}`,
+      );
+      return SBX_EXIT.usage;
+    }
+  }
   let maxPush: number | undefined;
   if (values['max-push'] !== undefined) {
     const raw = values['max-push'].trim();
@@ -956,18 +988,22 @@ async function sbxMainWith(
     (command === 'templates' && arg !== undefined) ||
     command === 'claude' ||
     command === 'codex' ||
-    (command === 'credentials'
-      ? arg === undefined ||
-        (arg === 'presets'
-          ? extra.length === 0
-          : arg === 'list'
+    (command === 'admin'
+      ? arg === 'subjects' &&
+        (extra.length === 0 ||
+          (['enroll', 'unenroll', 'grant', 'revoke'].includes(extra[0]!) && extra.length === 2))
+      : command === 'credentials'
+        ? arg === undefined ||
+          (arg === 'presets'
             ? extra.length === 0
-            : ['add', 'delete'].includes(arg) && extra.length === 1)
-      : command === 'put'
-        ? arg !== undefined && extra.length === 0
-        : command === 'mode'
-          ? extra.length <= 1
-          : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
+            : arg === 'list'
+              ? extra.length === 0
+              : ['add', 'delete'].includes(arg) && extra.length === 1)
+        : command === 'put'
+          ? arg !== undefined && extra.length === 0
+          : command === 'mode'
+            ? extra.length <= 1
+            : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
   if (!argsOk) {
     io.err(
       `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${SBX_USAGE}`,
@@ -1253,6 +1289,14 @@ async function sbxMainWith(
           ...(timeout !== undefined ? { timeoutS: timeout } : {}),
         });
       return cmdTemplates(ctx);
+    case 'admin':
+      if (extra.length === 0) return cmdSubjects(ctx);
+      return cmdSubjectChange(
+        ctx,
+        extra[0] as 'enroll' | 'unenroll' | 'grant' | 'revoke',
+        extra[1]!,
+        until,
+      );
     case 'hosts':
       return cmdHosts(ctx);
     case 'create':
@@ -1391,4 +1435,21 @@ async function sbxMainWith(
     default:
       return cmdEnv(ctx, id!);
   }
+}
+
+/**
+ * `--until` for `admin subjects grant`: a duration from now (`30m`, `2h`, `1d`) or
+ * epoch seconds, in the future either way and at most 365 days ahead; undefined when it is
+ * neither. The control plane's own bound is 366 days from ITS clock (so epoch milliseconds are
+ * refused); a day less here leaves room for a client clock that runs ahead of the server's.
+ */
+const MAX_GRANT_SECONDS = 365 * 86_400;
+export function parseUntil(raw: string, nowS: number): number | undefined {
+  const d = /^([1-9][0-9]*)([mhd])$/.exec(raw);
+  const n = d
+    ? nowS + Number(d[1]) * { m: 60, h: 3600, d: 86_400 }[d[2] as 'm' | 'h' | 'd']
+    : /^[1-9][0-9]*$/.test(raw)
+      ? Number(raw)
+      : Number.NaN;
+  return Number.isSafeInteger(n) && n > nowS && n <= nowS + MAX_GRANT_SECONDS ? n : undefined;
 }

@@ -3,7 +3,7 @@
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
-## 1.19.0
+## 1.21.0
 
 Admins set template quotas per subject, and reject a registered build after the fact
 ([#748](https://github.com/rossoctl/moca/issues/748)), per the
@@ -30,12 +30,67 @@ change is additive; the routes mount on both route profiles and need `SH_PROVENA
   override may leave `owned` to the default).
 - New POST /v1/templates/{id}/builds/{build}/reject `{reason}` (admin; the reason is required): a
   registered build becomes `rejected` with `reason.rule` `admin`, its activation leases go, a host
-  holding it finds it in the wanted state's `stop` (as a retired build) and its `detached` report is
-  taken, and a sandbox create naming it answers `400 unknown_template`. A `reject` record names the
-  admin, `from`, the reason and `buildRecord` (the digest of the build's `build` record). Answers
-  `{templateId, subject, build, buildId, record, status: rejected}`; idempotent (`record: null`).
-  Refused `409 build_in_use` while a live sandbox runs on the build; any status but `registered` is
-  `400 invalid_request`. Not reversible.
+  holding it finds it in the wanted state's `stop` (as a retired build, but never in `remove`: its
+  worker is stopped, not removed, and no `removed` report is taken for it) and its `detached`
+  report is taken, and a sandbox create naming it answers `400 unknown_template`. A `reject` record
+  names the admin, `from`, the reason and `buildRecord` (the digest of the build's `build` record).
+  Answers `{templateId, subject, build, buildId, record, status: rejected}`; idempotent
+  (`record: null`). Refused `409 build_in_use` while a live sandbox runs on the build; any status
+  but `registered` is `400 invalid_request`. Not reversible.
+
+## 1.20.0
+
+Enrollment and the admin role through the API
+([#739](https://github.com/rossoctl/moca/issues/739)), per the
+[enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md). Every change is
+additive; without `SH_PROVENANCE_DIR` nothing changes.
+
+- New GET /v1/subjects (every enrolled subject with its roles, each with `source: env | api`),
+  PUT and DELETE /v1/subjects/{subject} (enroll with `{"enrolled": true}`, unenroll), and PUT and
+  DELETE /v1/subjects/{subject}/roles/admin (grant, with an optional `until` in epoch seconds, at
+  most 366 days ahead; revoke), on both route profiles. Any admin reads the list; only an admin named in
+  `SH_ADMIN_SUBJECTS` changes it (`403 forbidden` otherwise). The same holds for a PUT /v1/policy
+  that widens the policy (a trusted gate record, a registry or a repository added; a profile added
+  or loosened: a rule dropped from `requires`, `requireOfflineGate` off, `selfAttest` or
+  `selfAttestEgress` on, an envelope bound raised or removed, its `exact` size changed or removed;
+  or a `defaultProfile` that accepts more): an admin by an API grant may narrow it (a profile
+  removed is a narrowing) and change its quotas. Each change answers the subject with
+  the `record` it wrote (null when nothing changed). With no store the routes answer
+  `400 invalid_request`. A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from
+  the settings and any role); enrolling a subject the settings enroll writes nothing
+  (`record: null`).
+- A subject on these routes is `github:<numeric id>` or `oidc:<provider sub>` (the sub pattern the
+  OIDC login verifies); `test:<n>` and anything else is `400 invalid_request`. New `Subject` schema.
+- New error codes `bootstrap_subject` (409: unenrolling or revoking a subject the settings enroll or
+  make admin) and `self_revoke` (409: an admin revoking its own role).
+- With a store, roles and enrollment are evaluated per request: the control plane replaces a
+  verified token's `roles` with the subject's roles now, so a grant, a revoke or a lapsed `until`
+  takes effect at the subject's next request. The login, the refresh and the egress owner check use
+  the same evaluation. Without a store the token's claims stand, as before.
+- Each change is a record on a new `members` provenance stream: `member {subject, enrolled, before}`
+  and `role {subject, role, state: granted | revoked | expired, until, before}`, naming the acting
+  admin (`control-plane` for an `expired`, written once). `verify-provenance.py` and `verifyExport`
+  accept the two kinds on that stream only.
+
+## 1.19.0
+
+The host agent removes a retired build's worker and snapshot
+([#743](https://github.com/rossoctl/moca/issues/743)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.1 step 7.
+Every change is additive.
+
+- GET /v1/hosts/{host}/wanted gains `remove`: the retired builds the host holds with no live sandbox
+  and no pinned session's hold on their worker, each also in `stop`; while a sandbox that ended on
+  the worker is still in `egressSids` (less than 600 s ago), it is in `stop` only, so its last
+  egress events are still taken. The agent stops a running worker, then uninstalls it
+  (`install-host.sh --uninstall --keep-shared`: its own files only), deletes the snapshot and its template record, and reports it. A
+  worker with a live sandbox is in no list, nor is a retired build whose build id or worker a build
+  that is not retired shares (in any template): its snapshot or worker is still needed.
+- POST /v1/hosts/{host}/workers/report takes `removed` for a retired build the host holds: a `retire`
+  record by `host:<id>` with `event: removed` and `buildRecord` (the digest of the build's `build`
+  record). The host no longer holds the build, so TemplateBuild's `heldBy` drops it at once, before
+  the host's next inventory. A `removed` for a build the wanted state leaves out because a build not
+  retired shares it is refused `409 build_in_use`.
 
 ## 1.18.0
 

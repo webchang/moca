@@ -16,6 +16,7 @@ import type {
   SbxQuota,
   SbxSandbox,
   SbxSandboxCreate,
+  SbxSubject,
 } from './api.js';
 import { openExec, sandboxFailureText, type ExecFactory } from './exec.js';
 import {
@@ -872,6 +873,126 @@ export async function cmdSetQuota(
       c.io.out(
         `${sanitizeRemote(r.target)}: ${quotaText(read)} -> ${quota === null ? 'the default' : quotaText(r.quota ?? quota)}` +
           ` (policy ${sanitizeRemote(r.policy)}, record ${sanitizeRemote(r.record)})\n`,
+      );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** The loud failure of an admin write: the value changed between this command's read and its write. */
+function raced(c: SbxCtx, what: string, read: string, before: string, now: string): number {
+  c.io.err(
+    `sbx: ${what} was changed by someone else between read and write: ${read} / ${before} / ${now} ` +
+      '(read / before this write / now): check it, and write again if need be',
+  );
+  return SBX_EXIT.failed;
+}
+
+/** One subject, for a person: `github:9  enrolled (api)  admin (api, until 2026-11-08T12:00:00Z)`. */
+function subjectLine(s: SbxSubject): string {
+  const roles = s.roles.map(
+    (r) =>
+      `${sanitizeRemote(r.role)} (${r.source}${r.until !== null ? `, until ${new Date(r.until * 1000).toISOString().replace('.000Z', 'Z')}` : ''})`,
+  );
+  return [
+    sanitizeRemote(s.subject),
+    `${s.enrolled ? 'enrolled' : 'not enrolled'} (${s.source}${s.source === 'env' && s.storeEnrolled ? ', api too' : ''})`,
+    ...roles,
+  ].join('  ');
+}
+
+/** `sbx admin subjects`: every enrolled subject and its roles (admins). */
+export async function cmdSubjects(c: SbxCtx): Promise<number> {
+  try {
+    const subjects = await c.api.listSubjects();
+    if (c.json) c.io.out(JSON.stringify(subjects) + '\n');
+    else for (const s of subjects) c.io.out(subjectLine(s) + '\n');
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** An API-granted admin role's state: `none`, or `admin` with its `until` (null: no expiry). */
+const roleOf = (s: SbxSubject | undefined) => {
+  const r = s?.roles.find((x) => x.role === 'admin' && x.source === 'api');
+  return r ? `admin until ${r.until ?? 'no expiry'}` : 'none';
+};
+
+/**
+ * Whether the subject read is already in the state the action asks for, so the write should change
+ * nothing (`record: null`); undefined where the list cannot tell. Enrollment compares the store's
+ * own enrollment (`storeEnrolled`), not `enrolled`, which folds in the settings and an admin role:
+ * the control plane answers an enroll of a settings subject unchanged, and refuses its unenroll.
+ */
+function alreadyThere(
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  s: SbxSubject | undefined,
+  until?: number,
+): boolean | undefined {
+  switch (action) {
+    case 'enroll':
+      return s?.source === 'env' || s?.storeEnrolled === true;
+    case 'unenroll':
+      return s?.source === 'env' ? undefined : s?.storeEnrolled !== true;
+    case 'grant':
+      return roleOf(s) === `admin until ${until ?? 'no expiry'}`;
+    case 'revoke':
+      // A lapsed grant is listed as none, yet a revoke still records its removal: "none" tells nothing.
+      return roleOf(s) === 'none' ? undefined : false;
+  }
+}
+
+/**
+ * `sbx admin subjects enroll|unenroll|grant|revoke SUBJECT` (an admin named in the
+ * settings). The subjects are read first, the change written, and the answer compared with the
+ * read. These answers name no `before`; their `record` does the same work (null when nothing
+ * changed), so a read that says "already so" with a record written, or "to change" with none, is a
+ * concurrent write, reported loudly (exit 1). Prints old -> new and the record's digest.
+ */
+export async function cmdSubjectChange(
+  c: SbxCtx,
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  subject: string,
+  until?: number,
+): Promise<number> {
+  try {
+    const mismatch = await loginMismatch(c);
+    if (mismatch) {
+      c.io.err(`sbx: refused: ${mismatch}`);
+      return SBX_EXIT.failed;
+    }
+    c.io.err(`sbx: admin write to ${sanitizeRemote(c.url)}`);
+    const read = (await c.api.listSubjects()).find((s) => s.subject === subject);
+    const r =
+      action === 'enroll'
+        ? await c.api.enrollSubject(subject)
+        : action === 'unenroll'
+          ? await c.api.unenrollSubject(subject)
+          : action === 'grant'
+            ? await c.api.grantAdmin(subject, until)
+            : await c.api.revokeAdmin(subject);
+    const state = (s: SbxSubject | undefined) =>
+      action === 'enroll' || action === 'unenroll'
+        ? s?.enrolled
+          ? `enrolled (${s.source})`
+          : 'not enrolled'
+        : roleOf(s);
+    if (c.json) c.io.out(JSON.stringify({ ...r, read: read ?? null }) + '\n');
+    else
+      c.io.out(
+        `${subjectLine(r)}${r.record ? '' : '  (unchanged)'}\n` +
+          `${sanitizeRemote(subject)}: ${state(read)} -> ${state(r)}${r.record ? ` (record ${sanitizeRemote(r.record)})` : ''}\n`,
+      );
+    const there = alreadyThere(action, read, until);
+    if (there !== undefined && there !== (r.record === null))
+      return raced(
+        c,
+        `${subject}'s ${action === 'enroll' || action === 'unenroll' ? 'enrollment' : 'admin role'}`,
+        state(read),
+        r.record === null ? 'already so' : 'changed by this write',
+        state(r),
       );
     return SBX_EXIT.ok;
   } catch (err) {

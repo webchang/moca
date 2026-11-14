@@ -1,7 +1,7 @@
 import { CpError } from './errors.js';
 import { hostMatches, parseDestination } from './egress-destination.js';
 import { resolverFor } from './egress-resolver.js';
-import { asRecord, auditBestEffort, seconds } from './handler-util.js';
+import { asRecord, auditBestEffort, membershipNow, seconds } from './handler-util.js';
 import type { Handler } from './handlers.js';
 import { isEnrolledForSandbox } from './sandbox-config.js';
 import { SANDBOX_ID_RE } from './sandbox-handlers.js';
@@ -60,7 +60,9 @@ export const EGRESS_HANDLERS: Record<string, Handler> = {
       throw new CpError('no_credential', 'no credential for this destination');
     };
     // The route gate, not the login gate: on `combined` login is open, the sandbox service is not.
-    if (!isEnrolledForSandbox(owner, deps.identity.rolesFor(owner), deps.config)) return none();
+    // Roles and store enrollment now, as a request of the owner's would be.
+    const m = await membershipNow(deps, owner, deps.identity.rolesFor(owner));
+    if (!isEnrolledForSandbox(owner, m.roles, deps.config, m.enrolled)) return none();
 
     // 3. Credentials: one element per (credential, matching destination entry).
     const elements: Element[] = [];

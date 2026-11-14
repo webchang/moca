@@ -205,6 +205,53 @@ Edit the list and re-run `setup.sh`. The control plane rolls with the new list:
 Admins (`SBX_ADMIN_SUBJECTS`) may list, read and delete every sandbox, but never mint a token for
 another user's: they cannot run commands in another user's code.
 
+**Enrollment and admins through the API** (on a deployment with a template store,
+`SBX_TEMPLATE_STORE=1`). The settings above stay the bootstrap; an admin named in
+`SBX_ADMIN_SUBJECTS` adds to them without a `setup.sh` run (an API-granted admin can't change
+access: `403`), each change a record on the `members` provenance stream:
+
+```bash
+mocactl sbx admin subjects                                   # who is enrolled, and how
+mocactl sbx admin subjects enroll github:<id>                # or unenroll; oidc:<sub> too
+mocactl sbx admin subjects grant github:<id> --until 1h      # a temporary admin: lapses by itself (365d at most)
+mocactl sbx admin subjects revoke github:<id>
+```
+
+Each change reads the subjects first and prints `old -> new` with its record; if the subject changed
+between that read and the write (another admin at once), it says so and exits 1: check and write
+again. A login issued for another deployment (another control plane or issuer) is refused before the
+write.
+
+It takes effect at the subject's next request. A subject in `SBX_ALLOWED_SUBJECTS` or
+`SBX_ADMIN_SUBJECTS` can't be unenrolled or revoked this way (`409 bootstrap_subject`): change the
+settings for those. Enrolling one of them writes nothing (it is already enrolled). Before removing a
+subject from the settings, check its `storeEnrolled` in `mocactl sbx admin subjects --json`
+(`enrolled (env, api too)` in the list): if true, the store still enrolls it, so unenroll it through
+the API once the settings no longer name it. An admin can't revoke its own role.
+A subject holding an admin grant can't be unenrolled while it does (`409 admin_granted`): revoke
+the role first.
+If the store's `members.json` can't be read (damaged by hand, a bad restore), the subjects in the
+settings keep working, with a warning in the control plane's log (once a minute at most), while API enrollments and grants
+don't count (those subjects are refused) until the file is restored: the settings stay the way back
+in.
+
+**What this changes for an operator:**
+
+- **Who controls access.** Without a store, every enrollment or admin change is a `setup.sh` run.
+  With one, an admin named in `SBX_ADMIN_SUBJECTS` enrolls subjects and grants admin through the
+  API. The record on the `members` stream is then the trace, so read it (`GET /v1/subjects`, the
+  provenance export) as part of any access review.
+- **Roles come from the store, not the login.** With a store, the control plane replaces a token's
+  `roles` claim, on every request, with the subject's roles now (the settings plus the store's
+  grants). Two consequences:
+  - **A login minted as a user acts as an admin** if its subject holds an API admin grant. Check
+    `GET /v1/subjects` before treating a login as user-only.
+  - **Revocation is immediate.** Removing a subject from `SBX_ADMIN_SUBJECTS` (a `setup.sh` run), or
+    revoking an API grant, takes effect at the subject's next request, even for an admin token that
+    is still valid. But `setup.sh` can't remove an API grant (those live in the store, on its
+    volume), so after removing an admin from the settings, check `GET /v1/subjects` for API admins
+    too. For a temporary admin, prefer an API grant with `--until`: it lapses by itself.
+
 ## 5. Adding, updating and removing a template
 
 The template onboarding folder, `deploy/sbx/template-onboarding/` (its `GUIDE.md` and
@@ -913,7 +960,8 @@ The self-serve template build of the
 §6.1, and the activation of §6.3. `deploy/sbx/host-agent.sh --once` is one poll of a KVM host's
 agent: it reports what the host holds, claims queued template builds (clients create them with
 `POST /v1/templates`), runs `template-build.sh` on each with its gate record, and reports the
-result; then it starts and stops installed workers by the host's wanted state. The control plane
+result; then it starts and stops installed workers by the host's wanted state, and removes the
+retired builds it is told to (worker and snapshot). The control plane
 registers or rejects each built build by policy; nobody approves it. It needs:
 
 - on the control plane, the template store and this host's bearer: run `setup.sh` with
@@ -934,8 +982,8 @@ registers or rejects each built build by policy; nobody approves it. It needs:
   `sbx-host-agent.service` with its timer (every 2 minutes) and `sbx-host-agent-wanted.service`
   with its timer (every 15 s, the wanted state alone); then `systemctl daemon-reload` and
   `systemctl enable --now sbx-host-agent.timer sbx-host-agent-wanted.timer`. The unit sets
-  `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
-  `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's
+  `SBX_TEMPLATE_BUILD` and `SBX_INSTALL_HOST` to the checkout at `/srv/sbx/src` (the agent cannot
+  find them from `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's
   home): log root's podman in with `--authfile /run/containers/0/auth.json`. With `SBX_REGISTRY`
   set, no build is claimed until that file holds a login for it. The unit also gives Go a home and
   caches under `/srv/sbx` (`build-snapshot.sh` compiles the guest agent): run
@@ -947,7 +995,7 @@ It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), cla
 `SBX_BUILD_CONCURRENCY` builds a poll (default 1, at most 4), and checks a gate record's bytes
 against their sha256 before building with it. The token stays in a 0600 header file, never in argv
 or the log. A bad setting is refused (exit 2) before any call. Each run ends with one summary line,
-`{"agent":"summary","claimed","built","failed","started","stopped","errors"}`, in the unit's
+`{"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}`, in the unit's
 journal, with `"psi":"absent"`, `"sliceUnread":[...]` and `"memfileMismatch":<n>` when there is
 something to say about memory, `"startQueued":<n>` when the start limit left wanted workers for a
 later run, and `"graced":<n>` when the idle grace keeps any.
@@ -1159,6 +1207,26 @@ while, so a template used again soon is warm (no memory-file read at all).
   and stops released workers as before; the agent then just applies `stop`. **Roll out the control
   plane before setting `SBX_IDLE_GRACE_S` on a host**: the order is the control plane, then the
   agent, then the setting.
+
+**Retired builds are removed by the agent.** Once a client retires a template or a build (`POST
+/v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`, or `mocactl sbx templates
+retire`), each host holding it gets it in its wanted state's `stop` and `remove` as soon as no live
+sandbox runs on its worker and no pinned session's hold keeps it; a worker whose sandbox ended less
+than 600 s ago is in `stop` only until then, so the host still ships that sandbox's last egress
+events (`retire --wait`'s default `--timeout`, 900 s, covers that window). In the same run the agent stops the worker, runs `install-host.sh
+--uninstall <worker> --keep-shared` (`SBX_INSTALL_HOST`), deletes the snapshot directory and its template record
+under `/srv/sbx`, and reports `removed`: the template's provenance gains a `retire` record by
+`host:<id>`, and the build's `heldBy` (`GET /v1/templates/{id}/builds/{build}`) no longer lists the
+host. It deletes only what its own template record names for that build id and worker, never a
+running worker's; a name no record matches is an `error` line and deletes nothing. The worker's
+workspace data stays for the janitor, as with any uninstall. `--keep-shared` removes the worker's own
+files only: even the host's last worker leaves the shared units (`sbx-worker@.service`, `sbx.slice`),
+`moca-egress` and its credential injection in place for the next worker, so a client's retire never
+undoes an operator's `--egress`. To remove them from a host with no worker left, run `install-host.sh
+--uninstall <that worker>` again without it (§12). Also re-run `setup.sh` without the
+worker's id in `SBX_WORKERS` (§5) to revoke its relay token. `mocactl sbx templates retire ID
+--wait` returns once the worker has stopped and every holding host has removed it; a host that is
+down removes it at its next poll.
 
 **A registered build's worker is still installed by an operator.** The agent builds, reports, and
 starts and stops installed workers; it installs none, and a wanted build whose worker is not

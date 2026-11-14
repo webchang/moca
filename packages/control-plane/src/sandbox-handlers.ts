@@ -3,6 +3,7 @@ import {
   asRecord,
   auditBestEffort,
   isAdmin,
+  membershipNow,
   requireEnrolledPrincipal,
   requireReader,
   seconds,
@@ -47,6 +48,7 @@ import {
   TEMPLATE_ID_RE,
   type Policy,
   type PolicyStore,
+  type Profile,
 } from './template-policy.js';
 import {
   TEMPLATE_DOC_SCHEMA,
@@ -842,6 +844,18 @@ const quotaLocks = new WeakMap<TemplateCatalog, SubjectQueue>();
 function quotaLock(cat: TemplateCatalog): SubjectQueue {
   let q = quotaLocks.get(cat);
   if (!q) quotaLocks.set(cat, (q = new SubjectQueue()));
+  return q;
+}
+
+/**
+ * One PUT /v1/policy at a time per policy store, within this process: its read, its widening check
+ * and its write run as one step, so two PUTs never both start from the same policy. The store
+ * serializes each call, not a read and a later write; a deployment runs one control plane.
+ */
+const policyLocks = new WeakMap<PolicyStore, SubjectQueue>();
+function policyLock(store: PolicyStore): SubjectQueue {
+  let q = policyLocks.get(store);
+  if (!q) policyLocks.set(store, (q = new SubjectQueue()));
   return q;
 }
 
@@ -2284,11 +2298,13 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const owner = asRecord(ctx.body).owner;
   if (typeof owner !== 'string' || !MEMBER_SUBJECT_RE.test(owner))
     throw new CpError('invalid_request', `owner must be a subject, ${MEMBER_SUBJECT_FORMS}`);
-  // The new owner must be able to act on it: enrolled now (the allow list, or an admin).
-  if (!isEnrolledForSandbox(owner, deps.identity.rolesFor(owner), deps.config))
+  // The new owner must be able to act on it: enrolled now (the allow list, an admin, or the
+  // members store), evaluated as a request of theirs would be.
+  const m = await membershipNow(deps, owner, deps.identity.rolesFor(owner));
+  if (!isEnrolledForSandbox(owner, m.roles, deps.config, m.enrolled))
     throw new CpError(
       'invalid_request',
-      `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS first`,
+      `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS, or enroll them through /v1/subjects, first`,
     );
   let before = null as string | null;
   let record: string | null = null;
@@ -2317,6 +2333,88 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
     });
   }
   return { status: 200, body: { templateId: d0.id, subject: p.sub, owner, before, record } };
+}
+
+/**
+ * How `next` accepts more than `cur`, as one profile: a rule dropped from `requires`, the offline
+ * gate no longer required, self-attestation (or its egress) turned on, an envelope bound raised or
+ * removed, or the exact size changed or removed. Empty: `next` accepts no more than `cur`.
+ */
+function profileWidens(cur: Profile, next: Profile): string[] {
+  const out: string[] = [];
+  const req = new Set(next.requires);
+  if (cur.requires.some((r) => !req.has(r))) out.push('requires');
+  // As checkCreate reads it: absent means the offline gate is required.
+  if (cur.requireOfflineGate !== false && next.requireOfflineGate === false)
+    out.push('requireOfflineGate');
+  if (cur.selfAttest !== true && next.selfAttest === true) out.push('selfAttest');
+  if (cur.selfAttestEgress !== true && next.selfAttestEgress === true) out.push('selfAttestEgress');
+  const a = cur.envelope;
+  const b = next.envelope;
+  if (
+    b.maxGuestMb > a.maxGuestMb ||
+    b.maxVcpus > a.maxVcpus ||
+    b.maxWorkspaceMb > a.maxWorkspaceMb ||
+    (a.exact !== undefined &&
+      (b.exact === undefined ||
+        b.exact.guestMb !== a.exact.guestMb ||
+        b.exact.vcpus !== a.exact.vcpus))
+  )
+    out.push('envelope');
+  return out;
+}
+
+/**
+ * The policy fields a change widens: a gate record trusted that was not, a registry allowed that
+ * was not, a registry's repository list that gains an entry or is dropped (no list allows every
+ * repository), a profile added or loosened (profileWidens), or a default profile that accepts more
+ * than the one it replaces. Registries and their keys compare case-insensitively, as the policy
+ * reads them. A profile removed, and every quota change, is not a widening.
+ */
+function policyWidens(cur: Policy, next: Policy): string[] {
+  const out: string[] = [];
+  for (const [name, n] of Object.entries(next.profiles)) {
+    const c = Object.hasOwn(cur.profiles, name) ? cur.profiles[name] : undefined;
+    if (!c) out.push(`profiles.${name} (new)`);
+    else for (const f of profileWidens(c, n)) out.push(`profiles.${name}.${f}`);
+  }
+  // Nothing ranks profiles: a new default must accept no more than the old one did.
+  if (next.defaultProfile !== cur.defaultProfile) {
+    const oldDefault = Object.hasOwn(cur.profiles, cur.defaultProfile)
+      ? cur.profiles[cur.defaultProfile]
+      : undefined;
+    const newDefault = next.profiles[next.defaultProfile]!;
+    if (!oldDefault || profileWidens(oldDefault, newDefault).length) out.push('defaultProfile');
+  }
+  const trusted = new Set(cur.trustedGateRecords);
+  if (next.trustedGateRecords.some((g) => !trusted.has(g))) out.push('trustedGateRecords');
+  const lower = (xs: string[]) => new Set(xs.map((x) => x.toLowerCase()));
+  const regs = lower(cur.allowedRegistries);
+  if (next.allowedRegistries.some((r) => !regs.has(r.toLowerCase()))) out.push('allowedRegistries');
+  // Each registry's effective list, as admitBuild reads it: the union of the lists of every key
+  // that names it in any case, so a second key in another case can't widen it unseen.
+  const repos = (m: Record<string, string[]> | undefined) => {
+    const out = new Map<string, Set<string>>();
+    for (const [k, v] of Object.entries(m ?? {})) {
+      const reg = k.toLowerCase();
+      const set = out.get(reg) ?? new Set<string>();
+      for (const x of v) set.add(x);
+      out.set(reg, set);
+    }
+    return out;
+  };
+  const was = repos(cur.allowedRepositories);
+  const now = repos(next.allowedRepositories);
+  const nextRegs = lower(next.allowedRegistries);
+  for (const [reg, list] of was) {
+    if (!nextRegs.has(reg)) continue;
+    const n = now.get(reg);
+    if (!n || [...n].some((x) => !list.has(x))) {
+      out.push('allowedRepositories');
+      break;
+    }
+  }
+  return out;
 }
 
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
@@ -2405,27 +2503,44 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const store = policyStore(deps);
     const bad = policyProblems(ctx.body);
     if (bad.length) throw new CpError('invalid_request', bad.join('; '));
-    // Self-attestation: a record whose trust this removes narrows its deployment-visible templates
-    // to private on read. Name each narrowed build in the policy record, so nothing is silent. The
-    // policy itself is what the admin sent, every field kept as sent.
-    const before = new Set((await store.current()).policy.trustedGateRecords);
-    const after = new Set((ctx.body as Policy).trustedGateRecords);
-    const narrowed: { template: string; buildId: string }[] = [];
-    if ([...before].some((g) => !after.has(g)) && deps.templates)
-      for (const d of await deps.templates.list())
-        if (effectiveVisibility(d, before) === 'deployment')
-          for (const x of d.builds)
-            if (
-              x.status === 'registered' &&
-              attestationOf(x, before) === 'deployment' &&
-              attestationOf(x, after) === 'self'
-            )
-              narrowed.push({ template: d.id, buildId: x.buildId });
-    const { policy, record } = await store.set(
-      ctx.body as Policy,
-      p.sub,
-      narrowed.length ? { narrowed } : undefined,
-    );
+    // The check and the write are one step (policyLock): a PUT built from an older policy can't
+    // pass the widening check against it and then land after a settings admin's narrowing,
+    // re-adding the trust that removed.
+    const { policy, record, narrowed } = await policyLock(store).run('policy', async () => {
+      const before = (await store.current()).policy;
+      // Widening what the policy trusts is the same kind of act as widening access (enrollment and
+      // roles spec, decision 1): an admin by an API grant may narrow the policy and change its
+      // quotas, but adding a trusted gate record, a registry or a repository needs an admin named
+      // in the settings. Without a members store every admin is one.
+      const widened = policyWidens(before, ctx.body as Policy);
+      if (widened.length && deps.members && !deps.members.bootstrap.admins.includes(p.sub))
+        throw new CpError(
+          'forbidden',
+          `widening ${widened.join(', ')} requires an admin named in the settings (SH_ADMIN_SUBJECTS)`,
+        );
+      // Self-attestation: a record whose trust this removes narrows its deployment-visible
+      // templates to private on read. Name each narrowed build in the policy record, so nothing is
+      // silent. The policy itself is what the admin sent, every field kept as sent.
+      const was = new Set(before.trustedGateRecords);
+      const after = new Set((ctx.body as Policy).trustedGateRecords);
+      const narrowed: { template: string; buildId: string }[] = [];
+      if ([...was].some((g) => !after.has(g)) && deps.templates)
+        for (const d of await deps.templates.list())
+          if (effectiveVisibility(d, was) === 'deployment')
+            for (const x of d.builds)
+              if (
+                x.status === 'registered' &&
+                attestationOf(x, was) === 'deployment' &&
+                attestationOf(x, after) === 'self'
+              )
+                narrowed.push({ template: d.id, buildId: x.buildId });
+      const set = await store.set(
+        ctx.body as Policy,
+        p.sub,
+        narrowed.length ? { narrowed } : undefined,
+      );
+      return { ...set, narrowed };
+    });
     await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
     return {
       status: 200,
