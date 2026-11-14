@@ -1,8 +1,7 @@
 # Moca — Template Onboarding Guide
 
 > **Preview.** Sandbox templates, their onboarding tools and the self-serve template API are
-> implemented but not yet declared Stable; interfaces and limits may change. This guide describes
-> the units proposed with #730 to #752; a section whose unit changes in review changes with it.
+> implemented but not yet declared Stable; interfaces and limits may change.
 
 This guide takes a container image to a **sandbox template**: a named image that a client, or an
 agent session, asks for by id, and whose commands then run in microVMs restored from that image's
@@ -22,7 +21,7 @@ plane and one build (§8).
   Deploying SBX0 itself is [`deploy/sbx/README.md`](../README.md) and
   [`RUNBOOK.md`](../RUNBOOK.md); using a sandbox is the
   [user guide](../../../docs/sbx/user-guide.md); templates in Moca's own agent sessions are designed in
-  `docs/specs/2026-10-30-session-sandbox-templates-design.md`.
+  [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../../docs/specs/2026-10-30-session-sandbox-templates-design.md).
 - **Every host and registry below is a placeholder:** `sbx-api.example.com`, `registry.example.com`.
   No real host, account id or token appears here.
 
@@ -68,9 +67,13 @@ copy-pasteable commands; §6 is a client choosing between the two sample templat
 
 ## 1. Mental model (read this first)
 
-1. **A sandbox runs every command in a fresh microVM** restored from its template's golden
-   snapshot, with the sandbox's own `/workspace` attached. Files in `/workspace` persist across
-   commands; nothing else does.
+1. **A sandbox runs every command in a fresh microVM** (the default per-exec mode) restored from
+   its template's golden snapshot, with the sandbox's own `/workspace` attached. Files in
+   `/workspace` persist across commands; nothing else does. A lease mode (`sbx create --mode
+lease|lease+processes`, `sbx mode`, `sbx reset`) keeps the guest between commands, where the
+   deployment allows it (`SBX_MODES_ALLOWED`, default `per-exec`) and the snapshot advertises
+   `lease-v1` (the
+   [lease-mode spec](../../../docs/specs/2026-11-08-sbx-lease-mode-design.md)).
 2. **One worker (`microvm-worker`) serves one snapshot.** A template is a name for a worker, so a new
    image of a template is a new snapshot and a new worker; the old one drains.
 3. **The client chooses the template** when it creates a sandbox (`mocactl sbx create --template ID`,
@@ -154,12 +157,13 @@ own key, refused unless an admin lists it, and listing it would bypass the repos
 
 **Which profile a create names** is its gate: the policy's profiles, listed by `GET /v1/policy`.
 `base` needs no gate record. `benchmark` needs a gate record that passed and that an admin trusts
-(`trustedGateRecords`). Two self-attested profiles accept the creating subject's own
+(`trustedGateRecords`; trusting a record widens the policy, which only an admin named in the
+settings, `SBX_ADMIN_SUBJECTS`, may do). Two self-attested profiles accept the creating subject's own
 gate record, for that subject's templates only, which stay private until an admin trusts the record:
 `benchmark-self` (the benchmark rules, offline) and `general-self` (no X11, so the KVM host's
 allowlisted egress). A build shows `attestation: deployment | self`. A profile exists on a deployment
 only once its stored policy lists it, so check `GET /v1/policy` first. See the subject trust spec,
-`docs/specs/2026-11-08-subject-trust-gate-records-design.md`.
+[`docs/specs/2026-11-08-subject-trust-gate-records-design.md`](../../../docs/specs/2026-11-08-subject-trust-gate-records-design.md).
 
 ### The probe must be shareable
 
@@ -217,6 +221,7 @@ template-build: the probe passed
 ==> built template default: snapshot default-eed901b838bf, worker sbx_default_eed901b838bf
 ==> record: /srv/sbx/templates/default-eed901b838bf.json (copy it to the operator's machine for deploy/sbx/template-onboarding/template-register.sh)
 ==> then, after setup.sh: sudo deploy/sbx/install-host.sh <bundle of sbx_default_eed901b838bf> --snapshot default-eed901b838bf --budget-mb <at least 1888>
+==> install-host.sh wires /srv/sbx/templates/default-eed901b838bf.json into the worker (SH_TEMPLATE_RECORD, SANDBOX_TEMPLATE=default), so the worker checks it at every start
 ```
 
 A 256 MiB guest's snapshot is small; a 4 GiB one is about 7.3 GB (§9).
@@ -257,22 +262,28 @@ mocactl sbx run -- python3 -c 'print(6*7)'
 
 ## 4b. From an OCI image to a Moca template (self-serve)
 
-For a **general user**: you have a Moca login and an image, and no operator access. Every step goes
-through the API (`POST /v1/templates`) and `mocactl sbx`. Moca builds and probes the template on a KVM
-host and registers it by policy; nobody approves it. Sections 4 and 5 are the operator's path for the
-same result.
+For a **general user**: you have a Moca login and an image, and no operator access. Every step you
+take goes through the API (`POST /v1/templates`) and `mocactl sbx`. Moca builds and probes the
+template on a KVM host and registers it by policy; nobody approves it. One step is still an
+operator's: the host agent installs no worker, so an operator installs each registered build's
+worker (its id in `SBX_WORKERS`, `setup.sh` for its relay token, then `install-host.sh` on the host
+that built it; [RUNBOOK](../RUNBOOK.md#the-template-host-agent)). Until then an activation's host
+reports it `refused` (`worker not installed`). Sections 4 and 5 are the operator's path for the same
+result.
 
 The commands that go through the API are as recorded in validation runs (answers abridged; their
 ids replaced by placeholders). **Both paths below ran end to end on a KVM host from a user's own
-images**, from create to retire, and so did the failures shown with them. Only a template with
-`egress: true` on a host that ships its egress is still _(unverified)_: those runs had egress off.
+images**, from create to retire, and so did the failures shown with them. Those runs had egress
+off: a self-serve template with `egress: true` is _(unverified)_ on these paths.
 
 ### 4b.1 What you need, and what you get
 
 - **An image, pinned by digest** (`repository@sha256:<64 hex>`), from a registry the deployment's
   policy allows. Read it first: `GET /v1/policy` lists `allowedRegistries` and, per registry,
   `allowedRepositories` (§3). Docker Hub is written with its host: `docker.io/library/python@sha256:…`.
-- **A Moca login** (`mocactl sbx login`) and room in your quota (`GET /v1/quota`).
+- **A Moca login** (`mocactl sbx login`) as an enrolled subject (in the deployment's
+  `SBX_ALLOWED_SUBJECTS`, or enrolled by an admin with `mocactl sbx admin subjects enroll`), and
+  room in your quota (`GET /v1/quota`).
 - **You get** a template only you can see, built and probed by Moca, which you activate, use from
   sandboxes or Moca agent sessions, update and retire. Others see it only if you make it
   `deployment`-visible, which a self-attested template can't be until an admin trusts its gate
@@ -283,13 +294,14 @@ images**, from create to retire, and so did the failures shown with them. Only a
 The profile you name in the create is the gate your template must pass (`GET /v1/policy` lists the
 deployment's profiles; a profile exists only once its stored policy lists it):
 
-| Profile          | Gate record                                        | Network                       | Visible to others                         | Use it for                                     |
-| ---------------- | -------------------------------------------------- | ----------------------------- | ----------------------------------------- | ---------------------------------------------- |
-| `base`           | none                                               | the host's allowlisted egress | if you make it so                         | most templates: a toolchain, an app            |
-| `general-self`   | **your own**, passed                               | the host's allowlisted egress | only after an admin trusts the record     | a tested image you want proved, with network   |
-| `benchmark-self` | **your own**, passed, its floor proved offline     | none (X11)                    | only after an admin trusts the record     | a benchmark task environment you gate yourself |
-| `benchmark`      | one an admin already trusts (`trustedGateRecords`) | none (X11)                    | as the deployment's curated templates are | the curated benchmark images                   |
+| Profile          | Gate record                                        | Network                       | Guest size (default policy)  | Visible to others                         | Use it for                                     |
+| ---------------- | -------------------------------------------------- | ----------------------------- | ---------------------------- | ----------------------------------------- | ---------------------------------------------- |
+| `base`           | none                                               | the host's allowlisted egress | up to 16 GiB and 8 vCPUs     | if you make it so                         | most templates: a toolchain, an app            |
+| `general-self`   | **your own**, passed                               | the host's allowlisted egress | exactly 4096 MiB and 2 vCPUs | only after an admin trusts the record     | a tested image you want proved, with network   |
+| `benchmark-self` | **your own**, passed, its floor proved offline     | none (X11)                    | exactly 4096 MiB and 2 vCPUs | only after an admin trusts the record     | a benchmark task environment you gate yourself |
+| `benchmark`      | one an admin already trusts (`trustedGateRecords`) | none (X11)                    | exactly 4096 MiB and 2 vCPUs | as the deployment's curated templates are | the curated benchmark images                   |
 
+A deployment's stored policy may set other sizes: `GET /v1/policy` shows each profile's envelope.
 Most users start with `base` (§4b.4). If you want Moca to hold your template to a test result, gate
 it yourself and use a self-attested profile (§4b.5).
 
@@ -301,10 +313,11 @@ A stranger's image usually fails as published, for reasons most images share:
   boots with none, so `localhost` doesn't resolve.
 - **The guest agent's minimum is missing**, most often `file`, and any tool your spec's `tools` lists
   (`git`, `rg`, …).
-- **`ca-certificates`** is missing. A template with `egress: true` needs it on a host whose egress
-  intercepts TLS (egress credentials): Moca bakes that host's CA into the system trust store at build,
-  and refuses the build without one. Add it whenever you use egress: it costs little and keeps the
-  template portable across hosts.
+- **`ca-certificates`** is missing. A template with `egress: true` needs the system trust store for
+  HTTPS. On a host whose egress intercepts TLS (egress credentials), an operator's build with
+  `template-build.sh --egress-ca` bakes that host's CA into the store, and refuses a rootfs with no
+  `update-ca-certificates` or `update-ca-trust`; a self-serve build (the host agent's) bakes no CA.
+  Add it whenever you use egress: it costs little and keeps the template portable across hosts.
 
 The fix is a small layer on top of your image: a localhost `/etc/hosts`, the guest minimum, and
 `ca-certificates` when the template uses egress. Each path below shows its own. Build it for
@@ -317,8 +330,8 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
    ```dockerfile
    # The Moca minimum on python:3.12-slim, for a `base` (or `general-self`) template whose tools are bash and
    # python3: a localhost /etc/hosts (a microVM guest boots with none), `file` (the guest agent's minimum),
-   # and `ca-certificates` (the system trust store, so Moca can bake a TLS-intercepting host's egress CA in
-   # with update-ca-certificates; on such a host a template with egress true is refused at build without it).
+   # and `ca-certificates` (the system trust store, for egress; an operator's template-build.sh --egress-ca
+   # bakes a TLS-intercepting host's CA in with update-ca-certificates, and refuses a rootfs without it).
    FROM docker.io/library/python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
    RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends file ca-certificates >/dev/null \
     && rm -rf /var/lib/apt/lists/*
@@ -368,16 +381,16 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
      host's snapshot check then failed a git-less image. With the build tooling's check for git-less
      images (an image with no git has no commit to fail), it passes by itself: leave the field out.
      An image that has git should never set it on `base`.
-   - The policy also reads the guest size as `guest_mb`; write `guest_ram_mb`, the name the build's
-     spec check reads, or the build can fail at its `spec` step.
 
    `POST /v1/templates` with that body and your API token. A create is answered `202` with the build
-   to follow. With mocactl (not yet run against a KVM host), the same create from that body saved
-   as `my-python.json`, after the policy's local checks:
+   to follow. With mocactl (not yet run against a KVM host), `--spec F` reads F as the spec itself
+   (or its `template` block), not as the API body: save the `spec` object with `id` and `image`
+   added as `my-python.json`, and name the profile with `--profile`. After the policy's local checks:
 
    ```bash
-   mocactl sbx templates create --spec my-python.json --dry-run   # nothing sent; names a failing rule
-   mocactl sbx templates create --spec my-python.json --json      # the answer below
+   jq '.spec + {id, image}' create-body.json > my-python.json     # the body above, as a flat spec
+   mocactl sbx templates create --spec my-python.json --profile base --dry-run   # nothing sent; names a failing rule
+   mocactl sbx templates create --spec my-python.json --profile base --json      # the answer below
    ```
 
    ```json
@@ -398,12 +411,12 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 
 4. **If it's refused or fails:**
    - **A policy refusal** is `422 policy_refused` naming the rule, before anything is built (for
-     example rule X10). A refused create stores no template, but a `check` record of the refusal stays on the
-     id's stream.
+     example rule X10). A refused create stores no template: on a new id it leaves only an audit
+     line (`template_create_refused`); on your existing template, a `check` record of the refusal
+     on its stream.
    - **A failed build** has a `reason` with a `step` and a `code` you can branch on, e.g.
-     step `probe` with code `probe_failed` (the probe didn't print what the spec expected). Two
-     more: step `spec` with code `spec_refused` (`guest_mb`, above) and step `build` with code
-     `build_failed` (no git, above). Section 10 lists the usual causes.
+     step `probe` with code `probe_failed` (the probe didn't print what the spec expected), or step
+     `build` with code `build_failed` (no git, above). Section 10 lists the usual causes.
 
 5. **Use it:** activate it (`POST /v1/templates/<id>/activate`; with mocactl,
    `mocactl sbx templates activate my-python --wait`, which polls until active), then
@@ -416,7 +429,9 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 
 6. **Update and retire:** a new build of the same id (`POST /v1/templates/<id>/builds`), then
    `mocactl sbx templates tag <id> default --build <new build>`; retire with
-   `mocactl sbx templates retire <id>` (`--wait` returns once no host holds it). A create after
+   `mocactl sbx templates retire <id>` (`--wait` returns once its worker has stopped and every
+   host has removed it, which waits out its sandboxes' 600 s egress window: 900 s by default,
+   exit 5 past it). A create after
    that answers `410 template_retired`. A retire is refused while a sandbox or session still uses the build
    (`409 build_in_use`) _(not yet recorded)_.
 
@@ -582,8 +597,10 @@ Send the record's bytes, unchanged, as `gateRecord` with a self-attested profile
 
 #### 6. Sharing it: trust
 
-To let others use it, ask an admin to trust the record: its sha256 goes into the policy's
-`trustedGateRecords` (`PUT /v1/policy`, a `policy` record names who did it). Its builds then read
+To let others use it, ask an admin named in the settings (`SBX_ADMIN_SUBJECTS`) to trust the
+record: its sha256 goes into the policy's `trustedGateRecords` (`PUT /v1/policy`, a `policy` record
+names who did it). Trusting a record widens the policy, so an admin granted through the API is
+refused (`403`). Its builds then read
 as `attestation: deployment`, and you can make the template `deployment`-visible. If the admin later
 removes that trust, the builds read as `self` again and fall back to private; the `policy` record
 names the builds it narrowed.
@@ -593,26 +610,33 @@ names the builds it narrowed.
 - **Provenance:** your create, its gate record, every policy check, the build, each activation, each
   sandbox or session on it, and its retire are records on the template's stream, chained by digest.
   Anyone with an export can check them offline (`deploy/sbx/template-onboarding/verify-provenance.py`).
-- **Egress records:** for a template with `egress: true`, `mocactl sbx egress <sandbox>` (or
-  `GET /v1/sandboxes/<id>/egress`) shows which hosts the sandbox reached, and the sandbox's end
-  record names the log's digest and whether it's complete. Paths are logged without query, fragment
-  or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL
-  path segment is logged as sent. With egress off (both recorded paths), the log is empty, complete,
-  and its digest is the sha256 of no bytes (seen on both paths);
-  a log with events is _(unverified)_ on
-  a host until one ships them.
+- **Egress records:** for a template with `egress: true`, the host agent ships the egress proxy's
+  events, and `mocactl sbx egress <sandbox>` (or `GET /v1/sandboxes/<id>/egress`) shows which hosts
+  the sandbox reached. The sandbox's end record names the log's digest and whether it's complete;
+  events that arrive in the 600 s after the end produce a later `sandbox` record with
+  `state: egress`. Check a saved copy only once the log is `sealed` (600 s after the end):
+  `mocactl sbx egress ID --verify`, and `--ndjson` for the log to give `verify-provenance.py
+--egress` ([RUNBOOK](../RUNBOOK.md#egress-records)). Paths are logged without query, fragment or
+  userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL path
+  segment is logged as sent. With egress off (both recorded paths), the log is empty, complete, and
+  its digest is the sha256 of no bytes (seen on both paths); a log with events is _(unverified)_ on
+  these paths.
 
 ### 4b.7 When something's refused (what users hit)
 
-| You see                                              | Why                                                                 | Do                                                                        |
-| ---------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `422 policy_refused`, rule `registry`                | the image's registry isn't in `allowedRegistries`                   | use an allowed registry; never another host name for the same registry    |
-| `422 policy_refused`, rule `registry.repository`     | that registry allows only listed repositories                       | ask an admin to list yours                                                |
-| `422 policy_refused`, rule `M7.guest`, `M7.vcpus`, … | the spec is outside the profile's envelope                          | fit the spec to the profile (`GET /v1/policy`)                            |
-| `429 quota_exceeded`                                 | your templates, queued builds or active templates are at your quota | retire or wait (`GET /v1/quota`)                                          |
-| `409 template_exists`                                | the id is someone else's, or one the deployment declares            | another id; an admin can hand a declared id to you (`templates transfer`) |
-| a build failed at `probe`                            | the probe printed something else, or `localhost` doesn't resolve    | the Moca minimum (§4b.3); match what the probe prints exactly             |
-| a build refused for egress                           | `egress: true` without `ca-certificates`                            | add it to the layer                                                       |
+| You see                                           | Why                                                                                                                                        | Do                                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| `422 policy_refused`, rule `registry`             | the image's registry isn't in `allowedRegistries`                                                                                          | use an allowed registry; never another host name for the same registry    |
+| `422 policy_refused`, rule `registry.repository`  | that registry allows only listed repositories                                                                                              | ask an admin to list yours                                                |
+| `422 policy_refused`, rule `envelope`             | the spec is outside the profile's envelope                                                                                                 | fit the spec to the profile (`GET /v1/policy`)                            |
+| `422 policy_refused`, rule `M7.guest`, `M7.vcpus` | outside the absolute bounds: at least 128 MiB, 1-32 vCPUs                                                                                  | fix the spec's size                                                       |
+| `429 quota_exceeded`                              | your templates, queued builds or active templates are at your quota                                                                        | retire or wait (`GET /v1/quota`)                                          |
+| `429 quota_exceeded`, quota `owned`               | you own as many template ids as allowed, in any status (200 by default)                                                                    | retiring frees none; reuse an id you own, or ask an admin                 |
+| `409 template_exists`                             | the id is another subject's visible template, or one the deployment declares (another's private template answers `404 template_not_found`) | another id; an admin can hand a declared id to you (`templates transfer`) |
+| `409 no_active_slot` (with `Retry-After`)         | every host holding the build is at its active limit, or short of memory                                                                    | retry after the wait it gives                                             |
+| `409 template_unavailable`                        | no registered build, no host reports holding it, or `reason: memfile_mismatch`                                                             | follow the build until `registered`; ask the operator about the host      |
+| a build failed at `probe`                         | the probe printed something else, or `localhost` doesn't resolve                                                                           | the Moca minimum (§4b.3); match what the probe prints exactly             |
+| an operator's build refused for egress            | `template-build.sh --egress-ca` on a rootfs without `ca-certificates`'s tools                                                              | add `ca-certificates` to the layer                                        |
 
 ## 5. Example 2: a SWE-bench instance (django\_\_django-11133)
 
@@ -651,7 +675,8 @@ sudo deploy/sbx/template-onboarding/template-build.sh deploy/sbx/template-onboar
 
 The spec names its gate record (`source_record_digest`), so the build needs it: before pulling, it
 checks the gate passed, the record is for this image, and commits are refused, and the template
-record keeps that evidence (gating rules X10 and X12, in `governance/GATING-RULES.md`). The run
+record keeps that evidence (gating rules X10 and X12, in
+[`governance/GATING-RULES.md`](governance/GATING-RULES.md)). The run
 below was before this check existed _(the `--gate-record` form is unverified on a host)_.
 
 As it ran (a 4 GiB guest on the host of §9: about 3 minutes, plus the pull; the runner's summary
@@ -671,9 +696,13 @@ needs (4096 + 32) × 3 + 1024 MiB for one session at standby depth 2.
 
 ### 5.3 A client: seed first
 
-A new sandbox's `/workspace` is empty. **SBX0 does not run the seed: the client does**, as its first
-command. And use `sbx create`, not `sbx up`: `up` pushes the client's own repository into
-`/workspace` before the seed runs.
+A new sandbox's `/workspace` is empty, and the client seeds it. On a deployment with the template
+store, `mocactl sbx create --template django-django-11133 --seed` runs the served build's seed,
+checks that `/workspace` is a clean tree, and makes the seeded HEAD the sandbox's baseline, so
+`sbx pull` and `sbx rm` measure changes from it ([user guide](../../../docs/sbx/user-guide.md), §8).
+Without the store, the client runs the seed as its first command, as below. Either way use
+`sbx create`, not `sbx up`: `up` pushes the client's own repository into `/workspace` before the
+seed runs.
 
 ```bash
 id=$(mocactl sbx create --template django-django-11133 --json | jq -r .id)
@@ -690,8 +719,9 @@ sandbox is `PERMISSION_DENIED` at any other template's worker.
 Point the agent's MCP server at the seeded sandbox (`mocactl sbx mcp --sandbox <id>`), keeping `sbx
 up`'s tools-off block, so the agent works only through the sandbox. A headless `opencode run`
 with the instance's problem statement used `sandbox_bash`, `sandbox_read` and `sandbox_edit` only.
-Take the patch from the sandbox (`git diff --binary <baseline>` in `/workspace`),
-not with `sbx pull`, which diffs against the client's repository.
+On a sandbox created with `--seed`, `sbx pull` returns the changes since the seeded baseline.
+On one seeded by hand, take the patch from the sandbox (`git diff --binary <baseline>` in
+`/workspace`), not with `sbx pull`, which diffs against the client's repository.
 
 ## 6. Two templates side by side: the client chooses
 
@@ -757,8 +787,8 @@ with SBX0's egress credentials: a second user's sandbox cloned, committed and pu
 private repository with its stored PAT, which never entered the sandbox; another user's sandbox got
 `401`; deleting the credential revoked it within its cache TTL ([`smoke.sh`](../smoke.sh) step 7).
 
-What SBX0 guarantees, as checked live with two templates (`deploy/sbx/templates-check.sh`, the live
-check that comes with the operations documentation):
+What SBX0 guarantees, as checked live with two templates
+([`deploy/sbx/templates-check.sh`](../templates-check.sh)):
 
 - the list names every template and **no worker id**;
 - each create records the template asked for; an **unknown template is refused** (`no such
@@ -791,7 +821,8 @@ token, a create of it was refused (`no such template`), and another template's s
 before kept running.
 
 **Self-serve, through the API** (a deployment with the template store and host agents; shown end to
-end): the template's owner does it all, with no operator step.
+end): the template's owner does each step itself. A new build is a new snapshot and a new worker, so
+an operator still installs that worker, as for any registered build (§4b).
 
 Point `default` at a new build (new creates use it), then retire the old build, or the whole
 template:
@@ -804,9 +835,12 @@ mocactl sbx templates retire django-django-11133 --reason 'done'
 
 A retire is refused while a sandbox or a session still uses the build (`409 build_in_use`): delete
 it first. A retired build is never used again (`410 template_retired`), and the host agent then
-removes its worker and snapshot. Every step is a record naming who did it. The owner also changes
-the description and visibility (`templates edit`); an admin rejects a build after the fact,
-transfers a template (`templates transfer`) and sets quotas (`templates quota`).
+removes its worker and snapshot, once the 600 s after its last sandbox ended have passed (the window
+in which that sandbox's last egress events still ship; `retire --wait` waits 900 s by default).
+Every step is a record naming who did it. The owner also changes the description and visibility
+(`templates edit`); an admin rejects a build after the fact (`POST
+/v1/templates/{id}/builds/{build}/reject`), transfers a template (`templates transfer`) and sets
+quotas (`templates quota`).
 
 The host agent's removal keeps each retired build's sandbox and session **workspaces** for the
 janitor (`install-host.sh --janitor`), which frees them once their sandboxes have ended. On a host
@@ -835,7 +869,8 @@ Checked live on a Moca-VM (P6+P4), with a scripted mock model: a session naming
 the workspace and did not seed again, a session with no template ran on the untemplated worker, and
 an unknown template was refused at creation.
 
-On the **combined control plane** (one control plane for both, `setup.sh SBX_PROFILE=combined`), a
+On the **combined control plane** (one control plane for both, `SBX_PROFILE=combined` in
+`setup.sh`'s env file), a
 session names a self-serve template the same way, and may pin a build (`ID@sha256:…`): it runs only
 on that build's workers. Checked on the cluster and the KVM host, with no model: a
 stock-agent sandbox and a session pinned to the same build, and first use through a session (`409
@@ -858,15 +893,15 @@ On a deployment with the template store (the combined control plane, an image wi
   capture is `{error}` and does not fail the turn. Each turn's patch is the whole end state, so a
   client takes the last turn's. Extract it with `jq -j` (shell `$(…)` drops the trailing newline, and
   the checksum then differs).
-- **Creating the session for `ID@build`:** today `mocactl run --option sandboxTemplate=` accepts
-  only the deployment's declared ids, and refuses `ID@sha256:…` before sending anything. Create the session through the API, then run it:
+- **Creating the session for `ID@build`:** `mocactl run` sends the `sandboxTemplate` option as
+  given (`ID`, `ID:tag` or `ID@sha256:…`), and the control plane's template store resolves it:
 
   ```bash
-  curl -sS -X POST -H @<header file with your api token> -H 'Content-Type: application/json' --data '{"sandbox": {"template": "django-django-11133@sha256:<build>"}, "model": "<model id>", "credentials": {"inference": "<name>"}}' https://sbx-api.example.com/v1/sessions
-  mocactl run "<prompt>" --session <sessionId> --json
-  mocactl sessions delete <sessionId>
+  mocactl run --option sandboxTemplate=django-django-11133@sha256:<build> --option model=<model id> --option inferenceCredential=<name> "<prompt>" --json
+  mocactl sessions delete <sessionId>   # its id: mocactl sessions
   ```
 
+  The API form is `POST /v1/sessions` with `{"sandbox": {"template": "ID@sha256:<build>"}, …}`.
   A first create on an inactive template is `409 template_not_active` with `Retry-After`: retry.
   Without the gateway's host in `SH_MODEL_CATALOG_HOSTS`, the model id is accepted unverified
   (`modelVerified: false`) and `GET /v1/sessions/{id}` shows it.
@@ -886,13 +921,13 @@ whole, and the provenance records of both kinds of client composed into one chai
 Measured on one KVM host (188 GiB of memory, 93 GB of disk free on the volume holding `/srv/sbx`),
 with SWE-bench templates of 4 GiB guests, image pulls included in the build times:
 
-| Limit               | Rule                                                                                                                            | Measured                                                                                                |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                                      | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
-| memory per template | each attached worker keeps its snapshot's memory mapped, idle or not                                                            | ~4.1 GiB each                                                                                           |
-| disk, sandboxes     | each seeded sandbox's workspace                                                                                                 | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
-| commands at once    | `--budget-mb` ≥ (guest + 32) × (running VMs) + 1024; a **running** VM is charged its full guest size, a standby its dirty pages | 3 per worker at 13408 MiB; every one at 65536 MiB, with almost no real memory used                      |
-| quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                                          | deployment settings                                                                                     |
+| Limit               | Rule                                                                                                                                                                                          | Measured                                                                                                |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| disk, templates     | 7.3-13.6 GB per snapshot; `template-build.sh` wants `SBX_MIN_FREE_GB` (50 by default) free                                                                                                    | 8 built in 31 min (140-515 s each, ~70 GB); room for about one more                                     |
+| memory per template | an operator-run worker keeps its snapshot's memory mapped, idle or not; with host agents only leased (or graced) builds' workers run, capped by `SBX_ACTIVE_LIMIT` and memory-aware placement | ~4.1 GiB each                                                                                           |
+| disk, sandboxes     | each seeded sandbox's workspace                                                                                                                                                               | 75-240 MB each; 25 sandboxes over 8 templates and 2 users took ~3.5 GB, and disk stopped the test first |
+| commands at once    | `--budget-mb` ≥ (guest + 32) × (running VMs) + 1024; a **running** VM is charged its full guest size, a standby its dirty pages                                                               | 3 per worker at 13408 MiB; every one at 65536 MiB, with almost no real memory used                      |
+| quotas              | `SBX_MAX_PER_SUBJECT`, `SBX_MAX_TOTAL`                                                                                                                                                        | deployment settings                                                                                     |
 
 So on a host like this, disk limits templates and sandboxes before memory does, and the default
 budget allows far fewer commands at once than memory holds: raise `--budget-mb` for parallel runs.
@@ -923,17 +958,17 @@ failure, where the command may have run.
 
 ## 10. Troubleshooting (what we actually hit)
 
-| Symptom                                                      | Cause                                                                 | Fix                                                                            |
-| ------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `no match for ^Ran N tests?\b`, though the tests passed      | an expected count rebuilt from "passed", but `Ran` counts skips       | expect what the runner prints (`^OK\b`, or the `Ran` total)                    |
-| `no match for \bN passed\b`, though pytest passed            | pytest coloured its summary (`ESC[32mN passed`)                       | fixed in `template-build.sh`: it matches with ANSI stripped                    |
-| a probe expectation from the gate's counts                   | the gate counts include grading tests                                 | use a public target (§3)                                                       |
-| `git checkout` fails part way as a non-root user             | root-owned files from earlier root builds in the checkout             | `chown -R` the checkout to its user first; check with `find … -not -user …`    |
-| a worker restarts and fails                                  | its env names a snapshot no longer on disk                            | point it at one that exists before starting                                    |
-| `sbx up` sandbox has the client's repo, not the template's   | `up` pushes the client repository                                     | `sbx create`, then the seed (§5.3)                                             |
-| every restore after `vm-9` fails "API socket never appeared" | the jail path overflowed a Unix socket for a 31-character template id | fixed: jails are keyed by a short hash of the worker id                        |
-| "no capacity" for minutes, never ending                      | the session's tier or template has no worker attached                 | the retry line (and the harness log) now name the cause; attach a worker of it |
-| `memory-budget: promoting a standby would re-price it …`     | the worker's `--budget-mb` fits fewer running VMs than the work needs | size the budget for the commands run at once (§9); clients retry, then exit 75 |
-| `unknown sandbox template 'ID@sha256:…'; declared: …`        | mocactl checks `--option sandboxTemplate` against the declared list   | create the session through the API, then `mocactl run --session` (§8)          |
-| a session's patch checksum does not match                    | `$(…)` in the shell dropped the patch's trailing newline              | write it with `jq -j '.workspace.patch'` (§8)                                  |
-| a self-serve create is `409 template_exists`, nobody owns it | the id is a template the deployment declares                          | use another id (§7)                                                            |
+| Symptom                                                              | Cause                                                                 | Fix                                                                            |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `no match for ^Ran N tests?\b`, though the tests passed              | an expected count rebuilt from "passed", but `Ran` counts skips       | expect what the runner prints (`^OK\b`, or the `Ran` total)                    |
+| `no match for \bN passed\b`, though pytest passed                    | pytest coloured its summary (`ESC[32mN passed`)                       | fixed in `template-build.sh`: it matches with ANSI stripped                    |
+| a probe expectation from the gate's counts                           | the gate counts include grading tests                                 | use a public target (§3)                                                       |
+| `git checkout` fails part way as a non-root user                     | root-owned files from earlier root builds in the checkout             | `chown -R` the checkout to its user first; check with `find … -not -user …`    |
+| a worker restarts and fails                                          | its env names a snapshot no longer on disk                            | point it at one that exists before starting                                    |
+| `sbx up` sandbox has the client's repo, not the template's           | `up` pushes the client repository                                     | `sbx create`, then the seed (§5.3)                                             |
+| every restore after `vm-9` fails "API socket never appeared"         | the jail path overflowed a Unix socket for a 31-character template id | fixed: jails are keyed by a short hash of the worker id                        |
+| "no capacity" for minutes, never ending                              | the session's tier or template has no worker attached                 | the retry line (and the harness log) now name the cause; attach a worker of it |
+| `memory-budget: promoting a standby would re-price it …`             | the worker's `--budget-mb` fits fewer running VMs than the work needs | size the budget for the commands run at once (§9); clients retry, then exit 75 |
+| `unknown sandbox template 'ID@sha256:…': this deployment declares …` | a control plane without the template store                            | use a deployment with the template store, or a declared id (§8)                |
+| a session's patch checksum does not match                            | `$(…)` in the shell dropped the patch's trailing newline              | write it with `jq -j '.workspace.patch'` (§8)                                  |
+| a self-serve create is `409 template_exists`, nobody owns it         | the id is a template the deployment declares                          | use another id (§7)                                                            |
