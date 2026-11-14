@@ -70,21 +70,24 @@ describe('§9.3 test 3 — contract drift', () => {
       if (auth === 'exchange') expect(schemes, `${method} ${path}`).toEqual(['exchangeToken']);
       if (auth === 'janitor') expect(schemes, `${method} ${path}`).toEqual(['janitorToken']);
       if (auth === 'egress') expect(schemes, `${method} ${path}`).toEqual(['egress']);
+      if (auth === 'host') expect(schemes, `${method} ${path}`).toEqual(['hostToken']);
     }
-    // Every auth kind the route table uses is one of the five handled above.
+    // Every auth kind the route table uses is one of the six handled above.
     expect([...new Set(ROUTES.map((r) => r.auth))].sort()).toEqual([
       'api',
       'egress',
       'exchange',
+      'host',
       'janitor',
       'none',
     ]);
   });
 
-  it('declares the four security schemes it references', () => {
+  it('declares the five security schemes it references', () => {
     expect(Object.keys(doc().components?.securitySchemes ?? {}).sort()).toEqual([
       'egress',
       'exchangeToken',
+      'hostToken',
       'janitorToken',
       'sessionToken',
     ]);
@@ -246,7 +249,7 @@ describe('§9.3 test 3 — contract drift', () => {
           r.path === '/v1/quota') &&
           r.auth === 'api'),
     ).map((r) => `${r.method} ${r.path}`);
-    expect(enrollable.length).toBe(24);
+    expect(enrollable.length).toBe(29);
     const missing = operations()
       .filter(({ path, method }) => enrollable.includes(`${method} ${path}`))
       .filter(({ op }) => !(op as { responses?: Record<string, unknown> }).responses?.['403'])
@@ -274,5 +277,17 @@ describe('§9.3 test 3 — contract drift', () => {
     // document is the only mechanical link between the two nine-state lists.
     const enumerated = doc().components.schemas.TurnStatus.properties.state.enum as string[];
     expect([...enumerated].sort()).toEqual([...TURN_STATES].sort());
+  });
+});
+
+describe('the contract version', () => {
+  it("info.version is the changelog's newest section, and change-policy names it", () => {
+    const changelog = readFileSync(resolve(REPO_ROOT, 'docs/api/CHANGELOG.md'), 'utf8');
+    const top = /^## (\d+\.\d+\.\d+)$/m.exec(changelog)?.[1];
+    expect(top).toBeDefined();
+    expect(doc().info.version).toBe(top);
+    const policy = readFileSync(resolve(REPO_ROOT, 'docs/reference/change-policy.md'), 'utf8');
+    expect(policy).toContain(`says \`version: ${top}\``);
+    expect(policy).toContain(`(control plane ${top},`);
   });
 });

@@ -1,9 +1,11 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { CpError, writeError } from './errors.js';
 import type { EgressHost } from './egress-config.js';
 import { checkExchangeAuth, checkStaticBearer } from './exchange.js';
 import { HANDLERS, apiIssuer, type CpDeps, type RequestCtx } from './handlers.js';
+import { membershipNow } from './handler-util.js';
 import { matchRoute, type RouteSpec, bodyLimitFor } from './routes.js';
 import { verifyToken } from './token.js';
 
@@ -83,6 +85,20 @@ function authorize(route: RouteSpec, req: IncomingMessage, deps: CpDeps, ctx: Re
     ctx.egressHost = found;
     return;
   }
+  if (route.auth === 'host') {
+    // As for egress: every configured host compared, no early return, digests of fixed length. The
+    // host named in the path must be the one whose token was presented (a host acts only as itself).
+    const want = presented ? createHash('sha256').update(presented).digest() : undefined;
+    let found: string | undefined;
+    for (const h of deps.config.templateHosts ?? []) {
+      const have = createHash('sha256').update(h.token).digest();
+      if (want && timingSafeEqual(want, have) && found === undefined) found = h.id;
+    }
+    if (!found || found !== ctx.params.host)
+      throw new CpError('unauthorized', 'host authentication failed');
+    ctx.host = found;
+    return;
+  }
   if (!presented) throw new CpError('token_required', 'this route requires a token');
   // requiredScope 'api' is what stops a session token rewriting credentials or creating a second
   // session, and stops the shared exchange bearer standing in for a user identity (plan gap #7).
@@ -91,6 +107,42 @@ function authorize(route: RouteSpec, req: IncomingMessage, deps: CpDeps, ctx: Re
     requiredScope: 'api',
     issuer: apiIssuer(deps.config),
   });
+}
+
+/** A handler's streamed body: chunks written as they come, so a large answer is never held whole. */
+const isStream = (b: unknown): b is AsyncIterable<string> =>
+  typeof b === 'object' && b !== null && Symbol.asyncIterator in b;
+
+/**
+ * Writes a streamed body with backpressure (the egress log's NDJSON export). The first chunk is read
+ * before the status goes out, so a store that fails at once still answers its error (a 503); one that
+ * fails mid-stream can only cut the response short, which the client sees as a truncated body.
+ */
+async function writeStream(
+  res: ServerResponse,
+  status: number,
+  headers: Record<string, string>,
+  body: AsyncIterable<string>,
+): Promise<void> {
+  const it = body[Symbol.asyncIterator]();
+  let next = await it.next();
+  res.writeHead(status, headers);
+  try {
+    while (!next.done) {
+      // A client that goes away mid-stream closes the response: stop reading the store.
+      if (!res.write(next.value)) await Promise.race([once(res, 'drain'), once(res, 'close')]);
+      if (res.destroyed) {
+        await it.return?.();
+        return;
+      }
+      next = await it.next();
+    }
+    res.end();
+  } catch (err) {
+    console.error('[control-plane] streamed response cut short:', (err as Error)?.message);
+    await it.return?.();
+    res.destroy();
+  }
 }
 
 export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerResponse) => void {
@@ -123,6 +175,17 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
       // consequence leaked and the 64 KiB cap bounded it, but authentication belongs in front. Every
       // route here is new in MU1, so no existing caller depends on the old codes.
       authorize(matched.route, req, deps, ctx);
+      // Roles and enrollment NOW: a token's `roles` are what was true at its mint; with
+      // a members store the subject's current ones replace them, so a grant, revoke or lapse takes
+      // effect at the next request. Without a store the token's claims stand, as before.
+      if (ctx.principal && deps.members) {
+        const m = await membershipNow(deps, ctx.principal.sub, ctx.principal.roles ?? []);
+        ctx.principal = { ...ctx.principal, roles: m.roles, enrolled: m.enrolled };
+      } else if (ctx.principal) {
+        // A token never carries enrollment: only this step sets it.
+        const { enrolled: _ignored, ...claims } = ctx.principal;
+        ctx.principal = claims;
+      }
 
       if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
         const raw = await readBody(req, bodyLimitFor(matched.route));
@@ -162,6 +225,15 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
       const extra = headers ?? {};
       if (body === undefined) {
         res.writeHead(status, extra).end();
+        return;
+      }
+      if (isStream(body)) {
+        await writeStream(
+          res,
+          status,
+          { 'Content-Type': contentType ?? 'text/plain', ...extra },
+          body,
+        );
         return;
       }
       if (typeof body === 'string') {

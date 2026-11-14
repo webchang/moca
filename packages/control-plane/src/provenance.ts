@@ -48,11 +48,17 @@ export const RECORD_KINDS = [
   'sandbox',
   // A Moca Pi session's span on a build (§7.1), as `sandbox` for a sandbox.
   'session',
+  // Enrollment and roles through the API, on the `members` stream only: a subject enrolled or
+  // unenrolled (`member`), the admin role granted, revoked or lapsed (`role`).
+  'member',
+  'role',
 ] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
-/** `policy`, or `template/<id>` with a template id as sandbox-config.ts admits it. */
-const STREAM_RE = /^(policy|template\/[a-z0-9][a-z0-9-]{0,30})$/;
+/** `policy`, `members`, or `template/<id>` with a template id as sandbox-config.ts admits it. */
+const STREAM_RE = /^(policy|members|template\/[a-z0-9][a-z0-9-]{0,30})$/;
+/** The kinds that belong to the `members` stream, and the only ones it holds. */
+const MEMBER_KINDS = new Set(['member', 'role']);
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 
 export interface ProvenanceRecord {
@@ -134,6 +140,27 @@ export function recordDigest(r: ProvenanceRecord): string {
   return `sha256:${sha256Hex(canonicalJson(r))}`;
 }
 
+/**
+ * The digest of a build's `build` record (outcome `built`): what a retire cites as `buildRecord`.
+ * Matched by the build's handle when it has one, so a build that was built and then rejected (its
+ * `buildId` stays its handle, not the manifest hash) still finds its record; by the manifest hash
+ * otherwise. Null for a build that never produced one (imported, or retired before it was built).
+ */
+export async function buildRecordOf(
+  store: ProvenanceStore,
+  template: string,
+  build: { buildId: string; handle?: string },
+): Promise<string | null> {
+  const r = (await store.chain(`template/${template}`)).find((x) => {
+    const body = x.body as { outcome?: string; handle?: string; manifest_hash?: string };
+    if (x.kind !== 'build' || body.outcome !== 'built') return false;
+    return build.handle !== undefined
+      ? body.handle === build.handle
+      : body.manifest_hash === build.buildId;
+  });
+  return r ? recordDigest(r) : null;
+}
+
 const hexOf = (digest: string): string => digest.slice('sha256:'.length);
 
 export interface AppendInput {
@@ -197,6 +224,9 @@ export class ProvenanceStore {
     }
     if (input.kind !== 'policy' && input.stream === 'policy') {
       throw new Error(`a ${input.kind} record belongs to a template stream`);
+    }
+    if (MEMBER_KINDS.has(input.kind) !== (input.stream === 'members')) {
+      throw new Error(`a ${input.kind} record does not belong to stream ${input.stream}`);
     }
     if (!input.subject) throw new Error('a provenance record names its subject');
     return this.queue.run(input.stream, async () => {
@@ -309,7 +339,7 @@ export class ProvenanceStore {
 
 function checkStream(stream: string): void {
   if (!STREAM_RE.test(stream))
-    throw new Error(`provenance stream must be policy or template/<id>, got ${stream}`);
+    throw new Error(`provenance stream must be policy, members or template/<id>, got ${stream}`);
 }
 
 /**
@@ -427,6 +457,8 @@ export function verifyExport(doc: ProvenanceExport): VerifyResult {
       if (!(RECORD_KINDS as readonly string[]).includes(r.kind))
         errors.push(`${where}: unknown kind ${r.kind}`);
       if ((r.kind === 'policy') !== (h.stream === 'policy'))
+        errors.push(`${where}: a ${r.kind} record in stream ${h.stream}`);
+      if (MEMBER_KINDS.has(r.kind) !== (h.stream === 'members'))
         errors.push(`${where}: a ${r.kind} record in stream ${h.stream}`);
       if (r.kind === 'check') {
         const p = r.body?.policy;

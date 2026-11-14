@@ -19,7 +19,7 @@ import {
   type AgentopExec,
 } from './agentop.js';
 import type { SbxSandbox } from './api.js';
-import { failed, SBX_EXIT, type SbxCtx } from './commands.js';
+import { createWaitingForActivation, failed, SBX_EXIT, type SbxCtx } from './commands.js';
 import {
   execFailed,
   openExec,
@@ -284,7 +284,7 @@ async function findOrCreate(
       c.io.err(`reusing ${sanitizeRemote(mine[0].id)}, this repository's sandbox`);
       return { sandbox: mine[0], reused: true };
     }
-    const s = await c.api.createSandbox({
+    const s = await createWaitingForActivation(c, {
       template: f.template ?? DEFAULT_TEMPLATE,
       ...(f.name ? { name: f.name } : {}),
       labels: { project: rid },
@@ -377,7 +377,7 @@ export async function cmdUp(
   if (code !== SBX_EXIT.ok) return code;
   if (!f.noAgentConfig) {
     try {
-      const { changed } = writeAgentConfig(root, { cortex });
+      const { changed } = writeAgentConfig(root, { cortex, mode: s.mode });
       if (cortex) c.io.err(CORTEX_NOTE);
       if (changed.length) {
         c.io.err(`configured Claude Code, OpenCode and IBM Bob: ${changed.join(', ')}`);

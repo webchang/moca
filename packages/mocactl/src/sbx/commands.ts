@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 // sandbox-client's POSIX single quotes: safe to `eval`, whatever the control plane sent.
@@ -6,17 +7,31 @@ import { ApiError, TOKEN_CODES } from '../api/errors.js';
 import { deviceLogin, toCachedAuth } from '../core/auth.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
-import { saveConfig, storedLoginUrl } from '../config.js';
+import { sameControlPlane, saveConfig, storedLoginUrl } from '../config.js';
 import { deviceLoginEnd, devicePrompt, type Io, type LoginHelpers } from '../headless.js';
 import { setAuth, type RefreshFailure, type Runtime } from '../runtime.js';
-import type { SandboxApiClient, SbxDiscovery, SbxSandbox } from './api.js';
-import { sandboxFailureText, type ExecFactory } from './exec.js';
+import type {
+  SandboxApiClient,
+  SbxDiscovery,
+  SbxSandbox,
+  SbxSandboxCreate,
+  SbxSubject,
+} from './api.js';
+import { openExec, sandboxFailureText, type ExecFactory } from './exec.js';
+import {
+  modeRank,
+  pendingText,
+  sendSetMode,
+  setModeFailureText,
+  type SetModeOutcome,
+} from './mode.js';
+import { forgetNotices } from './notices.js';
 import { seedSandbox, type SeedResult } from './templates.js';
 
 /**
  * `mocactl sbx`'s exit codes (SBX0 §6.1), as `mocactl auth token`'s beyond 0 and 2; 5 when a wait
- * (`templates follow`, a create waiting for a queue slot) ran out of time; 130 when Ctrl-C stopped
- * it, as `sbx run` and `sbx rm`.
+ * (`templates follow`, a create waiting for a queue slot, `templates activate --wait`) ran out of
+ * time; 130 when Ctrl-C stopped it, as `sbx run` and `sbx rm`.
  */
 export const SBX_EXIT = {
   ok: 0,
@@ -101,6 +116,12 @@ export function fail(io: Io, err: unknown, refreshFailure?: RefreshFailure): num
     // or a proxy's page) means the URL is not a sandbox-profile control plane -- a MOCA (harness
     // profile) one, or one from before SBX0.
     io.err('sbx: that control plane has no sandbox routes: is it the sandbox service?');
+  } else if (err instanceof ApiError && err.code === 'template_retired') {
+    // 410 (template lifecycle spec §5.1): not a typo in the id, so say what retired means.
+    io.err(
+      `sbx: ${describeError(err)}: a retired template or build is never served again; ` +
+        'use another build (mocactl sbx templates show ID) or another template',
+    );
   } else if (err instanceof ApiError) {
     io.err(`sbx: ${refusalText(err)}`);
   } else {
@@ -139,7 +160,8 @@ export async function cmdLogin(
       if (err instanceof ApiError && err.status === 404) return {};
       throw err;
     });
-    if (d.profile !== 'sandbox') {
+    // `combined` serves sessions and sandboxes in one control plane (combined control plane spec).
+    if (d.profile !== 'sandbox' && d.profile !== 'combined') {
       c.io.err(
         `sbx: ${c.url} is not the sandbox service (its /v1/discovery has no sandbox profile)`,
       );
@@ -302,44 +324,136 @@ export async function cmdTransferTemplate(c: SbxCtx, id: string, owner: string):
   }
 }
 
+/** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
+export const ACTIVATION_WAIT_MS = 10 * 60_000;
+
 /**
- * `sbx create [--template ID[:TAG|@BUILD]] [--seed]`. With --seed, the served build's seed runs as
- * the new sandbox's first command and the workspace is checked (seedSandbox): a failure there is
- * exit 1, the sandbox kept and named, so its state can be looked at.
+ * Creates a sandbox, waiting while its template activates (template lifecycle spec §6.4): a
+ * `409 template_not_active` means the control plane has started the activation (or, with no lease
+ * to take, is waiting for a host), so the create is retried after its Retry-After, saying why, until
+ * ACTIVATION_WAIT_MS. Any other refusal is thrown.
+ */
+export async function createWaitingForActivation(
+  c: SbxCtx,
+  body: { template: string; name?: string; labels?: Record<string, string> },
+): Promise<SbxSandbox & { buildId?: string | null; templateManifestHash?: string | null }> {
+  const start = c.rt.now();
+  for (;;) {
+    try {
+      return await c.api.createSandbox(body);
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 409 && err.code === 'template_not_active'))
+        throw err;
+      const left = ACTIVATION_WAIT_MS - (c.rt.now() - start);
+      if (left <= 0) throw err;
+      const waitMs = Math.min(Math.max(1, err.retryAfterS ?? 30) * 1000, left);
+      c.io.err(`sbx: ${sanitizeRemote(err.message)}; retrying in ${Math.ceil(waitMs / 1000)} s`);
+      await c.rt.sleep(waitMs, c.signal);
+      if (c.signal?.aborted) throw err;
+    }
+  }
+}
+
+/**
+ * `sbx create [--template ID[:TAG|@BUILD]] [--mode M] [--seed]`. A lease mode is stored by the
+ * create at epoch 1, which the worker serves per-Exec until a set_mode makes the epoch known (spec
+ * §8.2): the create answers no set-mode token, so one is minted and sent first, before the seed. A
+ * pending set_mode is a warning (exit 0); a refused one is exit 1, the sandbox kept and named. With
+ * --seed, the served build's seed runs as the new sandbox's first command and the workspace is
+ * checked (seedSandbox): a failure there is exit 1, the sandbox kept and named, so its state can be
+ * looked at.
  */
 export async function cmdCreate(
   c: SbxCtx,
-  body: { template: string; name?: string; labels?: Record<string, string> },
-  seed?: { factory?: ExecFactory },
+  body: SbxSandboxCreate,
+  o: { seed?: boolean; factory?: ExecFactory } = {},
 ): Promise<number> {
   try {
-    const s = await c.api.createSandbox(body);
-    c.io.err(
-      `created ${sanitizeRemote(s.id)} (${sanitizeRemote(s.template)}), expires ${when(s.expiresAt)}`,
-    );
+    const s = await createWaitingForActivation(c, body);
+    const id = sanitizeRemote(s.id);
+    c.io.err(`created ${id} (${sanitizeRemote(s.template)}), expires ${when(s.expiresAt)}`);
+    // A control plane from before modes ignores the body's mode: say so, never a silent per-exec.
+    if (body.mode !== undefined && s.mode !== body.mode) {
+      c.io.err(
+        `sbx: ${id} is ${s.mode}, not ${body.mode}: the control plane did not take the mode`,
+      );
+    }
+    let setMode: { outcome: 'applied' } | { outcome: 'pending'; code: string } | undefined;
+    if (modeRank(s.mode) > 0) {
+      const r = await sendCreatedMode(c, s.id, o.factory).catch((err: unknown) => ({
+        outcome: 'failed' as const,
+        err,
+      }));
+      if (r.outcome === 'failed' && c.signal?.aborted) {
+        // Ctrl-C: the mode is stored, as for a pending set_mode; the seed is not run (P4-R12).
+        const pending = { outcome: 'pending', code: 'cancelled' };
+        c.io.out(c.json ? JSON.stringify({ ...s, setMode: pending }) + '\n' : `${id}\n`);
+        c.io.err(`sbx: ${pendingText(id, 'cancelled')}`);
+        return SBX_EXIT.interrupted;
+      }
+      if (r.outcome === 'failed') {
+        // The sandbox exists, at its lease mode, served per-Exec: named, so it can be looked at.
+        const text = r.err instanceof ApiError ? describeError(r.err) : setModeFailureText(r.err);
+        if (c.json) c.io.out(JSON.stringify({ ...s, setMode: { error: text } }) + '\n');
+        else c.io.out(`${id}\n`);
+        c.io.err(
+          `sbx: ${id}: created, but its mode was not sent${o.seed ? '; the seed was not run' : ''}`,
+        );
+        if (r.err instanceof ApiError) return failed(c, r.err);
+        c.io.err(`sbx: ${text}`);
+        return SBX_EXIT.failed;
+      }
+      c.io.err(
+        r.outcome === 'pending'
+          ? `sbx: ${pendingText(id, r.code)}`
+          : `mode ${s.mode} (epoch ${s.modeEpoch})`,
+      );
+      // In --json too, so a script can tell a lease applied from one pending.
+      setMode =
+        r.outcome === 'pending' ? { outcome: 'pending', code: r.code } : { outcome: 'applied' };
+    }
+    const withSetMode = setMode ? { setMode } : {};
     let seeded: SeedResult | undefined;
-    if (seed) {
-      const r = await seedSandbox(c, s, seed.factory).catch((err: unknown) =>
+    if (o.seed) {
+      const r = await seedSandbox(c, s, o.factory).catch((err: unknown) =>
         err instanceof ApiError ? Promise.reject(err) : sandboxFailureText(err),
       );
       if (typeof r === 'string') {
-        if (c.json) c.io.out(JSON.stringify({ ...s, seed: { error: r } }) + '\n');
-        else c.io.out(`${sanitizeRemote(s.id)}\n`);
-        c.io.err(`sbx: ${sanitizeRemote(s.id)}: ${r}`);
+        if (c.json) c.io.out(JSON.stringify({ ...s, ...withSetMode, seed: { error: r } }) + '\n');
+        else c.io.out(`${id}\n`);
+        c.io.err(`sbx: ${id}: ${r}`);
         return SBX_EXIT.failed;
       }
       seeded = r;
       c.io.err(
         r.seed === ''
-          ? `${sanitizeRemote(s.id)}: the template has no seed`
-          : `seeded ${sanitizeRemote(s.id)}${r.head ? `: a clean tree at ${r.head}` : ''}`,
+          ? `${id}: the template has no seed`
+          : `seeded ${id}${r.head ? `: a clean tree at ${r.head}` : ''}`,
       );
     }
-    if (c.json) c.io.out(JSON.stringify(seeded ? { ...s, seed: seeded } : s) + '\n');
-    else c.io.out(`${sanitizeRemote(s.id)}\n`);
+    if (c.json) {
+      c.io.out(
+        JSON.stringify({ ...s, ...withSetMode, ...(seeded ? { seed: seeded } : {}) }) + '\n',
+      );
+    } else c.io.out(`${id}\n`);
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);
+  }
+}
+
+/** A lease create's set_mode: a token minted for the record's mode and epoch, sent once (M8). */
+async function sendCreatedMode(
+  c: SbxCtx,
+  id: string,
+  factory: ExecFactory | undefined,
+): Promise<SetModeOutcome> {
+  const x = await openExec(c.api, id, factory);
+  try {
+    const { setModeToken } = await c.api.mintSandboxModeToken(id);
+    return await sendSetMode(x, c.api, id, setModeToken, c.signal);
+  } finally {
+    x.close();
   }
 }
 
@@ -362,6 +476,7 @@ export async function cmdLs(c: SbxCtx, all: boolean): Promise<number> {
         cell(s.id, 30),
         cell(s.name ?? '-', 16),
         cell(s.template, 12),
+        cell(s.mode, 15),
         cell(stateText(s), 22),
         when(s.expiresAt),
         ...(all ? [cell(s.owner)] : []),
@@ -377,11 +492,22 @@ export async function cmdLs(c: SbxCtx, all: boolean): Promise<number> {
 /**
  * `sbx rm`. `goneOk`: the id is the repository's bound sandbox, so one the control plane no longer
  * knows (purged after its retention) is "already gone" (exit 0), and `rm` can still take back
- * the configuration `up` wrote. Any other id's 404 is the failure it was.
+ * the configuration `up` wrote. Any other id's 404 is the failure it was. A lease sandbox's lease
+ * is ended first (`sandbox_deleted`), so its guest does not outlive the record.
  */
-export async function cmdRm(c: SbxCtx, id: string, o: { goneOk?: boolean } = {}): Promise<number> {
+export async function cmdRm(
+  c: SbxCtx,
+  id: string,
+  o: { goneOk?: boolean; factory?: ExecFactory } = {},
+): Promise<number> {
+  await endLease(c, id, o.factory);
+  if (c.signal?.aborted) {
+    c.io.err(`sbx: interrupted (exit ${SBX_EXIT.interrupted}): nothing was deleted`);
+    return SBX_EXIT.interrupted;
+  }
   try {
     const r = await c.api.deleteSandbox(id);
+    forgetNotices(c.rt.paths.stateDir, id);
     if (c.json) c.io.out(JSON.stringify(r) + '\n');
     // Delete is not immediate (SBX0 §5.4): a token already minted works until it expires, plus the
     // relay's 30 s leeway. The client does not know the deployment's token lifetime, so the default.
@@ -394,12 +520,185 @@ export async function cmdRm(c: SbxCtx, id: string, o: { goneOk?: boolean } = {})
     return SBX_EXIT.ok;
   } catch (err) {
     if (o.goneOk && err instanceof ApiError && err.code === 'sandbox_not_found') {
+      forgetNotices(c.rt.paths.stateDir, id);
       if (c.json) c.io.out(JSON.stringify({ id, state: 'terminated', reason: 'gone' }) + '\n');
       c.io.err(`${id} is already gone (the control plane no longer has it)`);
       return SBX_EXIT.ok;
     }
     return failed(c, err);
   }
+}
+
+/**
+ * `sbx egress`: a sandbox's egress, as its KVM host's proxy logged it. Text: the
+ * summary per host, then whether the log is complete, whether it is sealed (final: the control
+ * plane takes no more events, 600 s after the sandbox ended) and its digest. `--json`: every event and the
+ * summary, read page by page. `--ndjson`: the log exactly as served, whose sha256 the summary and the
+ * sandbox's end record name (verify-provenance.py --egress checks a saved copy).
+ */
+export async function cmdEgress(
+  c: SbxCtx,
+  id: string,
+  ndjson: boolean,
+  verify = false,
+): Promise<number> {
+  try {
+    if (verify) return await verifyEgress(c, id);
+    if (ndjson) {
+      const body = await c.api.sandboxEgressNdjson(id);
+      if (c.io.outBytes) c.io.outBytes(body);
+      else c.io.out(body.toString('utf8'));
+      return SBX_EXIT.ok;
+    }
+    let page = await c.api.sandboxEgress(id, { limit: 1000 });
+    // The summary comes on the first page only (the control plane computes it once, there).
+    const summary = page.summary;
+    if (!summary) {
+      c.io.err('sbx: the control plane sent no egress summary on the first page');
+      return SBX_EXIT.failed;
+    }
+    if (c.json) {
+      const events = [...page.events];
+      // A server that hands out a `next` it handed out before would loop forever: refused.
+      const seen = new Set<string>();
+      while (page.next !== null) {
+        if (seen.has(page.next)) {
+          c.io.err("sbx: the control plane repeated an egress page's next; the log was not read");
+          return SBX_EXIT.failed;
+        }
+        seen.add(page.next);
+        page = await c.api.sandboxEgress(id, { after: page.next, limit: 1000 });
+        events.push(...page.events);
+      }
+      c.io.out(JSON.stringify({ events, summary }) + '\n');
+      return SBX_EXIT.ok;
+    }
+    const hosts = Object.entries(summary.byHost).sort(([a], [b]) => (a < b ? -1 : 1));
+    for (const [host, h] of hosts) {
+      const decisions = Object.entries(h.decisions)
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([d, n]) => `${sanitizeRemote(d)} ${num(n)}`)
+        .join(', ');
+      c.io.out(
+        `${sanitizeRemote(host || '-').padEnd(40)} ${num(h.count).padStart(6)}  ` +
+          `up ${num(h.bytesUp)} B, down ${num(h.bytesDown)} B  (${decisions})\n`,
+      );
+    }
+    c.io.out(
+      `${num(summary.total)} events; ` +
+        (summary.complete ? 'complete' : `INCOMPLETE: ${num(summary.dropped)} dropped`) +
+        sealedText(summary.sealed) +
+        `; ${sanitizeRemote(String(summary.sha256))}\n`,
+    );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/**
+ * How long `rm` waits on `sandbox_deleted`: the worker may block the op up to its grace limit
+ * (30 min), but it finishes the op once started, so `rm` stops waiting and deletes.
+ */
+export const RM_LEASE_WAIT_MS = 15_000;
+
+/**
+ * `LeaseControl sandbox_deleted` for a lease sandbox, before its DELETE (spec §4.1): best-effort,
+ * so any error (the record, the token, the call) is ignored and the DELETE goes ahead, as it does
+ * after RM_LEASE_WAIT_MS. The bound covers the whole step: the record read, the token mint and the
+ * dial, then the call (spec §8.3). Ctrl-C cancels it at any point (the caller then deletes
+ * nothing). A per-exec sandbox has no lease, and no call is made.
+ */
+async function endLease(c: SbxCtx, id: string, factory: ExecFactory | undefined): Promise<void> {
+  const waited = new AbortController();
+  const settled = new AbortController();
+  void (c.sleep ?? c.rt.sleep)(RM_LEASE_WAIT_MS, settled.signal).then(() => {
+    if (!settled.signal.aborted) waited.abort();
+  });
+  const signal = c.signal ? AbortSignal.any([c.signal, waited.signal]) : waited.signal;
+  try {
+    if (modeRank((await c.api.getSandbox(id, { signal })).mode) === 0) return;
+    const x = await openExec(c.api, id, factory, { signal });
+    try {
+      await x.leaseControl('sandbox_deleted', undefined, { signal });
+    } finally {
+      x.close();
+    }
+  } catch {
+    // Best-effort: the DELETE decides, and reports its own failure.
+  } finally {
+    settled.abort();
+  }
+}
+
+/**
+ * `sbx egress ID --verify`: the log as served, its sha256 and line count checked against the
+ * control plane's summary of the same log. That catches damage in transit and a server whose log
+ * and summary disagree; it does not read the sandbox's end record (an owner cannot read provenance
+ * records: verify-provenance.py --egress checks a saved copy against an export). The log is read
+ * first and the summary after, so an open log (not yet sealed) that gained events in between shows
+ * as such, not as damage. Exit 0 only when both match.
+ */
+async function verifyEgress(c: SbxCtx, id: string): Promise<number> {
+  const body = await c.api.sandboxEgressNdjson(id);
+  const summary = (await c.api.sandboxEgress(id, { limit: 1 })).summary;
+  if (!summary) {
+    c.io.err('sbx: the control plane sent no egress summary on the first page');
+    return SBX_EXIT.failed;
+  }
+  const sha256 = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+  let lines = 0;
+  for (const b of body) if (b === 0x0a) lines += 1;
+  const whole = body.length === 0 || body[body.length - 1] === 0x0a;
+  const ok = whole && sha256 === summary.sha256 && lines === summary.total;
+  // An open log that grew between the two reads: more events in the summary than were read.
+  const grew =
+    !ok && summary.sealed !== true && typeof summary.total === 'number' && summary.total > lines;
+  if (c.json)
+    c.io.out(
+      JSON.stringify({
+        verified: ok,
+        sha256,
+        lines,
+        summary: {
+          sha256: summary.sha256,
+          total: summary.total,
+          complete: summary.complete,
+          sealed: summary.sealed,
+        },
+        ...(grew ? { open: true } : {}),
+      }) + '\n',
+    );
+  else if (ok)
+    c.io.out(
+      `verified: ${lines} events, ${sanitizeRemote(sha256)}` +
+        (summary.complete ? '' : `; INCOMPLETE: ${num(summary.dropped)} dropped`) +
+        sealedText(summary.sealed) +
+        '\n',
+    );
+  else if (grew)
+    c.io.out(
+      `NOT verified: the log is still open (not sealed) and gained events while it was read ` +
+        `(${lines} read, ${num(summary.total)} now); run --verify again, or once it is sealed ` +
+        `(10 minutes after the sandbox ends)\n`,
+    );
+  else
+    c.io.out(
+      `NOT verified: the log served is ${lines} events, ${sanitizeRemote(sha256)}; ` +
+        `the summary names ${num(summary.total)}, ${sanitizeRemote(String(summary.sha256))}\n`,
+    );
+  return ok ? SBX_EXIT.ok : SBX_EXIT.failed;
+}
+
+/** A number from the server, printed only when it is one: anything else is `?`, never its text. */
+function num(x: unknown): string {
+  return typeof x === 'number' && Number.isFinite(x) ? String(x) : '?';
+}
+
+/** `; sealed` or `; open (not sealed yet)`; nothing from a server that does not say. */
+function sealedText(sealed: boolean | undefined): string {
+  if (sealed === undefined) return '';
+  return sealed ? '; sealed' : '; open (not sealed yet)';
 }
 
 /**
@@ -469,6 +768,163 @@ export async function cmdEnv(c: SbxCtx, id: string): Promise<number> {
       lines.push(['SBX_CA_FILE', writeCa(dir, `${id}-exec-ca.crt`, t.execCa)]);
     }
     for (const [k, v] of lines) c.io.out(`export ${k}=${q(v)}\n`);
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** The API token issuer each profile's control plane mints under (control-plane token.ts). */
+const ISSUER_BY_PROFILE: Record<string, string> = {
+  sandbox: 'sbx-control-plane-api',
+};
+
+/** A JWT's `iss`, read WITHOUT verifying it: only to compare. */
+function jwtIssuer(token: string): string | undefined {
+  try {
+    const c = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
+      iss?: unknown;
+    };
+    return typeof c.iss === 'string' ? c.iss : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Before an admin write: the login must be for this control plane, and its token minted under the
+ * issuer this control plane's profile mints under -- a login for one deployment pointed at another
+ * is refused here, before the read and the write. A token whose `iss` cannot be read (not a JWT) is
+ * left to the control plane to judge. Returns the refusal line.
+ */
+export async function loginMismatch(c: SbxCtx): Promise<string | undefined> {
+  const auth = c.rt.auth;
+  if (!auth) return undefined;
+  if (!sameControlPlane(auth.controlPlaneUrl, c.url))
+    return `the login is for ${sanitizeRemote(auth.controlPlaneUrl)}, not ${sanitizeRemote(c.url)}`;
+  const iss = jwtIssuer(auth.apiToken);
+  if (iss === undefined) return undefined;
+  const d: SbxDiscovery = await c.api.sandboxDiscovery();
+  const want = ISSUER_BY_PROFILE[d.profile ?? ''];
+  if (want !== undefined && iss !== want)
+    return `the login was issued by '${sanitizeRemote(iss)}', but ${sanitizeRemote(c.url)} (profile ${sanitizeRemote(d.profile ?? 'harness')}) issues '${want}': it is another deployment's login`;
+  return undefined;
+}
+
+/** The loud failure of an admin write: the value changed between this command's read and its write. */
+function raced(c: SbxCtx, what: string, read: string, before: string, now: string): number {
+  c.io.err(
+    `sbx: ${what} was changed by someone else between read and write: ${read} / ${before} / ${now} ` +
+      '(read / before this write / now): check it, and write again if need be',
+  );
+  return SBX_EXIT.failed;
+}
+
+/** One subject, for a person: `github:9  enrolled (api)  admin (api, until 2026-11-08T12:00:00Z)`. */
+function subjectLine(s: SbxSubject): string {
+  const roles = s.roles.map(
+    (r) =>
+      `${sanitizeRemote(r.role)} (${r.source}${r.until !== null ? `, until ${new Date(r.until * 1000).toISOString().replace('.000Z', 'Z')}` : ''})`,
+  );
+  return [
+    sanitizeRemote(s.subject),
+    `${s.enrolled ? 'enrolled' : 'not enrolled'} (${s.source}${s.source === 'env' && s.storeEnrolled ? ', api too' : ''})`,
+    ...roles,
+  ].join('  ');
+}
+
+/** `sbx admin subjects`: every enrolled subject and its roles (admins). */
+export async function cmdSubjects(c: SbxCtx): Promise<number> {
+  try {
+    const subjects = await c.api.listSubjects();
+    if (c.json) c.io.out(JSON.stringify(subjects) + '\n');
+    else for (const s of subjects) c.io.out(subjectLine(s) + '\n');
+    return SBX_EXIT.ok;
+  } catch (err) {
+    return failed(c, err);
+  }
+}
+
+/** An API-granted admin role's state: `none`, or `admin` with its `until` (null: no expiry). */
+const roleOf = (s: SbxSubject | undefined) => {
+  const r = s?.roles.find((x) => x.role === 'admin' && x.source === 'api');
+  return r ? `admin until ${r.until ?? 'no expiry'}` : 'none';
+};
+
+/**
+ * Whether the subject read is already in the state the action asks for, so the write should change
+ * nothing (`record: null`); undefined where the list cannot tell. Enrollment compares the store's
+ * own enrollment (`storeEnrolled`), not `enrolled`, which folds in the settings and an admin role:
+ * the control plane answers an enroll of a settings subject unchanged, and refuses its unenroll.
+ */
+function alreadyThere(
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  s: SbxSubject | undefined,
+  until?: number,
+): boolean | undefined {
+  switch (action) {
+    case 'enroll':
+      return s?.source === 'env' || s?.storeEnrolled === true;
+    case 'unenroll':
+      return s?.source === 'env' ? undefined : s?.storeEnrolled !== true;
+    case 'grant':
+      return roleOf(s) === `admin until ${until ?? 'no expiry'}`;
+    case 'revoke':
+      // A lapsed grant is listed as none, yet a revoke still records its removal: "none" tells nothing.
+      return roleOf(s) === 'none' ? undefined : false;
+  }
+}
+
+/**
+ * `sbx admin subjects enroll|unenroll|grant|revoke SUBJECT` (an admin named in the
+ * settings). The subjects are read first, the change written, and the answer compared with the
+ * read. These answers name no `before`; their `record` does the same work (null when nothing
+ * changed), so a read that says "already so" with a record written, or "to change" with none, is a
+ * concurrent write, reported loudly (exit 1). Prints old -> new and the record's digest.
+ */
+export async function cmdSubjectChange(
+  c: SbxCtx,
+  action: 'enroll' | 'unenroll' | 'grant' | 'revoke',
+  subject: string,
+  until?: number,
+): Promise<number> {
+  try {
+    const mismatch = await loginMismatch(c);
+    if (mismatch) {
+      c.io.err(`sbx: refused: ${mismatch}`);
+      return SBX_EXIT.failed;
+    }
+    c.io.err(`sbx: admin write to ${sanitizeRemote(c.url)}`);
+    const read = (await c.api.listSubjects()).find((s) => s.subject === subject);
+    const r =
+      action === 'enroll'
+        ? await c.api.enrollSubject(subject)
+        : action === 'unenroll'
+          ? await c.api.unenrollSubject(subject)
+          : action === 'grant'
+            ? await c.api.grantAdmin(subject, until)
+            : await c.api.revokeAdmin(subject);
+    const state = (s: SbxSubject | undefined) =>
+      action === 'enroll' || action === 'unenroll'
+        ? s?.enrolled
+          ? `enrolled (${s.source})`
+          : 'not enrolled'
+        : roleOf(s);
+    if (c.json) c.io.out(JSON.stringify({ ...r, read: read ?? null }) + '\n');
+    else
+      c.io.out(
+        `${subjectLine(r)}${r.record ? '' : '  (unchanged)'}\n` +
+          `${sanitizeRemote(subject)}: ${state(read)} -> ${state(r)}${r.record ? ` (record ${sanitizeRemote(r.record)})` : ''}\n`,
+      );
+    const there = alreadyThere(action, read, until);
+    if (there !== undefined && there !== (r.record === null))
+      return raced(
+        c,
+        `${subject}'s ${action === 'enroll' || action === 'unenroll' ? 'enrollment' : 'admin role'}`,
+        state(read),
+        r.record === null ? 'already so' : 'changed by this write',
+        state(r),
+      );
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);

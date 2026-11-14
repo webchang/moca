@@ -3,11 +3,14 @@ import {
   asRecord,
   auditBestEffort,
   isAdmin,
+  membershipNow,
   requireEnrolledPrincipal,
+  requireReader,
   seconds,
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
 import {
+  buildRecordOf,
   canonicalJson,
   LONE_SURROGATE_RE,
   sha256Hex,
@@ -15,7 +18,23 @@ import {
   type ProvenanceStore,
 } from './provenance.js';
 import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
-import { isEnrolled, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
+import { isEnrolledForSandbox, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
+import {
+  hostManaged,
+  lastLeaseEnd,
+  liveLeases,
+  place,
+  readinessOf,
+  readinessReasonOf,
+  startQueue,
+  startRetryAfterS,
+  type HostView,
+  type Placement,
+  type StartQueue,
+} from './activation.js';
+import { activationLock } from './activation-lock.js';
+import { busyWorkers, freshHosts, hostViewsOf, liveSnapshots } from './host-handlers.js';
+import { SubjectQueue } from './subject-document.js';
 import {
   checkCreate,
   DEFAULT_GATE_RECORD_SCHEMA,
@@ -26,6 +45,7 @@ import {
   TEMPLATE_ID_RE,
   type Policy,
   type PolicyStore,
+  type Profile,
 } from './template-policy.js';
 import {
   TEMPLATE_DOC_SCHEMA,
@@ -45,13 +65,20 @@ import {
   type SandboxView,
 } from './sandbox-store.js';
 import { mintSandboxToken, mintSetModeToken } from './sandbox-token.js';
-import { SubjectQueue } from './subject-document.js';
+import {
+  allLines,
+  EGRESS_GRACE_S,
+  ENTRY_ID_RE,
+  summarize,
+  type EgressStore,
+} from './egress-log.js';
 import type { TokenClaims } from './token.js';
 
 /**
  * The sandbox resource's handlers (SBX0 spec §5.1), mounted on the `sandbox` route profile only,
  * and the template routes (template lifecycle spec §4: reads, self-serve create, cancel, the policy
- * and the quota; §5.1-§5.2: tags, edits and owner transfer), mounted on both.
+ * and the quota; §5.1-§5.2: tags, edits and owner transfer; §6.3: activation leases), mounted on
+ * both.
  * Only TYPES come from handlers.ts, which spreads this table into HANDLERS: a runtime import back
  * would be a module cycle.
  */
@@ -281,12 +308,17 @@ const audit = (deps: CpDeps, subject: string, sandboxId: string, decision: strin
 
 /**
  * A sandbox's start on its template's chain (template lifecycle spec §7.1): the build its reference
- * resolved to, and that build's manifest hash (null for a build imported from SH_SANDBOX_TEMPLATES,
- * which names no snapshot). There are no activation leases yet, so `lease` is null; activation
- * fills it in, as the digest of the `activate` record the lease came from. A no-op without a
- * provenance store.
+ * resolved to, that build's manifest hash (null for a build imported from SH_SANDBOX_TEMPLATES,
+ * which names no snapshot), and `lease`: the digest of the `activate` record that granted the
+ * caller's live lease on the build (§6.3), or null with none (e.g. a deployment without host
+ * agents). A no-op without a provenance store.
  */
-async function sandboxCreated(deps: CpDeps, rec: SandboxRecord, subject: string): Promise<void> {
+async function sandboxCreated(
+  deps: CpDeps,
+  rec: SandboxRecord,
+  subject: string,
+  lease: string | null,
+): Promise<void> {
   if (!deps.provenance) return;
   await deps.provenance.append({
     stream: `template/${rec.template}`,
@@ -296,7 +328,7 @@ async function sandboxCreated(deps: CpDeps, rec: SandboxRecord, subject: string)
       sandboxId: rec.id,
       buildId: rec.buildId ?? null,
       templateManifestHash: rec.buildId?.startsWith('sha256:') ? rec.buildId : null,
-      lease: null,
+      lease,
       state: 'created',
       expiresAt: rec.expiresAt,
     },
@@ -327,8 +359,86 @@ async function sandboxEnded(
       reason,
       expiresAt: rec.expiresAt,
       ...(reason === 'deleted' ? { endedAt: nowS } : {}),
+      ...(deps.egress ? { egress: await egressDigest(deps.egress, rec.id) } : {}),
     },
   });
+}
+
+/**
+ * What a `sandbox` record names of the egress log: its digest, and its completeness
+ * with the reasons (`droppedBy`: proxy, cap, budget, invalid).
+ */
+async function egressDigest(store: EgressStore, id: string) {
+  const s = await summarize(store, id);
+  return {
+    events: s.total,
+    sha256: s.sha256,
+    dropped: s.dropped,
+    droppedBy: s.droppedBy,
+    complete: s.complete,
+  };
+}
+
+/** The egress log's NDJSON export, a store page at a time: each line and its `\n`. */
+async function* ndjson(store: EgressStore, id: string): AsyncGenerator<string> {
+  let chunk = '';
+  let n = 0;
+  for await (const line of allLines(store, id)) {
+    chunk += `${line}\n`;
+    if (++n % EGRESS_STREAM_LINES === 0) {
+      yield chunk;
+      chunk = '';
+    }
+  }
+  if (chunk) yield chunk;
+}
+const EGRESS_STREAM_LINES = 1000;
+
+/**
+ * Seals each ended sandbox's egress log once its grace has passed (egress-log.ts EGRESS_GRACE_S),
+ * in the janitor's sweep after recordExpiries. A log that changed after its end record named it
+ * (events that arrived in the grace) gets one more `sandbox` record, `state: 'egress'`, naming the
+ * final log: the newest `sandbox` record of a sandbox that carries `egress` is its log's digest.
+ *
+ * The seal comes last, after the record is written: a sweep that fails before it (the chain, the
+ * digest or the append) leaves the log unsealed, so the next sweep does the work again. Past the
+ * grace the host post takes no events for the sandbox, so the log no longer changes, and the
+ * compare with the chain's newest record keeps a repeated sweep from writing a second record.
+ */
+async function sealEgress(deps: CpDeps, recs: SandboxRecord[], nowS: number): Promise<void> {
+  const store = deps.egress;
+  const retentionS = deps.config.sandbox?.retentionS ?? 0;
+  if (!store) return;
+  const due = recs.filter(
+    (r) => !isLive(r, nowS) && nowS >= (r.deletedAt ?? r.expiresAt) + EGRESS_GRACE_S,
+  );
+  const chains = new Map<string, Awaited<ReturnType<ProvenanceStore['chain']>>>();
+  for (const r of due) {
+    if ((await store.meta(r.id)).sealed) continue;
+    if (deps.provenance) {
+      const stream = `template/${r.template}`;
+      if (!chains.has(stream)) chains.set(stream, await deps.provenance.chain(stream));
+      const named = chains
+        .get(stream)!
+        .filter(
+          (x) =>
+            x.kind === 'sandbox' &&
+            (x.body as { sandboxId?: string }).sandboxId === r.id &&
+            (x.body as { egress?: unknown }).egress !== undefined,
+        )
+        .pop()?.body.egress as { sha256?: string; dropped?: number } | undefined;
+      const now = await egressDigest(store, r.id);
+      if (!named || named.sha256 !== now.sha256 || named.dropped !== now.dropped) {
+        await deps.provenance.append({
+          stream,
+          kind: 'sandbox',
+          subject: 'janitor',
+          body: { sandboxId: r.id, buildId: r.buildId ?? null, state: 'egress', egress: now },
+        });
+      }
+    }
+    await store.seal(r.id, (r.deletedAt ?? r.expiresAt) + retentionS);
+  }
 }
 
 /**
@@ -427,12 +537,52 @@ interface ReadinessFacts {
   inUse: Map<string, number> | null;
   /** worker -> epoch seconds of the newest sandbox created on it, retained records included. */
   lastUsed: Map<string, number> | null;
+  /** Where wanted builds are placed (§6.2), when any host agent has reported; else null. */
+  placement: Placement | null;
+  /**
+   * The hosts' start lines (§6.5): placed, wanted builds not attached, per host that reports its
+   * startConcurrency; null without placement or presence.
+   */
+  queue: StartQueue | null;
+  /** The hosts as last reported (empty without host agents): a start line's Retry-After reads them. */
+  hosts: HostView[];
+  /**
+   * Every host as last reported, stale ones too, for each build's `heldBy`: it is the snapshot
+   * inventory, not placement, and a silent host still holds what it last reported (it is told to
+   * stop a retired build once it reports again). Null without host agents.
+   */
+  holders: HostView[] | null;
+  /** Whether a build's snapshot or worker a build that is not retired shares (liveSnapshots). */
+  shared: (b: TemplateBuild) => boolean;
+  nowS: number;
   /** The current policy's trusted gate records (self-attestation: attestation and visibility in effect). */
   trusted: ReadonlySet<string>;
 }
 
-async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
+/** The host views, or null on a deployment without host agents (no `heldBy` to report). */
+const viewsOrNull = (deps: CpDeps, hosts: HostView[]): HostView[] | null =>
+  hosts.length > 0 || deps.config.templateHosts?.length ? hosts : null;
+
+async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<ReadinessFacts> {
   const trusted = await trustedSet(deps);
+  const nowS = seconds(deps);
+  const hosts = hostViewsOf(deps);
+  // The workers with a live sandbox: they drain and keep their slot, and are never graced (§6.5).
+  const busy = await busyWorkers(deps, nowS);
+  // Every template, not only those the caller sees: sharing is judged across the catalog.
+  const all = docs ?? (await catalog(deps).list());
+  const shared = liveSnapshots(all);
+  const placement = hosts.length > 0 ? place(all, hosts, nowS, busy) : null;
+  // Fresh hosts only for placement (HOST_STALE_S); every reported host for `heldBy`.
+  const holders = viewsOrNull(
+    deps,
+    (deps.hosts?.all() ?? []).map(([id, h]) => ({
+      id,
+      holds: h.holds,
+      activeLimit: h.limits.activeLimit,
+      running: h.running,
+    })),
+  );
   let attached: Map<string, number> | null = null;
   if (deps.presence) {
     try {
@@ -442,8 +592,20 @@ async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
       attached = null;
     }
   }
-  if (deps.config.routeProfile !== 'sandbox' || !deps.sandboxes) {
-    return { attached, inUse: null, lastUsed: null, trusted };
+  const queue = placement && attached ? startQueue(all, hosts, placement, attached, nowS) : null;
+  if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
+    return {
+      attached,
+      inUse: null,
+      lastUsed: null,
+      placement,
+      queue,
+      hosts,
+      holders,
+      shared,
+      nowS,
+      trusted,
+    };
   }
   const inUse = new Map<string, number>();
   const lastUsed = new Map<string, number>();
@@ -452,36 +614,69 @@ async function readinessFacts(deps: CpDeps): Promise<ReadinessFacts> {
     if (isLive(r, now)) inUse.set(r.worker, (inUse.get(r.worker) ?? 0) + 1);
     lastUsed.set(r.worker, Math.max(lastUsed.get(r.worker) ?? 0, r.createdAt));
   }
-  return { attached, inUse, lastUsed, trusted };
+  return { attached, inUse, lastUsed, placement, queue, hosts, holders, shared, nowS, trusted };
 }
 
 /**
  * One build on the wire (openapi TemplateBuild), never its worker. Readiness, for a registered
- * build: `active` while the relay holds its worker's presence record, `inactive` without one,
- * `unknown` when presence cannot be read; null for a build that is not registered.
+ * build (§3.3, activation.ts readinessOf): from its leases, where it is placed and whether the
+ * relay holds its worker's presence record; `unknown` when presence cannot be read; `retired` for
+ * a retired build (§5.1); null for any other build that is not registered.
  */
 function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: boolean) {
+  const shared = b.status === 'retired' && f.shared(b);
   const readiness =
-    b.status !== 'registered'
-      ? null
-      : f.attached === null
-        ? 'unknown'
-        : f.attached.has(b.worker)
-          ? 'active'
-          : 'inactive';
+    b.status === 'retired'
+      ? 'retired'
+      : b.status !== 'registered'
+        ? null
+        : readinessOf(b, f.nowS, f.placement, f.attached);
+  const readinessReason = readinessReasonOf(b, readiness, f.placement);
+  // Waiting for a start slot on its host (§6.5): present only on an `activating` build.
+  const line = readiness === 'activating' ? f.queue?.byBuild.get(b.buildId) : undefined;
+  // In its host's idle grace (§6.5): no lease, its worker kept running until gracedUntil.
+  const grace = b.status === 'registered' ? f.placement?.graced.get(b.buildId) : undefined;
   return {
     buildId: b.buildId,
     status: b.status,
     profile: b.profile,
     readiness,
+    // Why an `unavailable` build is not placed: present only then.
+    ...(readinessReason ? { readinessReason } : {}),
+    ...(line ? { queued: line.queued, queuePosition: line.position } : {}),
+    ...(grace ? { graced: true, gracedUntil: grace.until } : {}),
+    // For an active build; and for a retired one whose worker still holds a presence record (it
+    // runs until its host stops it), so a client sees the stop. For a retired build whose
+    // presence cannot be read, `running: null`: not known to be stopped, so null capacity means
+    // only "read, and not attached". A build retired before it registered has no worker
+    // (`worker` empty), so nothing to stop: null capacity, presence read or not. Nor does one
+    // whose snapshot or worker a build that is not retired shares (`shared`): its worker is left
+    // running for that build, never stopped for the retire.
     capacity:
-      readiness === 'active'
+      readiness === 'active' ||
+      (b.status === 'retired' &&
+        b.worker !== '' &&
+        !shared &&
+        (f.attached === null || f.attached.has(b.worker)))
         ? {
-            running: f.attached?.get(b.worker) ?? 0,
+            running: f.attached === null ? null : (f.attached.get(b.worker) ?? 0),
             inUse: f.inUse === null ? null : (f.inUse.get(b.worker) ?? 0),
           }
         : null,
+    // A retired build whose snapshot or worker a build that is not retired shares: its worker is
+    // kept for that build. False for every other build.
+    shared,
     lastUsedAt: f.lastUsed === null ? null : (f.lastUsed.get(b.worker) ?? null),
+    // The hosts whose last inventory holds this build's snapshot (§6.1), a host silent past
+    // HOST_STALE_S too: ids only, no paths, so a client sees which hosts still hold a retired
+    // build. Null without host agents.
+    heldBy:
+      f.holders === null
+        ? null
+        : f.holders
+            .filter((h) => h.holds[b.buildId] !== undefined)
+            .map((h) => h.id)
+            .sort(),
     tags: Object.entries(d.tags)
       .filter(([, id]) => id === b.buildId)
       .map(([t]) => t)
@@ -509,6 +704,7 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
 /** One template on the wire (openapi Template): today's three fields first, then its builds. */
 function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
   const def = resolveBuild(d, {});
+  const defBody = def ? buildBody(d, def, f, false) : null;
   return {
     id: d.id,
     description: d.description,
@@ -525,7 +721,8 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
     onboarding: d.builds.some((b) => b.status === 'registered')
       ? 'registered'
       : (d.builds[0]?.status ?? null),
-    readiness: def ? buildBody(d, def, f, false).readiness : null,
+    readiness: defBody?.readiness ?? null,
+    ...(defBody?.readinessReason ? { readinessReason: defBody.readinessReason } : {}),
     tags: { ...d.tags },
     builds: d.builds.map((b) => buildBody(d, b, f, full)),
   };
@@ -535,25 +732,44 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
  * A sandbox's template reference (§3.2, §4): `id`, `id:tag` or `id@<build id>`, resolved to one
  * registered build and its worker at creation, and kept for the sandbox's life. An unknown id, tag
  * or build, one the caller cannot see, or a build not registered is `400 unknown_template`, as an
- * unknown id always was. A build not attached is not refused here: its first Exec waits on the
- * relay, as before.
+ * unknown id always was; a retired build, or a template whose every build is retired, is `410
+ * template_retired` (§5.1). Whether the build is active is requireActive's question (§6.4).
  */
-async function resolveForUse(
+export async function resolveForUse(
   deps: CpDeps,
   p: TokenClaims,
   ref: string,
-): Promise<{ id: string; worker: string; buildId: string }> {
+): Promise<{
+  id: string;
+  worker: string;
+  buildId: string;
+  doc: TemplateDoc;
+  build: TemplateBuild;
+}> {
   const at = ref.indexOf('@');
   const colon = at < 0 ? ref.indexOf(':') : -1;
   const id = at >= 0 ? ref.slice(0, at) : colon >= 0 ? ref.slice(0, colon) : ref;
   const r =
     at >= 0 ? { build: ref.slice(at + 1) } : colon >= 0 ? { tag: ref.slice(colon + 1) } : {};
   const d = await catalog(deps).get(id);
-  const b = d && canSee(d, p, await trustedSet(deps)) ? resolveBuild(d, r) : null;
+  const seen = d !== null && canSee(d, p, await trustedSet(deps));
+  const b = d && seen ? resolveBuild(d, r) : null;
+  // A retired build, or a template whose every build is retired, is gone, not unknown (§5.1).
+  if (
+    d &&
+    seen &&
+    (b?.status === 'retired' ||
+      (!b && d.builds.length > 0 && d.builds.every((x) => x.status === 'retired')))
+  ) {
+    throw new CpError(
+      'template_retired',
+      `template '${d.id}'${b ? ` build ${b.buildId}` : ''} is retired`,
+    );
+  }
   if (!d || !b || b.status !== 'registered' || !b.worker) {
     throw new CpError('unknown_template', 'no such template (GET /v1/templates lists them)');
   }
-  return { id: d.id, worker: b.worker, buildId: b.buildId };
+  return { id: d.id, worker: b.worker, buildId: b.buildId, doc: d, build: b };
 }
 
 /**
@@ -625,6 +841,18 @@ const quotaLocks = new WeakMap<TemplateCatalog, SubjectQueue>();
 function quotaLock(cat: TemplateCatalog): SubjectQueue {
   let q = quotaLocks.get(cat);
   if (!q) quotaLocks.set(cat, (q = new SubjectQueue()));
+  return q;
+}
+
+/**
+ * One PUT /v1/policy at a time per policy store, within this process: its read, its widening check
+ * and its write run as one step, so two PUTs never both start from the same policy. The store
+ * serializes each call, not a read and a later write; a deployment runs one control plane.
+ */
+const policyLocks = new WeakMap<PolicyStore, SubjectQueue>();
+function policyLock(store: PolicyStore): SubjectQueue {
+  let q = policyLocks.get(store);
+  if (!q) policyLocks.set(store, (q = new SubjectQueue()));
   return q;
 }
 
@@ -904,6 +1132,7 @@ async function admitBuild(
             worker: '',
             spec: buildSpec(built),
             createdAt: now,
+            queuedAtMs: deps.now(),
             provenance: created.digest,
             request: {
               image: b.image as string,
@@ -1075,6 +1304,604 @@ async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
     status: 200,
     body: { templateId: d0.id, build: cancelled!.handle ?? cancelled!.buildId, status: 'failed' },
   };
+}
+
+/**
+ * Per host: its limits, its use (the workers placement counts on it: placed, running, draining) and
+ * its disk (§4, §6.2), as its agent last reported them, and, from an agent that reports it, its
+ * memory: the figures, the effective floor, the use and headroom placement counts, and the brake
+ * (pressure or a stale inventory) that stops new starts; from an agent that reports them, its start
+ * limit, measured start time and start line, and its idle grace with the builds in it (§6.5, apart
+ * from `used`). Empty when no host has reported, never meaning "no limit"; a host silent for over
+ * HOST_STALE_S is left out, as placement leaves it out.
+ */
+function hostsBlock(deps: CpDeps, f: ReadinessFacts) {
+  const used = f.placement?.used ?? new Map<string, number>();
+  const graced = new Map<string, number>();
+  for (const g of f.placement?.graced.values() ?? [])
+    graced.set(g.host, (graced.get(g.host) ?? 0) + 1);
+  return freshHosts(deps).map(([id, h]) => {
+    const q = f.queue?.byHost.get(id);
+    const start = h.start
+      ? {
+          concurrency: h.start.concurrency,
+          seconds: h.start.seconds ?? null,
+          starting: q?.starting ?? null,
+          queued: q?.queued ?? null,
+        }
+      : undefined;
+    const m = h.memory;
+    const u = f.placement?.memory.get(id);
+    const memory =
+      m && m.totalMib !== undefined && u
+        ? {
+            totalMib: m.totalMib,
+            availableMib: m.availableMib!,
+            floorMib: m.floorMib!,
+            usedMib: u.usedMib,
+            headroomMib: u.headroomMib,
+            pressureFull10: m.pressureFull10 ?? null,
+            pressureLimit: m.pressureLimit ?? null,
+            brake: u.brake,
+            runningWorkers: (m.running ?? []).length,
+            memfileMismatch: [...(m.memfileMismatch ?? [])].sort(),
+            reportedAt: h.at,
+          }
+        : undefined;
+    return {
+      id,
+      active: { limit: h.limits.activeLimit, used: used.get(id) ?? 0 },
+      idleLimitSeconds: h.limits.idleLimitSeconds,
+      disk: { freeGb: h.limits.diskFreeGb, floorGb: h.limits.diskFloorGb },
+      ...(memory ? { memory } : {}),
+      ...(start ? { start } : {}),
+      // Its idle grace and the builds in it now, only from an agent that sets one.
+      ...(h.idleGraceSeconds
+        ? { idleGraceSeconds: h.idleGraceSeconds, graced: graced.get(id) ?? 0 }
+        : {}),
+    };
+  });
+}
+
+/** The builds `subject` holds a live lease on (§6.3): what the `active` quota counts. */
+const leasedBy = (docs: TemplateDoc[], subject: string, nowS: number): TemplateBuild[] =>
+  docs
+    .flatMap((d) => d.builds)
+    .filter((x) => liveLeases(x, nowS).some((l) => l.subject === subject));
+
+/**
+ * Activate (§6.3): take or renew this subject's lease on a registered build, by `tag` (default
+ * `default`) or `build`, `leaseSeconds` long (default the largest idle limit of the hosts that hold it, clamped
+ * to 60-86400, else 3600; at most a day per grant, renewals unlimited). Refused with template_unavailable when no
+ * registered build or no host holds it, no_active_slot (Retry-After) when every holder is full,
+ * quota_exceeded over the subject's active quota; on a refusal no lease is kept.
+ */
+async function activate(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const b = asRecord(ctx.body);
+  const ref =
+    typeof b.build === 'string'
+      ? { build: b.build }
+      : { tag: typeof b.tag === 'string' ? b.tag : 'default' };
+  const target = resolveBuild(d0, ref);
+  if (target?.status === 'retired')
+    throw new CpError('template_retired', `template '${d0.id}' build ${target.buildId} is retired`);
+  if (!target || target.status !== 'registered') {
+    throw new CpError(
+      'template_unavailable',
+      'no registered build of this template under that reference',
+      undefined,
+      { readiness: 'unavailable' },
+    );
+  }
+  if (!hostManaged(target)) throw deploymentRun(d0.id);
+  const r = await takeLease(deps, p, d0, target, b.leaseSeconds, 'owner');
+  return {
+    status: 200,
+    body: { templateId: d0.id, buildId: target.buildId, leaseUntil: r.until, host: r.host },
+  };
+}
+
+/**
+ * The refusal of a lease on a build no host can hold (activation.ts hostManaged): one imported from
+ * SH_SANDBOX_TEMPLATES, whose worker the deployment runs. It needs no activation: a sandbox is
+ * created on it whenever its worker is attached, as on a deployment without host agents.
+ */
+const deploymentRun = (id: string) =>
+  new CpError(
+    'invalid_request',
+    `template '${id}' is run by the deployment (SH_SANDBOX_TEMPLATES); it takes no activation lease`,
+  );
+
+/**
+ * Takes or renews `p`'s lease on `target` (§6.3) and records it, or refuses with no lease kept:
+ * template_unavailable, no_active_slot (Retry-After), quota_exceeded. Shared by activate and by
+ * activation on first use (§6.4); `reason` is the record's (§7.1). Runs under activationLock.
+ */
+async function takeLease(
+  deps: CpDeps,
+  p: TokenClaims,
+  d0: TemplateDoc,
+  target: TemplateBuild,
+  leaseSeconds: unknown,
+  reason: 'owner' | 'first_use',
+): Promise<{ until: number; host: string | null }> {
+  if (!hostManaged(target)) throw deploymentRun(d0.id);
+  const { cat } = writable(deps);
+  return activationLock(cat).run('activation', () =>
+    takeLeaseLocked(deps, p, d0, target, leaseSeconds, reason),
+  );
+}
+
+/** takeLease's body: run only under activationLock. */
+async function takeLeaseLocked(
+  deps: CpDeps,
+  p: TokenClaims,
+  d0: TemplateDoc,
+  target: TemplateBuild,
+  leaseSeconds: unknown,
+  reason: 'owner' | 'first_use',
+): Promise<{ until: number; host: string | null }> {
+  const { cat, policy, prov } = writable(deps);
+  const nowS = seconds(deps);
+  const DAY = 86_400;
+  const hosts = hostViewsOf(deps);
+  // An explicit leaseSeconds is the client's, range-checked. The default is the largest idle limit
+  // of the hosts that hold this build (3600 when none reports one), clamped into the range: a
+  // host's SBX_IDLE_LIMIT_S outside it never refuses a request that named no lease.
+  let want: number;
+  if (leaseSeconds !== undefined && leaseSeconds !== null) {
+    if (
+      typeof leaseSeconds !== 'number' ||
+      !Number.isSafeInteger(leaseSeconds) ||
+      leaseSeconds < 60 ||
+      leaseSeconds > DAY
+    ) {
+      throw new CpError('invalid_request', 'leaseSeconds must be 60-86400 (renew to hold longer)');
+    }
+    want = leaseSeconds;
+  } else {
+    const idle = hosts
+      .filter((h) => h.holds[target.buildId] !== undefined)
+      .map((h) => deps.hosts!.get(h.id)!.limits.idleLimitSeconds);
+    want = Math.min(DAY, Math.max(60, Math.max(0, ...idle) || 3600));
+  }
+  const { policy: pol } = await policy.current();
+  const docs = await cat.list();
+  // `target` was resolved before the lock; a retire takes the lock too, so this read is current. A
+  // build retired since is refused here, so no lease (none counting against the quota) is written
+  // onto it.
+  const fresh = docs.find((d) => d.id === d0.id)?.builds.find((x) => x.buildId === target.buildId);
+  if (fresh?.status === 'retired')
+    throw new CpError('template_retired', `template '${d0.id}' build ${target.buildId} is retired`);
+  if (fresh?.status !== 'registered')
+    throw new CpError('template_unavailable', 'this build is no longer registered', undefined, {
+      readiness: 'unavailable',
+    });
+  // A renewal does not count against itself.
+  const held = leasedBy(docs, p.sub, nowS).filter((x) => x.buildId !== target.buildId);
+  if (held.length >= pol.quota.active) {
+    throw new CpError(
+      'quota_exceeded',
+      `at most ${pol.quota.active} active templates per subject`,
+      undefined,
+      { quota: 'active' },
+    );
+  }
+  const withLease = (x: TemplateBuild, record?: string): TemplateBuild => {
+    const others = (x.leases ?? []).filter((l) => l.subject !== p.sub && l.until > nowS);
+    const mine = (x.leases ?? []).find((l) => l.subject === p.sub && l.until > nowS);
+    return {
+      ...x,
+      leases: [
+        ...others,
+        {
+          subject: p.sub,
+          until: nowS + want,
+          since: mine?.since ?? nowS,
+          ...(record ? { record } : {}),
+        },
+      ],
+    };
+  };
+  // Would it be placed? Judge with this lease added, before keeping it.
+  const trial = docs.map((d) =>
+    d.id !== d0.id
+      ? d
+      : { ...d, builds: d.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)) },
+  );
+  // A graced worker gives its slot up to this lease (it is not `placed`, so never "displaced"
+  // below); the workers with a live sandbox drain, keep their slot, and are never graced.
+  const busy = await busyWorkers(deps, nowS);
+  const pl = place(trial, hosts, nowS, busy);
+  // A held build is never evicted to make room (§6.3): placement breaks a tie of equal `since` (whole
+  // seconds) by buildId, so a lease taken in the same second as a placed one could otherwise sort
+  // ahead of it and push it off its host. Such a lease waits, as one that does not fit.
+  const before = place(docs, hosts, nowS, busy);
+  const displaced = [...before.placed.keys()].find(
+    (x) => x !== target.buildId && !pl.placed.has(x),
+  );
+  const displaces = displaced !== undefined;
+  // Displacing, the refusal's reason is the displaced build's: what would push it off.
+  const why =
+    displaced !== undefined ? pl.unplaced.get(displaced) : pl.unplaced.get(target.buildId);
+  if (hosts.length > 0 && why === 'not_held') {
+    throw new CpError('template_unavailable', "no host holds this build's snapshot", undefined, {
+      readiness: 'unavailable',
+    });
+  }
+  // Every holder reports this build's memory file wrong: no wait clears it, a rebuild does.
+  if (!displaces && why === 'memfile_mismatch') {
+    throw new CpError(
+      'template_unavailable',
+      "every host holding this build reports its memory file is not the guest's size",
+      undefined,
+      { readiness: 'unavailable', reason: 'memfile_mismatch' },
+    );
+  }
+  if (why === 'no_slot' || why === 'memory' || displaces) {
+    // Retry-After: the soonest a slot (or the memory) on one of this build's holders can free, that
+    // is the soonest another build placed on one of them loses its last live lease. Other hosts'
+    // builds, and other subjects' leases on a build that stays leased, free nothing here. 60 s when
+    // no leased build holds those slots (draining workers, whose end no lease tells).
+    const holders = new Set(
+      hosts.filter((h) => h.holds[target.buildId] !== undefined).map((h) => h.id),
+    );
+    const free = Math.min(
+      ...trial
+        .flatMap((d) => d.builds)
+        .filter((x) => x.buildId !== target.buildId && holders.has(pl.placed.get(x.buildId) ?? ''))
+        .map((x) => Math.max(...liveLeases(x, nowS).map((l) => l.until)) - nowS),
+    );
+    // A memory refusal says so; one at the active limit answers exactly as before.
+    throw new CpError(
+      'no_active_slot',
+      why === 'memory'
+        ? 'no host holding this build has the memory for its worker now (memory-aware placement)'
+        : 'every host holding this build is at its active limit with leased builds',
+      undefined,
+      why === 'memory'
+        ? { readiness: 'unavailable', reason: 'memory' }
+        : { readiness: 'unavailable' },
+      Number.isFinite(free) ? Math.max(1, free) : 60,
+    );
+  }
+  // The record first, so the lease can name it (a sandbox under this lease cites it, §7.1), and no
+  // lease is ever stored without its record.
+  const host = pl.placed.get(target.buildId) ?? null;
+  const rec = await prov.append({
+    stream: `template/${d0.id}`,
+    kind: 'activate',
+    subject: p.sub,
+    body: {
+      buildId: target.buildId,
+      leaseSeconds: want,
+      until: nowS + want,
+      ...(host ? { host } : {}),
+      ...(reason === 'first_use' ? { reason } : {}),
+    },
+  });
+  await cat.update(d0.id, async (cur) => ({
+    ...cur!,
+    builds: cur!.builds.map((x) => (x.buildId === target.buildId ? withLease(x, rec.digest) : x)),
+  }));
+  return { until: nowS + want, host };
+}
+
+/**
+ * Deactivate (§6.3): drop this subject's leases on the template's builds (an admin with
+ * `all: true`, everyone's); a build stays wanted while another subject's lease stands. A drop is
+ * a `deactivate` record; one that drops nothing writes none. When none is left, the time is kept
+ * as the build's lastLeaseEnd, from which a host's idle grace runs (§6.5). `stopNow: true` skips
+ * that grace: a build left with no lease is stopped at the next wanted answer (forced cold), and
+ * the `deactivate` record says `stopNow: true`.
+ */
+async function deactivate(ctx: RequestCtx, deps: CpDeps) {
+  const p = requireEnrolled(ctx, deps);
+  const { cat, prov } = writable(deps);
+  const d0 = await visibleTemplate(deps, p, ctx.params.id ?? '');
+  const b = asRecord(ctx.body);
+  if (b.stopNow !== undefined && typeof b.stopNow !== 'boolean')
+    throw new CpError('invalid_request', 'stopNow must be a boolean');
+  const stopNow = b.stopNow === true;
+  const nowS = seconds(deps);
+  const all = isAdmin(p) && b.all === true;
+  let dropped = 0;
+  // Builds whose idle grace this stopNow ends: unleased, with a lease end it had not covered yet.
+  let ended = 0;
+  await cat.update(d0.id, async (cur) => ({
+    ...cur!,
+    builds: cur!.builds.map((x) => {
+      const live = (x.leases ?? []).filter((l) => l.until > nowS);
+      const keep = live.filter((l) => !(all || l.subject === p.sub));
+      dropped += live.length - keep.length;
+      // The end of its last lease: now when this drop leaves none, else what the expired leases
+      // this write clears said (lastLeaseEnd reads them before they go).
+      const prior = lastLeaseEnd(x, nowS);
+      const end = keep.length === 0 && live.length > 0 ? nowS : prior;
+      const out: TemplateBuild = {
+        ...x,
+        leases: keep,
+        ...(end !== undefined ? { lastLeaseEnd: end } : {}),
+      };
+      if (stopNow && keep.length === 0 && x.status === 'registered' && end !== undefined) {
+        if (x.stopNowAt === undefined || end > x.stopNowAt) ended += 1;
+        out.stopNowAt = nowS;
+      }
+      return out;
+    }),
+  }));
+  if (dropped > 0 || ended > 0) {
+    await prov.append({
+      stream: `template/${d0.id}`,
+      kind: 'deactivate',
+      subject: p.sub,
+      body: { leases: dropped, all, ...(stopNow ? { stopNow: true } : {}) },
+    });
+  }
+  return { status: 200, body: { templateId: d0.id, released: dropped } };
+}
+
+/**
+ * Why each build is in use now (§5.1): a live sandbox runs on it. A retire is refused while any
+ * build it names is in use, so it never cuts off running work. A sandbox names the build it
+ * resolved to (`buildId`), so it counts for that build only: two builds of one template from one
+ * image can share a worker id, and a sandbox on one must not block retiring the other. A record
+ * from before builds were traced (no `buildId`) counts for every build on its worker. Sessions
+ * pinned to a build, once sessions are, are live use too, and are to be checked here.
+ */
+async function buildsInUse(
+  deps: CpDeps,
+  builds: TemplateBuild[],
+  nowS: number,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!deps.sandboxes) return out;
+  const busyBuilds = new Set<string>();
+  const legacyWorkers = new Set<string>();
+  for (const r of await deps.sandboxes.listAll(nowS)) {
+    if (!isLive(r, nowS)) continue;
+    if (r.buildId) busyBuilds.add(r.buildId);
+    else legacyWorkers.add(r.worker);
+  }
+  for (const x of builds) {
+    if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
+      out.set(x.buildId, 'still serves a live sandbox');
+  }
+  return out;
+}
+
+/** One build a retire answered for (openapi RetiredBuild). */
+interface RetiredBuild {
+  build: string;
+  buildId: string | null;
+  readiness: 'retired';
+  record: string | null;
+}
+
+/**
+ * Retire (§5.1): the owner, or an admin, retires a whole template (every build not yet retired) or
+ * one build. A retired build is never used again (a sandbox or an activation naming it answers
+ * `410 template_retired`) and its leases go, so it is no longer wanted: a host holding it is told
+ * to stop its worker (`GET /v1/hosts/{host}/wanted` `stop`). Refused while a live sandbox runs on
+ * a build it names (`409 build_in_use`). Its records stay, and each build retired writes a
+ * `retire` record naming the caller, the status before (`from`) and the build's `build` record
+ * (`buildRecord`). Idempotent: an already retired build is answered with `record: null`.
+ */
+async function retireBuilds(
+  ctx: RequestCtx,
+  deps: CpDeps,
+  which: (b: TemplateBuild) => boolean,
+): Promise<{ templateId: string; subject: string; builds: RetiredBuild[] }> {
+  // The owner's check is made on the template as read and again under its lock (ownerCheck), so a
+  // retire by an owner it was transferred away from meanwhile is refused.
+  const { p, cat, prov, d0, own } = await ownTemplate(ctx, deps, 'retires it');
+  const reason = asRecord(ctx.body).reason;
+  if (reason !== undefined && (typeof reason !== 'string' || reason.length > 1024))
+    throw new CpError('invalid_request', 'reason must be a string of at most 1024 characters');
+  const done: TemplateBuild[] = [];
+  const records = new Map<string, string>();
+  // Under the activation lock, so an activation never writes a lease onto a build retired after
+  // it resolved the build: it re-reads the build's status under the same lock (takeLeaseLocked).
+  await activationLock(cat).run('activation', async () => {
+    // The template is read again under the lock: the request's read (d0) may be older than a
+    // build registered, or a sandbox created on one, since. Read before the catalog update, so no
+    // sandbox-store lookup runs inside it.
+    const d1 = (await cat.get(d0.id)) ?? d0;
+    const inUse = await buildsInUse(deps, d1.builds.filter(which), seconds(deps));
+    await cat.update(d0.id, async (c) => {
+      const cur = own(c);
+      done.length = 0;
+      records.clear();
+      const targets = cur.builds.filter(which);
+      if (targets.length === 0)
+        throw new CpError('template_not_found', 'no such build of this template');
+      const busy = targets.find((x) => x.status !== 'retired' && inUse.has(x.buildId));
+      if (busy)
+        throw new CpError(
+          'build_in_use',
+          `build ${busy.handle ?? busy.buildId} ${inUse.get(busy.buildId)}: delete it, then retire`,
+        );
+      done.push(...targets.filter((x) => x.status !== 'retired'));
+      // Each `retire` record is written inside the update, as a host's build report writes its
+      // own: a record that cannot be written leaves the build as it was, so a retry retires it
+      // with its record, and no build is retired without one.
+      for (const x of done) {
+        const rec = await prov.append({
+          stream: `template/${d0.id}`,
+          kind: 'retire',
+          subject: p.sub,
+          body: {
+            build: x.handle ?? x.buildId,
+            ...(x.status === 'registered' ? { buildId: x.buildId } : {}),
+            buildRecord: await buildRecordOf(prov, d0.id, x),
+            from: x.status,
+            ...(typeof reason === 'string' ? { reason } : {}),
+          },
+        });
+        records.set(x.handle ?? x.buildId, rec.digest);
+      }
+      return {
+        ...cur,
+        builds: cur.builds.map((x) =>
+          done.includes(x) ? { ...x, status: 'retired' as const, leases: [] } : x,
+        ),
+      };
+    });
+  });
+  if (done.length > 0)
+    await auditBestEffort(deps, 'template_retired', d0.id, {
+      subject: p.sub,
+      decision: 'template_retired',
+    });
+  // Each build, its id, its readiness and the record written now (null for one already retired),
+  // so a client can tie the answer to the template's chain.
+  const after = (await cat.get(d0.id))!;
+  return {
+    templateId: d0.id,
+    subject: p.sub,
+    builds: after.builds
+      .filter((x) => x.status === 'retired' && which(x))
+      .map((x) => ({
+        build: x.handle ?? x.buildId,
+        // A build retired before it registered has only its handle.
+        buildId: x.buildId.startsWith('b-') ? null : x.buildId,
+        readiness: 'retired' as const,
+        record: records.get(x.handle ?? x.buildId) ?? null,
+      })),
+  };
+}
+
+/** POST /v1/templates/{id}/retire (§5.1): every build of the template not yet retired. */
+async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
+  const r = await retireBuilds(ctx, deps, () => true);
+  return { status: 200, body: { ...r, status: 'retired' } };
+}
+
+/** DELETE /v1/templates/{id}/builds/{build} (§5.1): one build, by its build id or handle. */
+async function retireTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
+  const ref = ctx.params.build ?? '';
+  const r = await retireBuilds(ctx, deps, (x) => x.handle === ref || x.buildId === ref);
+  return {
+    status: 200,
+    body: { templateId: r.templateId, subject: r.subject, ...r.builds[0], status: 'retired' },
+  };
+}
+
+/**
+ * A sandbox record's write (§5.1), run under the activation lock after re-reading its build's
+ * status. A retire judges use and retires under the same lock, so a create racing it either writes
+ * first, and the retire sees its sandbox and is refused `409 build_in_use`, or finds the build
+ * retired, and is refused `410 template_retired` with no record written. Without a template store
+ * nothing can be retired, so no lock is taken.
+ */
+async function notRetired<T>(
+  deps: CpDeps,
+  t: { id: string; buildId: string },
+  write: () => Promise<T>,
+): Promise<T> {
+  const cat = deps.templates;
+  if (!cat?.update || !deps.provenance) return write();
+  return activationLock(cat).run('activation', async () => {
+    const cur = (await cat.get(t.id))?.builds.find((x) => x.buildId === t.buildId);
+    if (cur?.status === 'retired')
+      throw new CpError('template_retired', `template '${t.id}' build ${t.buildId} is retired`);
+    return write();
+  });
+}
+
+/** How long a client waits before retrying a create on a template still activating (§6.4). */
+export const FIRST_USE_RETRY_S = 30;
+
+/**
+ * Activation on first use (§6.4): on a deployment with host agents, a sandbox is created only on
+ * an `active` build. One not active is refused with `409 template_not_active` and Retry-After, and,
+ * unless the client sent `activate: false`, the caller's lease on it is taken first, so the host
+ * agent starts its worker; the retry succeeds once it is attached. No sandbox record is kept while
+ * waiting, so a wait never uses the caller's live-sandbox cap. Without host agents (workers run
+ * by the deployment, SH_TEMPLATE_HOSTS unset) nothing changes: the create succeeds as before.
+ * With hosts configured but none reported within HOST_STALE_S (a fresh deploy, a restart, every
+ * host down), readiness is the worker's presence alone: an attached worker serves, and an absent one is refused rather
+ * than left to wait at the relay. A build imported from SH_SANDBOX_TEMPLATES (no snapshot, so no
+ * host ever holds it) is never gated: the deployment runs its worker.
+ *
+ * `mayActivate` false (a session's create by a subject not enrolled for sandboxes, combined spec
+ * §3.4) never takes a lease: activation is enrolled-only, as on the activate route. Such a caller
+ * waits (409) on a build another subject's lease is starting, and is refused (403 not_enrolled) one
+ * nobody is starting, which only an enrolled subject can.
+ */
+export async function requireActive(
+  deps: CpDeps,
+  p: TokenClaims,
+  t: { doc: TemplateDoc; build: TemplateBuild },
+  activate: boolean,
+  mayActivate = true,
+): Promise<void> {
+  if (hostViewsOf(deps).length === 0 && !deps.config.templateHosts?.length) return;
+  // A build imported from SH_SANDBOX_TEMPLATES is the deployment's to run, never a host's: no gate,
+  // as on a deployment without host agents.
+  if (!hostManaged(t.build)) return;
+  let facts = await readinessFacts(deps);
+  const readiness = readinessOf(t.build, facts.nowS, facts.placement, facts.attached);
+  if (readiness === 'active') return;
+  let now = readiness;
+  let started = false;
+  // A caller that already holds a live lease on the build (a retry of its own first use, say) is
+  // only told to wait: no renewal and no new `activate` record on every retry.
+  const leased = liveLeases(t.build, facts.nowS).some((l) => l.subject === p.sub);
+  if (activate && !mayActivate && !leased && readiness !== 'activating') {
+    throw new CpError(
+      'not_enrolled',
+      `template '${t.doc.id}' is ${readiness}, and this account (${p.sub}) is not enrolled in the ` +
+        'sandbox service, so it cannot activate it: an enrolled user must activate it first',
+      undefined,
+      { readiness },
+    );
+  }
+  if (
+    activate &&
+    mayActivate &&
+    !leased &&
+    (readiness === 'inactive' || readiness === 'deactivating' || readiness === 'activating')
+  ) {
+    // Its refusals (no_active_slot, quota_exceeded, template_unavailable) answer as activate's.
+    const lease = await takeLease(deps, p, t.doc, t.build, undefined, 'first_use');
+    // A build in its idle grace has its worker attached, and the lease keeps it there (placement
+    // prefers the host running it): it serves now, with no wait (§6.5).
+    const graced = facts.placement?.graced.get(t.build.buildId);
+    if (graced && lease.host === graced.host && readiness === 'deactivating') return;
+    now = 'activating';
+    started = true;
+    // The lease may have placed it just now: its start line is read after it (§6.5).
+    if (readiness !== 'activating') facts = await readinessFacts(deps);
+  }
+  // On a host whose agent reports its start limit and time, the wait its place in the host's
+  // start line implies (§6.5); else FIRST_USE_RETRY_S, as before.
+  const line = now === 'activating' ? facts.queue?.byBuild.get(t.build.buildId) : undefined;
+  const estimate = line
+    ? startRetryAfterS(
+        line,
+        facts.hosts.find((h) => h.id === line.host),
+      )
+    : null;
+  throw new CpError(
+    'template_not_active',
+    started
+      ? `template '${t.doc.id}' is ${now}; its activation has started: retry after the wait`
+      : activate
+        ? `template '${t.doc.id}' is ${now}: retry after the wait`
+        : `template '${t.doc.id}' is ${now}; activate it (POST /v1/templates/${t.doc.id}/activate) or retry without activate: false`,
+    undefined,
+    {
+      readiness: now,
+      ...(now === 'unavailable' && facts.placement?.unplaced.get(t.build.buildId)
+        ? { reason: facts.placement.unplaced.get(t.build.buildId)! }
+        : {}),
+    },
+    estimate ?? FIRST_USE_RETRY_S,
+  );
 }
 
 /**
@@ -1332,11 +2159,13 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   const owner = asRecord(ctx.body).owner;
   if (typeof owner !== 'string' || !MEMBER_SUBJECT_RE.test(owner))
     throw new CpError('invalid_request', `owner must be a subject, ${MEMBER_SUBJECT_FORMS}`);
-  // The new owner must be able to act on it: enrolled now (the allow list, or an admin).
-  if (!isEnrolled(owner, deps.identity.rolesFor(owner), deps.config))
+  // The new owner must be able to act on it: enrolled now (the allow list, an admin, or the
+  // members store), evaluated as a request of theirs would be.
+  const m = await membershipNow(deps, owner, deps.identity.rolesFor(owner));
+  if (!isEnrolledForSandbox(owner, m.roles, deps.config, m.enrolled))
     throw new CpError(
       'invalid_request',
-      `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS first`,
+      `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS, or enroll them through /v1/subjects, first`,
     );
   let before = null as string | null;
   let record: string | null = null;
@@ -1367,22 +2196,104 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   return { status: 200, body: { templateId: d0.id, subject: p.sub, owner, before, record } };
 }
 
+/**
+ * How `next` accepts more than `cur`, as one profile: a rule dropped from `requires`, the offline
+ * gate no longer required, self-attestation (or its egress) turned on, an envelope bound raised or
+ * removed, or the exact size changed or removed. Empty: `next` accepts no more than `cur`.
+ */
+function profileWidens(cur: Profile, next: Profile): string[] {
+  const out: string[] = [];
+  const req = new Set(next.requires);
+  if (cur.requires.some((r) => !req.has(r))) out.push('requires');
+  // As checkCreate reads it: absent means the offline gate is required.
+  if (cur.requireOfflineGate !== false && next.requireOfflineGate === false)
+    out.push('requireOfflineGate');
+  if (cur.selfAttest !== true && next.selfAttest === true) out.push('selfAttest');
+  if (cur.selfAttestEgress !== true && next.selfAttestEgress === true) out.push('selfAttestEgress');
+  const a = cur.envelope;
+  const b = next.envelope;
+  if (
+    b.maxGuestMb > a.maxGuestMb ||
+    b.maxVcpus > a.maxVcpus ||
+    b.maxWorkspaceMb > a.maxWorkspaceMb ||
+    (a.exact !== undefined &&
+      (b.exact === undefined ||
+        b.exact.guestMb !== a.exact.guestMb ||
+        b.exact.vcpus !== a.exact.vcpus))
+  )
+    out.push('envelope');
+  return out;
+}
+
+/**
+ * The policy fields a change widens: a gate record trusted that was not, a registry allowed that
+ * was not, a registry's repository list that gains an entry or is dropped (no list allows every
+ * repository), a profile added or loosened (profileWidens), or a default profile that accepts more
+ * than the one it replaces. Registries and their keys compare case-insensitively, as the policy
+ * reads them. A profile removed, and every quota change, is not a widening.
+ */
+function policyWidens(cur: Policy, next: Policy): string[] {
+  const out: string[] = [];
+  for (const [name, n] of Object.entries(next.profiles)) {
+    const c = Object.hasOwn(cur.profiles, name) ? cur.profiles[name] : undefined;
+    if (!c) out.push(`profiles.${name} (new)`);
+    else for (const f of profileWidens(c, n)) out.push(`profiles.${name}.${f}`);
+  }
+  // Nothing ranks profiles: a new default must accept no more than the old one did.
+  if (next.defaultProfile !== cur.defaultProfile) {
+    const oldDefault = Object.hasOwn(cur.profiles, cur.defaultProfile)
+      ? cur.profiles[cur.defaultProfile]
+      : undefined;
+    const newDefault = next.profiles[next.defaultProfile]!;
+    if (!oldDefault || profileWidens(oldDefault, newDefault).length) out.push('defaultProfile');
+  }
+  const trusted = new Set(cur.trustedGateRecords);
+  if (next.trustedGateRecords.some((g) => !trusted.has(g))) out.push('trustedGateRecords');
+  const lower = (xs: string[]) => new Set(xs.map((x) => x.toLowerCase()));
+  const regs = lower(cur.allowedRegistries);
+  if (next.allowedRegistries.some((r) => !regs.has(r.toLowerCase()))) out.push('allowedRegistries');
+  // Each registry's effective list, as admitBuild reads it: the union of the lists of every key
+  // that names it in any case, so a second key in another case can't widen it unseen.
+  const repos = (m: Record<string, string[]> | undefined) => {
+    const out = new Map<string, Set<string>>();
+    for (const [k, v] of Object.entries(m ?? {})) {
+      const reg = k.toLowerCase();
+      const set = out.get(reg) ?? new Set<string>();
+      for (const x of v) set.add(x);
+      out.set(reg, set);
+    }
+    return out;
+  };
+  const was = repos(cur.allowedRepositories);
+  const now = repos(next.allowedRepositories);
+  const nextRegs = lower(next.allowedRegistries);
+  for (const [reg, list] of was) {
+    if (!nextRegs.has(reg)) continue;
+    const n = now.get(reg);
+    if (!n || [...n].some((x) => !list.has(x))) {
+      out.push('allowedRepositories');
+      break;
+    }
+  }
+  return out;
+}
+
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
-  // The template reads (template lifecycle spec §4), on both route profiles (§4.1): on `harness`
-  // requireEnrolled admits any logged-in subject. The worker id is deployment plumbing; a client
-  // names a template, never a worker.
+  // The template reads (template lifecycle spec §4), on every route profile (§4.1): on `harness`
+  // and `combined` requireReader admits any logged-in subject. The worker id is deployment
+  // plumbing; a client names a template, never a worker.
   listTemplates: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const docs = await visibleTemplates(deps, p);
     const live = await readinessFacts(deps);
     const templates = docs.map((d) => templateBody(d, live, false));
-    // Per-host limits and use (§4, §6.2) are reported by a host agent, which a later issue adds:
-    // an empty list means "no host reports", never "no limit".
-    return { status: 200, body: { templates, hosts: [] } };
+    // Per-host limits and use (§4, §6.2), from the host agents' inventories (host-handlers.ts): an
+    // empty list means "no host reports", never "no limit".
+    return { status: 200, body: { templates, hosts: hostsBlock(deps, live) } };
   },
 
   listTemplateTags: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const tags = Object.entries(d.tags)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1394,20 +2305,20 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getTemplate: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     return { status: 200, body: templateBody(d, await readinessFacts(deps), true) };
   },
 
   listTemplateBuilds: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const live = await readinessFacts(deps);
     return { status: 200, body: { builds: d.builds.map((b) => buildBody(d, b, live, true)) } };
   },
 
   getTemplateBuild: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const ref = ctx.params.build ?? '';
     const b = d.builds.find((x) => x.buildId === ref || x.handle === ref);
@@ -1419,6 +2330,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   createTemplate: (ctx, deps) => createBuild(ctx, deps, false),
   createTemplateBuild: (ctx, deps) => createBuild(ctx, deps, true),
   cancelTemplateBuild: cancelBuild,
+  retireTemplate,
+  retireTemplateBuild,
 
   // The owner's and the admin's actions (§5.1-§5.2): tags, edits and owner transfer.
   moveTemplateTags,
@@ -1426,10 +2339,14 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   updateTemplate,
   transferTemplateOwner,
 
+  // Activation leases (§6.3): take or renew, and release.
+  activateTemplate: activate,
+  deactivateTemplate: deactivate,
+
   // The policy (§8): any enrolled client reads it; only an admin sets it, and each set is a
   // `policy` record naming who.
   getPolicy: async (ctx, deps) => {
-    requireEnrolled(ctx, deps);
+    requireReader(ctx, deps.config);
     const { policy, record } = await policyStore(deps).current();
     // The general-gate schema rides along, so a client's dry run applies X1.offline as this
     // deployment does.
@@ -1446,27 +2363,44 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const store = policyStore(deps);
     const bad = policyProblems(ctx.body);
     if (bad.length) throw new CpError('invalid_request', bad.join('; '));
-    // Self-attestation: a record whose trust this removes narrows its deployment-visible templates
-    // to private on read. Name each narrowed build in the policy record, so nothing is silent. The
-    // policy itself is what the admin sent, every field kept as sent.
-    const before = new Set((await store.current()).policy.trustedGateRecords);
-    const after = new Set((ctx.body as Policy).trustedGateRecords);
-    const narrowed: { template: string; buildId: string }[] = [];
-    if ([...before].some((g) => !after.has(g)) && deps.templates)
-      for (const d of await deps.templates.list())
-        if (effectiveVisibility(d, before) === 'deployment')
-          for (const x of d.builds)
-            if (
-              x.status === 'registered' &&
-              attestationOf(x, before) === 'deployment' &&
-              attestationOf(x, after) === 'self'
-            )
-              narrowed.push({ template: d.id, buildId: x.buildId });
-    const { policy, record } = await store.set(
-      ctx.body as Policy,
-      p.sub,
-      narrowed.length ? { narrowed } : undefined,
-    );
+    // The check and the write are one step (policyLock): a PUT built from an older policy can't
+    // pass the widening check against it and then land after a settings admin's narrowing,
+    // re-adding the trust that removed.
+    const { policy, record, narrowed } = await policyLock(store).run('policy', async () => {
+      const before = (await store.current()).policy;
+      // Widening what the policy trusts is the same kind of act as widening access (enrollment and
+      // roles spec, decision 1): an admin by an API grant may narrow the policy and change its
+      // quotas, but adding a trusted gate record, a registry or a repository needs an admin named
+      // in the settings. Without a members store every admin is one.
+      const widened = policyWidens(before, ctx.body as Policy);
+      if (widened.length && deps.members && !deps.members.bootstrap.admins.includes(p.sub))
+        throw new CpError(
+          'forbidden',
+          `widening ${widened.join(', ')} requires an admin named in the settings (SH_ADMIN_SUBJECTS)`,
+        );
+      // Self-attestation: a record whose trust this removes narrows its deployment-visible
+      // templates to private on read. Name each narrowed build in the policy record, so nothing is
+      // silent. The policy itself is what the admin sent, every field kept as sent.
+      const was = new Set(before.trustedGateRecords);
+      const after = new Set((ctx.body as Policy).trustedGateRecords);
+      const narrowed: { template: string; buildId: string }[] = [];
+      if ([...was].some((g) => !after.has(g)) && deps.templates)
+        for (const d of await deps.templates.list())
+          if (effectiveVisibility(d, was) === 'deployment')
+            for (const x of d.builds)
+              if (
+                x.status === 'registered' &&
+                attestationOf(x, was) === 'deployment' &&
+                attestationOf(x, after) === 'self'
+              )
+                narrowed.push({ template: d.id, buildId: x.buildId });
+      const set = await store.set(
+        ctx.body as Policy,
+        p.sub,
+        narrowed.length ? { narrowed } : undefined,
+      );
+      return { ...set, narrowed };
+    });
     await auditBestEffort(deps, 'policy_set', 'policy', { subject: p.sub, decision: 'policy_set' });
     return {
       status: 200,
@@ -1480,11 +2414,13 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getQuota: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const { cat, policy } = writable(deps);
     const { policy: pol } = await policy.current();
     const u = await usage(cat, p.sub);
     const nowS = seconds(deps);
+    // The builds this subject holds a live lease on (§6.3), as activate counts them.
+    const active = leasedBy(await cat.list(), p.sub, nowS).length;
     // SBX0's live-sandbox cap: shown where it applies, so a client sees it before a create is
     // refused by it.
     let sandboxes: { limit: number; used: number } | undefined;
@@ -1498,8 +2434,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
         subject: p.sub,
         templates: { limit: pol.quota.templates, used: u.templates },
         buildsQueued: { limit: pol.quota.buildsQueued, used: u.buildsQueued },
-        // Activation (§6) is not built yet: nothing holds a template active, so none is used.
-        active: { limit: pol.quota.active, used: 0 },
+        active: { limit: pol.quota.active, used: active },
         owned: { limit: ownedLimit(pol.quota), used: u.owned },
         ...(sandboxes ? { sandboxes } : {}),
       },
@@ -1512,6 +2447,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const b = asRecord(ctx.body);
     if (typeof b.template !== 'string')
       throw new CpError('invalid_request', 'template is required');
+    if (b.activate !== undefined && typeof b.activate !== 'boolean')
+      throw new CpError('invalid_request', 'activate must be true or false');
     const template = await resolveForUse(deps, p, b.template);
     if (b.name !== undefined && (typeof b.name !== 'string' || !NAME_RE.test(b.name))) {
       throw new CpError('invalid_request', `name must match ${NAME_RE}`);
@@ -1519,6 +2456,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const labels = parseLabels(b.labels);
     const mode = b.mode === undefined ? 'per-exec' : parseMode(b.mode, cfg);
     const idleTimeoutS = parseIdleTimeout(b.idleTimeoutS, cfg);
+    await requireActive(deps, p, template, b.activate !== false);
     const now = seconds(deps);
     const id = sandboxId(deps.newId());
     // Create does no I/O to the worker: the first Exec creates the workspace, and wsk being the
@@ -1543,10 +2481,12 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       // the workspace's epoch known (spec §8.2), which the client sends right after create.
       modeEpoch: mode === 'per-exec' ? 0 : 1,
     };
-    const outcome = await store.create(
-      rec,
-      { perSubject: cfg.maxPerSubject, total: cfg.maxTotal, retentionS: cfg.retentionS },
-      now,
+    const outcome = await notRetired(deps, template, () =>
+      store.create(
+        rec,
+        { perSubject: cfg.maxPerSubject, total: cfg.maxTotal, retentionS: cfg.retentionS },
+        now,
+      ),
     );
     if (outcome === 'quota_subject') {
       throw new CpError('quota_exceeded', `at most ${cfg.maxPerSubject} live sandboxes per user`);
@@ -1558,7 +2498,9 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       throw new CpError('name_conflict', `you already have a live sandbox named '${rec.name}'`);
     }
     await audit(deps, p.sub, id, 'sandbox_created');
-    await sandboxCreated(deps, rec, p.sub);
+    // Its lease (§7.1): the caller's live lease on the build, by the activate record that granted it.
+    const lease = liveLeases(template.build, now).find((l) => l.subject === p.sub);
+    await sandboxCreated(deps, rec, p.sub, lease?.record ?? null);
     return { status: 201, body: sandboxBody(viewOf(rec, now)) };
   },
 
@@ -1597,6 +2539,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     if (outcome === 'not_found') throw new CpError('sandbox_not_found', 'no such sandbox');
     if (outcome === 'deleted') {
       await audit(deps, ctx.principal!.sub, rec.id, 'sandbox_deleted');
+      // The egress log is kept as long as the record, whose retention now runs from the delete.
+      await deps.egress?.expireAt(rec.id, now + cfg.retentionS);
       await sandboxEnded(deps, rec, ctx.principal!.sub, 'deleted', now);
     }
     // Idempotent: a second delete, or a delete after expiry, reports how it actually ended.
@@ -1604,6 +2548,46 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     return {
       status: 200,
       body: { id: rec.id, state: 'terminated', reason: ended.reason ?? 'deleted' },
+    };
+  },
+
+  /**
+   * A sandbox's egress log, for whoever may read the sandbox (GET /v1/sandboxes/{id}):
+   * `{events, next, summary}` a page at a time (`after` is the last page's `next`; `summary` on the
+   * first page, null after it), or with
+   * `format=ndjson` the whole log, whose sha256 is `summary.sha256` and the end record's.
+   */
+  getSandboxEgress: async (ctx, deps) => {
+    const rec = await assertSandboxOwner(ctx, deps, { admin: true });
+    if (!deps.egress) throw new CpError('internal_error', 'the egress log is not configured');
+    const format = ctx.query.get('format');
+    if (format !== null && format !== 'json' && format !== 'ndjson')
+      throw new CpError('invalid_request', "format must be 'json' or 'ndjson'");
+    if (format === 'ndjson') {
+      // Streamed a store page at a time (server.ts writeStream), never built whole in memory.
+      return {
+        status: 200,
+        body: ndjson(deps.egress, rec.id),
+        contentType: 'application/x-ndjson',
+      };
+    }
+    const after = ctx.query.get('after');
+    if (after !== null && !ENTRY_ID_RE.test(after))
+      throw new CpError('invalid_request', "after must be a page's next");
+    const rawLimit = ctx.query.get('limit');
+    const limit = rawLimit === null ? 100 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+      throw new CpError('invalid_request', 'limit must be 1-1000');
+    const page = await deps.egress.page(rec.id, after, limit);
+    return {
+      status: 200,
+      body: {
+        events: page.map((e) => JSON.parse(e.line) as unknown),
+        next: page.length === limit ? page[page.length - 1]!.id : null,
+        // On the first page only: the summary reads the whole log, so a page after it (`after`)
+        // costs that page alone, and paging a log through is linear in its length.
+        summary: after === null ? await summarize(deps.egress, rec.id) : null,
+      },
     };
   },
 
@@ -1708,6 +2692,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       else terminated.push({ wsk: v.wsk, wrk: v.worker, terminatedAt: v.terminatedAt! });
     }
     await recordExpiries(deps, all, now);
+    await sealEgress(deps, all, now);
     return { status: 200, body: { live, terminated } };
   },
 };

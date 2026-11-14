@@ -60,14 +60,32 @@ describe('the route table', () => {
         'DELETE /v1/templates/{id}/tags/{tag}',
         'PATCH /v1/templates/{id}',
         'PUT /v1/templates/{id}/owner',
+        'POST /v1/templates/{id}/retire',
+        'DELETE /v1/templates/{id}/builds/{build}',
+        'POST /v1/templates/{id}/activate',
+        'POST /v1/templates/{id}/deactivate',
         'GET /v1/policy',
         'PUT /v1/policy',
         'GET /v1/quota',
+        'POST /v1/hosts/{host}/inventory',
+        'POST /v1/hosts/{host}/builds/claim',
+        'GET /v1/hosts/{host}/blobs/{digest}',
+        'POST /v1/hosts/{host}/builds/{build}/log',
+        'POST /v1/hosts/{host}/builds/{build}/report',
+        'GET /v1/hosts/{host}/wanted',
+        'POST /v1/hosts/{host}/workers/report',
+        'GET /v1/subjects',
+        'PUT /v1/subjects/{subject}',
+        'DELETE /v1/subjects/{subject}',
+        'PUT /v1/subjects/{subject}/roles/admin',
+        'DELETE /v1/subjects/{subject}/roles/admin',
+        'POST /v1/hosts/{host}/egress',
         'POST /v1/sandboxes',
         'GET /v1/sandboxes',
         'GET /v1/sandboxes/{id}',
         'DELETE /v1/sandboxes/{id}',
         'POST /v1/sandboxes/{id}/token',
+        'GET /v1/sandboxes/{id}/egress',
         // Lease-mode spec §8.1-§8.2.
         'PUT /v1/sandboxes/{id}/mode',
         'POST /v1/sandboxes/{id}/mode-token',
@@ -138,6 +156,8 @@ describe('the route table', () => {
       (r) =>
         r.path.startsWith('/v1/') &&
         !r.path.startsWith('/v1/auth/') &&
+        // A template host agent's routes take its host token (template lifecycle spec §6.1).
+        !(r.path.startsWith('/v1/hosts/{host}/') && r.auth === 'host') &&
         r.auth !== (EXEMPT.get(`${r.method} ${r.path}`) ?? 'api'),
     );
     expect(wrong.map((r) => r.path)).toEqual([]);

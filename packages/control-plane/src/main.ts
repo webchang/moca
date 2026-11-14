@@ -1,6 +1,9 @@
 import { ProvenanceStore } from './provenance.js';
 import { FilePolicyStore } from './template-policy-store.js';
+import { HostRegistry } from './host-handlers.js';
+import { templateHostsFromEnv } from './host-config.js';
 import type { PolicyStore } from './template-policy.js';
+import { MembersStore } from './members.js';
 import {
   FileTemplateCatalog,
   redisPresenceReader,
@@ -42,8 +45,13 @@ import { resolveVersion } from './version.js';
 import { VaultCredentialStore, vaultTokenSource } from './vault-store.js';
 import { withCredentials } from './systemd-credentials.js';
 import { parseSandboxTiers } from './sandbox-tiers.js';
-import { routeProfileFromEnv, sandboxConfigFromEnv } from './sandbox-config.js';
+import {
+  routeProfileFromEnv,
+  sandboxConfigFromEnv,
+  sessionTemplatesFromEnv,
+} from './sandbox-config.js';
 import { RedisSandboxStore, type SandboxRedisLike } from './sandbox-redis.js';
+import { RedisEgressStore, type EgressRedisLike } from './egress-log.js';
 import { readTenancy } from './tenancy.js';
 import { TurnStore } from './turn-store.js';
 import { resultTtlSeconds, TURN_RECORD_TTL_MARGIN_SECONDS } from './turn-record.js';
@@ -231,10 +239,12 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   if ((env.SH_IDENTITY_PROVIDER || 'github') === 'github') {
     required(env, 'SH_GITHUB_CLIENT_ID');
   }
-  if (routeProfileFromEnv(env) === 'sandbox') return sandboxProfileConfig(env);
+  const profile = routeProfileFromEnv(env);
+  if (profile === 'sandbox') return sandboxProfileConfig(env);
   keksFromBase64(required(env, 'SH_CREDENTIAL_KEK'));
   const config: CpConfig = {
     ...tokenTtlsFromEnv(env),
+    templateHosts: templateHostsFromEnv(env, [env.SH_EXCHANGE_TOKEN ?? ''].filter(Boolean)),
     ...grantTtlsFromEnv(env),
     exchangeToken: required(env, 'SH_EXCHANGE_TOKEN'),
     defaultInferenceEndpoint: env.SH_DEFAULT_INFERENCE_ENDPOINT || undefined,
@@ -248,6 +258,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     sandboxNamespace: env.SH_SANDBOX_NAMESPACE || 'default',
     publicHarnessUrl: urlEnv(env, 'SH_PUBLIC_HARNESS_URL'),
     sandboxTiers: parseSandboxTiers(env),
+    sessionTemplates: sessionTemplatesFromEnv(env),
     // A quarter of the total: four subjects, not two, to fill it, and still room for one
     // incompressible max-size bundle (~10.7 MiB stored).
     bundleSubjectBytes: byteBudgetEnv(env, 'SH_BUNDLE_SUBJECT_BYTES', 16 * 1024 * 1024),
@@ -268,7 +279,28 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   testUserSecretFromEnv(env.SH_TEST_USER_SECRET, config.testUsers);
   checkInferenceConfig(config);
   checkRefreshConfig(config);
-  return config;
+  return profile === 'combined' ? combinedProfileConfig(env, config) : config;
+}
+
+/**
+ * Combined control plane spec §3.5: everything the harness profile requires (above) AND the sandbox
+ * profile's own settings, each refusal naming what is missing. Test users may stay (they log in and
+ * use sessions; the sandbox routes refuse them, §3.2). The template list is the one list both read.
+ */
+function combinedProfileConfig(env: NodeJS.ProcessEnv, harness: CpConfig): CpConfig {
+  const sandbox = sandboxConfigFromEnv(env, { kekIsShared: true });
+  return {
+    ...harness,
+    routeProfile: 'combined',
+    sandbox,
+    sessionTemplates: sandbox.templates,
+    // Distinct from the exchange token, the janitor's and every egress host's bearer.
+    templateHosts: templateHostsFromEnv(env, [
+      ...(harness.exchangeToken ? [harness.exchangeToken] : []),
+      ...(sandbox.janitorToken ? [sandbox.janitorToken] : []),
+      ...(sandbox.egress?.hosts.map((h) => h.token) ?? []),
+    ]),
+  };
 }
 
 /**
@@ -308,9 +340,15 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
         'github:/oidc: subjects (SH_ALLOWED_SUBJECTS)',
     );
   }
+  const sandbox = sandboxConfigFromEnv(env);
   const config: CpConfig = {
     routeProfile: 'sandbox',
-    sandbox: sandboxConfigFromEnv(env),
+    sandbox,
+    // Distinct from the janitor's and every egress host's bearer (host-config.ts).
+    templateHosts: templateHostsFromEnv(env, [
+      ...(sandbox.janitorToken ? [sandbox.janitorToken] : []),
+      ...(sandbox.egress?.hosts.map((h) => h.token) ?? []),
+    ]),
     ...tokenTtlsFromEnv(env),
     ...grantTtlsFromEnv(env),
     allowOperatorFallback: false,
@@ -553,7 +591,8 @@ export function redisClientOptions(url: string) {
 /**
  * `SH_PROVENANCE_DIR` (template lifecycle spec §3.1, §7.2), either profile: a directory on the
  * control plane's persistent volume holding the provenance store, the template catalog and the
- * template policy (policy.json), opened together. Set, the catalog is the store (SH_SANDBOX_TEMPLATES imported into it once, each import
+ * template policy (policy.json) and the members store (enrollment and roles through the API),
+ * opened together. Set, the catalog is the store (SH_SANDBOX_TEMPLATES imported into it once, each import
  * a provenance `create` record); unset, templates come from SH_SANDBOX_TEMPLATES at every start, as
  * before, and nothing is recorded. Each store checks its directory writable here, so a missing or
  * read-only volume fails the start, not the first write.
@@ -561,7 +600,12 @@ export function redisClientOptions(url: string) {
 export function templateCatalogFromEnv(
   env: NodeJS.ProcessEnv,
   config: CpConfig,
-): { templates?: TemplateCatalog; policy?: PolicyStore; provenance?: ProvenanceStore } {
+): {
+  templates?: TemplateCatalog;
+  policy?: PolicyStore;
+  provenance?: ProvenanceStore;
+  members?: MembersStore;
+} {
   const dir = env.SH_PROVENANCE_DIR;
   if (!dir) return {};
   if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
@@ -574,6 +618,16 @@ export function templateCatalogFromEnv(
     }),
     policy: new FilePolicyStore({ dir, provenance }),
     provenance,
+    // Enrollment and roles through the API, beside the catalog; the settings' lists are its
+    // bootstrap, never edited by it.
+    members: new MembersStore({
+      dir,
+      provenance,
+      bootstrap: {
+        allowed: config.sandbox?.allowedSubjects ?? [],
+        admins: adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS),
+      },
+    }),
   };
 }
 
@@ -584,6 +638,8 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
   const verifyKeys = verifyKeysFromEnv(env, signer.publicKeyBase64);
   const client = createClient(redisClientOptions(env.REDIS_URL ?? 'redis://127.0.0.1:6379'));
   const sandboxProfile = config.routeProfile === 'sandbox';
+  // The sandbox stores, on the sandbox profile and on combined (combined control plane spec §3.5).
+  const servesSandboxes = config.routeProfile === 'sandbox' || config.routeProfile === 'combined';
   if (
     sandboxProfile &&
     config.sandbox?.egress &&
@@ -640,13 +696,21 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
       sandboxProfile && !config.sandbox?.egress
         ? new UnavailableCredentialStore()
         : credentialStoreFromEnv(env),
-    ...(sandboxProfile
-      ? { sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike) }
+    ...(servesSandboxes
+      ? {
+          sandboxes: new RedisSandboxStore(client as unknown as SandboxRedisLike),
+          // A host's last post is kept for the replay check as long as a sandbox record is.
+          egress: new RedisEgressStore(
+            client as unknown as EgressRedisLike,
+            config.sandbox?.retentionS ?? 14 * 86_400,
+          ),
+        }
       : {}),
     // Readiness (template lifecycle spec §3.3) from the relay's presence records, which the relay
     // writes into this same Redis on either profile.
     presence: redisPresenceReader(client as unknown as PresenceRedisLike),
     ...templateCatalogFromEnv(env, config),
+    hosts: new HostRegistry(),
     // github or oidc, per SH_IDENTITY_PROVIDER (identityProviderFromEnv above); the oidc
     // provider additionally carries the browser-callback half the seam defines.
     identity: identityProviderFromEnv(env),

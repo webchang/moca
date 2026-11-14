@@ -123,12 +123,17 @@ for k in SH_CREDENTIAL_STORE SH_CREDENTIAL_NAMESPACE SH_SANDBOX_NAMESPACE SH_SAN
 done
 for k in SH_ALLOWED_SUBJECTS SH_SANDBOX_TEMPLATES SH_SANDBOX_EXEC_ENDPOINT SH_SANDBOX_EXEC_CA \
   SH_SANDBOX_TOKEN_ISSUER SH_SANDBOX_LIFETIME_SECONDS SH_SANDBOX_TOKEN_TTL_SECONDS SH_SANDBOX_RETENTION_SECONDS \
-  SH_SANDBOX_MAX_PER_SUBJECT SH_SANDBOX_MAX_TOTAL; do
+  SH_SANDBOX_MAX_PER_SUBJECT SH_SANDBOX_MAX_TOTAL SH_SANDBOX_MODES_ALLOWED SH_SANDBOX_IDLE_CEILING_S; do
   [[ "$(cp_env "$k" | jq -r '.valueFrom.configMapKeyRef | "\(.name)/\(.key)"')" == "sbx-settings/$k" ]] ||
     fail "the control plane does not read $k from sbx-settings"
 done
 [[ "$(cp_env SH_SANDBOX_EXEC_CA | jq -r .valueFrom.configMapKeyRef.optional)" == true ]] ||
   fail 'SH_SANDBOX_EXEC_CA must be optional (absent when the exec certificate is issued)'
+# The lease policy keys are optional: absent, the control plane's defaults apply (per-exec, 1800 s).
+for k in SH_SANDBOX_MODES_ALLOWED SH_SANDBOX_IDLE_CEILING_S; do
+  [[ "$(cp_env "$k" | jq -r .valueFrom.configMapKeyRef.optional)" == true ]] ||
+    fail "$k must be optional (the control plane defaults it)"
+done
 [[ "$(jq -c '[.spec.template.spec.volumes[] | select(.secret) | {s: .secret.secretName, k: [.secret.items[]?.key]}]' <<<"$CP")" == '[{"s":"moca-mu1","k":["SH_SESSION_TOKEN_PRIVATE_KEY","SH_JANITOR_TOKEN"]}]' ]] ||
   fail "the control plane mounts more or less than its signing key and the janitor token: $(jq -c '[.spec.template.spec.volumes[] | select(.secret)]' <<<"$CP")"
 [[ "$(jq -r .spec.template.spec.automountServiceAccountToken <<<"$CP")" == false ]] || fail 'the control plane still mounts a service account token'
@@ -259,8 +264,14 @@ vol="$(jq -r '.spec.template.spec.volumes[] | select(.persistentVolumeClaim.clai
   fail 'the store PVC is not mounted at /var/lib/moca/templates'
 [[ "$(cp_env SH_PROVENANCE_DIR | jq -r .value)" == /var/lib/moca/templates ]] || fail 'SH_PROVENANCE_DIR is not /var/lib/moca/templates'
 [[ "$(jq -r .spec.strategy.type <<<"$CP")" == Recreate && "$(jq -r '.spec.strategy.rollingUpdate // "none"' <<<"$CP")" == none ]] || fail 'the control plane is not strategy Recreate (store on)'
-# Nothing else of the control plane changes: its credentials volume is moca-mu1's alone, no egress store.
-[[ "$(jq -c '[.spec.template.spec.volumes[] | select(.name == "credentials") | (.secret.secretName // (.projected.sources[]?.secret.name))]' <<<"$CP")" == '["moca-mu1"]' ]] ||
-  fail "store on changed the credentials volume: $(jq -c '.spec.template.spec.volumes[] | select(.name == "credentials")' <<<"$CP")"
+# The host agents' tokens (spec §6.1): sbx-template-hosts projected beside moca-mu1's two items, and
+# sbx-egress restated as optional (a strategic merge replaces the source list, and egress may be off);
+# SH_TEMPLATE_HOSTS from sbx-settings, optional. No egress store.
+[[ "$(jq -c '[.spec.template.spec.volumes[] | select(.name == "credentials") | .projected.sources[]?.secret | [.name, (.optional // false)]]' <<<"$CP")" == '[["moca-mu1",false],["sbx-egress",true],["sbx-template-hosts",false]]' ]] ||
+  fail "store on: the credentials volume is not moca-mu1, sbx-egress (optional) and sbx-template-hosts: $(jq -c '.spec.template.spec.volumes[] | select(.name == "credentials")' <<<"$CP")"
+[[ "$(jq -c '[.spec.template.spec.volumes[] | select(.name == "credentials") | .projected.sources[0].secret.items[].key]' <<<"$CP")" == '["SH_SESSION_TOKEN_PRIVATE_KEY","SH_JANITOR_TOKEN"]' ]] ||
+  fail "store on changed moca-mu1's items in the credentials volume"
+[[ "$(cp_env SH_TEMPLATE_HOSTS | jq -c .valueFrom.configMapKeyRef)" == '{"key":"SH_TEMPLATE_HOSTS","name":"sbx-settings","optional":true}' ]] ||
+  fail 'SH_TEMPLATE_HOSTS is not read from sbx-settings (optional)'
 [[ -z "$(cp_env SH_CREDENTIAL_STORE)" ]] || fail 'store on turned on the credential store'
-pass 'template store on: PVC (RWO 1Gi) mounted at /var/lib/moca/templates as SH_PROVENANCE_DIR, Recreate, credentials unchanged'
+pass 'template store on: PVC (RWO 1Gi) mounted at /var/lib/moca/templates as SH_PROVENANCE_DIR, Recreate, the host tokens projected beside moca-mu1, SH_TEMPLATE_HOSTS from sbx-settings'

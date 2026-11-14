@@ -26,6 +26,7 @@ import {
   asRecord,
   auditBestEffort,
   isAdmin,
+  membershipNow,
   requireEnrolledPrincipal,
   seconds,
 } from './handler-util.js';
@@ -66,12 +67,22 @@ import { isRefreshTokenShape, type RefreshStore } from './refresh-store.js';
 import { projectResources, resolveSandbox } from './resources.js';
 import type { SandboxTiers } from './sandbox-tiers.js';
 import type { RouteProfile } from './routes.js';
-import { isEnrolled, notEnrolled, type SandboxConfig } from './sandbox-config.js';
+import {
+  isEnrolled,
+  isEnrolledForSandbox,
+  notEnrolled,
+  type SandboxConfig,
+  type SandboxTemplate,
+} from './sandbox-config.js';
 import type { ProvenanceStore } from './provenance.js';
-import type { PresenceReader, TemplateCatalog } from './template-catalog.js';
+import type { PresenceReader, TemplateBuild, TemplateCatalog } from './template-catalog.js';
 import type { PolicyStore } from './template-policy.js';
 import type { SandboxStore } from './sandbox-store.js';
-import { SANDBOX_HANDLERS } from './sandbox-handlers.js';
+import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handlers.js';
+import type { TemplateHost } from './host-config.js';
+import { HOST_HANDLERS, type HostRegistry } from './host-handlers.js';
+import { MEMBER_HANDLERS } from './member-handlers.js';
+import type { MembersStore } from './members.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
 import { TURN_HANDLERS } from './turn-handlers.js';
 import type { Tenancy } from './tenancy.js';
@@ -79,6 +90,7 @@ import type { TurnQueue } from './turn-queue.js';
 import type { ResultRedisLike } from './turn-result.js';
 import type { TurnStore } from './turn-store.js';
 import type { EgressHost } from './egress-config.js';
+import type { EgressStore } from './egress-log.js';
 import { formatDestination, parseDestination } from './egress-destination.js';
 
 /** A stored destination in normalized form; a legacy or corrupt entry compares as written. */
@@ -98,6 +110,8 @@ export function apiIssuer(config: Pick<CpConfig, 'routeProfile'>): string {
 export interface CpConfig {
   /** Which routes this control plane mounts (SBX0 §4.1). Absent means `harness`. */
   routeProfile?: RouteProfile;
+  /** The template hosts (SH_TEMPLATE_HOSTS, template lifecycle spec §6.1); absent or empty: none. */
+  templateHosts?: TemplateHost[];
   apiTokenTtlSeconds: number;
   sessionTokenTtlSeconds: number;
   /** A refresh family dies this long after its last use (`SH_REFRESH_IDLE_TTL_SECONDS`, B14). */
@@ -136,6 +150,11 @@ export interface CpConfig {
    * configFromEnv refuses a list it cannot serve, so a session is never validated against a typo.
    */
   sandboxTiers: SandboxTiers | null;
+  /**
+   * The declared session templates (session-templates spec §3.3), harness profile only: absent or
+   * null when the deployment declares none, and then sessions are exactly as before.
+   */
+  sessionTemplates?: SandboxTemplate[] | null;
   /** Stored config-bundle bytes one subject may hold (`SH_BUNDLE_SUBJECT_BYTES`). */
   bundleSubjectBytes: number;
   /** Stored config-bundle bytes the whole deployment may hold (`SH_BUNDLE_TOTAL_BYTES`). */
@@ -221,6 +240,8 @@ export interface CpDeps {
   close?: () => Promise<void>;
   /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
   sandboxes?: SandboxStore;
+  /** Per-sandbox egress logs, beside `sandboxes`; absent, the routes store nothing. */
+  egress?: EgressStore;
   /**
    * The template provenance store (template lifecycle spec §7). Absent, nothing is recorded and no
    * handler's behavior changes; when present, a sandbox's create and end are recorded on its
@@ -240,6 +261,13 @@ export interface CpDeps {
    * absent without SH_PROVENANCE_DIR, where templates cannot be created through the API.
    */
   policy?: PolicyStore;
+  /** The template hosts' inventories and limits (§6.1), as their agents last reported them. */
+  hosts?: HostRegistry;
+  /**
+   * Enrollment and roles through the API, opened with `provenance`: absent without
+   * SH_PROVENANCE_DIR, when roles and enrollment come from the settings alone, as before.
+   */
+  members?: MembersStore;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
   /** The async turn record store (async spec §5.1); absent only in suites that never submit. */
@@ -278,6 +306,8 @@ export interface RequestCtx {
   janitorAuthorized?: boolean;
   /** Set by the router for `auth: 'egress'` routes: the host whose token was presented. */
   egressHost?: EgressHost;
+  /** Set by the router for `auth: 'host'` routes: the template host whose token was presented. */
+  host?: string;
 }
 
 export type Handler = (
@@ -357,6 +387,28 @@ function loginBody(
     refreshToken: refresh.refreshToken,
     refreshExpiresAt: refresh.absExpS,
   };
+}
+
+/**
+ * A `session` record on its build's chain (lifecycle spec §7.1), written BEST EFFORT: it records a
+ * create or delete that has already happened, so a failed append is logged and the write stands, as
+ * the audit mirroring does (auditBestEffort). Throwing would answer 500 for a session that exists,
+ * or is gone, and a client retrying that create would make a second session.
+ */
+async function appendSessionRecord(
+  deps: CpDeps,
+  stream: string,
+  subject: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await deps.provenance!.append({ stream, kind: 'session', subject, body });
+  } catch (err) {
+    console.error(
+      `[control-plane] session record write failed for ${String(body.sessionId)} (${String(body.state)}): ` +
+        `${(err as Error)?.message ?? String(err)} -- the write itself SUCCEEDED`,
+    );
+  }
 }
 
 async function turnInFlight(sessionId: string, deps: CpDeps): Promise<boolean> {
@@ -462,6 +514,19 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     lastTurnAt: runtime.lastTurnAt ? Number(runtime.lastTurnAt) : null,
     turns: runtime.turns ? Number(runtime.turns) : 0,
     sandboxTier: tier,
+    // Shown on a deployment that declares templates, and wherever the session named one, so a
+    // dropped template is visible too (it fails closed); a view elsewhere is unchanged.
+    ...(deps.config.sessionTemplates || rec.sandboxTemplate
+      ? {
+          sandboxTemplate: rec.sandboxTemplate || null,
+          // The build the template resolved to at creation (combined control plane spec §3.4),
+          // which its turns run on; its manifest hash, null for an imported build.
+          sandboxBuildId: rec.sandboxBuildId || null,
+          templateManifestHash: rec.sandboxBuildId?.startsWith('sha256:')
+            ? rec.sandboxBuildId
+            : null,
+        }
+      : {}),
     model: rec.model || null,
   };
 }
@@ -668,26 +733,41 @@ export const HANDLERS: Record<string, Handler> = {
   // SBX0 §4.1 (v1.1): the sandbox profile answers only where clients send Exec, and the CA to trust
   // when its certificate is self-issued (absent otherwise); templates are at the fixed /v1/templates.
   getDiscovery: async (_ctx, deps) => {
-    if (deps.config.routeProfile === 'sandbox') {
+    const profile = deps.config.routeProfile ?? 'harness';
+    let sandboxFields: Record<string, string> = {};
+    if (profile !== 'harness') {
       const sbx = deps.config.sandbox;
       // Never fall through to the harness body: a sandbox profile without its config is a bug.
-      if (!sbx) throw new CpError('internal_error', 'the sandbox profile has no sandbox config');
-      return {
-        status: 200,
-        body: {
-          profile: 'sandbox',
-          execEndpoint: sbx.execEndpoint,
-          ...(sbx.execCa ? { execCa: sbx.execCa } : {}),
-        },
+      if (!sbx) throw new CpError('internal_error', `the ${profile} profile has no sandbox config`);
+      sandboxFields = {
+        execEndpoint: sbx.execEndpoint,
+        ...(sbx.execCa ? { execCa: sbx.execCa } : {}),
       };
     }
+    if (profile === 'sandbox') {
+      return { status: 200, body: { profile: 'sandbox', ...sandboxFields } };
+    }
+    // harness, and combined (combined control plane spec §3.1): the harness fields, plus the
+    // sandbox ones on combined.
     return {
       status: 200,
       body: {
         harnessUrl: deps.config.publicHarnessUrl ?? null,
         sandboxTiers: deps.config.sandboxTiers,
+        // Only when declared (session-templates spec §3.3), so discovery elsewhere is byte-identical.
+        // The seed is the harness's business: clients see what they choose between.
+        ...(deps.config.sessionTemplates
+          ? {
+              sandboxTemplates: deps.config.sessionTemplates.map((t) => ({
+                id: t.id,
+                description: t.description,
+                tools: t.tools,
+              })),
+            }
+          : {}),
         version: deps.config.version ?? null,
-        profile: deps.config.routeProfile ?? 'harness',
+        profile,
+        ...sandboxFields,
       },
     };
   },
@@ -703,10 +783,13 @@ export const HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', 'deviceCode is required');
     }
     // A pending authorization propagates as authorization_pending (428) -- the client polls.
-    const principal = await deps.identity.completeDeviceAuth(deviceCode);
+    const fromIdp = await deps.identity.completeDeviceAuth(deviceCode);
+    // Roles and store enrollment now: an API grant counts at login as at every request.
+    const m = await membershipNow(deps, fromIdp.subject, fromIdp.roles);
+    const principal = { ...fromIdp, roles: m.roles };
     // SBX0 §4.2: on the sandbox profile only enrolled subjects (and admins) get a login, and the
     // refusal comes BEFORE a refresh family is issued, so nothing is left behind for them.
-    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+    if (!isEnrolled(principal.subject, principal.roles, deps.config, m.enrolled)) {
       throw notEnrolled(principal.subject);
     }
     const label = asRecord(ctx.body).label;
@@ -756,10 +839,12 @@ export const HANDLERS: Record<string, Handler> = {
     if (typeof index !== 'number' || !provider.has(index)) {
       throw new CpError('invalid_request', `index must be a whole number in 1..${provider.count}`);
     }
-    const principal = provider.principalFor(index);
+    const fromProvider = provider.principalFor(index);
+    const m = await membershipNow(deps, fromProvider.subject, fromProvider.roles);
+    const principal = { ...fromProvider, roles: m.roles };
     // SBX0 §4.2's enrolment gate still applies: main.ts refuses to boot test users on the sandbox
     // profile, and this keeps the invariant even if that guard were ever relaxed.
-    if (!isEnrolled(principal.subject, principal.roles, deps.config)) {
+    if (!isEnrolled(principal.subject, principal.roles, deps.config, m.enrolled)) {
       throw notEnrolled(principal.subject);
     }
     const label = body.label;
@@ -816,15 +901,17 @@ export const HANDLERS: Record<string, Handler> = {
     const r = await deps.refresh.rotate(token, deps.now());
     // One code for every refusal: the client's only move is to log in again (errors.ts).
     if (!r.ok) throw new CpError('invalid_grant', `refresh token refused: ${r.reason}`);
-    const roles = deps.identity.rolesFor(r.subject);
-    // A subject removed from SH_ALLOWED_SUBJECTS loses access at its next refresh, not its next login.
+    const m = await membershipNow(deps, r.subject, deps.identity.rolesFor(r.subject));
+    const roles = m.roles;
+    // A subject removed from SH_ALLOWED_SUBJECTS (or unenrolled through the API) loses access at
+    // its next refresh, not its next login.
     // rotate() has already stored a successor the client never sees, so the token it still holds is
     // superseded: presented again after the grace window it would read as reuse, revoke the family
     // as theft and audit refresh_reuse_detected. Revoke the family here, under a reason of its own,
     // so that token is a plain `revoked` refusal instead.
     // The revoke is best effort: a store failure here must not turn the answer into a 503, which a
     // client reads as "unreachable" and so keeps the superseded token. The refusal is the 403.
-    if (!isEnrolled(r.subject, roles, deps.config)) {
+    if (!isEnrolled(r.subject, roles, deps.config, m.enrolled)) {
       try {
         await deps.refresh.revoke(r.refreshToken, deps.now(), 'not_enrolled');
       } catch (err) {
@@ -923,6 +1010,44 @@ export const HANDLERS: Record<string, Handler> = {
       );
     }
     const sandboxTier = requestedTier ?? tiers?.default ?? '';
+    // The sandbox template (session-templates spec §3.3), recorded like the tier. Omitted: none, and
+    // the session runs only on untemplated workers (§4).
+    const requestedTemplate = asRecord(sandbox).template;
+    if (requestedTemplate !== undefined && typeof requestedTemplate !== 'string') {
+      throw new CpError('invalid_request', 'sandbox.template must be a string');
+    }
+    const activateField = asRecord(sandbox).activate;
+    if (activateField !== undefined && typeof activateField !== 'boolean') {
+      throw new CpError('invalid_request', 'sandbox.activate must be true or false');
+    }
+    // With a template store, a session's template resolves through the catalog as a sandbox's does
+    // (combined control plane spec §3.4): `id`, `id:tag` or `id@sha256:…`, a registered build the
+    // caller may see. Its activation on first use (§6.4) comes last, below, once nothing else can
+    // refuse the create.
+    let resolved: { id: string; buildId: string; build: TemplateBuild } | undefined;
+    let forUse: Awaited<ReturnType<typeof resolveForUse>> | undefined;
+    if (requestedTemplate !== undefined && deps.templates && deps.provenance) {
+      forUse = await resolveForUse(deps, p, requestedTemplate);
+      resolved = { id: forUse.id, buildId: forUse.buildId, build: forUse.build };
+    }
+    const templates = deps.config.sessionTemplates;
+    if (requestedTemplate !== undefined && !resolved && !templates) {
+      throw new CpError('invalid_request', 'this deployment declares no sandbox templates');
+    }
+    if (
+      requestedTemplate !== undefined &&
+      !resolved &&
+      templates &&
+      !templates.some((t) => t.id === requestedTemplate)
+    ) {
+      throw new CpError(
+        'invalid_request',
+        `unknown sandbox template '${requestedTemplate}': this deployment declares ${templates.map((t) => t.id).join(', ')}`,
+      );
+    }
+    const sandboxTemplate = resolved?.id ?? requestedTemplate ?? '';
+    // The build the reference resolved to, kept for the session's life; none without a store.
+    const sandboxBuildId = resolved?.buildId ?? '';
 
     if (configRef) {
       let found: boolean;
@@ -949,6 +1074,20 @@ export const HANDLERS: Record<string, Handler> = {
       ? await chooseFor({ owner: p.sub, credentialName }, requestedModel, deps)
       : undefined;
 
+    // Activation on first use, after every other check, so a create refused for another reason
+    // holds no lease. Only a subject enrolled for sandboxes takes one: on `combined` any login may
+    // create a session, but activation is enrolled-only, as on the activate route (spec §3.2).
+    if (forUse) {
+      await requireActive(
+        deps,
+        p,
+        forUse,
+        activateField !== false,
+        // The request's own enrollment (server.ts sets it per request, from the members store).
+        isEnrolledForSandbox(p.sub, p.roles ?? [], deps.config, p.enrolled === true),
+      );
+    }
+
     const sessionId = deps.newId();
     const rec: SessionRecord = {
       sessionId,
@@ -960,6 +1099,8 @@ export const HANDLERS: Record<string, Handler> = {
       credentialName,
       configRef,
       sandboxTier,
+      ...(sandboxTemplate ? { sandboxTemplate } : {}),
+      ...(sandboxBuildId ? { sandboxBuildId } : {}),
       tombstone: false,
       model: choice?.model ?? '',
       ...(choice?.limits ? { modelLimits: choice.limits } : {}),
@@ -975,6 +1116,22 @@ export const HANDLERS: Record<string, Handler> = {
     resolveAuditLog(deps)({ event: 'audit', ...sessionCreatedEntry });
     await deps.index.audit(sessionCreatedEntry);
     const iat = seconds(deps);
+    // The session on its build's chain (lifecycle spec §7.1), as a sandbox is: its lease is the
+    // caller's live lease on the build, as the digest of the activate record that granted it (null:
+    // no lease, e.g. no host agents). Written after the session is stored, so a create that any check
+    // refuses, its activation on first use included, writes no `created` record.
+    if (resolved && deps.provenance) {
+      const live = (resolved.build.leases ?? []).find((l) => l.subject === p.sub && l.until > iat);
+      await appendSessionRecord(deps, `template/${resolved.id}`, p.sub, {
+        sessionId,
+        buildId: resolved.buildId,
+        // Null for a build imported from SH_SANDBOX_TEMPLATES, which names no snapshot, as on a
+        // sandbox's record: resolveForUse returns only registered builds, imported ones included.
+        templateManifestHash: resolved.buildId.startsWith('sha256:') ? resolved.buildId : null,
+        lease: live?.record ?? null,
+        state: 'created',
+      });
+    }
     return {
       status: 201,
       body: {
@@ -1111,6 +1268,23 @@ export const HANDLERS: Record<string, Handler> = {
     };
     resolveAuditLog(deps)({ event: 'audit', ...deletedEntry });
     await deps.index.audit(deletedEntry);
+    // Its end on the build's chain (§7.1): a session has a build id only when its template resolved
+    // through the store at creation, which wrote its `created` record, so the same gate on both
+    // sides gives every `created` its end, an `imported:` build's included.
+    if (deps.provenance && rec.sandboxTemplate && rec.sandboxBuildId) {
+      await appendSessionRecord(
+        deps,
+        `template/${rec.sandboxTemplate}`,
+        ctx.principal?.sub ?? rec.owner,
+        {
+          sessionId: rec.sessionId,
+          buildId: rec.sandboxBuildId,
+          state: 'terminated',
+          reason: 'deleted',
+          endedAt: seconds(deps),
+        },
+      );
+    }
     // 202 rather than pretending a synchronous delete happened; a sweeper reaps what the in-flight
     // turn writes on its way out (spec §7.3).
     return { status: inFlight ? 202 : 204, body: undefined };
@@ -1139,7 +1313,10 @@ export const HANDLERS: Record<string, Handler> = {
         'the sandbox service stores only consumer: sandbox-egress credentials',
       );
     }
-    if (sandbox) {
+    // Two egress credentials of one subject never hold one destination: keyed on the consumer, so
+    // it holds on `combined` (whose credential routes keep the harness behaviour) as on `sandbox`.
+    const servesSandboxes = sandbox || deps.config.routeProfile === 'combined';
+    if (servesSandboxes && cred.descriptor.consumer === 'sandbox-egress') {
       const mine = new Set(cred.descriptor.destination.hosts);
       for (const other of await deps.credentials.list(p.sub)) {
         if (other.consumer !== 'sandbox-egress' || other.name === name) continue;
@@ -1398,6 +1575,8 @@ export const HANDLERS: Record<string, Handler> = {
 
   // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
   ...SANDBOX_HANDLERS,
+  ...HOST_HANDLERS,
+  ...MEMBER_HANDLERS,
   ...EGRESS_HANDLERS,
   ...TURN_HANDLERS,
 };
