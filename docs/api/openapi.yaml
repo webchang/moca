@@ -2292,8 +2292,9 @@ paths:
         writes `create`, `gate` (with a gate record) and `check` records and queues the build for
         a build host; follow it at `build`. A create whose inputs match a build of the caller's
         template that is registered or on its way (§3.2) queues nothing and answers that build with
-        `reused: true`: `200` when it is registered, `202` while it is not. A failed or rejected
-        build is never reused.
+        `reused: true`: `200` when it is registered, `202` while it is not. A registered build
+        counts only while a host holds its snapshot (on a deployment with host agents). A failed or
+        rejected build is never reused.
       security: [{ sessionToken: [] }]
       requestBody:
         required: true
