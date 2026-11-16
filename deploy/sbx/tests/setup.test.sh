@@ -203,6 +203,10 @@ refusals=(
   'export SBX_RETENTION_DAYS=91 => SBX_RETENTION_DAYS must be'
   'export SBX_MAX_INFLIGHT=0 => SBX_MAX_INFLIGHT must be 1-8'
   'export SBX_MAX_INFLIGHT=9 => SBX_MAX_INFLIGHT must be 1-8'
+  'export SBX_GATE_RECORD_SCHEMA="image factory/gate/1" => SBX_GATE_RECORD_SCHEMA must be a schema string'
+  'export SBX_GATE_RECORD_SCHEMA=image-factory//gate => SBX_GATE_RECORD_SCHEMA must be a schema string'
+  'export SBX_GATE_RECORD_SCHEMA=/gate/1 => SBX_GATE_RECORD_SCHEMA must be a schema string'
+  'export SBX_GATE_RECORD_SCHEMA=gate/1/ => SBX_GATE_RECORD_SCHEMA must be a schema string'
   'export SBX_MODES_ALLOWED=per-exec,bogus => SBX_MODES_ALLOWED must be a comma list of per-exec, lease and lease\+processes'
   'export SBX_MODES_ALLOWED="per-exec, lease" => SBX_MODES_ALLOWED must be a comma list'
   'export SBX_MODES_ALLOWED=per-exec, => SBX_MODES_ALLOWED must be a comma list'
@@ -530,6 +534,25 @@ grep -qx 'SH_LEASE_IDLE_CEILING_S=1800' "$GEN/workers/sbx_default/worker.env" ||
 render
 [[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the hash did not return with the defaults'
 pass 'SBX_MODES_ALLOWED and SBX_IDLE_CEILING_S reach sbx-settings and move the hash; the ceiling reaches every worker bundle'
+
+# 4c'''. SBX_GATE_RECORD_SCHEMA: set, it reaches sbx-settings as SH_GATE_RECORD_SCHEMA, the control
+# plane reads it (an optional key), and it moves the hash; unset, no key is written and the hash is
+# the defaults' (the control plane's own default holds).
+! jq -e '.data // {} | has("SH_GATE_RECORD_SCHEMA")' "$MOCK_STATE/configmap-sbx-settings.json" >/dev/null ||
+  fail 'SH_GATE_RECORD_SCHEMA written with SBX_GATE_RECORD_SCHEMA unset'
+run_setup export SBX_GATE_RECORD_SCHEMA=image-factory/gate/1 || fail 'a run with SBX_GATE_RECORD_SCHEMA failed'
+[[ "$(cm sbx-settings SH_GATE_RECORD_SCHEMA)" == image-factory/gate/1 ]] || fail 'SBX_GATE_RECORD_SCHEMA not written'
+render
+[[ "$(pod_hash moca-control-plane)" != "$cp_hash" ]] || fail 'SBX_GATE_RECORD_SCHEMA is not in the settings hash'
+{ grep -A6 -- '- name: SH_GATE_RECORD_SCHEMA$' "$TMP/render.yaml" | grep -q 'name: sbx-settings' &&
+  grep -A6 -- '- name: SH_GATE_RECORD_SCHEMA$' "$TMP/render.yaml" | grep -q 'optional: true'; } ||
+  fail 'the control plane does not read SH_GATE_RECORD_SCHEMA from sbx-settings as an optional key'
+run_setup true || fail 'the run back to the defaults failed'
+! jq -e '.data // {} | has("SH_GATE_RECORD_SCHEMA")' "$MOCK_STATE/configmap-sbx-settings.json" >/dev/null ||
+  fail 'SH_GATE_RECORD_SCHEMA left behind once SBX_GATE_RECORD_SCHEMA was unset'
+render
+[[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the hash did not return with the defaults'
+pass 'SBX_GATE_RECORD_SCHEMA reaches sbx-settings and the control plane, and moves the hash; unset, nothing is written'
 
 # 4c''. A running worker keeps the SH_LEASE_IDLE_CEILING_S it was installed with until install-host.sh
 # is re-run on its host, so a ceiling change names the hosts to reinstall. A warning, not a refusal:

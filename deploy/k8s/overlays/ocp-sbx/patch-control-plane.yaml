@@ -30,6 +30,10 @@ spec:
             - name: SH_SANDBOX_EXEC_CA
               valueFrom:
                 { configMapKeyRef: { name: sbx-settings, key: SH_SANDBOX_EXEC_CA, optional: true } }
+            # Only when SBX_GATE_RECORD_SCHEMA is set (setup.sh); unset, the control plane's default.
+            - name: SH_GATE_RECORD_SCHEMA
+              valueFrom:
+                configMapKeyRef: { name: sbx-settings, key: SH_GATE_RECORD_SCHEMA, optional: true }
             - name: SH_SANDBOX_TOKEN_ISSUER
               valueFrom: { configMapKeyRef: { name: sbx-settings, key: SH_SANDBOX_TOKEN_ISSUER } }
             - name: SH_SANDBOX_LIFETIME_SECONDS

@@ -32,6 +32,10 @@
 #                           may set, in seconds. Also every worker bundle's SH_LEASE_IDLE_CEILING_S, so
 #                           the control plane and the workers clamp alike; at least 300, the worker's
 #                           default idle timeout, which it refuses to start above its ceiling
+#   SBX_GATE_RECORD_SCHEMA  optional; unset by default: the schema of the general-gate records the control
+#                           plane reads (its SH_GATE_RECORD_SCHEMA; unset, its default moca-gate-record/1).
+#                           The image builder's general-gate records use image-factory/gate/1, so a
+#                           deployment that takes them sets that value
 #   SBX_EGRESS_CREDENTIALS  optional; unset, 0 or 1 (SBX0.2b, spec §4.3). 1 turns on user-scoped egress
 #                           credentials: the control plane's file store (a PVC) and credential routes,
 #                           a KEK and one bearer per KVM host in the Secret sbx-egress, and an egress
@@ -192,6 +196,10 @@ validate() {
   [[ -z "${SBX_API_CA_FILE:-}" ]] || { [[ -f "$SBX_API_CA_FILE" && -r "$SBX_API_CA_FILE" ]] && grep -q -- '-----BEGIN CERTIFICATE-----' "$SBX_API_CA_FILE"; } ||
     die 'SBX_API_CA_FILE must name a readable PEM certificate file (the CA the janitor trusts for the API Route)'
   [[ "$SBX_MAX_INFLIGHT" =~ ^[1-8]$ ]] || die 'SBX_MAX_INFLIGHT must be 1-8'
+  # The control plane's SH_GATE_RECORD_SCHEMA grammar (sandbox-config.ts SCHEMA_RE); it refuses to
+  # boot on any other value.
+  [[ -z "${SBX_GATE_RECORD_SCHEMA:-}" || "$SBX_GATE_RECORD_SCHEMA" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] ||
+    die 'SBX_GATE_RECORD_SCHEMA must be a schema string such as image-factory/gate/1 (letters, digits, ., _, - and /, no spaces)'
   # The control plane's modesAllowedFromEnv names, with no spaces; it refuses to boot on any other.
   [[ "$SBX_MODES_ALLOWED" =~ $MODES_RE ]] ||
     die 'SBX_MODES_ALLOWED must be a comma list of per-exec, lease and lease+processes, no spaces'
@@ -794,6 +802,7 @@ ensure_settings() {
     "SH_SANDBOX_MAX_TOTAL=$SBX_MAX_TOTAL" "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT"
     "SH_SANDBOX_MODES_ALLOWED=$SBX_MODES_ALLOWED" "SH_SANDBOX_IDLE_CEILING_S=$SBX_IDLE_CEILING_S")
   [[ -z "$ca" ]] || sbx+=("SH_SANDBOX_EXEC_CA=$ca")
+  [[ -z "${SBX_GATE_RECORD_SCHEMA:-}" ]] || sbx+=("SH_GATE_RECORD_SCHEMA=$SBX_GATE_RECORD_SCHEMA")
   [[ -z "$STORE_ON" ]] || sbx+=("SH_TEMPLATE_HOSTS=$STORE_HOSTS_JSON")
   if [[ -n "$EGRESS_ON" ]]; then
     sbx+=("SH_EGRESS_HOSTS=$EGRESS_HOSTS_JSON")
