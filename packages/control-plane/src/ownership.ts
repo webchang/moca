@@ -123,8 +123,9 @@ export const runtimeKey = (sid: string): string => `sh:cp:session:${sid}:runtime
 /** Hashed, so the keyspace itself discloses no logins -- same derivation as the Secret name. */
 export const ownerKey = (subject: string): string => `sh:cp:owner:${subjectHash(subject)}:sessions`;
 /**
- * The sessions pinned to one template build (lifecycle spec §5.1): a retire is refused while one is
- * active, as a sandbox's live record refuses it. The build id is hashed into the key, as the owner is.
+ * The sessions pinned to one template build (lifecycle spec §5.1): a retire or a reject is refused
+ * while one is active, as a live sandbox refuses it. The build id is hashed into the key, as the
+ * owner is.
  */
 export const buildSessionsKey = (buildId: string): string =>
   `sh:cp:build:${subjectHash(buildId)}:sessions`;
@@ -154,7 +155,7 @@ const RUNTIME_FIELDS = [
   'turnStartedAt',
   'turnEndedAt',
   // P6.3 spec §6: where the last leased turn ran, and when the session last lost its workspace
-  // (knative-server runtimeFieldsForTurn). Display-only, read by the resources view's `placement`.
+  // (`@moca/server` runtimeFieldsForTurn). Display-only, read by the resources view's `placement`.
   'sandboxId',
   'sandboxTier',
   'workspaceResetAt',
@@ -229,22 +230,18 @@ export class OwnershipIndex {
       this.redis.zAdd(ownerKey(rec.owner), { score: rec.createdAt, value: rec.sessionId }),
     );
     if (rec.sandboxBuildId) {
-      await this.guard(() =>
-        this.redis.zAdd(buildSessionsKey(rec.sandboxBuildId!), {
-          score: rec.createdAt,
-          value: rec.sessionId,
-        }),
-      );
+      const key = buildSessionsKey(rec.sandboxBuildId);
+      await this.guard(() => this.redis.zAdd(key, { score: rec.createdAt, value: rec.sessionId }));
     }
   }
 
   /**
    * Whether an active session is pinned to this build (lifecycle spec §5.1). A member whose record
-   * is gone, deleting, or pinned to another build does not count, so a crash between the cascade's
-   * steps cannot block a retire; such a member is removed from the set here, so the set does not
-   * grow with sessions that ended without the cascade's own removal. The cascade (cascadeDelete) is
-   * the one place a session leaves `active`, and it removes the member too. Sessions created before
-   * this index existed are not in it, so they never block a retire.
+   * is gone, not active (left `deleting` by a crash mid-cascade, say) or pinned to another build
+   * does not count, so a crash between the cascade's steps cannot block a retire for good; such a
+   * member is removed from the set as the check scans it, so the set does not keep growing with
+   * sessions that ended without the cascade's own removal. Sessions created before this index
+   * existed are not in it, so they never block a retire.
    */
   async hasActiveSessionOnBuild(buildId: string): Promise<boolean> {
     const key = buildSessionsKey(buildId);
@@ -458,7 +455,8 @@ export class OwnershipIndex {
     await this.guard(() => this.redis.del([...dataKeys(rec.sessionId), runtimeKey(rec.sessionId)]));
     await this.guard(() => this.redis.zRem(ownerKey(rec.owner), rec.sessionId));
     if (rec.sandboxBuildId) {
-      await this.guard(() => this.redis.zRem(buildSessionsKey(rec.sandboxBuildId!), rec.sessionId));
+      const key = buildSessionsKey(rec.sandboxBuildId);
+      await this.guard(() => this.redis.zRem(key, rec.sessionId));
     }
     await this.guard(() => this.redis.del([sessionKey(rec.sessionId)]));
   }
