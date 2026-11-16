@@ -290,6 +290,7 @@ function addWorkerService(server: Server, relay: ReturnType<typeof createRelay>)
 
 /** The lease calls are a sandbox's own (lease-mode §8.2): the harness never uses leases. */
 const HARNESS_NO_LEASES = 'lease calls not permitted: the harness never uses leases';
+const CLIENT_NO_LEASES = 'lease calls not permitted: a client token never uses leases';
 
 function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
   // Audit lines (SBX0 §3.5) only on a relay with sandbox keys, so a MOCA relay's output is
@@ -429,7 +430,12 @@ function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
       const caller = execCaller(call.metadata, auth);
       const req = call.request;
       if (caller.kind !== 'sandbox') {
-        const reason = caller.kind === 'harness' ? HARNESS_NO_LEASES : caller.reason;
+        const reason =
+          caller.kind === 'harness'
+            ? HARNESS_NO_LEASES
+            : caller.kind === 'client'
+              ? CLIENT_NO_LEASES
+              : caller.reason;
         if (reason)
           audit.leaseControl(t0, {
             wrk: req.sandboxId,
@@ -440,7 +446,9 @@ function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
         cb(
           caller.kind === 'harness'
             ? grpcError(status.PERMISSION_DENIED, HARNESS_NO_LEASES)
-            : unauthenticated(),
+            : caller.kind === 'client'
+              ? grpcError(status.PERMISSION_DENIED, CLIENT_NO_LEASES)
+              : unauthenticated(),
           null,
         );
         return;
@@ -472,7 +480,9 @@ function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
         cb(
           caller.kind === 'harness'
             ? grpcError(status.PERMISSION_DENIED, HARNESS_NO_LEASES)
-            : unauthenticated(),
+            : caller.kind === 'client'
+              ? grpcError(status.PERMISSION_DENIED, CLIENT_NO_LEASES)
+              : unauthenticated(),
           null,
         );
         return;
