@@ -139,7 +139,7 @@ A JSON file, schema `moca-sbx-template-spec/1`. Every field is checked before an
 | `image`                   | `repository@sha256:<digest>`, never a tag; a repository with no host takes it from `--registry`                         |
 | `guest_ram_mb`, `vcpus`   | the guest's size, fixed in the snapshot                                                                                 |
 | `guest_home`              | optional, a writable `HOME` under `/tmp` (the rootfs is read-only)                                                      |
-| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose                                                               |
+| `skip_git_identity_check` | `true` for an image that refuses agent commits on purpose, with a gate record that shows it (X12)                       |
 | `guest_home_gitconfig`    | optional, `true`: copy the image's `/root/.gitconfig` into `guest_home`; refused with `skip_git_identity_check`         |
 | `egress`                  | `false`: no network at all (`--no-egress`); `true`: the host's allowlisted egress                                       |
 | `seed`                    | a bash command that fills a new sandbox's empty `/workspace`, or `""`                                                   |
@@ -362,7 +362,6 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
        "vcpus": 2,
        "egress": false,
        "seed": "",
-       "skip_git_identity_check": true,
        "tools": ["bash", "python3"],
        "probe": {
          "cmd": "python3 -c 'import sys; print(sys.version_info[:2])'",
@@ -377,10 +376,10 @@ The fix is a small layer on top of your image: a localhost `/etc/hosts`, the gue
 
    - **`egress: false`** is how it ran; `true` gives the sandbox the host's allowlisted egress
      (§4b.3's `ca-certificates`, and §4b.6's egress records).
-   - **`skip_git_identity_check: true`** is how it ran, because this image has no git and the build
-     host's snapshot check then failed a git-less image. With the build tooling's check for git-less
-     images (an image with no git has no commit to fail), it passes by itself: leave the field out.
-     An image that has git should never set it on `base`.
+   - **No `skip_git_identity_check`.** The build tooling's git identity check passes an image with
+     no git by itself (an image with no git has no commit to fail). And under every profile, a create
+     that sets the field without a gate record showing commits refused (X5) is refused (X12). On
+     `base` there is no gate record, so leave it out.
 
    `POST /v1/templates` with that body and your API token. A create is answered `202` with the build
    to follow. With mocactl (not yet run against a KVM host), `--spec F` reads F as the spec itself
