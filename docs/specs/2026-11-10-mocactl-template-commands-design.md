@@ -3,6 +3,15 @@
 - **Status:** implemented and merged (e2ba2aa4; `activate --wait`'s sized default 5b0c4696), as accepted (the user, 2026-11-10: all seven
   recommendations in §7), after reviews by autobench-moca and autobench. As built: §4a. Not yet run
   against a live control plane or in a KVM-host window (§5's side-by-side run).
+  **Since the sync with upstream main 0dc3d01e (2026-11-16):** upstream's reviewed client (#767,
+  #768) is the code on this branch. It leaves out, and so this branch no longer has: `sbx create
+--seed`'s check of the seeded HEAD against the spec's `baseline_commit`; `activate --wait` stopping
+  at once on `not_held` or `memfile_mismatch`; a refusal's `readiness`, `readinessReason` and
+  `queuePosition`; an admin write refused when the control plane URL came only from the login; the
+  admin-write issuer check on the combined profile; the dry run's X1.offline check and its
+  `guest_mb` and git-less advice; and the extra fields in the quota, policy and build lines
+  (`quotaSource`, `selfAttest`, `allowedRepositories`, `heldBy`, the attestation). The server still
+  enforces every rule. Each could be proposed upstream again.
 - **Date:** 2026-11-10
 - **Asked for by:** the user, 2026-11-09: "after we are done with Moca API enrichment/enhancement, we
   also need to enrich/enhance Moca's mocactl for template and user management/consumption."

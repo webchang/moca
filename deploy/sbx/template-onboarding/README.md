@@ -4,7 +4,7 @@ The all-in-one place for **sandbox templates**: what they are, how to create and
 container image, how to check it, and how clients and agents use it. A template is a named image
 that a client asks for by id; its commands then run in microVMs restored from that image's snapshot.
 
-Start with the [Template Onboarding Guide](GUIDE.md). It walks through the whole flow with two
+Start with the [Template Onboarding Guide](GUIDE.md) ([PDF](GUIDE.pdf)). It walks through the whole flow with two
 sample templates and a client choosing between them.
 
 **Gating, provenance and the process** that govern these tools (which images may become templates,
@@ -15,6 +15,8 @@ what each step records): [`governance/`](governance/README.md).
 | File                                                                                               | What it is                                                                                                                                                                                                                                         |
 | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`GUIDE.md`](GUIDE.md)                                                                             | the guide: mental model, the flow, two worked examples, self-serve from your own image (§4b), update and retire, capacity, troubleshooting                                                                                                         |
+| [`GUIDE.pdf`](GUIDE.pdf)                                                                           | the guide as a PDF (this fork's), regenerated with `python3 docs/tools/gen_pdf.py deploy/sbx/template-onboarding/GUIDE.md` ([`docs/tools/`](../../../docs/tools/))                                                                                 |
+| [`deck/`](deck/README.md)                                                                          | this fork's decks: the template lifecycle overview and the 2026-11-12 meeting deck, with their generators                                                                                                                                          |
 | [`ONBOARDING.md`](ONBOARDING.md)                                                                   | the short reference: the steps, the spec's fields, the tools' options                                                                                                                                                                              |
 | [`governance/`](governance/README.md)                                                              | the gating rules, the process, and where each is owned                                                                                                                                                                                             |
 | [`template-build.sh`](template-build.sh)                                                           | **KVM host, root:** spec → pull by digest → rootfs → snapshot, the probe run in a restored microVM → a template record                                                                                                                             |
@@ -32,15 +34,16 @@ These are part of the same flow but live with the code they belong to.
 
 **SBX0, the sandbox service the templates run on** (`deploy/sbx/`):
 
-| File                                             | Role in the flow                                                                                                        |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| [`../setup.sh`](../setup.sh)                     | the cluster side: mints each worker's token and bundle; a template change restarts the control plane only               |
-| [`../install-host.sh`](../install-host.sh)       | the KVM host: installs (or `--uninstall`s) a template's worker                                                          |
-| [`../host-agent.sh`](../host-agent.sh)           | the KVM host's template agent: builds queued templates, starts and stops their workers, removes retired builds          |
-| [`../templates-check.sh`](../templates-check.sh) | the live check that a client gets the template it asked for, and that templates are isolated                            |
-| [`../README.md`](../README.md)                   | installing SBX0                                                                                                         |
-| [`../RUNBOOK.md`](../RUNBOOK.md)                 | operating it: §5 templates, [guest egress](../RUNBOOK.md#guest-egress), the template host agent, checking the templates |
-| [`../tests/`](../tests/)                         | the deploy scripts' tests (`install-host.test.sh`, `setup.test.sh`, …)                                                  |
+| File                                             | Role in the flow                                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| [`../setup.sh`](../setup.sh)                     | the cluster side: mints each worker's token and bundle; a template change restarts the control plane only                       |
+| [`../install-host.sh`](../install-host.sh)       | the KVM host: installs (or `--uninstall`s) a template's worker                                                                  |
+| [`../host-agent.sh`](../host-agent.sh)           | the KVM host's template agent: builds queued templates, starts and stops their workers, removes retired builds                  |
+| [`../mint-login.sh`](../mint-login.sh)           | a test login for a deployment without a GitHub OAuth app (this fork's; [RUNBOOK](../RUNBOOK.md), "A test login without GitHub") |
+| [`../templates-check.sh`](../templates-check.sh) | the live check that a client gets the template it asked for, and that templates are isolated                                    |
+| [`../README.md`](../README.md)                   | installing SBX0                                                                                                                 |
+| [`../RUNBOOK.md`](../RUNBOOK.md)                 | operating it: §5 templates, [guest egress](../RUNBOOK.md#guest-egress), the template host agent, checking the templates         |
+| [`../tests/`](../tests/)                         | the deploy scripts' tests (`install-host.test.sh`, `setup.test.sh`, …)                                                          |
 
 **Snapshots** (`deploy/microvm/`):
 

@@ -6,6 +6,9 @@
   ccac7696), its host agent part deployed at the grace window (2026-11-10). **The idle grace is implemented**
   (merged 43379f55), its control plane deployed (2026-11-09) and its host agent at the same window,
   where both were verified live (register G43). §4a records where the build differs from §4.
+  **Since the sync with upstream main 0dc3d01e (2026-11-16):** upstream's reviewed version of this
+  work (#784, the template lifecycle design §6.5) is the code on this branch; this note stays as the
+  fork's record of the design, and where they differ upstream's design holds.
 - **Date:** 2026-11-09
 - **Found in:** the Lite-28 batch window, 2026-11-08: 28 templates activated at once on one KVM host,
   and many activations waited minutes for their workers. The user kept the host's disk as it was
@@ -164,8 +167,9 @@ live, and a sandbox keeps its worker wanted.
   the activation lock (G40's, moved to `activation-lock.ts` so the wanted answer and activation share
   it); no host or Redis call runs under it.
 - **A retire or reject while graced:** the removal step skips a running worker, so on a host with a
-  grace the wanted answer lists a retired or rejected build in `stop` as well as `remove`; the agent
-  stops it, then removes it in the same run, and `workers/report` accepts `detached` for it.
+  grace the wanted answer lists a retired build in `stop` as well as `remove`; the agent stops it,
+  then removes it in the same run, and `workers/report` accepts `detached` for it. (Upstream lists a
+  build an admin rejected in `stop` only: it is stopped, never removed.)
 - **`stopNow`** on a build already in its grace ends it (a record with `leases: 0`, `stopNow: true`;
   a repeat writes nothing); while other subjects still hold leases it changes nothing for them.
 - **A graced, attached worker's first use** takes a lease and creates the sandbox at once.

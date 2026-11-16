@@ -269,6 +269,12 @@ density work. The long-term multi-tenant design (SBX1) is exploratory and not in
 | **mocactl for templates**          | **The client's whole template path in mocactl** — reads (quota, policy, hosts), create with a local dry-run and follow, activate with a sized wait and release with `stopNow`, seed, egress, retire with wait, refusals with their rule, admin writes that print old → new, and a per-call record with no secret                                                                                                                                                                           | **proposed**; implementation proposed with the server units (#737 and those after it) | #737; [user guide §8](../sbx/user-guide.md#8-your-own-templates)                                                                                                                                               |
 | **Combined control plane**         | **One control plane for sessions and sandboxes** — a third route profile, `combined`, the union of `harness` and `sandbox`: one template store, quota and lease for Moca Pi sessions and stock-agent sandboxes; login open, enrollment on the sandbox and template-write routes; the token separation kept; sessions resolved through the store, first use and turns by build                                                                                                              | **design — accepted (C1-C4); increments 1-6 built**                                   | [`2026-11-05-combined-control-plane-design.md`](2026-11-05-combined-control-plane-design.md)                                                                                                                   |
 
+**This fork's own design notes** (not upstream's): [cold-start pacing](2026-11-09-cold-start-pacing-design.md),
+[memory-aware placement](2026-11-09-memory-aware-placement-design.md) and
+[mocactl for templates](2026-11-10-mocactl-template-commands-design.md), the designs as the fork
+built them. Upstream folded them into the template lifecycle design (§6.4, §6.5) and the
+[user guide](../sbx/user-guide.md); where they differ, upstream's holds.
+
 ---
 
 ## Other specs (not in a track above)

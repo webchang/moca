@@ -7,10 +7,12 @@ How a container image becomes a Moca sandbox template that may be deployed, and 
 image and template stays traceable. The tools are one level up, in
 [`deploy/sbx/template-onboarding/`](../README.md); this folder holds what governs their use.
 
-| Document                             | What                                                                                                                                                    | Owner             |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| [`GATING-RULES.md`](GATING-RULES.md) | the gating rules for images and templates: Moca's own (M) plus the image builder's extensions (X), each with its tier, evidence, record and enforcement | the image builder |
-| [`PROCESS.md`](PROCESS.md)           | the process, written while it is built: onboarding, gating, provenance, activation                                                                      | the operator      |
+| Document                                             | What                                                                                                                                                    | Owner             |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| [`GATING-RULES.md`](GATING-RULES.md)                 | the gating rules for images and templates: Moca's own (M) plus the image builder's extensions (X), each with its tier, evidence, record and enforcement | the image builder |
+| [`GAPS-AND-ASSUMPTIONS.md`](GAPS-AND-ASSUMPTIONS.md) | this fork's register: the decisions the work rests on (D), the gaps found (G, PV, S, W), the assumptions (A) and open questions (Q)                     | sbx-template      |
+| [`INVENTORY-2026-11-02.md`](INVENTORY-2026-11-02.md) | Moca's rules as found on 2026-11-02, with file and line (a snapshot, not kept current)                                                                  | sbx-template      |
+| [`PROCESS.md`](PROCESS.md)                           | the process, written while it is built: onboarding, gating, provenance, activation                                                                      | the operator      |
 
 **Changing a rule.** A rule changes by a pull request to `GATING-RULES.md` that its owner reviews,
 and the code that enforces it (`packages/control-plane/src/template-policy.ts`, `template-build.sh`)

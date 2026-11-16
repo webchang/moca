@@ -252,6 +252,30 @@ in.
     volume), so after removing an admin from the settings, check `GET /v1/subjects` for API admins
     too. For a temporary admin, prefer an API grant with `--until`: it lapses by itself.
 
+**A test login without GitHub** (this fork's `mint-login.sh`). A deployment whose
+`SBX_GITHUB_CLIENT_ID` is a placeholder (no OAuth app) has no device flow. To test it, an operator
+mints a login for an enrolled subject with the deployment's own signing key:
+
+```bash
+deploy/sbx/mint-login.sh --env-file <env file> --subject github:<id> --home <dir> [--ttl-minutes N]
+HOME=<dir> mocactl sbx templates
+```
+
+It reads `moca-mu1` with `kubectl` and writes `<dir>/.config/mocactl/sbx-auth.json` (0600), the
+cache `mocactl sbx` reads, with `XDG_CONFIG_HOME` unset. The key and the token reach no argv, log
+or output. The login cannot refresh: mint another when it ends (60 minutes by default, at most a
+day). Anyone who can read Secrets in the namespace can do this, so it grants nothing an operator
+lacks. Give each test user a `<dir>` of their own, as the smoke's two `HOME`s (§13). A minted
+login writes no `config.json`, so `mocactl sbx` takes its control plane from the login itself; name
+it with `--control-plane-url` or `MOCACTL_SBX_URL` for an admin write, so the write goes where you
+mean.
+
+A second test user must still be a real `github:<id>` enrolled in `SBX_ALLOWED_SUBJECTS`. A made-up
+id is safe only while the client id is a placeholder, since nothing can then sign in through
+GitHub. Once a real OAuth app is configured, whoever owns that id on GitHub could log in as an
+enrolled user. So drop a made-up id from the list when the test ends, and use a real second account
+on a deployment with an OAuth app.
+
 ## 5. Adding, updating and removing a template
 
 The template onboarding folder, `deploy/sbx/template-onboarding/` (its `GUIDE.md` and
