@@ -1270,7 +1270,10 @@ workspace data stays for the janitor, as with any uninstall. `--keep-shared` rem
 files only: even the host's last worker leaves the shared units (`sbx-worker@.service`, `sbx.slice`),
 `moca-egress` and its credential injection in place for the next worker, so a client's retire never
 undoes an operator's `--egress`. To remove them from a host with no worker left, run `install-host.sh
---uninstall <that worker>` again without it (§12). Also re-run `setup.sh` without the
+--uninstall-shared` (no id; refused while a worker is installed), or `install-host.sh --uninstall
+<that worker>` again without `--keep-shared` (§12). Either writes the snapshot device's recorded
+read-ahead back: run one before removing `/etc/sbx`, or the record is lost and the read-ahead unit
+keeps setting the value at boot. Also re-run `setup.sh` without the
 worker's id in `SBX_WORKERS` (§5) to revoke its relay token. `mocactl sbx templates retire ID
 --wait` returns once the worker has stopped and every holding host has removed it; a host that is
 down removes it at its next poll.
