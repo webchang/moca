@@ -16,6 +16,7 @@ import { writeError } from '../src/errors.js';
 import { exchangeCredential } from '../src/exchange.js';
 import { HANDLERS } from '../src/handlers.js';
 import { MembersStore } from '../src/members.js';
+import { buildSessionsKey, type CpRedisLike } from '../src/ownership.js';
 import {
   HOST_STALE_S,
   HostRegistry,
@@ -1805,6 +1806,48 @@ describe('retire (§5.1)', () => {
     expect(await refusal(() => retireBuild(d, 't1', hash('1')))).toBe('build_in_use');
     expect((await d.templates!.get('t1'))!.builds[0].status).toBe('registered');
     await HANDLERS.deleteSession!(ctx({ principal: alice, params: { id: s.sessionId } }), d);
+    expect((await retire(d, 't1')).status).toBe(200);
+  });
+
+  it("prunes a pinned session that ended without the cascade's removal; an active one still blocks", async () => {
+    const d = await setup();
+    attachedNow = ['sbx_t1'];
+    await registered(d, 't1', hash('1'), 'sbx_t1');
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    await activate(d, 't1');
+    await seedCredential(d);
+    const pinned = async () =>
+      (
+        (
+          await HANDLERS.createSession!(
+            ctx({ principal: alice, body: { sandbox: { template: `t1@${hash('1')}` } } }),
+            d,
+          )
+        ).body as Body
+      ).sessionId as string;
+    const redis = (d.index as unknown as { redis: CpRedisLike }).redis;
+    const members = () =>
+      redis.zRange(buildSessionsKey(hash('1')), '+inf', '-inf', { BY: 'SCORE', REV: true });
+    let n = 0;
+    d.newId = () => `sid-${++n}`;
+    const ended = await pinned();
+    // Ended without the cascade's removal: its record no longer active (as a crash mid-delete leaves it).
+    await d.index.tombstone(ended);
+    const ended2 = await pinned();
+    await d.index.tombstone(ended2);
+    // Alone, it does not block (the retire check answers false) and the check drops it.
+    expect(await members()).toEqual(expect.arrayContaining([ended, ended2]));
+    expect(await d.index.hasActiveSessionOnBuild(hash('1'))).toBe(false);
+    expect(await members()).toEqual([]);
+    // Beside an active one: the retire is refused, and its check drops the ended one.
+    const ended3 = await pinned();
+    await d.index.tombstone(ended3);
+    const live = await pinned();
+    expect(await members()).toEqual(expect.arrayContaining([ended3, live]));
+    expect(await refusal(() => retire(d, 't1'))).toBe('build_in_use');
+    expect(await members()).toEqual([live]);
+    await HANDLERS.deleteSession!(ctx({ principal: alice, params: { id: live } }), d);
+    expect(await members()).toEqual([]);
     expect((await retire(d, 't1')).status).toBe(200);
   });
 

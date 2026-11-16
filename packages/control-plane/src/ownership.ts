@@ -240,18 +240,27 @@ export class OwnershipIndex {
 
   /**
    * Whether an active session is pinned to this build (lifecycle spec §5.1). A member whose record
-   * is gone or deleting does not count, so a crash between the cascade's steps cannot block a retire.
+   * is gone, deleting, or pinned to another build does not count, so a crash between the cascade's
+   * steps cannot block a retire; such a member is removed from the set here, so the set does not
+   * grow with sessions that ended without the cascade's own removal. The cascade (cascadeDelete) is
+   * the one place a session leaves `active`, and it removes the member too. Sessions created before
+   * this index existed are not in it, so they never block a retire.
    */
   async hasActiveSessionOnBuild(buildId: string): Promise<boolean> {
+    const key = buildSessionsKey(buildId);
     const ids = await this.guard(() =>
-      this.redis.zRange(buildSessionsKey(buildId), '+inf', '-inf', { BY: 'SCORE', REV: true }),
+      this.redis.zRange(key, '+inf', '-inf', { BY: 'SCORE', REV: true }),
     );
+    let active = false;
     for (const sid of ids) {
       const rec = await this.get(sid);
-      if (rec && rec.state === 'active' && !rec.tombstone && rec.sandboxBuildId === buildId)
-        return true;
+      if (rec && rec.state === 'active' && !rec.tombstone && rec.sandboxBuildId === buildId) {
+        active = true;
+        continue;
+      }
+      await this.guard(() => this.redis.zRem(key, sid));
     }
-    return false;
+    return active;
   }
 
   async get(sid: string): Promise<SessionRecord | null> {
