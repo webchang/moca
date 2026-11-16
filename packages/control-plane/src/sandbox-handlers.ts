@@ -1680,8 +1680,8 @@ async function deactivate(ctx: RequestCtx, deps: CpDeps) {
  * build it names is in use, so it never cuts off running work. A sandbox names the build it
  * resolved to (`buildId`), so it counts for that build only: two builds of one template from one
  * image can share a worker id, and a sandbox on one must not block retiring the other. A record
- * from before builds were traced (no `buildId`) counts for every build on its worker. Sessions
- * pinned to a build, once sessions are, are live use too, and are to be checked here.
+ * from before builds were traced (no `buildId`) counts for every build on its worker. An active Moca
+ * Pi session pinned to a build is live use too: its next turn needs the build's worker.
  */
 async function buildsInUse(
   deps: CpDeps,
@@ -1689,17 +1689,25 @@ async function buildsInUse(
   nowS: number,
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  if (!deps.sandboxes) return out;
-  const busyBuilds = new Set<string>();
-  const legacyWorkers = new Set<string>();
-  for (const r of await deps.sandboxes.listAll(nowS)) {
-    if (!isLive(r, nowS)) continue;
-    if (r.buildId) busyBuilds.add(r.buildId);
-    else legacyWorkers.add(r.worker);
+  if (deps.sandboxes) {
+    const busyBuilds = new Set<string>();
+    const legacyWorkers = new Set<string>();
+    for (const r of await deps.sandboxes.listAll(nowS)) {
+      if (!isLive(r, nowS)) continue;
+      if (r.buildId) busyBuilds.add(r.buildId);
+      else legacyWorkers.add(r.worker);
+    }
+    for (const x of builds) {
+      if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
+        out.set(x.buildId, 'still serves a live sandbox');
+    }
   }
-  for (const x of builds) {
-    if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
-      out.set(x.buildId, 'still serves a live sandbox');
+  if (typeof deps.index?.hasActiveSessionOnBuild === 'function') {
+    for (const x of builds) {
+      if (out.has(x.buildId) || !x.buildId) continue;
+      if (await deps.index.hasActiveSessionOnBuild(x.buildId))
+        out.set(x.buildId, 'is pinned by an active session');
+    }
   }
   return out;
 }
