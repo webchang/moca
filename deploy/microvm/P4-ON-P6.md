@@ -118,33 +118,35 @@ rootfs, agent, vmstate, memfile; for Cloud Hypervisor `ch-config.json`) and one 
 field and digest, marked `"hash_version": 2`, so the hash names the build and any edit to the
 manifest is refused at worker start. The worker re-hashes the kernel, rootfs, agent and vmstate at
 every start, and the memory file only with `SH_VERIFY_MEMFILE=1` (a full read of the guest's RAM).
-The verify cache (G50, on by default; `SH_VERIFY_CACHE=0` turns it off, `SH_VERIFY_CACHE_PATH`
-or `SH_VERIFY_CACHE_DIR` moves it; SBX0 keeps it under `/srv/sbx/verify-cache`) spares the re-read: a file is hashed in full once on this host, and while its device,
-inode, size and mtime are unchanged a later start trusts that hash. The trust point is a full
-check on this host: an entry is written only after a full hash matched the manifest, and a cached
-digest is still compared with the manifest at every start. ctime is not in the identity: every VM
-restore hardlinks the snapshot's files into its jail and chowns the links, and the teardown removes
-them, so ctime moves at every restore (the G50 window's cold round: 0 of 4 unchanged on all 8
-starts). The cost is that a same-size rewrite whose mtime is then set back (`touch -d`) is trusted;
+The verify cache (on by default; `SH_VERIFY_CACHE=0` turns it off, `SH_VERIFY_CACHE_PATH`
+or `SH_VERIFY_CACHE_DIR` moves it; SBX0 keeps it under `/srv/sbx/verify-cache`) spares the re-read:
+a file is hashed in full once on this host, and while its device, inode, size and mtime are
+unchanged a later start trusts that hash. The trust point is a full check on this host: an entry is
+written only after a full hash matched the manifest, and a cached digest is still compared with the
+manifest at every start. ctime is not in the identity: every VM restore hardlinks the snapshot's
+files into its jail and chowns the links, and the teardown removes them, so ctime moves at every
+restore. The cost is that a same-size rewrite whose mtime is then set back (`touch -d`) is trusted;
 only the snapshot's owner (root) can write those files, and it can rewrite the cache as well. A
-device number that changes across a reboot only means a re-hash. `build-snapshot.sh` seeds the cache after it publishes, with the worker's own
+device number that changes across a reboot only means a re-hash.
+`build-snapshot.sh` seeds the cache after it publishes, with the worker's own
 `microvm-worker -verify-snapshot OUT` (`--worker-bin`, default `/usr/local/bin/microvm-worker`;
 best-effort, it never fails a build), while the files are still in the page cache, so a fresh
-snapshot's first start is spared too. The memory file's pin (`PinMemoryFile`) still reads the
-whole memory file at every start.
-Why it matters, as measured on one KVM host with an EBS gp3 root volume (2026-11-11, 28 cold starts,
-4 at a time, snapshots of 7.3-13.6 GiB, before G50): each start read its whole snapshot, the re-hash
-3.5-9.6 GiB of it. At 125 MiB/s all 28 were active after 1,977 s; with the volume raised to 750 MiB/s
-and 3,000 IOPS, after 638 s, the disk at a median 423 MiB/s in 128 KiB reads. 128 KiB is the device's
-largest request (`max_hw_sectors_kb`), so readahead cannot make the reads larger: after the volume,
-reading fewer bytes per start is the lever left, and G50 leaves about 4 GiB (the memory file) of a
+snapshot's first start is spared too. The memory file's pin (`PinMemoryFile`) still reads the whole
+memory file at every start.
+Why it matters, as measured on one KVM host with a network block volume as root (28 cold starts,
+4 at a time, snapshots of 7.3-13.6 GiB, before the verify cache, each start reading its whole snapshot):
+at 125 MiB/s all 28 were active after 1,977 s; with the volume raised to 750 MiB/s and 3,000 IOPS,
+after 638 s, the disk reading in 128 KiB requests. 128 KiB is the device's largest request
+(`max_hw_sectors_kb`), so readahead cannot make the reads larger: after the volume, reading fewer
+bytes per start is the lever left, and the verify cache leaves the memory file as the bulk of a
 start's read.
 A snapshot built before version 2 (no `hash_version`) still verifies under its old rule, a hash over
-kernel, rootfs and agent only, until it is rebuilt. A version-2 manifest also carries
-`source_image_digest`, the image digest `build-rootfs.sh` recorded in `/etc/moca-rootfs-source`, so a
-worker given its template record (`SH_TEMPLATE_RECORD`, set by SBX0's `install-host.sh`) checks the
-record's image against the snapshot without mounting the rootfs
-([template lifecycle spec](../../docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md) §8, PV2-PV4).
+kernel, rootfs and agent only, until it is rebuilt.
+
+The steps below build one snapshot by hand. To turn a container image into a **sandbox template**
+(a snapshot checked in a microVM, a worker for it, and the id clients and sessions ask for), follow
+the [template onboarding guide](../sbx/template-onboarding/GUIDE.md) instead: its tools run these
+same scripts, and it covers images that are not Moca's own (a SWE-bench instance image, for example).
 
 **1. A guest kernel.** Firecracker's CI publishes one. This is its `getting-started.md` recipe,
 kernel only:
@@ -201,14 +203,7 @@ Opt-in flags, all off by default (a default build is unchanged):
   tmpfs. The default `HOME=/` is on the read-only rootfs. That HOME starts empty, so an identity set
   in the image with `git config --global` (as root) does not apply; `--guest-home-gitconfig` copies
   the image's root git config (`/root/.gitconfig`, `/root/.config/git`) into it. It is off by default:
-  SWE-bench's base images carry a root identity, and their testbeds refuse agent commits on purpose.
-
-Every snapshot's init also links `/dev/fd` and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` to
-`/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. Its `/var`
-is the image's own `/var` with a tmpfs overlay on top: writable and fresh in every VM, and still
-holding what the image put there (a plain tmpfs used to hide it). Without overlayfs in the guest
-kernel, init copies the image's `/var` into a tmpfs instead. The build checks all three in the guest
-(a file the image has under `/var` is readable, and `/var` takes a write) and fails without them.
+  a benchmark image can carry a root identity while its testbed refuses agent commits on purpose.
 
 - `--verify-command CMD` (with `--verify-timeout-s N`, 1-86400, default 600): what the last step
   runs in the restored VM in place of `true`. It's a bash command, run in `/workspace` once it's
@@ -216,9 +211,15 @@ kernel, init copies the image's `/var` into a tmpfs instead. The build checks al
   test suite). A nonzero exit fails the build, and the last 16 KiB of its output are logged.
   Nothing is published, so a snapshot that can't do its job never reaches a worker.
 
-`--guest-ram-mb` is recorded as `guest_ram_mb`. The worker must run with the same `SH_GUEST_RAM_MB`:
-SBX0's `install-host.sh` takes it from the manifest; `setup-microvm.sh` does not, so set it in
-`microvm-worker.env` for a snapshot other than 256 MiB.
+The git identity check (#415) passes an image with no git at all (`no-git`); git without an
+identity still fails the build unless `--skip-git-identity-check` is given.
+
+Every snapshot's init also links `/dev/fd` and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` to
+`/proc/self/fd`, which the kernel's devtmpfs lacks; without them bash's `<(...)` fails. Its `/var`
+is the image's own `/var` with a tmpfs overlay on top: writable and fresh in every VM, and still
+holding what the image put there (a plain tmpfs used to hide it). Without overlayfs in the guest
+kernel, init copies the image's `/var` into a tmpfs instead. The build checks all three in the guest
+(a file the image has under `/var` is readable, and `/var` takes a write) and fails without them.
 
 `/srv/snapshots/default` is where the shipped unit looks (`SH_SNAPSHOT_DIR` plus
 `SH_SNAPSHOT_IMAGE`). The script boots the VM, probes the guest for its tools, snapshots it, then
@@ -373,14 +374,13 @@ A session can name a **sandbox template** (`mocactl run --option sandboxTemplate
 A templated worker is a **second** P4 worker beside the main one, which stays untemplated for
 sessions that name no template and for leaves (`/runs`):
 
-1. Build the template's snapshot, for example with
-   [`template-build.sh`](../sbx/template-onboarding/template-build.sh)
-   ([the onboarding folder](../sbx/template-onboarding/README.md)). Any directory holding its
-   `manifest.json` will do; `template-build.sh` writes `/srv/sbx/snapshots/<snapshot>`.
+1. Build the template's snapshot from its image with `build-rootfs.sh` and `build-snapshot.sh`, as
+   above, into a directory of its own, say `/srv/snapshots/<snapshot>`. Any directory holding its
+   `manifest.json` will do.
 2. Install the worker, after the main install:
 
    ```bash
-   sudo deploy/microvm/setup-microvm.sh --template <id> --snapshot /srv/sbx/snapshots/<snapshot>
+   sudo deploy/microvm/setup-microvm.sh --template <id> --snapshot /srv/snapshots/<snapshot>
    ```
 
    It installs the template unit `microvm-worker@.service` and runs instance `tpl_<id>` (dashes as
@@ -721,8 +721,8 @@ proxy's `DynamicUser` needs no group). While `moca-egress` is down, restores fai
   family), and dies if the rootfs has neither. Init then exports `NODE_EXTRA_CA_CERTS`,
   `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE`. `manifest.json` gains `egress_ca_sha256`, the SHA-256 of
   the CA in DER form (`openssl x509 -outform DER | sha256sum`, prefixed `sha256:`). It is inside
-  `hash` (version 2); a worker that predates version 2 refuses the snapshot, so upgrade workers first. Without the flag the rootfs and the manifest
-  are unchanged.
+  `hash` (version 2); a worker that predates version 2 refuses the snapshot, so upgrade workers
+  first. Without the flag the rootfs and the manifest are unchanged.
 - **Not in this slice:** no credentials (the guest's `GH_TOKEN` is the placeholder `moca-placeholder`),
   no TLS interception, no cert-pinning escape hatch, and `MOCA_TENANCY=multi` is refused at boot.
   Because nothing swaps the placeholder yet, tools that send `GH_TOKEN`/`GITHUB_TOKEN` to GitHub (`gh`,

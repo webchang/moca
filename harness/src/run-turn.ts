@@ -149,8 +149,6 @@ export interface AcquiredTurnSandbox {
 export interface TurnPlacement {
   sandboxId: string;
   tier: string;
-  /** The session's sandbox template; absent for none (session-templates spec §6). */
-  template?: string;
   /** The seed the session's workspace is filled with: where it came from (session-templates spec §5). */
   seed?: TurnSeed;
   workspaceReset?: WorkspaceReset;
@@ -320,7 +318,6 @@ export async function acquireTurnSandbox(
     placement: {
       sandboxId: selected.sandboxId,
       tier: selected.tier ?? '',
-      ...(template ? { template: template.id } : {}),
       ...(template?.seed ? { seed: seedOrigin(template) } : {}),
       ...(selected.workspaceReset ? { workspaceReset: selected.workspaceReset } : {}),
     },
@@ -328,7 +325,7 @@ export async function acquireTurnSandbox(
 }
 
 /** A seeded template's TurnSeed: an absent source is a control plane from before it was sent. */
-function seedOrigin(t: { seedSource?: 'build' | 'declared'; build?: string }): TurnSeed {
+export function seedOrigin(t: { seedSource?: 'build' | 'declared'; build?: string }): TurnSeed {
   const source = t.seedSource ?? 'declared';
   return { source, ...(source === 'build' && t.build ? { buildId: t.build } : {}) };
 }
@@ -372,9 +369,11 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * leaves no marker, so the next turn runs it again on whatever it left: a seed must be safe to
  * re-run (`cp -a` is; a bare `git clone` into the workspace is not). A workspace reset has no
  * marker and is seeded again. The seed's output goes to SEED_LOG, never into the turn: only the
- * exit code is read, so a chatty seed cannot trip the output cap. When the workspace is a git
- * repository's root (a seeded checkout), the seed's own files are added to its `info/exclude`, so a
- * patch taken with `git add -A` or `git status --porcelain` never carries them.
+ * exit code is read, so a chatty seed cannot trip the output cap. Right after the seed, the commit it
+ * left the workspace at is written to SEED_BASELINE (best effort), the base of the turn's patch. When
+ * the workspace is a git repository (a seeded checkout), the seed's own files, the baseline among
+ * them, are added to its `info/exclude`, so a patch taken with `git add -A` or
+ * `git status --porcelain` never carries them.
  */
 export async function seedWorkspace(
   transport: {
@@ -542,7 +541,6 @@ function placementView(p: TurnPlacement): NonNullable<TurnResult['sandbox']> {
   return {
     id: p.sandboxId,
     tier: p.tier,
-    ...(p.template ? { template: p.template } : {}),
     ...(p.seed ? { seed: p.seed } : {}),
     ...(p.workspaceReset ? { workspaceReset: p.workspaceReset } : {}),
   };
@@ -627,8 +625,8 @@ export interface TurnConfig {
   /** Where sandboxSeed came from, from the exchange: the pinned build's spec, or the declared list. */
   sandboxSeedSource?: 'build' | 'declared';
   /**
-   * The build the session's template resolved to (`sha256:…`, combined control plane spec §3.4,
-   * register G19). Set: only workers labelled `moca.dev/build=<it>` serve the turn.
+   * The build the session's template resolved to (`sha256:…`, combined control plane spec §3.4).
+   * Set: only workers labelled `moca.dev/build=<it>` serve the turn.
    */
   sandboxBuildId?: string;
   /**
@@ -883,13 +881,7 @@ export interface TurnResult {
   stopReason: string;
   errorMessage?: string;
   usage?: LeafUsage;
-  sandbox?: {
-    id: string;
-    tier: string;
-    template?: string;
-    seed?: TurnSeed;
-    workspaceReset?: WorkspaceReset;
-  };
+  sandbox?: { id: string; tier: string; seed?: TurnSeed; workspaceReset?: WorkspaceReset };
   /** A templated session's workspace patch after the turn (session-templates spec §5.1). */
   workspace?: TurnWorkspace;
 }

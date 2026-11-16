@@ -1,10 +1,11 @@
 # deploy/sbx/sbx-host-agent.service -- one poll of the template host agent (deploy/sbx/host-agent.sh,
 # template lifecycle spec §6.1), started by sbx-host-agent.timer. host-agent.env holds SBX_API_URL,
 # SBX_HOST_ID, SBX_KERNEL and, optionally, SBX_API_CA_FILE, SBX_REGISTRY and the limits; the token is
-# only in host-agent.token, which the script reads itself. Not yet installed by install-host.sh: copy
-# it, the timer and host-agent.sh by hand for the validation (the RUNBOOK's host-agent section).
+# only in host-agent.token, which the script reads itself. Installed by hand, with the timer and
+# host-agent.sh (the RUNBOOK's host agent section). After its builds, a poll also applies the wanted
+# state; sbx-host-agent-wanted.service does that alone, every 15 s.
 [Unit]
-Description=SBX0 template host agent: build queued templates, report them
+Description=SBX0 template host agent: build queued templates, report them, apply the wanted state
 After=network-online.target
 Wants=network-online.target
 
@@ -15,7 +16,7 @@ Environment=SBX_ENV_DIR=/etc/sbx
 Environment=SBX_SRV=/srv/sbx
 Environment=SBX_HOST_TOKEN_FILE=/etc/sbx/host-agent.token
 # Installed outside the source tree (/usr/local/libexec), the agent cannot find template-build.sh
-# from its own path: point it at the checkout (bm1, 2026-11-04). Overridable in host-agent.env.
+# from its own path: point it at the checkout. Overridable in host-agent.env.
 Environment=SBX_TEMPLATE_BUILD=/srv/sbx/src/deploy/sbx/template-onboarding/template-build.sh
 # The removal of retired builds (§6.1 step 7) runs install-host.sh --uninstall; installed outside the
 # tree, the agent cannot find it from /usr/local/libexec, as with template-build.sh.
@@ -24,7 +25,7 @@ Environment=SBX_INSTALL_HOST=/srv/sbx/src/deploy/sbx/install-host.sh
 # (log in with `podman login --authfile /run/containers/0/auth.json <host>`).
 Environment=REGISTRY_AUTH_FILE=/run/containers/0/auth.json
 # The unit has no HOME and hides root's (ProtectHome), and build-snapshot.sh compiles the guest
-# agent with `go build`: give Go a module cache and build cache of its own (bm1, 2026-11-04: "go:
+# agent with `go build`: give Go a module cache and build cache of its own (otherwise "go:
 # module cache not found"). install -d -m 0700 /srv/sbx/go /srv/sbx/home before the first poll.
 Environment=HOME=/srv/sbx/home
 Environment=GOPATH=/srv/sbx/go

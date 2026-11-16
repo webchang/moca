@@ -39,7 +39,7 @@ export const seconds = (deps: { now(): number }): number => Math.floor(deps.now(
 export const defaultNewId = (): string => randomUUID();
 
 /**
- * Whether the caller holds the admin role: SH_ADMIN_SUBJECTS, or an API grant (register G38). With a
+ * Whether the caller holds the admin role: SH_ADMIN_SUBJECTS, or an API grant. With a
  * members store the router replaces a token's `roles` with the subject's roles now, so this reads a
  * per-request answer, not one fixed when the token was minted.
  */

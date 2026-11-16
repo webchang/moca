@@ -4,7 +4,6 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { HANDLERS } from '../src/handlers.js';
 import { ProvenanceStore, sha256Hex, verifyExport } from '../src/provenance.js';
-import { resolveForUse } from '../src/sandbox-handlers.js';
 import { FileTemplateCatalog } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
 import {
@@ -15,7 +14,8 @@ import {
 } from '../src/template-policy.js';
 import { admin, alice, bob, codeOf, ctx, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
 
-// G41 (c): per-subject trust for gate records (docs/specs/2026-11-08-subject-trust-gate-records-design.md).
+// Self-attestation: per-subject trust for gate records
+// (docs/specs/2026-11-08-subject-trust-gate-records-design.md).
 const EX = resolve(__dirname, '../../../deploy/sbx/template-onboarding/examples');
 const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf8')) as Record<
   string,
@@ -23,16 +23,16 @@ const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf
 >; // eslint-disable-line @typescript-eslint/no-explicit-any
 const { id: _id, image: IMAGE, schema: _s, notes: _n, ...REST } = SPEC;
 const DIGEST = IMAGE.slice(IMAGE.indexOf('@') + 1);
-const spec = REST;
+const spec = { ...REST };
 
 /**
- * A record in image-factory's general-gate shape (`image-factory/gate/1`, image-factory 7892ab5):
- * no testbed/environment/base image and no recipe, the gate run as given.
+ * A record in the general-gate shape (`moca-gate-record/1`, the default SH_GATE_RECORD_SCHEMA): no
+ * testbed/environment/base image and no recipe, the gate run as given.
  */
 const general = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
-    schema: 'image-factory/gate/1',
-    image: { repository: 'image-factory/moca-microvm', digest: DIGEST },
+    schema: 'moca-gate-record/1',
+    image: { repository: 'images/moca-microvm', digest: DIGEST },
     contract_sha256: 'c'.repeat(64),
     gate: {
       passed: true,
@@ -40,14 +40,12 @@ const general = (over: Record<string, unknown> = {}) =>
       network: 'none',
       rootfs: 'read-only',
       user: 'root',
-      floor: { rc: 0 },
       floor_checked_offline: true,
       network_needed: false,
     },
     observed: {
       testbed: { agent_can_commit: 'no' },
       guest: { git_identity: 'none' },
-      run: { rc: 0, passed: 12, failed: 0 },
     },
     problems: [],
     test_cmd_sha256: 'd'.repeat(64),
@@ -73,7 +71,7 @@ async function setup(policy: Policy = DEFAULT_POLICY): Promise<TestDeps> {
     policy: new FilePolicyStore({ dir, provenance }),
     config: { routeProfile: 'sandbox' },
   });
-  await d.policy!.set(policy, 'github:admin');
+  await d.policy!.set(policy, admin.sub);
   return d;
 }
 const body = (over: Record<string, unknown> = {}) => ({
@@ -111,8 +109,19 @@ const view = async (d: TestDeps, id = 't-self', principal = alice) =>
   (await HANDLERS.getTemplate!(ctx({ principal, params: { id } }), d)).body as Body;
 const putPolicy = (d: TestDeps, p: Policy) =>
   HANDLERS.putPolicy!(ctx({ principal: admin, body: p }), d);
+/** A sandbox of the template, for `principal`: the build it resolved to. */
+const use = async (d: TestDeps, principal = alice, template = 't-self') =>
+  ((await HANDLERS.createSandbox!(ctx({ principal, body: { template } }), d)).body as Body)
+    .buildId as string;
+/**
+ * Stored visibility set to `deployment`, as the owner's edit of its template would; the edit route
+ * refuses it for a self-attested build (409 self_attested), so these tests set it only once the
+ * record is trusted.
+ */
+const makeVisible = (d: TestDeps, id = 't-self') =>
+  d.templates!.update!(id, async (cur) => ({ ...cur!, visibility: 'deployment' as const }));
 
-describe('the default policy (G41 (c))', () => {
+describe('the default policy (self-attestation)', () => {
   it('holds benchmark-self (offline) and general-self (allowlisted egress) beside a curated benchmark', () => {
     expect(DEFAULT_POLICY.profiles.benchmark!.selfAttest).toBeUndefined();
     expect(DEFAULT_POLICY.profiles['benchmark-self']).toMatchObject({
@@ -144,7 +153,7 @@ describe('the default policy (G41 (c))', () => {
   });
 });
 
-describe('a subject self-attests its own gate record (G41 (c))', () => {
+describe('a subject self-attests its own gate record (self-attestation)', () => {
   it('admits its submitter on benchmark-self, private, with a gate record naming source self, scope and policy', async () => {
     const d = await setup();
     const r = await create(d);
@@ -301,7 +310,7 @@ describe('a subject self-attests its own gate record (G41 (c))', () => {
   it('checks X1.image on the new profile', async () => {
     const d = await setup();
     const other = general({
-      image: { repository: 'image-factory/moca-microvm', digest: `sha256:${'e'.repeat(64)}` },
+      image: { repository: 'images/moca-microvm', digest: `sha256:${'e'.repeat(64)}` },
     });
     expect(await rule(() => create(d, body({ gateRecord: other })))).toBe('X1.image');
   });
@@ -350,7 +359,7 @@ describe('a subject self-attests its own gate record (G41 (c))', () => {
   });
 });
 
-describe("a gate's floor checked offline (X1.offline, image-factory ec4b5a0)", () => {
+describe("a gate's floor checked offline (X1.offline)", () => {
   const gate1 = (g: Record<string, unknown>) =>
     general({
       gate: {
@@ -359,7 +368,6 @@ describe("a gate's floor checked offline (X1.offline, image-factory ec4b5a0)", (
         network: 'none',
         rootfs: 'read-only',
         user: 'root',
-        floor: { rc: 0 },
         ...g,
       },
     });
@@ -401,6 +409,36 @@ describe("a gate's floor checked offline (X1.offline, image-factory ec4b5a0)", (
     );
   });
 
+  it("reads the deployment's general-gate schema (SH_GATE_RECORD_SCHEMA), default moca-gate-record/1", async () => {
+    // Another builder's schema: its records must carry the field once the deployment names it.
+    const other = (g: Record<string, unknown>) =>
+      JSON.stringify({ ...JSON.parse(gate1(g)), schema: 'builder.example/gate/1' });
+    const d = await setup();
+    // Not the default schema: read as a curated family record, absence is offline.
+    expect((await create(d, body({ gateRecord: other({}) }))).status).toBe(202);
+    const d2 = await setup();
+    d2.config.sandbox!.gateRecordSchema = 'builder.example/gate/1';
+    expect(await rule(() => create(d2, body({ gateRecord: other({}) })))).toBe('X1.offline');
+    // ...and the default schema is then the family case.
+    expect((await create(d2, body({ id: 't-self2', gateRecord: missing }))).status).toBe(202);
+    const pol = (await HANDLERS.getPolicy!(ctx({ principal: alice }), d2)).body as Body;
+    expect(pol.gateRecordSchema).toBe('builder.example/gate/1');
+    const pol1 = (await HANDLERS.getPolicy!(ctx({ principal: alice }), d)).body as Body;
+    expect(pol1.gateRecordSchema).toBe('moca-gate-record/1');
+  });
+
+  it('checkCreate takes the schema as an option', () => {
+    const input = { id: 't-x', image: IMAGE, spec, profile: 'benchmark-self', subject: 'github:1' };
+    const of = (gate: string, gateRecordSchema?: string) =>
+      checkCreate(
+        { ...input, gateRecordBytes: Buffer.from(gate) },
+        DEFAULT_POLICY,
+        gateRecordSchema ? { gateRecordSchema } : {},
+      ).failed?.rule;
+    expect(of(missing)).toBe('X1.offline');
+    expect(of(missing, 'builder.example/gate/1')).toBeUndefined();
+  });
+
   it('accepts either value on general-self, shown on the build', async () => {
     const d = await setup();
     expect((await create(d, body({ profile: 'general-self', gateRecord: online }))).status).toBe(
@@ -417,29 +455,76 @@ describe("a gate's floor checked offline (X1.offline, image-factory ec4b5a0)", (
   });
 });
 
-describe("promotion and removal of trust (G41 (c), the user's Q4 (i))", () => {
-  it('shows attestation self, refuses PATCH to deployment, and flips on promotion with no rewrite', async () => {
+describe('promotion and removal of trust (self-attestation)', () => {
+  it('shows attestation self, refuses a deployment-visible create, and flips on promotion with no rewrite', async () => {
     const d = await setup();
+    expect(await codeOf(() => create(d, body({ visibility: 'deployment' })))).toBe('self_attested');
     await create(d);
     await register(d, 't-self', HASH);
     const stored = JSON.stringify(await d.templates!.get('t-self'));
     let t = await view(d);
     expect(t.attestation).toBe('self');
     expect(t.builds[0].attestation).toBe('self');
-    const patch = () =>
-      HANDLERS.updateTemplate!(
-        ctx({ principal: alice, params: { id: 't-self' }, body: { visibility: 'deployment' } }),
-        d,
-      );
-    expect(await codeOf(patch)).toBe('self_attested');
+    // Even with deployment stored, a self-attested build keeps the template private in effect.
+    await makeVisible(d);
+    expect((await view(d)).visibility).toBe('private');
+    expect(await codeOf(() => view(d, 't-self', bob))).toBe('template_not_found');
     // An admin trusts the record: the build reads as deployment-trusted, nothing rewritten.
+    const visibleStored = JSON.stringify(await d.templates!.get('t-self'));
+    expect(visibleStored).not.toBe(stored);
     await putPolicy(d, { ...(await d.policy!.current()).policy, trustedGateRecords: [SHA] });
-    expect(JSON.stringify(await d.templates!.get('t-self'))).toBe(stored);
+    expect(JSON.stringify(await d.templates!.get('t-self'))).toBe(visibleStored);
     t = await view(d);
     expect(t.attestation).toBe('deployment');
     expect(t.builds[0].attestation).toBe('deployment');
-    expect((await patch()).status).toBe(200);
     expect((await view(d, 't-self', bob)).visibility).toBe('deployment');
+  });
+
+  it('refuses a visibility edit to deployment while a build is self-attested, and allows it once trusted', async () => {
+    const d = await setup();
+    await create(d);
+    const edit = (visibility: string, principal = alice) =>
+      HANDLERS.updateTemplate!(
+        ctx({ principal, params: { id: 't-self' }, body: { visibility } }),
+        d,
+      );
+    // Queued, then registered: refused either way, for the owner and for an admin alike.
+    expect(await codeOf(() => edit('deployment'))).toBe('self_attested');
+    await register(d, 't-self', HASH);
+    expect(await codeOf(() => edit('deployment'))).toBe('self_attested');
+    expect(await codeOf(() => edit('deployment', admin))).toBe('self_attested');
+    expect((await d.templates!.get('t-self'))!.visibility).toBe('private');
+    expect(
+      (await d.provenance!.chain('template/t-self')).some((x) => x.kind === 'visibility'),
+    ).toBe(false);
+    // An admin trusts the record: the edit goes through.
+    await putPolicy(d, { ...(await d.policy!.current()).policy, trustedGateRecords: [SHA] });
+    const r = (await edit('deployment')).body as Body;
+    expect(r.visibility).toBe('deployment');
+    expect((await view(d, 't-self', bob)).visibility).toBe('deployment');
+  });
+
+  it('refuses an owner transfer while a build is self-attested, and allows it once trusted', async () => {
+    const d = await setup();
+    await create(d);
+    const transfer = () =>
+      HANDLERS.transferTemplateOwner!(
+        ctx({ principal: admin, params: { id: 't-self' }, body: { owner: bob.sub } }),
+        d,
+      );
+    // Queued, then registered: refused either way, with no owner record written.
+    expect(await codeOf(transfer)).toBe('self_attested');
+    await register(d, 't-self', HASH);
+    expect(await codeOf(transfer)).toBe('self_attested');
+    expect((await d.templates!.get('t-self'))!.owner).toBe(alice.sub);
+    expect((await d.provenance!.chain('template/t-self')).some((x) => x.kind === 'owner')).toBe(
+      false,
+    );
+    // An admin trusts the record: the transfer goes through.
+    await putPolicy(d, { ...(await d.policy!.current()).policy, trustedGateRecords: [SHA] });
+    const r = (await transfer()).body as Body;
+    expect(r.owner).toBe(bob.sub);
+    expect((await d.templates!.get('t-self'))!.owner).toBe(bob.sub);
   });
 
   it('narrows a visible template to private on removal, names it in the policy record, and refuses others', async () => {
@@ -448,11 +533,8 @@ describe("promotion and removal of trust (G41 (c), the user's Q4 (i))", () => {
     await register(d, 't-self', HASH);
     const promoted = { ...(await d.policy!.current()).policy, trustedGateRecords: [SHA] };
     await putPolicy(d, promoted);
-    await HANDLERS.updateTemplate!(
-      ctx({ principal: alice, params: { id: 't-self' }, body: { visibility: 'deployment' } }),
-      d,
-    );
-    expect((await resolveForUse(d, bob, 't-self')).buildId).toBe(HASH);
+    await makeVisible(d);
+    expect(await use(d, bob)).toBe(HASH);
     // The admin takes the trust away: the template is private again, on read.
     const r = (await putPolicy(d, { ...promoted, trustedGateRecords: [] })).body as Body;
     expect(r.narrowed).toEqual([{ template: 't-self', buildId: HASH }]);
@@ -460,11 +542,11 @@ describe("promotion and removal of trust (G41 (c), the user's Q4 (i))", () => {
     expect(rec.body.narrowed).toEqual([{ template: 't-self', buildId: HASH }]);
     expect((await view(d)).visibility).toBe('private');
     expect(await codeOf(() => view(d, 't-self', bob))).toBe('template_not_found');
-    expect(await codeOf(() => resolveForUse(d, bob, 't-self'))).toBe('unknown_template');
+    expect(await codeOf(() => use(d, bob))).toBe('unknown_template');
     const listed = (await HANDLERS.listTemplates!(ctx({ principal: bob }), d)).body as Body;
     expect(listed.templates.map((x: Body) => x.id)).not.toContain('t-self');
     // Its owner still uses it.
-    expect((await resolveForUse(d, alice, 't-self')).buildId).toBe(HASH);
+    expect(await use(d, alice)).toBe(HASH);
   });
 
   it("narrows on removal another subject's build made on a selfAttest profile while the record was trusted", async () => {
@@ -475,29 +557,30 @@ describe("promotion and removal of trust (G41 (c), the user's Q4 (i))", () => {
     expect((await create(d, body({ id: 't-bob' }), bob)).status).toBe(202);
     await register(d, 't-bob', HASH);
     expect((await view(d, 't-bob', alice)).visibility).toBe('deployment');
-    expect((await resolveForUse(d, alice, 't-bob')).buildId).toBe(HASH);
+    expect(await use(d, alice, 't-bob')).toBe(HASH);
     const r = (await putPolicy(d, { ...promoted, trustedGateRecords: [] })).body as Body;
     expect(r.narrowed).toEqual([{ template: 't-bob', buildId: HASH }]);
     const t = await view(d, 't-bob', bob);
     expect(t).toMatchObject({ visibility: 'private', attestation: 'self' });
     expect(t.builds[0].attestation).toBe('self');
     expect(await codeOf(() => view(d, 't-bob', alice))).toBe('template_not_found');
-    expect(await codeOf(() => resolveForUse(d, alice, 't-bob'))).toBe('unknown_template');
+    expect(await codeOf(() => use(d, alice, 't-bob'))).toBe('unknown_template');
     // Its owner keeps using it, as decision (i) says.
-    expect((await resolveForUse(d, bob, 't-bob')).buildId).toBe(HASH);
+    expect(await use(d, bob, 't-bob')).toBe(HASH);
   });
 
-  it('keeps every other policy field, quotaBySubject included, across a policy write', async () => {
+  it('keeps every other policy field across a policy write, and names nothing when nothing narrows', async () => {
     const d = await setup();
-    const withOverride: Policy = {
+    const changed: Policy = {
       ...DEFAULT_POLICY,
-      quotaBySubject: { [alice.sub]: { templates: 100, buildsQueued: 10, active: 32 } },
+      quota: { templates: 50, buildsQueued: 5, active: 4 },
     };
-    await putPolicy(d, withOverride);
-    await putPolicy(d, { ...withOverride, trustedGateRecords: [SHA] });
-    await putPolicy(d, { ...withOverride, trustedGateRecords: [] });
+    await putPolicy(d, changed);
+    await putPolicy(d, { ...changed, trustedGateRecords: [SHA] });
+    const r = (await putPolicy(d, { ...changed, trustedGateRecords: [] })).body as Body;
+    expect(r).not.toHaveProperty('narrowed');
+    expect((await d.provenance!.chain('policy')).at(-1)!.body).not.toHaveProperty('narrowed');
     const { policy } = await d.policy!.current();
-    expect(policy).toEqual({ ...withOverride, trustedGateRecords: [] });
-    expect(policy.quotaBySubject).toEqual(withOverride.quotaBySubject);
+    expect(policy).toEqual({ ...changed, trustedGateRecords: [] });
   });
 });

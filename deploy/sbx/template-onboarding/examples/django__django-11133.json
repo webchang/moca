@@ -1,7 +1,7 @@
 {
   "schema": "moca-sbx-template-spec/1",
   "id": "django-django-11133",
-  "image": "image-factory/moca-microvm@sha256:3d3e705ff379defc6684c220f97fc8701df4e06fce8fa8841c13d3ff8cef7746",
+  "image": "images/moca-microvm@sha256:3d3e705ff379defc6684c220f97fc8701df4e06fce8fa8841c13d3ff8cef7746",
   "guest_ram_mb": 4096,
   "vcpus": 2,
   "guest_home": "/tmp/home",

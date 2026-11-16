@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy/sbx/template-onboarding/template-register.sh -- on the operator's machine, add a built template to SBX0's inputs,
-# or retire a worker from them (deploy/sbx/template-onboarding/ONBOARDING.md, step 3; RUNBOOK §5).
+# or retire a worker from them (RUNBOOK §5, steps 2-4, for deployments without a host agent).
 #
 #   deploy/sbx/template-onboarding/template-register.sh --env-file FILE RECORD [--apply]
 #   deploy/sbx/template-onboarding/template-register.sh --env-file FILE --retire WORKER_ID [--apply]
@@ -82,6 +82,8 @@ jq -e 'type == "array"' "$TEMPLATES" >/dev/null 2>&1 || die "$TEMPLATES is not a
   die "$ENV_FILE sets SBX_EGRESS_HOSTS, which names template workers by host: change templates there by hand (RUNBOOK §5)"
 
 has_worker() { [[ " $WORKERS " == *" $1 "* ]]; }
+# Unquoted on purpose: SBX_WORKERS is a space-separated list of ids (WORKER_RE: no glob characters).
+# shellcheck disable=SC2086
 NEW_WORKERS="$(printf '%s ' $WORKERS)"
 NEW_WORKERS="${NEW_WORKERS% }"
 NEW_TEMPLATES="$(jq -c . "$TEMPLATES")"
@@ -117,6 +119,7 @@ elif [[ -n "$RETIRE" ]]; then
   used="$(jq -r --arg w "$RETIRE" '[.[] | select(.worker == $w) | .id] | join(" ")' <<<"$NEW_TEMPLATES")"
   [[ -z "$used" ]] || die "worker $RETIRE still serves template $used: register its new version first, or --remove the template"
   if has_worker "$RETIRE"; then
+    # shellcheck disable=SC2086 # the id list, split on purpose
     NEW_WORKERS="$(printf '%s\n' $NEW_WORKERS | grep -vx -- "$RETIRE" | tr '\n' ' ')"
     NEW_WORKERS="${NEW_WORKERS% }"
     CHANGES+=("worker $RETIRE retired: the next setup.sh revokes its token and deletes its bundle")
@@ -127,6 +130,7 @@ else
   if [[ -n "$W" ]]; then
     NEW_TEMPLATES="$(jq -c --arg id "$REMOVE" 'map(select(.id != $id))' <<<"$NEW_TEMPLATES")"
     [[ "$(jq 'length' <<<"$NEW_TEMPLATES")" -gt 0 ]] || die "template $REMOVE is the only one: SBX0 needs at least one"
+    # shellcheck disable=SC2086 # the id list, split on purpose
     NEW_WORKERS="$(printf '%s\n' $NEW_WORKERS | grep -vx -- "$W" | tr '\n' ' ')"
     NEW_WORKERS="${NEW_WORKERS% }"
     CHANGES+=("template $REMOVE removed, and its worker $W: its sandboxes stop working at once")
@@ -141,12 +145,26 @@ fi
 [[ -n "$NEW_WORKERS" ]] || die 'SBX_WORKERS would be empty'
 
 # Write both files whole, through a temporary file beside each, keeping their modes: a failure part
-# way leaves the previous file, never half of one.
+# way leaves the previous file, never half of one. A path that is a symlink is written through to the
+# file it names, with that file's mode, so the link stays a link: replacing the link itself would
+# leave a regular file with the link's own mode (0777 on Linux) in its place.
+resolve_link() {
+  local p="$1" l n=0
+  while [[ -L "$p" ]]; do
+    ((n++ < 40)) || die "$1: too many levels of symbolic links"
+    l="$(readlink "$p")"
+    if [[ "$l" == /* ]]; then p="$l"; else p="$(dirname "$p")/$l"; fi
+  done
+  printf '%s' "$p"
+}
 write_file() {
-  local path="$1" tmp
+  local path tmp mode
+  path="$(resolve_link "$1")"
+  [[ -f "$path" ]] || die "$1: not a regular file (or a link to one)"
+  mode="$(stat -L -c '%a' "$path" 2>/dev/null || stat -L -f '%Lp' "$path")"
   tmp="$(mktemp "$path.XXXXXX")"
   cat >"$tmp"
-  chmod "$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path")" "$tmp"
+  chmod "$mode" "$tmp"
   mv "$tmp" "$path"
 }
 jq . <<<"$NEW_TEMPLATES" | write_file "$TEMPLATES"

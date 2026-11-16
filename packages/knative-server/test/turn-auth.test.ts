@@ -281,7 +281,7 @@ describe('the one rule /turn enforces', () => {
           body: {
             mode: 'direct',
             anthropicAuthToken: 'sk-alice', // notsecret
-            anthropicBaseUrl: 'https://litellm.internal/v1',
+            anthropicBaseUrl: 'https://gateway.example/v1',
             sessionId: 'sid-1',
             subject: 'github:1234',
             ...extra,
@@ -323,7 +323,7 @@ describe('the one rule /turn enforces', () => {
         exchangeWith({ sandboxTemplate: 'py312', sandboxSeed: 'echo hi', sandboxSeedSource: 'x' }),
       ),
     ).rejects.toThrow('malformed sandboxSeedSource');
-    // The build a session is pinned to (register G19): carried beside its template, refused malformed.
+    // The build a session is pinned to: carried beside its template, refused malformed.
     const B = 'sha256:' + 'b'.repeat(64);
     expect(
       (await turn(exchangeWith({ sandboxTemplate: 'py312', sandboxBuildId: B })))?.sandboxBuildId,

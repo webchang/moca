@@ -8,9 +8,9 @@ import type { SandboxTemplate } from './sandbox-config.js';
 
 /**
  * The template catalog (template lifecycle spec §3.1-§3.3): templates are declared in the control
- * plane's store, each a name over its builds, with tags naming builds. This first increment holds
- * what the read API (§4) needs; creating templates and builds through the API, and activation, are
- * later items of §11.
+ * plane's store, each a name over its builds, with tags naming builds. This holds what the read API
+ * (§4), the self-serve create (§4, §8.1), the host agents' builds and registration (§6.1, §8.2,
+ * host-handlers.ts) and activation (§6.2-§6.4, activation.ts: each build's leases) need.
  *
  * Two implementations:
  *   MemoryTemplateCatalog  built from SH_SANDBOX_TEMPLATES at every start: today's behaviour, no
@@ -21,8 +21,8 @@ import type { SandboxTemplate } from './sandbox-config.js';
  *
  * A template imported from the env list has one build, `imported:<12 hex>` (importedBuildId): the
  * list names no snapshot, so there is no manifest hash to be its id, and the worker id is
- * deployment plumbing a client never sees, so the id is a digest of it, not the worker itself. Builds from template-build.sh records
- * (§8.2, a later item) are named by their manifest hash.
+ * deployment plumbing a client never sees, so the id is a digest of it, not the worker itself. A
+ * registered build from a host agent is named by its snapshot's manifest hash.
  */
 
 /** Written last by the one-time import, so a start without it resumes an interrupted import. */
@@ -44,7 +44,7 @@ export interface BuildSpec {
 export interface TemplateBuild {
   /**
    * The provisional handle `b-<26 hex>` a queued build is followed by (§4), until it is built and
-   * its buildId becomes its manifest hash; equal to buildId for an imported build.
+   * its buildId becomes its manifest hash; absent for an imported build.
    */
   handle?: string;
   /** `sha256:<manifest hash>`, or `imported:<12 hex>` for a build imported from the env list. */
@@ -61,9 +61,13 @@ export interface TemplateBuild {
   provenance?: string;
   /** What a host agent needs to build it (§6.1): the image and the spec as the client sent them. */
   request?: { image: string; spec: Record<string, unknown>; gateRecordSha256?: string };
+  /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */
+  queuedAtMs?: number;
+  /** The host that claimed it, and when (epoch seconds). */
+  claim?: { host: string; at: number };
   /**
-   * Created on a selfAttest profile with a gate record the policy did not trust (G41 (c)): a fact
-   * of its create. Whether it is self-attested NOW is recomputed from the current policy
+   * Created on a selfAttest profile with a gate record the policy did not trust (self-attestation):
+   * a fact of its create. Whether it is self-attested NOW is recomputed from the current policy
    * (attestationOf): an admin's promotion or removal of the record needs no rewrite.
    */
   selfAttested?: boolean;
@@ -78,32 +82,24 @@ export interface TemplateBuild {
    * `network_needed` contract, whether the offline run met it. Absent: no gate record.
    */
   gateFloor?: { checkedOffline: boolean; metOffline?: boolean };
-  /** Epoch milliseconds it was queued: the claim order (createdAt is whole seconds). */
-  queuedAtMs?: number;
-  /** The host that claimed it, and when (epoch seconds). */
-  claim?: { host: string; at: number };
   /** On `failed` or `rejected`: why, and at which step or rule. */
   reason?: { message: string; step?: string; rule?: string };
   /**
-   * Activation leases (§6.3): each subject's hold on this build, until (epoch seconds). The build
-   * is wanted active while any lease is unexpired; aging is a lease running out.
+   * Activation leases (§6.3): each subject's hold on this build, until (epoch seconds). The build is
+   * wanted active while any lease is unexpired; aging is a lease running out. `since` is when the
+   * subject's hold began (renewals keep it: first leased, first placed); `record` is the digest of
+   * the `activate` record that granted the lease, which a sandbox under it cites (§7.1).
    */
-  leases?: {
-    subject: string;
-    until: number;
-    since?: number;
-    /** The digest of the `activate` record this grant wrote (§7.1): a sandbox names it as its lease. */
-    record?: string;
-  }[];
+  leases?: { subject: string; until: number; since?: number; record?: string }[];
   /**
-   * When its last lease ended, epoch seconds (register G43, the idle grace): set when leases are
-   * dropped (a deactivate's time, or the end of an expired lease the write clears). An expired lease
-   * still stored counts too (lastLeaseEnd() in activation.ts takes the later).
+   * When its last lease ended, epoch seconds (§6.5, the idle grace): set when leases are dropped (a
+   * deactivate's time, or the end of an expired lease the write clears). An expired lease still
+   * stored counts too (lastLeaseEnd() in activation.ts takes the later).
    */
   lastLeaseEnd?: number;
   /**
-   * The time of a deactivate with `stopNow: true` that left it with no lease (register G43): a lease
-   * that ended at or before it gets no idle grace (forced cold).
+   * The time of a deactivate with `stopNow: true` that left it with no lease (§6.5): a lease that
+   * ended at or before it gets no idle grace (forced cold).
    */
   stopNowAt?: number;
   /** The host agent's build log, newest last, at most LOG_MAX entries (§4 logs). */
@@ -182,7 +178,7 @@ export function docFromDeclared(
         status: 'registered',
         profile: 'imported',
         worker: t.worker,
-        spec: { tools: [...t.tools], ...(t.seed !== undefined ? { seed: t.seed } : {}) },
+        spec: { tools: [...t.tools] },
         createdAt: nowS,
         ...(provenance ? { provenance } : {}),
       },
@@ -287,7 +283,6 @@ export class FileTemplateCatalog implements TemplateCatalog {
         worker: t.worker,
         description: t.description,
         tools: [...t.tools],
-        ...(t.seed !== undefined ? { seed: t.seed } : {}),
       },
     });
     return digest;

@@ -16,12 +16,14 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HANDLERS } from '../src/handlers.js';
 import { MembersStore } from '../src/members.js';
+import { DEFAULT_POLICY, type Policy } from '../src/template-policy.js';
+import { FilePolicyStore } from '../src/template-policy-store.js';
 import { ProvenanceStore, verifyExport } from '../src/provenance.js';
 import { buildHandler } from '../src/server.js';
 import { ctx, codeOf, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
 import type { TokenClaims } from '../src/token.js';
 
-// Register G38: enrollment and roles through the API (enrollment and roles spec §3-§6).
+// Enrollment and roles through the API (enrollment and roles spec §3-§6).
 
 const ENV_ADMIN = 'github:1';
 const ALLOWED = 'github:2';
@@ -32,7 +34,7 @@ const who = (sub: string, roles: string[] = []): TokenClaims =>
   ({ sub, tenant: sub, roles, scope: ['api'] }) as unknown as TokenClaims;
 
 let now = NOW_MS;
-function setup(profile: 'sandbox' | 'combined' = 'sandbox'): TestDeps & {
+function setup(profile: 'sandbox' | 'harness' | 'combined' = 'sandbox'): TestDeps & {
   members: MembersStore;
   provenance: ProvenanceStore;
 } {
@@ -195,7 +197,7 @@ describe('enroll and unenroll (spec §4)', () => {
   it('enrolls an oidc subject too (#701), and refuses what no provider mints', async () => {
     const d = setup();
     const a = who(ENV_ADMIN);
-    const ERIN = 'oidc:erin@example.com';
+    const ERIN = 'oidc:erin@example.test';
     expect(await codeOf(() => call(d, 'listTemplates', who(ERIN)))).toBe('not_enrolled');
     const r = (await call(d, 'enrollSubject', a, { subject: ERIN }, { enrolled: true })).body as {
       enrolled: boolean;
@@ -237,7 +239,7 @@ describe('the admin role (spec §3, §6)', () => {
     const d = setup();
     await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
     const asCarol = who(CAROL);
-    // CAROL is an admin (templates, policy, quota) and may read the list ...
+    // CAROL is an admin on every other admin route and may read the list ...
     await call(d, 'listSubjects', asCarol);
     // ... but changes nothing about who has access.
     for (const [op, args, body] of [
@@ -249,6 +251,240 @@ describe('the admin role (spec §3, §6)', () => {
       expect(await codeOf(() => call(d, op, asCarol, args, body))).toBe('forbidden');
     }
     expect((await d.provenance.chain('members')).length).toBe(1);
+  });
+
+  it("refuses an API-granted admin's policy change that widens trust, registries or repositories", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const base: Policy = {
+      ...DEFAULT_POLICY,
+      allowedRegistries: ['<default>', 'docker.io'],
+      allowedRepositories: { 'docker.io': ['library/python'] },
+      trustedGateRecords: [`sha256:${'a'.repeat(64)}`],
+    };
+    await policy.set(base, ENV_ADMIN);
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const put = (p: TokenClaims, body: Policy) => call(d, 'putPolicy', p, {}, body);
+    // Each widening, by CAROL (an admin by an API grant): refused, the policy unchanged.
+    for (const wider of [
+      { ...base, trustedGateRecords: [...base.trustedGateRecords, `sha256:${'b'.repeat(64)}`] },
+      { ...base, allowedRegistries: [...base.allowedRegistries, 'quay.io'] },
+      { ...base, allowedRepositories: { 'docker.io': ['library/python', 'library/node'] } },
+      { ...base, allowedRepositories: {} },
+      // A second key in another case: the registry's list is the union of both, so it widens,
+      // whichever key comes first.
+      {
+        ...base,
+        allowedRepositories: { 'docker.io': ['library/python'], 'DOCKER.IO': ['library/node'] },
+      },
+      {
+        ...base,
+        allowedRepositories: { 'DOCKER.IO': ['library/node'], 'docker.io': ['library/python'] },
+      },
+    ]) {
+      expect(await codeOf(() => put(who(CAROL), wider))).toBe('forbidden');
+      expect((await policy.current()).policy).toEqual(base);
+    }
+    // Narrowing and quotas are CAROL's to change.
+    const narrower = {
+      ...base,
+      trustedGateRecords: [],
+      allowedRegistries: ['<default>', 'DOCKER.IO'],
+      quota: { ...base.quota, templates: base.quota.templates + 1 },
+    };
+    await put(who(CAROL), narrower);
+    expect((await policy.current()).policy.trustedGateRecords).toEqual([]);
+    // A settings admin widens it again.
+    await put(who(ENV_ADMIN), base);
+    expect((await policy.current()).policy.trustedGateRecords).toEqual(base.trustedGateRecords);
+  });
+
+  it("refuses an API-granted admin's policy change that adds or loosens a profile, or weakens the default", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const P = DEFAULT_POLICY.profiles;
+    const bench = P.benchmark!;
+    const base: Policy = {
+      ...DEFAULT_POLICY,
+      profiles: {
+        base: P.base!,
+        benchmark: bench,
+        'benchmark-self': P['benchmark-self']!,
+        'general-self': P['general-self']!,
+        strict: { ...bench, envelope: { ...bench.envelope, maxWorkspaceMb: 4096 } },
+      },
+      defaultProfile: 'benchmark',
+    };
+    await policy.set(base, ENV_ADMIN);
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const put = (p: TokenClaims, body: Policy) => call(d, 'putPolicy', p, {}, body);
+    const withProfile = (name: string, pr: Policy['profiles'][string]): Policy => ({
+      ...base,
+      profiles: { ...base.profiles, [name]: pr },
+    });
+    const env = bench.envelope;
+    const widenings: [string, Policy][] = [
+      [
+        'requires',
+        withProfile('benchmark', { ...bench, requires: bench.requires.filter((r) => r !== 'X11') }),
+      ],
+      ['requireOfflineGate', withProfile('benchmark', { ...bench, requireOfflineGate: false })],
+      ['selfAttest', withProfile('benchmark', { ...bench, selfAttest: true })],
+      [
+        'selfAttestEgress',
+        withProfile('benchmark-self', { ...P['benchmark-self']!, selfAttestEgress: true }),
+      ],
+      ['a raised bound', withProfile('benchmark', { ...bench, envelope: { ...env, maxVcpus: 4 } })],
+      [
+        'exact removed',
+        withProfile('benchmark', {
+          ...bench,
+          envelope: {
+            maxGuestMb: env.maxGuestMb,
+            maxVcpus: env.maxVcpus,
+            maxWorkspaceMb: env.maxWorkspaceMb,
+          },
+        }),
+      ],
+      [
+        'exact changed',
+        withProfile('benchmark', {
+          ...bench,
+          envelope: { ...env, exact: { guestMb: 2048, vcpus: 2 } },
+        }),
+      ],
+      ['a new profile', withProfile('extra', { ...bench })],
+      ['a weaker default', { ...base, defaultProfile: 'base' }],
+    ];
+    for (const [name, wider] of widenings) {
+      expect({ name, code: await codeOf(() => put(who(CAROL), wider)) }).toEqual({
+        name,
+        code: 'forbidden',
+      });
+      expect((await policy.current()).policy).toEqual(base);
+    }
+    const { 'general-self': _gone, ...withoutGeneralSelf } = base.profiles;
+    const narrowings: [string, Policy][] = [
+      ['requires added', withProfile('base', { ...P.base!, requires: ['X10'] })],
+      [
+        'requireOfflineGate on',
+        withProfile('general-self', { ...P['general-self']!, requireOfflineGate: true }),
+      ],
+      [
+        'selfAttestEgress off',
+        withProfile('general-self', { ...P['general-self']!, selfAttestEgress: false }),
+      ],
+      [
+        'selfAttest off',
+        withProfile('benchmark-self', { ...P['benchmark-self']!, selfAttest: false }),
+      ],
+      [
+        'a lowered bound',
+        withProfile('base', { ...P.base!, envelope: { ...P.base!.envelope, maxVcpus: 4 } }),
+      ],
+      [
+        'exact added',
+        withProfile('base', {
+          ...P.base!,
+          envelope: { ...P.base!.envelope, exact: { guestMb: 4096, vcpus: 2 } },
+        }),
+      ],
+      ['a profile removed', { ...base, profiles: withoutGeneralSelf }],
+      ['a stricter default', { ...base, defaultProfile: 'strict' }],
+    ];
+    for (const [name, narrower] of narrowings) {
+      expect({ name, status: (await put(who(CAROL), narrower)).status }).toEqual({
+        name,
+        status: 200,
+      });
+      expect((await policy.current()).policy).toEqual(narrower);
+      // A settings admin's widening (back to base) goes through.
+      expect((await put(who(ENV_ADMIN), base)).status).toBe(200);
+      expect((await policy.current()).policy).toEqual(base);
+    }
+    // And a settings admin's widening of each kind.
+    for (const [, wider] of widenings) {
+      expect((await put(who(ENV_ADMIN), wider)).status).toBe(200);
+      await put(who(ENV_ADMIN), base);
+    }
+  });
+
+  it("never lets an API-granted admin's PUT built from an older policy restore trust a settings admin removed", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const G = `sha256:${'a'.repeat(64)}`;
+    const base: Policy = { ...DEFAULT_POLICY, trustedGateRecords: [G] };
+    await policy.set(base, ENV_ADMIN);
+    // CAROL's write is slow: without one step for the check and the write, the settings admin's
+    // removal lands between CAROL's check (against the policy with G) and CAROL's write (with G).
+    const set = policy.set.bind(policy);
+    policy.set = (async (pol: Policy, subject: string, extra?: Record<string, unknown>) => {
+      if (subject === CAROL) await new Promise((r) => setTimeout(r, 50));
+      return set(pol, subject, extra);
+    }) as typeof policy.set;
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const put = (p: TokenClaims, body: Policy) => call(d, 'putPolicy', p, {}, body);
+    // CAROL keeps G and changes a quota, from the policy she read; the settings admin removes G.
+    const carols = { ...base, quota: { ...base.quota, templates: base.quota.templates + 1 } };
+    const removal = { ...base, trustedGateRecords: [] };
+    // Whichever PUT takes the lock first, G is not restored: CAROL's lands before the removal, or
+    // is checked against the policy without G, and refused as a widening.
+    for (const carolFirst of [true, false]) {
+      await policy.set(base, ENV_ADMIN);
+      const puts = [() => put(who(CAROL), carols), () => put(who(ENV_ADMIN), removal)];
+      const [c, s] = carolFirst
+        ? await Promise.allSettled(puts.map((f) => f()))
+        : (await Promise.allSettled([puts[1]!(), puts[0]!()])).reverse();
+      expect(s!.status).toBe('fulfilled');
+      if (c!.status === 'rejected') expect((c!.reason as { code?: string }).code).toBe('forbidden');
+      expect((await policy.current()).policy.trustedGateRecords).toEqual([]);
+    }
+  });
+
+  it("never loses a quota write to a PUT /v1/policy whose read came before it, or the PUT's change", async () => {
+    const d = setup();
+    const policy = new FilePolicyStore({
+      dir: mkdtempSync(join(tmpdir(), 'cp-pol-')),
+      provenance: d.provenance,
+    });
+    const G = `sha256:${'a'.repeat(64)}`;
+    const base: Policy = { ...DEFAULT_POLICY, trustedGateRecords: [G] };
+    await policy.set(base, ENV_ADMIN);
+    // The settings admin's PUT is slow to write: without one lock for both, CAROL's quota write
+    // lands between that PUT's read and its write, and the PUT's policy replaces it unseen.
+    const set = policy.set.bind(policy);
+    policy.set = (async (pol: Policy, subject: string, extra?: Record<string, unknown>) => {
+      if (subject === ENV_ADMIN) await new Promise((r) => setTimeout(r, 50));
+      return set(pol, subject, extra);
+    }) as typeof policy.set;
+    (d as { policy?: FilePolicyStore }).policy = policy;
+    await call(d, 'grantAdmin', who(ENV_ADMIN), { subject: CAROL }, {});
+    const quota = { templates: 2, buildsQueued: 1, active: 1 };
+    const [put, q] = await Promise.all([
+      call(d, 'putPolicy', who(ENV_ADMIN), {}, { ...base, trustedGateRecords: [] }),
+      call(d, 'putQuota', who(CAROL), { subject: DAVE }, quota),
+    ]);
+    expect(put.status).toBe(200);
+    expect(q.status).toBe(200);
+    // Both changes stand: the quota write ran after the PUT, on the policy it wrote.
+    const now = (await policy.current()).policy;
+    expect(now.trustedGateRecords).toEqual([]);
+    expect(now.quotaBySubject).toEqual({ [DAVE]: quota });
+    expect((q.body as { before: unknown }).before).toBeNull();
+    const by = (await d.provenance.chain('policy')).map((r) => r.subject);
+    expect(by.slice(-2)).toEqual([ENV_ADMIN, CAROL]);
   });
 
   it('revokes at the next request, and refuses a non-admin', async () => {
@@ -456,12 +692,83 @@ describe('per-request evaluation from one read (spec §8)', () => {
   });
 });
 
+describe('a members.json of the wrong shape is refused as a corrupt one', () => {
+  for (const [name, content] of [
+    ['members null', '{"members": null}'],
+    ['members an array', '{"members": []}'],
+    [
+      'a member with no roles array',
+      `{"members": {"${CAROL}": {"subject": "${CAROL}", "enrolled": true, "since": 1, "by": "${ENV_ADMIN}"}}}`,
+    ],
+    [
+      'a role that is not a grant',
+      `{"members": {"${CAROL}": {"subject": "${CAROL}", "enrolled": true, "roles": ["admin"], "since": 1, "by": "${ENV_ADMIN}"}}}`,
+    ],
+  ] as const) {
+    it(`${name}: the settings' subjects are answered, everyone else fails closed, no TypeError`, async () => {
+      const d = setup();
+      const a = who(ENV_ADMIN);
+      await call(d, 'enrollSubject', a, { subject: CAROL }, { enrolled: true });
+      writeFileSync((d.members as unknown as { path: string }).path, content);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(await d.members.membershipNow(ALLOWED, nowS())).toEqual({
+          roles: [],
+          enrolled: false,
+        });
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('answered from the settings'));
+        // A request of an allow-listed subject is served, not a 500.
+        expect((await call(d, 'listTemplates', who(ALLOWED))).status).toBe(200);
+        await expect(d.members.membershipNow(CAROL, nowS())).rejects.toThrow(
+          'members.json is invalid',
+        );
+        await expect(d.members.membershipNow(DAVE, nowS())).rejects.toThrow(
+          'members.json is invalid',
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  }
+
+  it('through the router: an allow-listed subject is served, a store-only one is refused', async () => {
+    // Combined: its tokens carry the issuer the test signer mints under, and /v1/sandboxes is
+    // enrolled-only there.
+    const d = setup('combined');
+    await call(d, 'enrollSubject', who(ENV_ADMIN), { subject: CAROL }, { enrolled: true });
+    writeFileSync((d.members as unknown as { path: string }).path, '{"members": null}');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const server = createServer(buildHandler(d));
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/sandboxes`;
+      const get = async (sub: string) =>
+        (
+          await fetch(url, {
+            headers: {
+              authorization: `Bearer ${d.signer.mint({ sub, tenant: sub, roles: [], scope: ['api'], ttlSeconds: 3600, now: nowS() })}`,
+            },
+          })
+        ).status;
+      expect(await get(ALLOWED)).toBe(200);
+      // As for an unparseable file: the store-only subject fails closed (the read error, a 500).
+      expect(await get(CAROL)).toBe(500);
+    } finally {
+      server.close();
+      warn.mockRestore();
+      err.mockRestore();
+    }
+  });
+});
+
 describe('per-request evaluation through the router (spec §3)', () => {
   const servers: Server[] = [];
   afterEach(() => servers.splice(0).forEach((s) => s.close()));
 
   it("replaces a token's roles with the subject's roles now", async () => {
-    const d = setup('combined');
+    // The harness profile: its tokens carry the issuer the test signer mints under.
+    const d = setup('harness');
     const server = createServer(buildHandler(d));
     servers.push(server);
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));

@@ -327,7 +327,7 @@ describe('SessionManager', () => {
     expect(cp.calls).not.toContain('mintSessionToken');
   });
 
-  it('create waits while its template activates (§6.4), then gives up after its bound', async () => {
+  it('create waits while its template activates, then gives up after its bound', async () => {
     const waits: number[] = [];
     let t = NOW;
     const { manager, cp, slept } = setup([], {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HANDLERS } from '../src/handlers.js';
-import { HostRegistry } from '../src/host-handlers.js';
+import { buildJobSpec, HostRegistry } from '../src/host-handlers.js';
 import { templateHostsFromEnv } from '../src/host-config.js';
 import { matchRoute, ROUTES } from '../src/routes.js';
 import { buildHandler } from '../src/server.js';
@@ -291,7 +291,7 @@ describe('the host agent flow (§6.1, §8.2)', () => {
     ).toBe('invalid_request');
   });
 
-  it('lets the owner cancel a build the host is building, and refuses the host its later reports (G22)', async () => {
+  it('lets the owner cancel a build the host is building, and refuses the host its later reports', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
     await HANDLERS.hostBuildReport!(asHost('host-1', { build }, { event: 'building' }), d);
@@ -575,7 +575,7 @@ describe('host authentication through the router', () => {
   });
 });
 
-describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
+describe('following a build by its handle', () => {
   it('resolves the 202 handle after registration, the body naming the manifest hash', async () => {
     const d = await setup();
     const build = await claimAndBuild(d);
@@ -615,5 +615,64 @@ describe('following a build by its handle (autobench-moca, 2026-11-04)', () => {
       await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build: b2 } }), d2)
     ).body as Body;
     expect(f.reason).toEqual({ message: 'exit 91', step: 'probe' });
+  });
+});
+
+describe('the build job names the guest size template-build.sh reads (guest_mb)', () => {
+  it('maps guest_mb to guest_ram_mb, keeps guest_ram_mb, and prefers guest_mb as the policy does', () => {
+    expect(buildJobSpec('t', 'i@sha256:x', { guest_mb: 4096, vcpus: 2 })).toEqual({
+      id: 't',
+      image: 'i@sha256:x',
+      vcpus: 2,
+      guest_ram_mb: 4096,
+    });
+    expect(buildJobSpec('t', 'i', { guest_ram_mb: 2048 })).toEqual({
+      id: 't',
+      image: 'i',
+      guest_ram_mb: 2048,
+    });
+    expect(buildJobSpec('t', 'i', { guest_mb: 1024, guest_ram_mb: 2048 })).toEqual({
+      id: 't',
+      image: 'i',
+      guest_ram_mb: 1024,
+    });
+    expect(buildJobSpec('t', 'i', { vcpus: 1 })).toEqual({ id: 't', image: 'i', vcpus: 1 });
+    // A spec's own id or image never renames the build or swaps its image.
+    expect(
+      buildJobSpec('t', 'i@sha256:x', { id: 'other', image: 'evil@sha256:y', vcpus: 1 }),
+    ).toEqual({
+      id: 't',
+      image: 'i@sha256:x',
+      vcpus: 1,
+    });
+  });
+
+  it('claims a create that names guest_mb with guest_ram_mb', async () => {
+    const d = await setup();
+    // The queued build of setup() first, then this one.
+    await claimAndBuild(d);
+    const { guest_ram_mb: g, ...noRam } = REST as Body;
+    const r = await HANDLERS.createTemplate!(
+      ctx({
+        principal: alice,
+        body: {
+          id: 'gmb',
+          image: IMAGE,
+          spec: {
+            ...noRam,
+            guest_mb: g,
+            source_record_digest: undefined,
+            skip_git_identity_check: false,
+          },
+          profile: 'base',
+        },
+      }),
+      d,
+    );
+    expect(r.status).toBe(202);
+    const c = (await HANDLERS.hostClaimBuilds!(asHost('host-1', {}, { max: 1 }), d)).body as Body;
+    expect(c.builds[0].template).toBe('gmb');
+    expect(c.builds[0].spec.guest_ram_mb).toBe(g);
+    expect(c.builds[0].spec.guest_mb).toBeUndefined();
   });
 });

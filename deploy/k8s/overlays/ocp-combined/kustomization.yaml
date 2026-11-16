@@ -23,7 +23,7 @@
 # one renderable for tests. Deployed by deploy/sbx/setup.sh SBX_PROFILE=combined (combined design increment 6).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: moca-combined
+namespace: moca-sbx-combined
 resources:
   - ../ocp-single
   - api-route.yaml

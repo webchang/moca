@@ -10,10 +10,10 @@ import { openCallRecord, RUN_LENGTH_FIELDS } from '../src/sbx/call-record.js';
 
 // `mocactl run --record F`: the real runtime and clients over a fake control plane and a fake SSE
 // harness (the harness discovered, under a path prefix), every planted secret and text grepped for.
-// example.com hosts only.
+// example.invalid hosts only.
 
-const CP = 'https://cp.example.com/api';
-const HARNESS = 'https://harness.example.com/h';
+const CP = 'https://cp.example.invalid/api';
+const HARNESS = 'https://harness.example.invalid/h';
 const PROMPT = 'PLANTED-PROMPT-fix the failing test';
 const REPLY = 'PLANTED-REPLY-done, see the patch';
 const PATCH = 'diff --git a/PLANTED-PATCH b/PLANTED-PATCH\n+x\n';
@@ -99,9 +99,9 @@ function rig(turn: (init: RequestInit) => Response, opts: { expired?: boolean } 
             name: 'anthropic',
             kind: 'anthropic',
             consumer: 'inference',
-            destination: { hosts: ['api.example.com'] },
+            destination: { hosts: ['api.example.invalid'] },
             binding: { header: 'x-api-key', format: '{secret}' },
-            endpoint: 'https://gw.example.com/v1',
+            endpoint: 'https://gw.example.invalid/v1',
           },
         ],
       });
@@ -179,6 +179,7 @@ describe('mocactl run --record F', () => {
     expect(l.map((x) => `${x.endpoint ?? ''} ${x.method ?? x.event} ${x.path ?? ''}`)).toEqual([
       'control-plane GET /v1/credentials',
       'control-plane GET /v1/models?credential=anthropic',
+      // The session options read the discovery twice: the sandbox tier, then the sandbox template.
       'control-plane GET /v1/discovery',
       'control-plane GET /v1/discovery',
       'control-plane POST /v1/sessions',
@@ -194,9 +195,12 @@ describe('mocactl run --record F', () => {
     expect(created.token).toBe(sha(SESSION_JWT));
     // The credential's name stays; its hosts and endpoint are lengths.
     const cred = (l[0]!.answer as { credentials: Record<string, unknown>[] }).credentials[0]!;
-    expect(cred).toMatchObject({ name: 'anthropic', endpoint: { length: 25 } });
+    expect(cred).toMatchObject({
+      name: 'anthropic',
+      endpoint: { length: 'https://gw.example.invalid/v1'.length },
+    });
     expect((cred.destination as { hosts: unknown }).hosts).toEqual({
-      length: JSON.stringify(['api.example.com']).length,
+      length: JSON.stringify(['api.example.invalid']).length,
     });
     // The turn's request: its session id, the prompt as its length.
     expect(l[6]!.request).toEqual({ sessionId: 's-1', prompt: { length: PROMPT.length } });
@@ -321,7 +325,9 @@ describe('the stream pass-through', () => {
       new Response(body.stream, {
         headers: { 'content-type': 'text/event-stream' },
       })) as unknown as typeof fetch;
-    const res = await rec.wrapEndpoints(fetchBad, () => [])(`https://other.example.com/v1/turn`);
+    const res = await rec.wrapEndpoints(fetchBad, () => [])(
+      `https://other.example.invalid/v1/turn`,
+    );
     body.send(frame({ type: 'text', delta: REPLY }));
     const err = Object.assign(new TypeError('terminated'), { cause: { code: 'UND_ERR_SOCKET' } });
     body.fail(err);

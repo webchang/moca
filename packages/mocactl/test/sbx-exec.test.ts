@@ -4,31 +4,56 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
+  ExecAbortedError,
   ExecMachineryError,
   ExecRefusedError,
+  LEASE_RULE,
+  LeaseControlError,
+  PROCESS_RULE,
+  leaseNotice,
   MAX_STDIN_BYTES,
+  RESET_ENDED_TEXT,
   SANDBOX_BUSY_TEXT,
+  SandboxExecConn,
   TEMPLATE_BUSY_TEXT,
   TOKEN_EXPIRED_TEXT,
   writeFileCommand,
   type ExecConnOptions,
   type ExecResult,
+  type LeaseEvent,
+  type LeaseStatusView,
 } from '@moca/sandbox-client';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../src/api/errors.js';
 import { DEFAULT_CONFIG, saveAuth, saveConfig } from '../src/config.js';
 import { SandboxApiClient } from '../src/sbx/api.js';
 import { sbxMain, sbxPaths } from '../src/sbx/cli.js';
-import { sandboxTokenFn } from '../src/sbx/exec.js';
+import { jwtMode, sandboxTokenFn, type ExecFactory } from '../src/sbx/exec.js';
+import { busyRetries } from '../src/sbx/run.js';
 import { readRecords, recordCall } from '../src/sbx/recorder.js';
-import { jwt, LOGIN, SBX, TOKEN, TOKEN_IAT, fakeCp, sandbox, setup, URL_ } from './helpers/sbx.js';
+import { fakeExecRelay } from '../../sandbox-client/test/helpers/fake-relay.js';
+import {
+  jwt,
+  LOGIN,
+  NO_LEASE,
+  SBX,
+  TOKEN,
+  TOKEN_IAT,
+  fakeCp,
+  leaseEnd,
+  sandbox,
+  setup,
+  URL_,
+} from './helpers/sbx.js';
 
 const res = (over: Partial<ExecResult> = {}): ExecResult => ({
   stdout: Buffer.from('out\n'),
   stderr: Buffer.from('err\n'),
   exitCode: 0,
   truncated: false,
+  lease: [],
   ...over,
 });
 
@@ -52,12 +77,26 @@ function fakeExec(answer: (command: string) => ExecResult | Error = () => res())
         return a;
       },
       close: () => void closed++,
+      ...NO_LEASE,
     };
   };
   return { factory, opened, sent, closed: () => closed };
 }
 const mint = () =>
   fakeCp({ [`POST /v1/sandboxes/${SBX}/token`]: () => ({ status: 200, body: TOKEN }) });
+/** The end a reset of a live lease leaves pending (the worker's answer to `reset`). */
+const RESET_END = {
+  reqId: 0,
+  state: 'end',
+  reason: 'reset',
+  atUnixMs: 1_800_000_100_000,
+  mode: 2, // SANDBOX_MODE_LEASE
+  ageMs: 5_000,
+  processes: [],
+  endsByUnixMs: 0,
+  tracked: [],
+};
+
 /** TOKEN's lifetime is 900 s: the default timeout and the cap are 840 s (spec §6.5). */
 const CAP = 840;
 
@@ -227,7 +266,7 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
   it('exits 124 for a timed-out or killed command, 125 for a sandbox failure, 75 for a refusal before start', async () => {
     const run = async (answer: ExecResult | Error) => {
       const { home, env: env0, io } = setup();
-      // No retry here (G36's retry has its own tests below): every failure exits on the first try.
+      // No retry here (the retry before start has its own tests below): every failure exits on the first try.
       const env = { ...env0, MOCACTL_SBX_BUSY_RETRIES: '0' };
       const x = fakeExec(() => answer);
       const code = await sbxMain(['run', '--sandbox', SBX, '--', 'sleep', '9'], env, io, {
@@ -255,7 +294,7 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
     const busy = await run(
       new ExecMachineryError('sandbox busy: 4 Execs already in flight', 8, 'busy'),
     );
-    // Refused before start: nothing ran, so its own exit (75, register G36), not a sandbox failure.
+    // Refused before start: nothing ran, so its own exit (75), not a sandbox failure.
     expect(busy.code).toBe(75);
     expect(busy.err).toContain(SANDBOX_BUSY_TEXT);
     const full = await run(
@@ -283,7 +322,7 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
     expect(expired.err).toContain(TOKEN_EXPIRED_TEXT);
   });
 
-  describe('a refusal before start is retried (register G36)', () => {
+  describe('a refusal before start is retried', () => {
     const memoryBudget = () =>
       new ExecMachineryError(
         'template busy: memory-budget: promoting a standby would re-price it',
@@ -319,7 +358,13 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
           ...(over.signal ? { signal: over.signal } : {}),
         },
       );
-      return { code, sent: x.sent.length, waits, err: io.errs.join('\n') };
+      return {
+        code,
+        sent: x.sent.length,
+        timeouts: x.sent.map((m) => m.timeoutS),
+        waits,
+        err: io.errs.join('\n'),
+      };
     }
 
     it("sends it again after a backoff, and exits with the command's code once it runs", async () => {
@@ -342,6 +387,12 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
       expect(r.err).toMatch(
         /refused the command 5 times before starting it; nothing ran \(exit 75\)/,
       );
+    });
+
+    it("re-caps each retry's timeout to what the token has left after the waits", async () => {
+      // TOKEN's 900 s lifetime less the 60 s margin is 840 s; the waits (1, 2, 4, 8 s) spend it.
+      const r = await runWith(Array.from({ length: 9 }, memoryBudget));
+      expect(r.timeouts).toEqual([840, 839, 837, 833, 825]);
     });
 
     it('keeps the waits under 30 s at the most jitter', async () => {
@@ -391,6 +442,17 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
       });
       expect(one.code).toBe(75);
       expect(one.sent).toBe(2);
+    });
+
+    it('MOCACTL_SBX_BUSY_RETRIES: a whole number, at most 20; anything else is the default (4)', () => {
+      expect(busyRetries({})).toBe(4);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: '' })).toBe(4);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: '-1' })).toBe(4);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: '2.5' })).toBe(4);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: 'many' })).toBe(4);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: ' 7 ' })).toBe(7);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: '20' })).toBe(20);
+      expect(busyRetries({ MOCACTL_SBX_BUSY_RETRIES: '500' })).toBe(20);
     });
   });
 
@@ -515,7 +577,111 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
   });
 });
 
+describe('mocactl sbx run lease notices (spec §5)', () => {
+  const end = {
+    reqId: 0,
+    state: 'end',
+    reason: 'idle',
+    atUnixMs: 1_800_000_100_000,
+    mode: 2,
+    ageMs: 60_000,
+    processes: [],
+    endsByUnixMs: 0,
+    tracked: [],
+  };
+  const start = { ...end, state: 'start', reason: '', atUnixMs: end.atUnixMs + 5 };
+  const runIt = async (s: ReturnType<typeof setup>, answer: () => ExecResult | Error) => {
+    s.io.errs.length = 0;
+    s.io.errB.length = 0;
+    return sbxMain(['run', '--sandbox', SBX, '--', 'true'], s.env, s.io, {
+      home: s.home,
+      fetchImpl: mint().fetchImpl,
+      execFactory: fakeExec(answer).factory,
+    });
+  };
+
+  it('run prints a lease end notice on stderr', async () => {
+    const s = setup();
+    expect(await runIt(s, () => res({ lease: [end, start] }))).toBe(0);
+    const notice = leaseNotice(end, Date.now())!;
+    expect(notice).toContain('[sandbox] guest restarted (idle, ');
+    // The end, once; the start is not shown beside it.
+    expect(s.io.errs).toEqual([notice]);
+    expect(Buffer.concat(s.io.errB).toString()).toBe('err\n');
+    // Seen: the same event on a later result is not shown again (the store in the sbx state dir).
+    expect(await runIt(s, () => res({ lease: [end] }))).toBe(0);
+    expect(s.io.errs).toEqual([]);
+    // An event that came before a failure is shown before the failure's text.
+    const later = { ...end, reason: 'memory_reclaim', atUnixMs: end.atUnixMs + 60_000 };
+    const boom = new ExecMachineryError('sandbox failure: lease_ended(memory_reclaim)');
+    boom.lease = [later];
+    expect(await runIt(s, () => boom)).toBe(125);
+    expect(s.io.errs[0]).toBe(leaseNotice(later, Date.now()));
+    expect(s.io.errs[1]).toMatch(/^sbx: /);
+    // A refused or aborted Exec carries the events it had received too (re-review New-2).
+    const refusedEnd = { ...end, reason: 'grace_limit', atUnixMs: end.atUnixMs + 120_000 };
+    expect(
+      await runIt(s, () => new ExecRefusedError('token rejected', 16, [refusedEnd as LeaseEvent])),
+    ).toBe(125);
+    expect(s.io.errs[0]).toBe(leaseNotice(refusedEnd, Date.now()));
+    expect(s.io.errs[1]).toMatch(/^sbx: /);
+    const abortedEnd = { ...end, reason: 'reset', atUnixMs: end.atUnixMs + 180_000 };
+    const ac = new AbortController();
+    s.io.errs.length = 0;
+    expect(
+      await sbxMain(['run', '--sandbox', SBX, '--', 'true'], s.env, s.io, {
+        home: s.home,
+        fetchImpl: mint().fetchImpl,
+        signal: ac.signal,
+        execFactory: fakeExec(() => {
+          ac.abort(); // Ctrl-C while the command runs
+          const e = new ExecAbortedError(ac.signal);
+          e.lease = [abortedEnd as LeaseEvent];
+          return e;
+        }).factory,
+      }),
+    ).toBe(130);
+    expect(s.io.errs).toEqual([leaseNotice(abortedEnd, Date.now())]);
+    // An expiring event is shown on every result: it marks nothing seen.
+    const exp = {
+      ...end,
+      state: 'expiring',
+      reason: 'max_duration',
+      endsByUnixMs: Date.now() + 120_000,
+    };
+    for (let i = 0; i < 2; i++) {
+      expect(await runIt(s, () => res({ lease: [exp] }))).toBe(0);
+      expect(s.io.errs).toEqual([leaseNotice(exp, Date.now())]);
+    }
+  });
+});
+
 describe('mocactl sbx put (SBX0 §6.1)', () => {
+  it('put says the lease events its Exec carried, on stderr, a failure too (plan-4 M2)', async () => {
+    const end = leaseEnd({ reason: 'idle' });
+    const { home, env, io } = setup();
+    const ok = fakeExec(() =>
+      res({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), lease: [end] }),
+    );
+    const put = (factory: ReturnType<typeof fakeExec>['factory']) =>
+      sbxMain(['put', 'a.txt', '--sandbox', SBX], env, io, {
+        home,
+        fetchImpl: mint().fetchImpl,
+        execFactory: factory,
+        stdinIsTTY: false,
+        readStdinBytes: async () => Buffer.from('x'),
+      });
+    expect(await put(ok.factory)).toBe(0);
+    expect(io.errs).toEqual([leaseNotice(end, Date.now())]);
+    io.errs.length = 0;
+    const later = leaseEnd({ reason: 'memory_reclaim', atUnixMs: end.atUnixMs + 60_000 });
+    const boom = new ExecMachineryError('sandbox failure: lease_ended(memory_reclaim)');
+    boom.lease = [later];
+    expect(await put(fakeExec(() => boom).factory)).toBe(125);
+    expect(io.errs[0]).toBe(leaseNotice(later, Date.now()));
+    expect(io.errs[1]).toMatch(/^sbx: /);
+  });
+
   it('puts stdin, byte for byte, at a workspace path, with the atomic write command', async () => {
     const { home, env, io } = setup();
     const x = fakeExec(() => res({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
@@ -626,7 +792,7 @@ describe('mocactl sbx put (SBX0 §6.1)', () => {
   });
 });
 
-describe('mocactl sbx put: a refusal before start (register G36)', () => {
+describe('mocactl sbx put: a refusal before start', () => {
   it("is retried as run's, and the write goes out once it is accepted", async () => {
     const { home, env, io } = setup();
     let n = 0;
@@ -797,6 +963,8 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
       content: { text: string }[];
     };
     expect(info.content[0]!.text).toMatch(/template node22.*expires/s);
+    // A per-exec record: no lease call (P4-R9), so the fake's missing lease calls never show.
+    expect(info.content[0]!.text).toContain('\nmode: per-exec\nlease: none (per-exec)\n');
     await client.close();
     expect(await served).toBe(0);
     expect(io.outs).toEqual([]); // stdout belongs to MCP frames only
@@ -869,6 +1037,446 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
     ).toBe(1);
     expect(io.errs.join('\n')).toContain('no such sandbox');
     expect(io.outs).toEqual([]);
+  });
+
+  /** A sandbox token whose (unverified) payload carries a `mode` claim. */
+  const modeJwt = (mode: string) => {
+    const b = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${b({ alg: 'EdDSA' })}.${b({ sbx: SBX, iat: TOKEN_IAT, exp: TOKEN.expiresAt, mode })}.sig`;
+  };
+  const ACTIVE: LeaseStatusView = {
+    mode: 'lease',
+    epochKnown: true,
+    state: 'active',
+    ageMs: 5_000,
+    idleTimeoutS: 0,
+  };
+  /**
+   * A lease sandbox's MCP session: each token mint takes the next of `modes` (the last repeats);
+   * a `remint` command forces a mint, as the exec client's retry does.
+   */
+  function leaseSession(
+    modes: string[],
+    over: {
+      keepalive?: () => Promise<void>;
+      record?: () => string;
+      /** Answers `reset` in place of the default; gets the call's signal. */
+      reset?: (signal?: AbortSignal) => Promise<LeaseStatusView>;
+      /** Wraps the control plane's fetch (a mint that hangs, say). */
+      fetchWrap?: (f: typeof fetch) => typeof fetch;
+    } = {},
+  ) {
+    const { home, env, io } = setup();
+    let minted = 0;
+    const cp = fakeCp({
+      [`POST /v1/sandboxes/${SBX}/token`]: () => ({
+        status: 200,
+        body: { ...TOKEN, token: modeJwt(modes[Math.min(minted++, modes.length - 1)]!) },
+      }),
+      [`GET /v1/sandboxes/${SBX}`]: () => ({
+        status: 200,
+        body: sandbox({ mode: over.record?.() ?? 'lease' }),
+      }),
+    });
+    const flags: boolean[] = [];
+    const ops: string[] = [];
+    const processOps: string[] = [];
+    const signals: (AbortSignal | undefined)[] = [];
+    let keepalives = 0;
+    const factory: ExecFactory = (o) => ({
+      exec: async (command) => {
+        await o.token({ force: command === 'remint', minValidS: 60 });
+        flags.push(typeof o.keepalive === 'function' ? o.keepalive() : Boolean(o.keepalive));
+        return res({ stderr: Buffer.alloc(0) });
+      },
+      close: () => {},
+      leaseControl: async (op, _token, x) => {
+        ops.push(op);
+        signals.push(x?.signal);
+        if (op === 'reset' && over.reset) return over.reset(x?.signal);
+        // A reset of the live lease leaves its end pending, as the worker does (spec §5).
+        return op === 'reset' ? { ...ACTIVE, state: 'none', pending: RESET_END } : ACTIVE;
+      },
+      leaseKeepalive: async () => {
+        keepalives++;
+        await over.keepalive?.();
+      },
+      process: (async (op: string) => {
+        await o.token({ force: false, minValidS: 60 });
+        processOps.push(op);
+        return { result: [], lease: [] };
+      }) as never,
+    });
+    const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+    const served = sbxMain(['mcp', '--sandbox', SBX], env, io, {
+      home,
+      fetchImpl: over.fetchWrap ? over.fetchWrap(cp.fetchImpl) : cp.fetchImpl,
+      execFactory: factory,
+      mcpTransport: serverSide,
+    });
+    const client = new Client({ name: 't', version: '0' });
+    const bash = (command: string) =>
+      client.callTool({ name: 'bash', arguments: { command } }) as Promise<{
+        content: { text: string }[];
+      }>;
+    return {
+      io,
+      served,
+      client,
+      bash,
+      flags,
+      ops,
+      processOps,
+      signals,
+      keepalives: () => keepalives,
+      mints: () => minted,
+      connect: () => client.connect(clientSide),
+    };
+  }
+
+  it("keepalive follows the token's mode; stops on close", async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const m = leaseSession(['lease', 'per-exec', 'lease']);
+      await m.connect();
+      await m.bash('echo'); // the first mint: lease
+      expect(m.keepalives()).toBe(0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(m.keepalives()).toBe(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(m.keepalives()).toBe(2);
+      await m.bash('remint'); // the owner downgraded: the next mint says per-exec
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(m.keepalives()).toBe(2);
+      await m.bash('remint'); // and back to lease
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(m.keepalives()).toBe(3);
+      // Exec.keepalive follows each Exec's token.
+      expect(m.flags).toEqual([true, false, true]);
+      await m.client.close();
+      expect(await m.served).toBe(0);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(m.keepalives()).toBe(3);
+      expect(m.io.errs).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failing keepalive is ignored and logged once', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const m = leaseSession(['lease'], {
+        keepalive: async () => {
+          throw new LeaseControlError('unavailable', 'relay down');
+        },
+      });
+      await m.connect();
+      await m.bash('echo');
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(m.keepalives()).toBe(3);
+      expect(m.io.errs).toEqual([
+        'sbx mcp: lease keepalive failed (unavailable): relay down; further failures are not logged',
+      ]);
+      await m.client.close();
+      await m.served;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a lease sandbox gets the lease texts; reset and sandbox_info reach the connection's lease calls", async () => {
+    const m = leaseSession(['lease']);
+    await m.connect();
+    expect(m.client.getInstructions()).toContain(LEASE_RULE);
+    expect(m.client.getInstructions()).not.toMatch(/fresh VM/);
+    const { tools } = await m.client.listTools();
+    expect(tools.find((t) => t.name === 'bash')!.description).toContain(LEASE_RULE);
+    const info = (await m.client.callTool({ name: 'sandbox_info', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(info.content[0]!.text).toContain(LEASE_RULE);
+    expect(info.content[0]!.text).not.toMatch(/fresh VM/);
+    expect(info.content[0]!.text).toMatch(/\nmode: lease\nlease: active\nage: 5s\n/);
+    const reset = (await m.client.callTool({ name: 'reset', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(reset.content[0]!.text).toBe(RESET_ENDED_TEXT);
+    expect(m.ops).toEqual(['status', 'reset']);
+    await m.client.close();
+    await m.served;
+  });
+
+  it("the reset tool passes its call's cancel signal to the lease calls (M1)", async () => {
+    const m = leaseSession(['lease'], {
+      // Held behind another client's Exec until the call is cancelled.
+      reset: (signal) =>
+        new Promise((_, reject) =>
+          signal?.addEventListener('abort', () =>
+            reject(new LeaseControlError('cancelled', 'the lease call was cancelled')),
+          ),
+        ),
+    });
+    await m.connect();
+    const ac = new AbortController();
+    const p = m.client.callTool({ name: 'reset', arguments: {} }, undefined, {
+      signal: ac.signal,
+    });
+    await vi.waitFor(() => expect(m.ops).toEqual(['reset']));
+    ac.abort();
+    await expect(p).rejects.toThrow();
+    expect(m.signals.every((x) => x instanceof AbortSignal && x.aborted)).toBe(true);
+    // The server's call queue is free again: the next call runs.
+    expect((await m.bash('echo')).content[0]!.text).toBe('out\n');
+    await m.client.close();
+    await m.served;
+  });
+
+  it("reset and sandbox_info follow the latest minted token's mode over the start record", async () => {
+    // The owner upgraded after the server started: the record it read said per-exec.
+    const m = leaseSession(['lease'], { record: () => 'per-exec' });
+    await m.connect();
+    const reset = async () =>
+      (
+        (await m.client.callTool({ name: 'reset', arguments: {} })) as {
+          content: { text: string }[];
+        }
+      ).content[0]!.text;
+    expect(await reset()).toBe('no lease to reset'); // no token yet: the record decides
+    expect(m.ops).toEqual([]);
+    await m.bash('echo'); // the first mint carries lease
+    expect(await reset()).toBe(RESET_ENDED_TEXT);
+    expect(m.ops).toEqual(['reset']);
+    const info = (await m.client.callTool({ name: 'sandbox_info', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(info.content[0]!.text).toContain('\nmode: lease\nlease: active\n');
+    expect(m.ops).toEqual(['reset', 'status']);
+    await m.client.close();
+    await m.served;
+  });
+
+  it('reset before any mint re-reads the record: upgraded since start, it resets', async () => {
+    let record = 'per-exec';
+    const m = leaseSession(['lease'], { record: () => record });
+    await m.connect(); // the server read per-exec at start
+    record = 'lease'; // the owner upgrades; no call has minted a token yet
+    const r = (await m.client.callTool({ name: 'reset', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(r.content[0]!.text).toBe(RESET_ENDED_TEXT);
+    expect(m.ops).toEqual(['reset']);
+    await m.client.close();
+    await m.served;
+  });
+
+  it('after a mode change, the next file tool call succeeds: the exec client re-mints on stale_mode (P4-R21)', async () => {
+    // Review Focus 5, the Exec half: the owner downgrades while the MCP session runs. The held
+    // token (900 s) still covers a file tool's 120 s ask, so the next `read` goes out under the old
+    // epoch; the worker refuses it stale_mode, and the real exec client re-mints and retries.
+    const { home, env, io } = setup();
+    const epochJwt = (mode: string, mode_epoch: number) => {
+      const b = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+      const claims = { sbx: SBX, iat: TOKEN_IAT, exp: TOKEN.expiresAt, mode, mode_epoch };
+      return `${b({ alg: 'EdDSA' })}.${b(claims)}.sig`;
+    };
+    let current = { mode: 'lease', epoch: 1 };
+    let mints = 0;
+    const cp = fakeCp({
+      [`POST /v1/sandboxes/${SBX}/token`]: () => (
+        mints++,
+        { status: 200, body: { ...TOKEN, token: epochJwt(current.mode, current.epoch) } }
+      ),
+      [`GET /v1/sandboxes/${SBX}`]: () => ({ status: 200, body: sandbox({ mode: 'lease' }) }),
+    });
+    type Claims = { mode_epoch: number };
+    const epochOf = (bearer: string) =>
+      (JSON.parse(Buffer.from(bearer.split('.')[1]!, 'base64url').toString()) as Claims).mode_epoch;
+    const relay = await fakeExecRelay((_req, bearer) =>
+      epochOf(bearer) < current.epoch
+        ? {
+            refuse: `stale_mode: workspace_key ${SBX} Exec mode_epoch ${epochOf(bearer)} is below the stored ${current.epoch}`,
+          }
+        : { stdout: `file at epoch ${current.epoch}\n` },
+    );
+    try {
+      // The real connection, dialed at the fake relay in plain text.
+      const factory: ExecFactory = (o) => {
+        const c = new SandboxExecConn({ ...o, addr: relay.addr, tls: false, caPem: undefined });
+        return {
+          exec: c.exec,
+          close: c.close,
+          leaseControl: c.leaseControl,
+          leaseKeepalive: c.leaseKeepalive,
+        };
+      };
+      const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+      const served = sbxMain(['mcp', '--sandbox', SBX], env, io, {
+        home,
+        fetchImpl: cp.fetchImpl,
+        execFactory: factory,
+        mcpTransport: serverSide,
+      });
+      const client = new Client({ name: 't', version: '0' });
+      await client.connect(clientSide);
+      const read = () =>
+        client.callTool({ name: 'read', arguments: { path: 'f' } }) as Promise<{
+          content: { text: string }[];
+          isError?: boolean;
+        }>;
+      const before = await read();
+      expect(before.isError).toBeFalsy();
+      expect(before.content[0]!.text).toBe('file at epoch 1\n');
+      current = { mode: 'per-exec', epoch: 2 }; // `mocactl sbx mode per-exec` in another terminal
+      const after = await read();
+      expect(after.isError).toBeFalsy();
+      expect(after.content[0]!.text).toBe('file at epoch 2\n');
+      expect(mints).toBe(2); // the first token, then the retry's forced mint
+      expect(relay.seen.map((s) => epochOf(s.bearer))).toEqual([1, 1, 2]);
+      // Exec.keepalive follows the re-minted per-exec token.
+      expect(relay.seen.map((s) => s.req.exec!.keepalive)).toEqual([true, true, false]);
+      await client.close();
+      expect(await served).toBe(0);
+    } finally {
+      relay.close();
+    }
+  });
+
+  it("the tool list follows the minted token's mode: list_changed on a change, the process tools at lease+processes (P5-R27)", async () => {
+    const m = leaseSession(['lease', 'lease+processes', 'lease+processes', 'lease']);
+    let changed = 0;
+    m.client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    await m.connect();
+    expect(m.client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+    const names = async () => (await m.client.listTools()).tools.map((t) => t.name);
+    expect(await names()).not.toContain('process_start'); // the lease record, no token yet
+    await m.bash('echo'); // the first mint: lease, as listed
+    await m.bash('remint'); // the owner upgraded: lease+processes
+    await vi.waitFor(() => expect(changed).toBe(1));
+    expect(await names()).toEqual(expect.arrayContaining(['process_start', 'process_stop']));
+    const bash = (await m.client.listTools()).tools.find((t) => t.name === 'bash')!;
+    expect(bash.description).toContain(PROCESS_RULE);
+    const r = (await m.client.callTool({ name: 'process_list', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(r.content[0]!.text).toBe('no tracked processes');
+    expect(m.processOps).toEqual(['list']);
+    await m.bash('remint'); // the same mode again: nothing to tell
+    await m.bash('remint'); // a downgrade
+    await vi.waitFor(() => expect(changed).toBe(2));
+    expect(await names()).not.toContain('process_start');
+    await m.client.close();
+    await m.served;
+  });
+
+  it('an upgrade since the held token: the process call re-mints once and goes through (P5-R29)', async () => {
+    // The user ran `mocactl sbx mode <id> lease+processes` after the held token was minted.
+    const m = leaseSession(['lease', 'lease+processes'], { record: () => 'lease+processes' });
+    let changed = 0;
+    m.client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    await m.connect();
+    expect((await m.client.listTools()).tools.map((t) => t.name)).toContain('process_start');
+    const info = (await m.client.callTool({ name: 'sandbox_info', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(info.content[0]!.text).toContain('process_start');
+    expect(info.content[0]!.text).not.toContain('no process survives');
+    await m.bash('echo'); // the held token: lease, unlike the list: the client is told
+    await vi.waitFor(() => expect(changed).toBe(1));
+    expect(m.mints()).toBe(1);
+    const r = (await m.client.callTool({
+      name: 'process_start',
+      arguments: { command: 'python3 -m http.server' },
+    })) as { content: { text: string }[]; isError?: boolean };
+    expect(r.isError).toBeFalsy();
+    expect(m.processOps).toEqual(['start']);
+    expect(m.mints()).toBe(2); // exactly one re-mint, which says lease+processes
+    // The next process call needs no re-mint.
+    await m.client.callTool({ name: 'process_list', arguments: {} });
+    expect(m.mints()).toBe(2);
+    expect(m.processOps).toEqual(['start', 'list']);
+    await m.client.close();
+    await m.served;
+  });
+
+  // PR #814 review: the gate's forced re-mint gets the tool call's AbortSignal, so a cancelled
+  // process tool call stops its mint rather than leaving it to run on.
+  it("a cancelled process call aborts the gate's forced re-mint", async () => {
+    let tokenPosts = 0;
+    let mintSignal: AbortSignal | undefined;
+    let markReached!: () => void;
+    const reached = new Promise<void>((r) => (markReached = r));
+    const m = leaseSession(['lease', 'lease+processes'], {
+      record: () => 'lease+processes',
+      fetchWrap: (f) =>
+        (async (input: string | URL, init?: RequestInit) => {
+          const isMint = init?.method === 'POST' && String(input).endsWith('/token');
+          if (!isMint || ++tokenPosts === 1) return f(input, init);
+          // The re-mint hangs until its request is aborted.
+          mintSignal = init?.signal ?? undefined;
+          markReached();
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), {
+              once: true,
+            });
+          });
+        }) as typeof fetch,
+    });
+    await m.connect();
+    await m.bash('echo'); // the held token: lease
+    const ac = new AbortController();
+    const call = m.client.callTool({ name: 'process_list', arguments: {} }, undefined, {
+      signal: ac.signal,
+    });
+    await reached;
+    expect(mintSignal).toBeDefined();
+    ac.abort();
+    await expect(call).rejects.toThrow();
+    await vi.waitFor(() => expect(mintSignal!.aborted).toBe(true));
+    expect(m.processOps).toEqual([]);
+    await m.client.close();
+    await m.served;
+  });
+
+  it('a record still below lease+processes: the §7 refusal naming the sandbox, after one re-mint, sending nothing', async () => {
+    const REFUSAL = `processes not enabled for this sandbox; ask the user to run: mocactl sbx mode ${SBX} lease+processes`;
+    const m = leaseSession(['lease'], { record: () => 'lease' });
+    await m.connect();
+    await m.bash('echo'); // the held token
+    expect(m.mints()).toBe(1);
+    const r = (await m.client.callTool({
+      name: 'process_start',
+      arguments: { command: 'python3 -m http.server' },
+    })) as { content: { text: string }[]; isError?: boolean };
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toBe(REFUSAL);
+    expect(m.mints()).toBe(2); // one re-mint per refused call, no more
+    expect(m.processOps).toEqual([]);
+    await m.client.close();
+    await m.served;
+    // No token held yet: the call's own first mint is the fresh one, and is not repeated.
+    const first = leaseSession(['lease'], { record: () => 'lease' });
+    await first.connect();
+    const r2 = (await first.client.callTool({ name: 'process_list', arguments: {} })) as {
+      content: { text: string }[];
+      isError?: boolean;
+    };
+    expect(r2.content[0]!.text).toBe(REFUSAL);
+    expect(first.mints()).toBe(1);
+    expect(first.processOps).toEqual([]);
+    await first.client.close();
+    await first.served;
+  });
+
+  it('jwtMode reads the mode claim; anything else is per-exec', () => {
+    expect(jwtMode(modeJwt('lease+processes'))).toBe('lease+processes');
+    expect(jwtMode(modeJwt('bogus'))).toBe('per-exec');
+    expect(jwtMode(TOKEN.token)).toBe('per-exec');
+    expect(jwtMode('not-a-jwt')).toBe('per-exec');
   });
 
   it('stops serving when the signal aborts', async () => {

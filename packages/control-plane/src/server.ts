@@ -152,12 +152,13 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
         req.method ?? '',
         req.url ?? '',
         deps.config.routeProfile ?? 'harness',
-        // Both gates, in one object. ADR-0045: a feature-gated route is unmounted when its
+        // Every gate, in one object. ADR-0045: a feature-gated route is unmounted when its
         // feature is off, so it 404s before the body below is read -- otherwise an empty body
         // would answer 400 invalid_json and thereby reveal that the route exists.
         {
           egress: deps.config.sandbox?.egress !== undefined,
           testUsers: !!deps.testUsers,
+          grants: deps.grantSigner !== undefined,
         },
       );
       if (!matched) {
@@ -174,7 +175,7 @@ export function buildHandler(deps: CpDeps): (req: IncomingMessage, res: ServerRe
       // consequence leaked and the 64 KiB cap bounded it, but authentication belongs in front. Every
       // route here is new in MU1, so no existing caller depends on the old codes.
       authorize(matched.route, req, deps, ctx);
-      // Roles and enrollment NOW (register G38): a token's `roles` are what was true at its mint; with
+      // Roles and enrollment NOW: a token's `roles` are what was true at its mint; with
       // a members store the subject's current ones replace them, so a grant, revoke or lapse takes
       // effect at the next request. Without a store the token's claims stand, as before.
       if (ctx.principal && deps.members) {

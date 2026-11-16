@@ -1,4 +1,4 @@
-# deploy/sbx/sbx-host-agent-wanted.timer -- apply the wanted state every 15 seconds (register G31).
+# deploy/sbx/sbx-host-agent-wanted.timer -- apply the wanted state every 15 seconds.
 # Oneshot runs do not overlap; a run takes about a second, plus a worker start when one is wanted.
 [Unit]
 Description=Apply the SBX0 wanted state every 15 seconds

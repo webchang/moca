@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # deploy/sbx/template-onboarding/template-build.sh -- on the KVM host, turn a container image into an SBX0 template's
-# golden snapshot, checked in a microVM before it is published (deploy/sbx/template-onboarding/ONBOARDING.md, steps 1-2).
+# golden snapshot, checked in a microVM before it is published, and its template record (RUNBOOK §5).
 #
 #   sudo deploy/sbx/template-onboarding/template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker]
 #                                     [--registry HOST] [--egress-ca PATH] [--gate-record FILE [--gate-commit SHA]]
 #                                     [--keep-image] [--force]
 #
-# --gate-record FILE is the image's gate record from its builder (image-factory's
-# `image-factory/<family>/1`; governance/GATING-RULES.md §3). The build refuses unless the record's
+# The rule ids below (M3, X1, X5, X10, X12, X16) are governance/GATING-RULES.md's.
+#
+# --gate-record FILE is the image's gate record from its builder (a family record such as
+# `<builder>/<family>/1`; governance/GATING-RULES.md §3). The build refuses unless the record's
 # gate passed (X1), its image digest is the spec's, and the spec's `source_record_digest` is that
 # digest (X10); for a spec that skips the git identity check, the record must show commits refused
 # (X5, X12). The template record then carries `gate_record`: the evidence, the record's sha256 and,
@@ -21,9 +23,11 @@
 #
 # --registry HOST pulls a spec image that names no registry (`team/image@sha256:...`, as image
 # builders write them so that no registry host is committed) from HOST. An image that names one
-# (its first part has a dot or a colon, or is localhost) is pulled as it is.
+# (its first part has a dot or a colon, or is localhost) is pulled as it is. The host is used for
+# the pull only: build-rootfs.sh --source-name records the spec's own reference in the guest, and
+# the template record keeps it too, so neither names the registry host (X16).
 #
-# SPEC is a template spec, JSON (schema moca-sbx-template-spec/1; ONBOARDING.md has the fields):
+# SPEC is a template spec, JSON (schema moca-sbx-template-spec/1):
 #   id                       the template id clients ask for, ^[a-z0-9][a-z0-9-]{0,30}$
 #   image                    the container image, pinned: repository@sha256:<64 hex>
 #   guest_ram_mb, vcpus      the guest's size (build-snapshot.sh --guest-ram-mb, --vcpus)
@@ -42,14 +46,17 @@
 #                            every extended regex in expect
 #   description, tools       the template's entry, as clients see it (GET /v1/templates)
 #   etc_hosts_sha256         optional: the sha256 the image's /etc/hosts must have in the rootfs (an
-#                            image builder's own check, e.g. image-factory's; a mismatch stops the build)
+#                            image builder's own check; a mismatch stops the build)
+#   source_record_digest     optional: the digest of the image's gate record (X10; --gate-record)
+#   probe_status             optional: how the probe's expectation was measured; `unmeasured` or
+#                            `none` is refused, since such a probe cannot be checked
 #
 # The probe's command and counts must be ones that may be shared: for a benchmark, a public test
 # target, never the tests that grade a fix (their counts would be answer-key material).
 #
 # What it does, each step failing the whole build:
-#   1. checks the spec, and that $SBX_SRV has SBX_MIN_FREE_GB free (default 50: a 4 GiB guest's
-#      snapshot is 7-11 GB, and the rootfs and image are on top while it builds);
+#   1. checks the spec, and that $SBX_SRV has SBX_MIN_FREE_GB free (default 50: a snapshot holds the
+#      guest's whole RAM and its rootfs, and the rootfs tree and the image are on top while it builds);
 #   2. pulls the image by digest and checks the digest it got;
 #   3. deploy/microvm/build-rootfs.sh (then, with etc_hosts_sha256, that check on the tree), then
 #      deploy/microvm/build-snapshot.sh with the spec's flags and
@@ -62,12 +69,14 @@
 #
 # Names: the snapshot is <id>-<first 12 hex of the image digest>, and its worker id is
 # sbx_<id with - as _>_<the same 12 hex>, so a new image of a template is a new snapshot and a new
-# worker (RUNBOOK §5, versioned updates). A snapshot that already exists with the same record is not
+# worker, and the old worker keeps serving until it is retired. A snapshot that already exists with the same record is not
 # rebuilt: the same spec, CA, --vmm and --kernel (its sha256 in the manifest). --force rebuilds it,
 # and is needed after a change to the guest agent's source (--agent), which is not compared.
 #
 # It touches nothing else: no worker, no unit, no cluster. Installing the worker is
-# deploy/sbx/install-host.sh, after template-register.sh and setup.sh (ONBOARDING.md).
+# deploy/sbx/install-host.sh, after template-register.sh and setup.sh; it finds the record beside the
+# snapshot and sets the worker's SH_TEMPLATE_RECORD and SANDBOX_TEMPLATE, so the worker checks the
+# record against its snapshot at every start.
 #
 # Exit: 0 built (or already built); 1 a step failed; 2 a usage or spec error.
 set -euo pipefail
@@ -76,9 +85,9 @@ TPL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TPL_DIR/../../.." && pwd)"
 : "${SBX_SRV:=/srv/sbx}"
 : "${SBX_MIN_FREE_GB:=50}"
-# The verify cache's seed (G50): SBX0's own worker binary, never Moca's /usr/local/bin one (an SBX0
+# The verify cache's seed: SBX0's own worker binary, never Moca's /usr/local/bin one (an SBX0
 # build runs no Moca binary), and the cache under SBX0's own tree, where install-host.sh points each
-# worker and E's rm -rf of SBX_SRV removes it. A missing binary only skips the seed.
+# worker, so removing SBX_SRV removes it too. A missing binary only skips the seed.
 : "${SBX_WORKER_BIN:=/usr/local/libexec/sbx/microvm-worker}"
 : "${SH_VERIFY_CACHE_DIR:=$SBX_SRV/verify-cache}"
 export SH_VERIFY_CACHE_DIR
@@ -93,7 +102,7 @@ STANDBY_DEPTH=2 MEMORY_RESERVE_MB=1024 VM_OVERHEAD_MB=32
 log() { printf '==> %s\n' "$*"; }
 die() { echo "deploy/sbx/template-onboarding/template-build.sh: $*" >&2; exit 1; }
 usage() {
-  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--egress-ca PATH] [--keep-image] [--force]' >&2
+  echo 'usage: template-build.sh SPEC --kernel PATH [--agent DIR] [--vmm firecracker|cloud-hypervisor] [--registry HOST] [--egress-ca PATH] [--gate-record FILE [--gate-commit SHA]] [--keep-image] [--force]' >&2
   exit 2
 }
 spec_error() { echo "deploy/sbx/template-onboarding/template-build.sh: $SPEC: $*" >&2; exit 2; }
@@ -137,7 +146,7 @@ if [[ -n "$REGISTRY" && "$IMAGE" == */* && "$first" != *.* && "$first" != *:* &&
   PULL="$REGISTRY/$IMAGE"
 fi
 RAM="$(field guest_ram_mb)" VCPUS="$(field vcpus)"
-[[ "$RAM" =~ ^[1-9][0-9]*$ ]] && ((RAM >= 128)) || spec_error "guest_ram_mb must be a whole number of MiB, at least 128, got '$RAM'"
+[[ "$RAM" =~ ^[1-9][0-9]*$ && "$RAM" -ge 128 ]] || spec_error "guest_ram_mb must be a whole number of MiB, at least 128, got '$RAM'"
 [[ "$VCPUS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || spec_error "vcpus must be 1-32, got '$VCPUS'"
 GUEST_HOME="$(field guest_home)"
 [[ -z "$GUEST_HOME" || "$GUEST_HOME" =~ ^/tmp(/[A-Za-z0-9._-]+)+$ ]] || spec_error "guest_home must be a path under /tmp, got '$GUEST_HOME'"
@@ -172,7 +181,7 @@ esac
 HOSTS_SHA="$(field etc_hosts_sha256)"
 [[ -z "$HOSTS_SHA" || "$HOSTS_SHA" =~ ^[0-9a-f]{64}$ ]] || spec_error "etc_hosts_sha256 must be 64 hex digits, got '$HOSTS_SHA'"
 
-# The gate evidence (governance/GATING-RULES.md X1, X5, X10, X12). Checked here, with the spec, so a
+# The gate evidence (X1, X5, X10, X12). Checked here, with the spec, so a
 # refusal costs no pull.
 SRC_DIGEST="$(field source_record_digest)"
 [[ -z "$GATE_COMMIT" || -n "$GATE_RECORD" ]] || spec_error '--gate-commit needs --gate-record'
@@ -228,7 +237,10 @@ verify_command() {
   # Test runners colour their summaries (pytest: ESC[32m8 passed ESC[0m), so the patterns are
   # matched against the log with ANSI escapes stripped, and the tail shown is the plain text too.
   printf '%s\n' "sed 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/.template-probe.log >/tmp/.template-probe.txt"
+  # The guest's shell expands $rc, not this one.
+  # shellcheck disable=SC2016
   printf '%s\n' 'tail -c 12288 /tmp/.template-probe.txt' 'echo "template-build: the probe exited $rc"'
+  # shellcheck disable=SC2016
   printf '[ "$rc" = %q ] || { echo "template-build: want exit %s"; exit 91; }\n' "$want" "$want"
   for re in $(jq -r '.probe.expect // [] | .[] | @base64' "$SPEC"); do
     re="$(printf '%s' "$re" | base64 --decode)"
@@ -335,7 +347,7 @@ got="$(podman image inspect --format '{{.Digest}}' "$PULL")"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
 log "building the rootfs of $NAME"
-# The tools this template's image must carry (GATING-RULES.md M3): its spec's `tools` plus what the
+# The tools this template's image must carry (M3): its spec's `tools` plus what the
 # guest agent itself runs (bash for every command; base64, cat, ls and file for the harness's file
 # operations). Not Moca's whole sandbox toolchain, which benchmark images do not carry.
 required="$(jq -r '[.tools[]] + ["bash","ls","cat","base64","file"] | unique | join(" ")' "$SPEC")"
@@ -366,3 +378,4 @@ egress_flag=''
 log "built template $ID: snapshot $NAME, worker $WORKER"
 log "record: $RECORD (copy it to the operator's machine for deploy/sbx/template-onboarding/template-register.sh)"
 log "then, after setup.sh: sudo deploy/sbx/install-host.sh <bundle of $WORKER> --snapshot $NAME --budget-mb <at least $BUDGET_MIN>$egress_flag"
+log "install-host.sh wires $RECORD into the worker (SH_TEMPLATE_RECORD, SANDBOX_TEMPLATE=$ID), so the worker checks it at every start"

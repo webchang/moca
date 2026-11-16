@@ -60,7 +60,7 @@ export interface ExchangeResponse {
   sandboxSeedSource?: 'build' | 'declared';
   /**
    * The build the session resolved its template to (`sha256:<manifest hash>`, combined control plane
-   * spec §3.4, register G19): the data plane keeps the session on workers labelled `moca.dev/build`
+   * spec §3.4): the data plane keeps the session on workers labelled `moca.dev/build`
    * with it. Absent for a session without a resolved build, so that response is unchanged.
    */
   sandboxBuildId?: string;
@@ -92,8 +92,14 @@ export function placeholderFor(subject: string): string {
  * response stays byte-identical. That holds even for a record that stored a tier while tiers were
  * declared: the data plane runs untiered then and filters nothing, so naming the stored tier would
  * claim a placement that no longer happens (spec §3.3).
+ *
+ * Takes the FIELD rather than a SessionRecord, so a TurnRecord -- which pins its own
+ * `sandboxTier` (#388) -- gets the identical reading with no second copy of this rule.
  */
-export function sessionTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers']): string {
+export function sessionTier(
+  rec: Pick<SessionRecord, 'sandboxTier'>,
+  tiers: CpConfig['sandboxTiers'],
+): string {
   return tiers ? rec.sandboxTier || tiers.default : '';
 }
 
@@ -130,9 +136,9 @@ export function sessionTemplate(
  * §3.2), else the declared one (sessionTemplate). The build is the session's, never the newest. A
  * build with no seed (or an empty one) sends none, even if the env list declares one: the build is
  * what the session runs. A store that cannot answer FAILS CLOSED, as sessionTemplate does: the
- * exchange refuses (internal_error, or the store's own CpError), never a turn on a workspace
- * without its build's seed. Only a template or build the store does not hold falls back to the
- * declared seed.
+ * exchange refuses (a CpError the data plane reads as retryable: credential_unavailable, and a
+ * dequeue leaves the turn pending), never a turn on a workspace without its build's seed. Only a
+ * template or build the store does not hold falls back to the declared seed.
  */
 export async function sessionSeed(
   rec: SessionRecord,
@@ -398,10 +404,20 @@ export const targetOf = (r: ResolvedInference): InferenceTarget => ({
   header: r.authHeader,
 });
 
-export async function exchangeCredential(
+/**
+ * The IDENTITY half of a session-token exchange: verify the token, find the session it names, and
+ * refuse one that is not the presenter's or is tombstoned. Everything the caller does with the
+ * session afterwards -- resolving a credential, or minting MI1 §6.1's grants -- is its own.
+ *
+ * Shared rather than duplicated so the 404-shaped answer lives in ONE place: `exchangeCredential`
+ * below and `grant-exchange.ts` must refuse an unknown session, another subject's session and a
+ * deleted session identically, or the pair of them becomes an existence oracle that the session
+ * route alone is not.
+ */
+export async function sessionFromToken(
   presentedToken: string,
   deps: CpDeps,
-): Promise<ExchangeResponse> {
+): Promise<SessionRecord> {
   // Only a SESSION token may drive a turn; an api token is rejected here (plan gap #7).
   const claims = verifyToken(presentedToken, deps.verifyKeys, {
     now: Math.floor(deps.now() / 1000),
@@ -417,6 +433,14 @@ export async function exchangeCredential(
   }
   // The tombstone check is what stops a DELETED session starting a new turn (spec §5.3, §7.3).
   if (rec.tombstone) throw new CpError('session_not_found', undefined, claims.sid);
+  return rec;
+}
+
+export async function exchangeCredential(
+  presentedToken: string,
+  deps: CpDeps,
+): Promise<ExchangeResponse> {
+  const rec = await sessionFromToken(presentedToken, deps);
 
   const resolved = await resolveInference(rec, deps);
   const { secretValue, credentialName, baseUrl, authHeader, usedOperatorFallback } = resolved;
@@ -463,7 +487,9 @@ export async function exchangeCredential(
   }
 
   const tier = sessionTier(rec, deps.config.sandboxTiers);
-  // A turn of a session pinned to a build keeps that build's worker running between turns.
+  // A turn of a session pinned to a build keeps that build's worker running between turns. After
+  // the audit and every refusal (the template and seed are resolved above), so a refused exchange
+  // holds nothing; best effort, it never refuses one itself.
   if (template) await holdPinnedWorker(rec, deps);
   return {
     mode,

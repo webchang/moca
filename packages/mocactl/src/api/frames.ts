@@ -28,11 +28,10 @@ export type ToolResultFrame = {
   isError: boolean;
   preview: string;
 };
-/** Where the turn ran (`TurnResult.sandbox`): its template and, for a seeded one, the seed's origin. */
+/** Where the turn ran (`TurnResult.sandbox`): for a seeded template, the seed's origin. */
 export type TurnPlacement = {
   id: string;
   tier: string;
-  template?: string;
   seed?: { source: 'build' | 'declared'; buildId?: string };
   workspaceReset?: unknown;
 };

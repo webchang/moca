@@ -28,7 +28,7 @@ export const TIER_LABEL = 'moca.dev/tier';
  * workers labelled T; a session with none only on workers without the label (§4).
  */
 export const TEMPLATE_LABEL = 'moca.dev/template';
-/** The build a worker serves, its snapshot's manifest hash (remote-worker session.BuildLabelKey, G19). */
+/** The build a worker serves, its snapshot's manifest hash (remote-worker session.BuildLabelKey). */
 export const BUILD_LABEL = 'moca.dev/build';
 
 /**

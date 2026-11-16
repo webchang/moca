@@ -41,9 +41,9 @@ export interface SessionOptionField {
   /**
    * A value the caller gave that is not among the choices is still sent, even when there are
    * choices, for the server to resolve and check: the sandbox template, whose choices are only the
-   * deployment's declared ids while the control plane's template store also resolves `id`,
-   * `id:tag` and `id@sha256:…` (combined control plane spec §3.4; register G37). A wrong one is
-   * the server's refusal (`unknown_template`, `template_retired`, `template_not_active`).
+   * deployment's declared ids while a control plane with a template store may also resolve
+   * references such as `id:tag` and `id@<build>`. A wrong one is the server's refusal, shown as
+   * the server words it.
    */
   sendUnlisted?: boolean;
   /** `values` are the fields resolved before this one, so a choice can depend on them (the model on the credential). */

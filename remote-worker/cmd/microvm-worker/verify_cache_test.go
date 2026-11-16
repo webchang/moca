@@ -23,7 +23,7 @@ func writeCLISnapshot(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	m := vmpool.Manifest{Image: "sbx_py312", VMM: string(vmpool.Firecracker), InstanceType: "c5.metal", GuestRAMMB: 4096}
+	m := vmpool.Manifest{Image: "sbx_py312", VMM: string(vmpool.Firecracker), InstanceType: "example.metal", GuestRAMMB: 4096}
 	if err := m.Fill(img); err != nil {
 		t.Fatal(err)
 	}

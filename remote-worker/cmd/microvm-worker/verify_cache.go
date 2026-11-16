@@ -13,7 +13,7 @@ import (
 	"github.com/rossoctl/moca/remote-worker/internal/vmpool"
 )
 
-// defaultVerifyCacheDir holds the worker's verify caches (G50, vmpool/verifycache.go), one
+// defaultVerifyCacheDir holds the worker's verify caches (vmpool/verifycache.go), one
 // file per snapshot directory. The worker has no state directory of its own otherwise; this
 // follows the host's /var/lib/moca-control-plane, root-owned like the snapshots it describes,
 // and deliberately NOT inside SH_SNAPSHOT_DIR: snapshot directories are sealed read-only by
@@ -74,7 +74,7 @@ func verifyCachePath(get func(string) string, snapDir string) (string, error) {
 // its one mode is -verify-snapshot DIR: the full start-time verify of DIR (memfile included),
 // recording what matched in the cache the worker for DIR will read. build-snapshot.sh runs
 // it after publishing a snapshot, while the files are still in the page cache, so the
-// window's first cold start skips the re-hash too (Settle waits out the cache's ~2 s
+// first cold start skips the re-hash too (Settle waits out the cache's ~2 s
 // racy window for files the build touched last). Exit 0 verified, 1 not, 2 usage.
 func runCLI(args []string, get func(string) string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("microvm-worker", flag.ContinueOnError)

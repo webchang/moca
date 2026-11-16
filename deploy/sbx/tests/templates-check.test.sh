@@ -6,6 +6,8 @@
 # check against a correct service; fail the check that a broken service breaks (two templates on one
 # worker, an unknown template accepted, a probe that answers on the wrong template, a cross-worker
 # token accepted, B reaching A's sandbox); delete every sandbox it created; never print a token.
+# The check runs under this test's own interpreter ($BASH), so `/bin/bash templates-check.test.sh`
+# tests it on bash 3.2.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CHECK="$SRC/deploy/sbx/templates-check.sh"
@@ -97,13 +99,13 @@ run_check() { # run_check [VAR=VALUE ...]: the check against the fakes, its outp
   rm -rf "$MOCK_DIR/sb"; mkdir -p "$MOCK_DIR/sb"; : >"$MOCK_LOG"
   env SBX_LIVE_CHECK=1 SBX_API_URL=https://sbx-api.example.invalid SBX_CHECK_HOME_A="$TMP/home-a" SBX_CHECK_HOME_B="$TMP/home-b" \
     SBX_CHECK_TEMPLATES=default,swe-x SBX_CHECK_PROBE_SWE_X=probe-swe MOCACTL="$TMP/mocactl.mjs" SBX_CHECK_PYTHON="$TMP/bin/python3" \
-    XDG_CONFIG_HOME=/should-be-unset "$@" bash "$CHECK" >"$TMP/out" 2>&1
+    XDG_CONFIG_HOME=/should-be-unset "$@" "$BASH" "$CHECK" >"$TMP/out" 2>&1
 }
 live_left() { jq -r 'select(.state != "terminated") | .id' "$MOCK_DIR"/sb/*.json 2>/dev/null | wc -l | tr -d ' '; }
 
 # Nothing without SBX_LIVE_CHECK=1.
 : >"$MOCK_LOG"
-bash "$CHECK" >"$TMP/out" 2>&1 || fail 'without SBX_LIVE_CHECK it exited non-zero'
+"$BASH" "$CHECK" >"$TMP/out" 2>&1 || fail 'without SBX_LIVE_CHECK it exited non-zero'
 grep -q '^SKIP: ' "$TMP/out" && [[ ! -s "$MOCK_LOG" ]] || fail 'without SBX_LIVE_CHECK it did something'
 pass 'does nothing without SBX_LIVE_CHECK=1'
 

@@ -2,18 +2,31 @@
 # deploy/sbx/host-agent.sh -- sbx-host-agent, a KVM host's template agent
 # (docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md §6.1). One run is one poll:
 # report the inventory, claim queued builds, build each with template-build.sh, report the outcome;
-# then start and stop installed workers as the control plane wants (§6.3), and remove retired builds
-# it names (§6.1 step 7: the worker uninstalled, the snapshot and its record deleted). The control plane
-# registers or rejects a built build by policy (§8.2) and decides what runs; nothing here does.
+# then start and stop installed workers as the control plane wants (§6.3), and remove the retired
+# builds it names (§6.1 step 7: the worker uninstalled, the snapshot and its record deleted). The
+# control plane registers or rejects a built build by policy (§8.2) and decides what runs; nothing
+# here does.
 #
-# A worker must already be installed (install-host.sh, with its relay token from setup.sh): a wanted
-# build whose worker is not is reported `refused`, never installed here (register gap G18).
+# It installs no worker: a registered build's worker is installed by an operator (install-host.sh,
+# from the template record template-build.sh wrote, with its relay token from setup.sh). A wanted
+# build whose worker is not installed is reported `refused`, never installed here.
 #
 #   sudo deploy/sbx/host-agent.sh --once          one poll (the unit's timer runs it)
 #   sudo deploy/sbx/host-agent.sh --wanted-only   the inventory and the wanted state only: no claim,
 #                                                 no build (sbx-host-agent-wanted's timer, every 15 s,
-#                                                 so an activation waits seconds, not behind a build:
-#                                                 register G31); then the egress step below
+#                                                 so an activation waits seconds, not behind a build);
+#                                                 then the egress step below
+#
+# The wanted state (GET /v1/hosts/<id>/wanted): `run` lists the leased builds placed on this host,
+# `stop` the ones it holds with no lease and no live sandbox (or that another host is placed on). The
+# agent stops each `stop` worker whose unit is active, then starts each `run` worker whose
+# sbx-worker@<id> unit is installed and not active, reporting each start (`attached`), refusal
+# (`refused`, with why) and stop (`detached`) to POST /v1/hosts/<id>/workers/report. `remove` lists
+# the retired builds it holds with no live sandbox (each also in `stop`, so a running worker is
+# stopped first): see removal(), reported `removed`. Readiness is the relay's attached record, never
+# these reports. A
+# lock ($SBX_SRV/.activation.lock, flock) keeps a build poll and a --wanted-only run from applying
+# the wanted state at once: the one that does not get it skips, saying so.
 #
 # The egress step, in --wanted-only runs only: it READS moca-egress's journal and posts
 # the proxy's audit events, with no field added, removed or changed, to POST /v1/hosts/<id>/egress, where each event
@@ -22,13 +35,13 @@
 #   - Off when `systemctl is-active moca-egress.service` does not say active (a --no-egress host, none
 #     installed, or a reused moca-egress not started): then no journal read, no post, no cursor file.
 #     Active, not enabled: install-host.sh reuses a moca-egress.service another install owns (a P6
-#     worker's) without enabling it, and that install may start it for a window only; what matters is
+#     worker's) without enabling it, and that install may start it for a while only; what matters is
 #     that a proxy serves this host's workers now. A read, so the agent still never acts on moca-egress.
 #   - Only this host's sandboxes' events leave it: the wanted state's `egressSids` (the workspace keys
 #     of the sandboxes on its workers, live or just ended) is the list, and an event whose sid is not in
 #     it (a Moca P6 session's, served by the same proxy) is not sent, only counted (egressNotOurs).
 #     An audit_dropped report (a count, no sid) is sent. A control plane whose wanted state has no
-#     egressSids (older than openapi 1.7.0) gets nothing: an error line, no journal read, the cursor kept.
+#     egressSids (older than openapi 1.14.0) gets nothing: an error line, no journal read, the cursor kept.
 #     The list comes from activation()'s read of the wanted state; a run whose activation was skipped
 #     for the lock reads it once itself. That read comes before the journal read, so a sandbox created
 #     in between would be missing from it: a batch with any sid not in the list reads the wanted state
@@ -79,37 +92,40 @@
 #   SBX_SRV                  default /srv/sbx: snapshots under $SBX_SRV/snapshots, records under templates/
 #   SBX_ENV_DIR              default /etc/sbx
 #   SBX_DISK_FLOOR_GB        default 60: no build is claimed below this much free disk on $SBX_SRV
-#                            (template-build.sh's own refusal; retained workspaces count, W8)
-#   SBX_BUILD_CONCURRENCY    default 1: builds claimed per poll
-#   SBX_ACTIVE_LIMIT, SBX_IDLE_LIMIT_S   reported to the control plane (§6.2); default 0 (none set)
+#                            (template-build.sh's own refusal)
+#   SBX_BUILD_CONCURRENCY    default 1 (1-4): builds claimed per poll
+#   SBX_ACTIVE_LIMIT, SBX_IDLE_LIMIT_S   reported to the control plane in the inventory's limits;
+#                            default 0 (none set)
 #   SBX_MEM_FLOOR_MIB        optional; the memory the control plane never places workers into
-#                            (memory-aware placement spec §4, register G39): a whole number of MiB,
-#                            at least 1. Unset: 10% of MemTotal, at least 4096. The inventory reports
-#                            the effective floor (memFloorMib)
+#                            (memory-aware placement): a whole number of MiB, at least 1. Unset: 10%
+#                            of MemTotal, at least 4096. The inventory reports the effective floor
+#                            (memFloorMib)
 #   SBX_MEM_PRESSURE_LIMIT   default 10: while memory PSI `full avg10` (a percentage) is above it, the
 #                            host takes no new start (what it runs is kept); a number, more than 0,
 #                            at most 100, up to two decimals
 #   SBX_START_CONCURRENCY    default 4: at most this many workers STARTING at once (started, not yet
-#                            attached to the relay: cold-start pacing spec §4, register G43); a whole
+#                            attached to the relay: the start limit, §6.5); a whole
 #                            number, at least 1 (0 is refused). Not SBX_ACTIVE_LIMIT, which caps running ones
 #   SBX_START_WINDOW_S       default 300: with a control plane that sends no `starting` (older than
-#                            openapi 1.9.0), a worker this agent started less than this many seconds ago,
+#                            openapi 1.13.0), a worker this agent started less than this many seconds ago,
 #                            whose unit is active and which is still wanted, counts as starting. With
 #                            `starting`, the most a listed worker counts as starting: past it, it is
 #                            stuck (an error line each run) and holds no start slot
 #   SBX_IDLE_GRACE_S         default 0 (off): how long the control plane keeps a released build's running
-#                            worker before it is stopped (the idle grace, register G43); a whole number
+#                            worker before it is stopped (the idle grace); a whole number
 #                            of seconds, at most 86400 (a day), without a leading zero. Reported in the
 #                            inventory's limits (idleGraceSeconds); the control plane decides the grace
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
-#   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs it
-#                            (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
-#   SBX_REGISTRY             optional; template-build.sh --registry
+#   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs
+#                            its --uninstall (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
+#   SBX_REGISTRY             optional; template-build.sh --registry. With it set, no build is claimed
+#                            until REGISTRY_AUTH_FILE (default /run/containers/0/auth.json) holds a
+#                            login for it
 #   SBX_SYS_ROOT             default /: where /proc and /sys/fs/cgroup are read from (a test seam)
 #
-# The inventory's memory (register G39), sent on every run, so the control plane places workers by
-# memory as well as by SBX_ACTIVE_LIMIT: `memory: {memTotalMib, memAvailableMib, memPressureFull10,
-# memFloorMib, memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
+# The inventory's memory, sent on every run, so the control plane places workers by memory as well
+# as by SBX_ACTIVE_LIMIT: `memory: {memTotalMib, memAvailableMib, memPressureFull10, memFloorMib,
+# memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
 #   - memTotalMib, memAvailableMib: /proc/meminfo; memFloorMib the effective floor. Without the two,
 #     none of the three is sent (an error line): the control plane then places by SBX_ACTIVE_LIMIT
 #     alone, as with an older agent.
@@ -122,13 +138,14 @@
 #     slice's memory.stat (cgroup v2, sbx.slice/sbx-<id>.slice): anon + shmem + kernel (kernel_stack +
 #     pagetables + slab on a kernel without the `kernel` line). Never memory.current: that counts the
 #     page cache the VMs' files fill (rootfs, workspace), several GiB a worker that the kernel takes
-#     back at need (register G48). The pinned memory file is file-backed and mlocked, so it is in
-#     neither: the worker's cost counts it. A slice whose memory.stat cannot be read, or has no anon
-#     line, is left out, never guessed; the summary lists it ("sliceUnread").
+#     back at need. The pinned memory file is file-backed and mlocked, so it is in neither: the
+#     worker's cost counts it. A slice whose memory.stat cannot be read, or has no anon line, is left
+#     out, never guessed; the summary lists it ("sliceUnread").
 #   - memfileMismatch: the held builds whose memory file (snapshots/<snapshot>/memfile) is not exactly
 #     the manifest's guest_ram_mb x 1 MiB (or is missing): each is an error line, the summary counts
 #     them ("memfileMismatch"), the control plane never places one here, and this agent refuses to
 #     start one (reported `refused`) whatever a control plane asks.
+#
 # Nothing that names where an image lives leaves the host: a failed build's reason and its log are
 # redacted (see redact()), the full log stays in $SBX_SRV/agent-logs (0700), and a template record or
 # manifest that names SBX_REGISTRY is not sent (the build fails `leak_refused`). A failure's reason
@@ -138,12 +155,12 @@
 # template record or manifest after the build). Every claimed build is reported failed, best
 # effort, on any way out short of `built`.
 #
-# The start limit (register G43), in activation(): a cold worker reads and pins its whole memory file
-# before it attaches, and starts at once share the disk, so the agent starts at most
-# SBX_START_CONCURRENCY less those starting now, per run, in the wanted answer's order (oldest lease
-# first); the rest wait for the next run (15 s) and are counted in the summary (startQueued).
-# activation() never waits for a start: `systemctl start` of the Type=simple worker unit returns at once.
-#   - "Starting" comes from the control plane: the wanted answer's `starting` (openapi 1.9.0) lists the
+# The start limit (§6.5), in activation(): a cold worker reads and pins its whole memory file before
+# it attaches, and starts at once share the disk, so the agent starts at most SBX_START_CONCURRENCY
+# less those starting now, per run, in the wanted answer's order (oldest lease first); the rest wait
+# for the next run (15 s) and are counted in the summary (startQueued). activation() never waits for
+# a start: `systemctl start` of the Type=simple worker unit returns at once.
+#   - "Starting" comes from the control plane: the wanted answer's `starting` (openapi 1.13.0) lists the
 #     builds placed here whose worker is not attached to the relay; a listed build whose unit is active
 #     is starting. A control plane without `starting` cannot say what is attached, so the agent counts
 #     its own: the workers it started less than SBX_START_WINDOW_S ago that are still active and wanted.
@@ -158,27 +175,26 @@
 #     their mean as startSeconds (absent until a start is done, so always with an older control plane),
 #     beside startConcurrency.
 #
-# The idle grace (register G43): with SBX_IDLE_GRACE_S > 0, the control plane keeps a released build in
-# `run` for that long after its last lease ends (if the host has the slot and the memory), and lists
-# it in the wanted answer's `graced`; a wanted build that needs the slot moves it to `stop`. The agent
+# The idle grace (§6.5): with SBX_IDLE_GRACE_S > 0, the control plane keeps a released build in `run`
+# for that long after its last lease ends (if the host has the slot and the memory), and lists it in
+# the wanted answer's `graced`; a wanted build that needs the slot moves it to `stop`. The agent
 # applies the answer as ever (a graced worker's unit runs, so nothing is started for it), never starts
-# a graced build whose unit is not running (a grace keeps a worker, it never starts one), and counts the
-# graced workers it runs in the summary ("graced":<n>). A retired build may come in `stop` beside
-# `remove`: its worker is stopped first, and removed in the same run.
+# a graced build whose unit is not running (a grace keeps a worker, it never starts one), and counts
+# the graced workers it runs in the summary ("graced":<n>).
 #
-# The token never reaches argv or a log: curl reads it from a 0600 header file. No host IP, account
-# or registry host is logged, and no egress event is printed. Output: one JSON line per action, then one
-# summary line {"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}, a
-# --wanted-only one ending with "egress":"on"|"off" and "egressRead","egressAccepted","egressRefused",
-# "egressSkipped","egressRejected","egressNotOurs"; then, when there is something to say about memory,
-# "psi":"absent", "sliceUnread":[<worker id>...] and "memfileMismatch":<n>; then "startQueued":<n> when
-# the start limit left wanted workers for a later run; then "graced":<n> when the idle grace keeps any.
-# A refusal of its own settings is exit 2.
+# The token never reaches argv or a log: curl reads it from a 0600 header file, and no egress event is
+# printed. Output: one JSON line per action, then one summary line {"agent":"summary","claimed","built",
+# "failed","started","stopped","removed","errors"}, in a --wanted-only run followed by "egress":"on"|"off" and
+# "egressRead","egressAccepted","egressRefused","egressSkipped","egressRejected","egressNotOurs"; then,
+# when there is something to say about memory, "psi":"absent", "sliceUnread":[<worker id>...] and
+# "memfileMismatch":<n>; then "startQueued":<n> when the start limit left wanted workers for a later
+# run; then "graced":<n> when the idle grace keeps any. A refusal of its own settings is exit 2.
 set -euo pipefail
 export LC_ALL=C
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${SBX_TEMPLATE_BUILD:=$REPO_ROOT/deploy/sbx/template-onboarding/template-build.sh}"
+: "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}"
 HOST_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 HANDLE_RE='^b-[0-9a-f]{26}$'
 WORKER_RE='^[A-Za-z_][A-Za-z0-9_]*$'
@@ -188,12 +204,11 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
 CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
-EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NOT_OURS=0 EG_CODE=''
-EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
-: "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}" # a test seam
-: "${SBX_SYS_ROOT:=/}"                                            # a test seam: /proc, /sys
+: "${SBX_SYS_ROOT:=/}" # a test seam: /proc, /sys
 MEM_SUMMARY='' START_SUMMARY='' GRACE_SUMMARY='' INFLIGHT=0
 BUILD_ID_RE='^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$'
+EGRESS=off EG_READ=0 EG_ACCEPTED=0 EG_REFUSED=0 EG_SKIPPED=0 EG_REJECTED=0 EG_NOT_OURS=0 EG_CODE=''
+EGRESS_BATCH=1000 EGRESS_BATCHES=10 EGRESS_BUDGET_S=120
 error() { ERRORS=$((ERRORS + 1)); say "{\"agent\":\"error\",\"why\":$(jq -Rn --arg w "$1" '$w')}"; }
 
 check_settings() {
@@ -217,8 +232,9 @@ check_settings() {
   [[ "$SBX_START_WINDOW_S" =~ ^[1-9][0-9]{0,8}$ ]] ||
     refuse 'SBX_START_WINDOW_S must be a whole number of seconds, at least 1, without a leading zero'
   : "${SBX_IDLE_GRACE_S:=0}"
-  [[ "$SBX_IDLE_GRACE_S" =~ ^(0|[1-9][0-9]{0,4})$ ]] && ((SBX_IDLE_GRACE_S <= 86400)) ||
+  if ! [[ "$SBX_IDLE_GRACE_S" =~ ^(0|[1-9][0-9]{0,4})$ ]] || ((SBX_IDLE_GRACE_S > 86400)); then
     refuse 'SBX_IDLE_GRACE_S must be a whole number of seconds, 0 (off) to 86400, without a leading zero'
+  fi
   for v in SBX_DISK_FLOOR_GB SBX_BUILD_CONCURRENCY SBX_ACTIVE_LIMIT SBX_IDLE_LIMIT_S; do
     [[ -z "${!v:-}" || "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || refuse "$v must be a whole number without a leading zero"
   done
@@ -227,9 +243,10 @@ check_settings() {
   [[ -z "${SBX_MEM_FLOOR_MIB:-}" || "$SBX_MEM_FLOOR_MIB" =~ ^[1-9][0-9]{0,8}$ ]] ||
     refuse 'SBX_MEM_FLOOR_MIB must be a whole number of MiB, at least 1, without a leading zero'
   : "${SBX_MEM_PRESSURE_LIMIT:=10}"
-  [[ "$SBX_MEM_PRESSURE_LIMIT" =~ ^(0|[1-9][0-9]{0,2})(\.[0-9]{1,2})?$ ]] &&
-    awk -v v="$SBX_MEM_PRESSURE_LIMIT" 'BEGIN { exit !(v > 0 && v <= 100) }' ||
+  if ! [[ "$SBX_MEM_PRESSURE_LIMIT" =~ ^(0|[1-9][0-9]{0,2})(\.[0-9]{1,2})?$ ]] ||
+    ! awk -v v="$SBX_MEM_PRESSURE_LIMIT" 'BEGIN { exit !(v > 0 && v <= 100) }'; then
     refuse 'SBX_MEM_PRESSURE_LIMIT must be a number more than 0 and at most 100 (PSI full avg10, a percentage)'
+  fi
   [[ "$SBX_SYS_ROOT" == /* ]] || refuse 'SBX_SYS_ROOT must be an absolute path'
 }
 
@@ -297,7 +314,7 @@ memory_report() {
     grep -qxF -- "$w" "$running" && continue
     systemctl is-active --quiet "sbx-worker@$w.service" || continue
     printf '%s\n' "$w" >>"$running"
-    # Its VMs' unreclaimable memory (G48): anon + shmem + kernel, bytes to MiB; no anon line: unread.
+    # Its VMs' unreclaimable memory: anon + shmem + kernel, bytes to MiB; no anon line: unread.
     cur="$(awk '$2 ~ /^[0-9]+$/ { v[$1] = $2 }
       END { if (!("anon" in v)) exit
             k = ("kernel" in v) ? v["kernel"] : v["kernel_stack"] + v["pagetables"] + v["slab"]
@@ -338,8 +355,8 @@ memory_report() {
 
 # The snapshots this host holds, by manifest hash, as template-build.sh's records name them, each
 # with whether its worker's unit is running (the control plane counts running workers against
-# SBX_ACTIVE_LIMIT and keeps a running build on this host); its limits, with its start limit and
-# measured start time; and its memory.
+# SBX_ACTIVE_LIMIT and keeps a running build on this host); its limits, with its start limit,
+# measured start time and idle grace; and its memory.
 inventory() {
   local f w r out="$WORK/inventory.json" mem='{}' secs
   if memory_report; then mem="$(jq -c '{memory: .}' "$WORK/memory.json")" || mem='{}'; fi
@@ -367,11 +384,11 @@ report() { # report HANDLE BODY_JSON
 
 # redact: stdin to stdout with registry hosts, account-shaped numbers, URLs and IP addresses masked.
 # Build output names the image it pulls in full (build-rootfs.sh), and a private registry's host
-# carries its account (ykt3, 2026-11-04: one leaked into a build's reason and log). The control plane
-# keeps what it is sent, readable by clients and append-only in provenance, so nothing that names
-# where an image lives leaves the host. The full log stays on the host (SBX_SRV/agent-logs).
+# carries its account. The control plane keeps what it is sent, readable by clients and
+# append-only in provenance, so nothing that names where an image lives leaves the host. The full
+# log stays on the host (SBX_SRV/agent-logs).
 redact() {
-  # SBX_REGISTRY itself first, exactly, whatever its shape (register G28: the patterns below miss a
+  # SBX_REGISTRY itself first, exactly, whatever its shape (the patterns below miss a
   # bare dotted name with an uncommon suffix). Then portable ERE (GNU and BSD sed): a host is a
   # dotted name, or localhost, with an optional port.
   local own=()
@@ -425,8 +442,9 @@ build_one() { # build_one JOB_JSON
   "$SBX_TEMPLATE_BUILD" "$spec" --kernel "$SBX_KERNEL" ${args[@]+"${args[@]}"} >"$WORK/$handle.log" 2>&1 || rc=$?
   # The full, unredacted log stays on the host (root-only), for whoever runs it; only redacted text
   # leaves (log_tail, the failure report).
-  install -d -m 0700 "$SBX_SRV/agent-logs" && install -m 0600 "$WORK/$handle.log" "$SBX_SRV/agent-logs/$handle.log" ||
+  if ! { install -d -m 0700 "$SBX_SRV/agent-logs" && install -m 0600 "$WORK/$handle.log" "$SBX_SRV/agent-logs/$handle.log"; }; then
     error "could not keep the build log of $handle"
+  fi
   log_tail "$handle" "$WORK/$handle.log"
   if ((rc != 0)); then
     FAILED=$((FAILED + 1))
@@ -442,7 +460,7 @@ build_one() { # build_one JOB_JSON
     *"GiB free"* | *"free disk"*) code=disk_floor ;;
     *"spec"*"must"* | *"is not a JSON"*) code=spec_refused ;;
     esac
-    # The step a client reads without the code (autobench-moca, 2026-11-05): where the build failed.
+    # The step a client reads without the code: where the build failed.
     local step=build
     case "$code" in pull_failed) step=pull ;; probe_failed) step=probe ;; disk_floor) step=disk ;; spec_refused) step=spec ;; esac
     report "$handle" "$(jq -cn --arg m "$code: template-build.sh exit $rc: $last" --arg s "$step" '{event: "failed", step: $s, message: $m}')" >/dev/null ||
@@ -464,7 +482,7 @@ build_one() { # build_one JOB_JSON
   snap="$SBX_SRV/snapshots/$name"
   [[ -f "$snap/manifest.json" ]] || { fail_claimed "$handle" report 'the snapshot has no manifest'; return; }
   # T and S go byte for byte (the control plane checks T against the create and hashes S), so they
-  # cannot be redacted: one that names this host's registry is not sent at all (register G28).
+  # cannot be redacted: one that names this host's registry is not sent at all.
   if [[ -n "${SBX_REGISTRY:-}" ]] && grep -qF -- "$SBX_REGISTRY" "$rec" "$snap/manifest.json"; then
     FAILED=$((FAILED + 1))
     report "$handle" '{"event":"failed","step":"report","message":"leak_refused: the template record or manifest names this host'"'"'s registry; not sent (name the image without its registry)"}' >/dev/null ||
@@ -503,7 +521,7 @@ start_book() { # start_book NOW HAS_STARTING
     while IFS=$'\t' read -r w b t a; do
       [[ "$w" =~ $WORKER_RE && "$b" =~ $BUILD_ID_RE && "$t" =~ ^[0-9]{1,12}$ ]] || continue
       grep -qxF -- "$w"$'\t'"$b" "$WORK/run.tsv" || continue
-      # Released before it was seen attached, and kept by the idle grace (G43): no start time to take.
+      # Released before it was seen attached, and kept by the idle grace: no start time to take.
       ! grep -qxF -- "$b" "$WORK/graced.ids" || continue
       systemctl is-active --quiet "sbx-worker@$w.service" || continue
       if ((has == 1)); then
@@ -569,16 +587,21 @@ start_record() { # start_record WORKER BUILD NOW
 # SBX_START_CONCURRENCY workers are starting at once (the start limit, see the header); a start is
 # never waited on.
 activation() {
-  local wanted w unit now has=0 slots queued=0 graced=0
+  local wanted w b unit now has=0 slots queued=0 graced=0
   exec 9>"$SBX_SRV/.activation.lock"
   if ! flock -n 9; then
     say '{"agent":"skipped","why":"another run is applying the wanted state"}'
+    exec 9>&-
     return 0
   fi
-  wanted="$(api GET "/v1/hosts/$SBX_HOST_ID/wanted")" || { error 'wanted state unreadable'; return; }
+  if ! wanted="$(api GET "/v1/hosts/$SBX_HOST_ID/wanted")"; then
+    error 'wanted state unreadable'; exec 9>&-; return 0
+  fi
   # Kept for egress(), which takes its egressSids from this read rather than asking again.
   (umask 077 && printf '%s' "$wanted" >"$WORK/wanted.json")
-  jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted" || { error 'wanted state malformed'; return; }
+  if ! jq -e '(.run | type) == "array" and (.stop | type) == "array"' >/dev/null 2>&1 <<<"$wanted"; then
+    error 'wanted state malformed'; exec 9>&-; return 0
+  fi
   now="$(date +%s)"
   jq -r '.run[] | [.worker, .buildId] | @tsv' <<<"$wanted" >"$WORK/run.tsv"
   : >"$WORK/starting.ids"
@@ -586,7 +609,7 @@ activation() {
     has=1
     jq -r '.starting[] | strings' <<<"$wanted" >"$WORK/starting.ids"
   fi
-  # The idle grace's builds (register G43): kept running, never started. Absent: none. The last
+  # The idle grace's builds: kept running, never started. Absent: none. The last
   # answer's list ($SBX_SRV/graced, 0600) says which stop ends a grace.
   jq -r 'if (.graced | type) == "array" then .graced[] | strings else empty end' <<<"$wanted" >"$WORK/graced.ids" 2>/dev/null ||
     : >"$WORK/graced.ids"
@@ -599,7 +622,7 @@ activation() {
     systemctl is-active --quiet "$unit" || continue
     if systemctl stop "$unit"; then
       # A stop of a worker the idle grace kept is logged as such: a wanted build needed
-      # its slot, its grace ended, or its build was released with stopNow or retired.
+      # its slot, its grace ended, or its build was released with stopNow.
       STOPPED=$((STOPPED + 1)); worker_report "$b" detached; say "{\"agent\":\"stopped\",\"worker\":\"$w\"$(! grep -qxF -- "$b" "$WORK/graced.prev" || printf ',"was":"graced"')}"
     else
       error "stop $unit failed"
@@ -623,7 +646,7 @@ activation() {
     fi
     systemctl is-active --quiet "$unit" && continue
     # A build whose memory file does not match its guest size (memory_report) is never started here,
-    # whatever the control plane asks (one older than openapi 1.8.0 does not read memfileMismatch).
+    # whatever the control plane asks (one older than openapi 1.12.0 does not read memfileMismatch).
     if [[ -s "$WORK/memfile-mismatch" ]] && grep -qxF -- "$b" "$WORK/memfile-mismatch"; then
       worker_report "$b" refused 'memfile mismatch: its memory file is not guest_ram_mb x 1 MiB on this host'
       say "{\"agent\":\"refused\",\"worker\":\"$w\",\"why\":\"memfile mismatch\"}"
@@ -648,6 +671,7 @@ activation() {
     say "{\"agent\":\"queued\",\"workers\":$queued,\"why\":\"$INFLIGHT starting, SBX_START_CONCURRENCY $SBX_START_CONCURRENCY: started in a later run\"}"
   fi
   ((graced == 0)) || GRACE_SUMMARY=",\"graced\":$graced"
+  # A control plane older than API 1.19.0 sends no `remove`.
   [[ "$(jq -r '.remove | type' <<<"$wanted")" != array ]] || removal "$wanted"
   exec 9>&-
 }
@@ -662,14 +686,15 @@ activation() {
 # the next one; its workspace data stays for the janitor), then the snapshot directory and its
 # record go. Each removal is reported `removed`.
 removal() {
-  local w b rec snap
+  local w b f rec snap
   while IFS=$'\t' read -r w b; do
     [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to remove is malformed'; continue; }
-    [[ "$b" =~ ^sha256:[0-9a-f]{64}$ ]] || { error 'a build id to remove is malformed'; continue; }
+    [[ "$b" =~ $DIGEST_RE ]] || { error 'a build id to remove is malformed'; continue; }
     rec=''
     for f in "$SBX_SRV"/templates/*.json; do
       [[ -f "$f" ]] || continue
-      jq -e --arg b "$b" --arg w "$w" '.schema == "moca-sbx-template/1" and .manifest_hash == $b and .worker == $w' "$f" >/dev/null 2>&1 && { rec="$f"; break; }
+      jq -e --arg b "$b" --arg w "$w" '.schema == "moca-sbx-template/1" and .manifest_hash == $b and .worker == $w' "$f" >/dev/null 2>&1 &&
+        { rec="$f"; break; }
     done
     [[ -n "$rec" ]] || { error "no template record here for build $b of worker $w"; continue; }
     # A string only: a missing or non-string `snapshot` is empty (never the word null), and refused.
@@ -811,7 +836,7 @@ egress() {
     (umask 077 && api GET "/v1/hosts/$SBX_HOST_ID/wanted" >"$WORK/wanted.json") || { error 'egress: wanted state unreadable; nothing sent'; exec 8>&-; return; }
   fi
   if ! jq -e '.egressSids | type == "array" and all(type == "string")' "$WORK/wanted.json" >/dev/null 2>&1; then
-    error 'egress: the wanted state has no egressSids (a control plane older than openapi 1.7.0); nothing sent, the cursor kept'
+    error 'egress: the wanted state has no egressSids (a control plane older than openapi 1.14.0); nothing sent, the cursor kept'
     exec 8>&-
     return
   fi
@@ -892,6 +917,10 @@ egress() {
   exec 8>&-
 }
 
+summary() { # summary [MORE]: MORE follows "errors" in the line (the egress counts)
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS${1:-}$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
+}
+
 main() {
   [[ $# -eq 1 && ( "$1" == --once || "$1" == --wanted-only ) ]] ||
     { echo 'usage: host-agent.sh --once | --wanted-only' >&2; exit 2; }
@@ -910,20 +939,16 @@ main() {
   if [[ "$mode" == --wanted-only ]]; then
     activation
     egress
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS,\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
+    summary ",\"egress\":\"$EGRESS\",\"egressRead\":$EG_READ,\"egressAccepted\":$EG_ACCEPTED,\"egressRefused\":$EG_REFUSED,\"egressSkipped\":$EG_SKIPPED,\"egressRejected\":$EG_REJECTED,\"egressNotOurs\":$EG_NOT_OURS"
     return 0
   fi
   local free
   free="$(free_gb)"
-  # A build pulls its image: claiming one with no registry login fails it at the pull and loses it
-  # (bm1, 2026-11-04 16:33Z). With SBX_REGISTRY set, require a login for it in REGISTRY_AUTH_FILE first.
+  # A build pulls its image: claiming one with no registry login fails it at the pull and loses it.
+  # With SBX_REGISTRY set, require a login for it in REGISTRY_AUTH_FILE first.
   if [[ -n "${SBX_REGISTRY:-}" ]] && ! registry_logged_in; then
     say '{"agent":"skipped","why":"no registry login for SBX_REGISTRY in REGISTRY_AUTH_FILE: log in before builds"}'
-    activation
-    say "{\"agent\":\"summary\",\"claimed\":0,\"built\":0,\"failed\":0,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
-    return 0
-  fi
-  if [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
+  elif [[ -z "$free" ]] || ((free < SBX_DISK_FLOOR_GB)); then
     say "{\"agent\":\"skipped\",\"why\":\"free disk ${free:-?} GB is below the floor $SBX_DISK_FLOOR_GB GB\"}"
   else
     printf '{"max":%d}' "$SBX_BUILD_CONCURRENCY" >"$WORK/claim.json"
@@ -934,8 +959,10 @@ main() {
       error 'claim failed'
     fi
   fi
+  # The wanted state is applied whether or not a build was claimed (a registry login or the disk
+  # floor holds builds, never activations).
   activation
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
+  summary
 }
 
 main "$@"

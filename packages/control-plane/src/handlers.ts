@@ -1,8 +1,3 @@
-import type { PresenceReader, TemplateBuild, TemplateCatalog } from './template-catalog.js';
-import type { PolicyStore } from './template-policy.js';
-import type { TemplateHost } from './host-config.js';
-import { HOST_HANDLERS, type HostRegistry } from './host-handlers.js';
-import type { ProvenanceStore } from './provenance.js';
 import {
   assertValidDigest,
   BundleDigestMismatchError,
@@ -36,6 +31,7 @@ import {
   seconds,
 } from './handler-util.js';
 import { subjectHash } from './subject-document.js';
+import { asyncCounters } from './counters.js';
 import {
   resolveInferenceName,
   parseCredentialBody,
@@ -51,10 +47,10 @@ import {
   resolveInference,
   targetOf,
   viewTier,
-  sessionTemplate,
 } from './exchange.js';
 import { MODEL_ID_RE } from './models.js';
 import { exchangeTurnCredential } from './turn-exchange.js';
+import { issueTurnGrants, refreshTurnGrants } from './grant-exchange.js';
 import { isMintedTurnId } from './turn-record.js';
 import {
   catalogAllowList,
@@ -78,8 +74,13 @@ import {
   type SandboxConfig,
   type SandboxTemplate,
 } from './sandbox-config.js';
+import type { ProvenanceStore } from './provenance.js';
+import type { PresenceReader, TemplateBuild, TemplateCatalog } from './template-catalog.js';
+import type { PolicyStore } from './template-policy.js';
 import type { SandboxStore } from './sandbox-store.js';
 import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handlers.js';
+import type { TemplateHost } from './host-config.js';
+import { HOST_HANDLERS, type HostRegistry } from './host-handlers.js';
 import { MEMBER_HANDLERS } from './member-handlers.js';
 import type { MembersStore } from './members.js';
 import { EGRESS_HANDLERS } from './egress-handlers.js';
@@ -182,6 +183,16 @@ export interface CpConfig {
    * §5.1). A non-terminal record has no TTL at all, which is the invariant TurnStore owns.
    */
   turnRecordTtlSeconds: number;
+  /**
+   * `MOCA_GRANT_TTL_S`, default 300 (MI1 §15): how long a session grant lives before the worker
+   * must refresh it. Short on purpose -- with no revocation list, this IS the revocation latency.
+   */
+  grantTtlS: number;
+  /**
+   * `MOCA_TURN_MAX_S`, default 1800 (MI1 §15): the deployment-wide ceiling on one turn. A turn may
+   * ask for less through its caps and never for more; the clamp is at mint (`grant.ts`'s `turnExp`).
+   */
+  turnMaxS: number;
 }
 
 export interface CpDeps {
@@ -229,34 +240,55 @@ export interface CpDeps {
   close?: () => Promise<void>;
   /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
   sandboxes?: SandboxStore;
-  /** Per-sandbox egress logs (register G42), beside `sandboxes`; absent, the routes store nothing. */
+  /** Per-sandbox egress logs, beside `sandboxes`; absent, the routes store nothing. */
   egress?: EgressStore;
   /**
-   * The template catalog (template lifecycle spec §3.1). Absent: built from the sandbox profile's
-   * SH_SANDBOX_TEMPLATES, as before the catalog existed.
+   * The template provenance store (template lifecycle spec §7). Absent, nothing is recorded and no
+   * handler's behavior changes; when present, a sandbox's create and end are recorded on its
+   * template's chain.
+   */
+  provenance?: ProvenanceStore;
+  /**
+   * The template catalog (template lifecycle spec §3.1), opened with `provenance` when
+   * SH_PROVENANCE_DIR is set. Absent: built from the sandbox profile's SH_SANDBOX_TEMPLATES, as
+   * before the catalog existed.
    */
   templates?: TemplateCatalog;
   /** The relay's presence records, which template readiness is derived from (§3.3). */
   presence?: PresenceReader;
-  /** The deployment's template policy (§8), stored with the catalog; absent without SH_PROVENANCE_DIR. */
-  policy?: PolicyStore;
-  /** The provenance store (§7), when SH_PROVENANCE_DIR is set. */
-  provenance?: ProvenanceStore;
   /**
-   * Enrollment and roles through the API (register G38), with the provenance store: absent without
+   * The deployment's template policy (§8), stored with the catalog and recorded in `provenance`;
+   * absent without SH_PROVENANCE_DIR, where templates cannot be created through the API.
+   */
+  policy?: PolicyStore;
+  /** The template hosts' inventories and limits (§6.1), as their agents last reported them. */
+  hosts?: HostRegistry;
+  /**
+   * Enrollment and roles through the API, opened with `provenance`: absent without
    * SH_PROVENANCE_DIR, when roles and enrollment come from the settings alone, as before.
    */
   members?: MembersStore;
-  /** The template hosts' inventories and limits (§6.1), as their agents last reported them. */
-  hosts?: HostRegistry;
   /** Stdout mirror of audit decisions; defaults to `defaultAuditLog` in depsFromEnv. */
   log?: AuditLog;
   /** The async turn record store (async spec §5.1); absent only in suites that never submit. */
   turns?: TurnStore;
   /** The leaf queue, holding turn ids and nothing else (§5.1). */
   turnQueue?: TurnQueue;
-  /** Reads `leaf:result:<sid>` for the status route (§4.4); absent means a turn reports no result. */
+  /** Reads `leaf:result:<sid>:<turnId>` for the status route (§4.4); absent means no result. */
   leafResults?: ResultRedisLike;
+  /**
+   * The GRANT ring's private half (MI1 §6.1), a SEPARATE key from `signer` so a session token can
+   * never pass as a grant. Present only when `MOCA_GRANT_SIGNING_KEY` is set, and its absence is
+   * what 404s both grant routes (ADR-0045's shape, `server.ts`'s `grants` feature).
+   */
+  grantSigner?: { kid: string; signJws(typ: string, claims: object): string };
+  /**
+   * The public halves used to verify a grant presented at `/internal/grants/refresh`: the grant
+   * signer's own key, plus `MOCA_GRANT_PUBLIC_KEYS` during a rotation window. Set together with
+   * `grantSigner`; the refresh route is the control plane's only grant verifier, since workers
+   * receive grants over the authenticated exchange and never verify them.
+   */
+  grantVerifyKeys?: Map<string, KeyObject>;
 }
 
 /** `deps.log` with the production default; keeps the field optional on `CpDeps`. */
@@ -482,13 +514,13 @@ async function sessionView(rec: SessionRecord, deps: CpDeps) {
     lastTurnAt: runtime.lastTurnAt ? Number(runtime.lastTurnAt) : null,
     turns: runtime.turns ? Number(runtime.turns) : 0,
     sandboxTier: tier,
-    // Shown only on a deployment that declares templates, so a view elsewhere is unchanged.
-    // Shown wherever the session named one, so a dropped template is visible too (it fails closed).
+    // Shown on a deployment that declares templates, and wherever the session named one, so a
+    // dropped template is visible too (it fails closed); a view elsewhere is unchanged.
     ...(deps.config.sessionTemplates || rec.sandboxTemplate
       ? {
           sandboxTemplate: rec.sandboxTemplate || null,
-          // Template lifecycle spec §9: the build the template resolved to at creation (G19: not
-          // enforced by routing; a sandbox's buildId is).
+          // The build the template resolved to at creation (combined control plane spec §3.4),
+          // which its turns run on; its manifest hash, null for an imported build.
           sandboxBuildId: rec.sandboxBuildId || null,
           templateManifestHash: rec.sandboxBuildId?.startsWith('sha256:')
             ? rec.sandboxBuildId
@@ -684,6 +716,18 @@ async function oidcCallbackImpl(
 
 export const HANDLERS: Record<string, Handler> = {
   healthz: async () => ({ status: 200, body: 'ok' }),
+
+  /**
+   * §7's `async_quota_refusals`. Process-local and reset by a restart, like every count in the
+   * supervisor's own /metrics: with more than one replica a scraper sees one replica's share per
+   * request. That is the right trade for a rate signal -- a shared counter would put a Redis write
+   * on the refusal path, which is the one path already shedding load.
+   */
+  getMetrics: async (ctx) => {
+    const p = requirePrincipal(ctx);
+    if (!isAdmin(p)) throw new CpError('forbidden', '/metrics requires the admin role');
+    return { status: 200, body: { counters: asyncCounters() } };
+  },
   // `null`, not a 404, when unset: the client can tell "this deployment advertises no harness" from
   // "this control plane predates discovery" and name the right fix for each.
   // SBX0 §4.1 (v1.1): the sandbox profile answers only where clients send Exec, and the CA to trust
@@ -740,7 +784,7 @@ export const HANDLERS: Record<string, Handler> = {
     }
     // A pending authorization propagates as authorization_pending (428) -- the client polls.
     const fromIdp = await deps.identity.completeDeviceAuth(deviceCode);
-    // Roles and store enrollment now (register G38): an API grant counts at login as at every request.
+    // Roles and store enrollment now: an API grant counts at login as at every request.
     const m = await membershipNow(deps, fromIdp.subject, fromIdp.roles);
     const principal = { ...fromIdp, roles: m.roles };
     // SBX0 §4.2: on the sandbox profile only enrolled subjects (and admins) get a login, and the
@@ -859,7 +903,7 @@ export const HANDLERS: Record<string, Handler> = {
     if (!r.ok) throw new CpError('invalid_grant', `refresh token refused: ${r.reason}`);
     const m = await membershipNow(deps, r.subject, deps.identity.rolesFor(r.subject));
     const roles = m.roles;
-    // A subject removed from SH_ALLOWED_SUBJECTS (or unenrolled through the API, G38) loses access at
+    // A subject removed from SH_ALLOWED_SUBJECTS (or unenrolled through the API) loses access at
     // its next refresh, not its next login.
     // rotate() has already stored a successor the client never sees, so the token it still holds is
     // superseded: presented again after the grace window it would read as reuse, revoke the family
@@ -1002,15 +1046,8 @@ export const HANDLERS: Record<string, Handler> = {
       );
     }
     const sandboxTemplate = resolved?.id ?? requestedTemplate ?? '';
-    // The build the reference names (resolved above), or the default tag's now (§9) without a store.
-    let sandboxBuildId = resolved?.buildId ?? '';
-    if (sandboxTemplate && !resolved && deps.templates) {
-      const doc = await deps.templates.get(sandboxTemplate).catch(() => null);
-      const def = doc?.tags.default
-        ? doc.builds.find((x) => x.buildId === doc.tags.default)
-        : undefined;
-      if (def?.status === 'registered') sandboxBuildId = def.buildId;
-    }
+    // The build the reference resolved to, kept for the session's life; none without a store.
+    const sandboxBuildId = resolved?.buildId ?? '';
 
     if (configRef) {
       let found: boolean;
@@ -1046,6 +1083,7 @@ export const HANDLERS: Record<string, Handler> = {
         p,
         forUse,
         activateField !== false,
+        // The request's own enrollment (server.ts sets it per request, from the members store).
         isEnrolledForSandbox(p.sub, p.roles ?? [], deps.config, p.enrolled === true),
       );
     }
@@ -1080,7 +1118,8 @@ export const HANDLERS: Record<string, Handler> = {
     const iat = seconds(deps);
     // The session on its build's chain (lifecycle spec §7.1), as a sandbox is: its lease is the
     // caller's live lease on the build, as the digest of the activate record that granted it (null:
-    // no lease, e.g. no host agents).
+    // no lease, e.g. no host agents). Written after the session is stored, so a create that any check
+    // refuses, its activation on first use included, writes no `created` record.
     if (resolved && deps.provenance) {
       const live = (resolved.build.leases ?? []).find((l) => l.subject === p.sub && l.until > iat);
       await appendSessionRecord(deps, `template/${resolved.id}`, p.sub, {
@@ -1478,6 +1517,33 @@ export const HANDLERS: Record<string, Handler> = {
     return { status: 200, body: await exchangeTurnCredential(turnId, deps) };
   },
 
+  issueTurnGrants: async (ctx, deps) => {
+    // Same shape as the two exchanges above: the router is the only layer that sees headers, so a
+    // handler reached without its mark is a routing bug and 401 is the safe answer.
+    if (!ctx.exchangeAuthorized) {
+      throw new CpError('unauthorized', 'exchange authentication failed');
+    }
+    const token = asRecord(ctx.body).token;
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new CpError('invalid_request', 'token is required');
+    }
+    return { status: 200, body: await issueTurnGrants(token, deps) };
+  },
+
+  refreshTurnGrants: async (ctx, deps) => {
+    if (!ctx.exchangeAuthorized) {
+      throw new CpError('unauthorized', 'exchange authentication failed');
+    }
+    // `grant`, not `token`: the two fields carry different credentials to different verifiers, and a
+    // worker that sent a session token here would otherwise get a confusing grant_invalid instead of
+    // being told it used the wrong field.
+    const grant = asRecord(ctx.body).grant;
+    if (typeof grant !== 'string' || grant.length === 0) {
+      throw new CpError('invalid_request', 'grant is required');
+    }
+    return { status: 200, body: await refreshTurnGrants(grant, deps) };
+  },
+
   /**
    * Readiness is "can I serve session routes", i.e. is Redis answering. Credentials live in
    * Kubernetes Secrets, so they stay up while Redis is down (spec §7.1, §9.2) -- which is why this
@@ -1509,8 +1575,8 @@ export const HANDLERS: Record<string, Handler> = {
 
   // SBX0 §5.1: the sandbox resource (sandbox-handlers.ts), mounted on the sandbox profile only.
   ...SANDBOX_HANDLERS,
-  ...MEMBER_HANDLERS,
   ...HOST_HANDLERS,
+  ...MEMBER_HANDLERS,
   ...EGRESS_HANDLERS,
   ...TURN_HANDLERS,
 };

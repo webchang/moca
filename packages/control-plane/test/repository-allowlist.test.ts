@@ -1,5 +1,5 @@
-// The policy's per-registry repository allowlist (allowedRepositories): Docker Hub opened to named
-// repositories only, for the template onboarding guide's general-user samples.
+// The policy's per-registry repository allowlist (allowedRepositories): a registry such as Docker Hub
+// opened to named repositories only, not to all of it.
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -48,7 +48,7 @@ describe('registryOf and repositoryOf', () => {
     expect(registryOf(`index.docker.io/library/python@${D}`)).toBe('docker.io');
     expect(registryOf(`python@${D}`)).toBe('<default>');
     expect(registryOf(`library/python@${D}`)).toBe('<default>');
-    expect(registryOf(`image-factory/moca-microvm@${D}`)).toBe('<default>');
+    expect(registryOf(`images/moca-microvm@${D}`)).toBe('<default>');
     expect(registryOf(`ghcr.io/x/y@${D}`)).toBe('ghcr.io');
     expect(registryOf(`localhost:5000/x/y@${D}`)).toBe('localhost:5000');
   });
@@ -63,7 +63,7 @@ describe('registryOf and repositoryOf', () => {
     expect(repositoryOf(`localhost:5000/x/y@${D}`)).toBe('x/y');
     // No host: the build host's default registry, so no Docker Hub normalization.
     expect(repositoryOf(`python@${D}`)).toBe('python');
-    expect(repositoryOf(`image-factory/moca-microvm@${D}`)).toBe('image-factory/moca-microvm');
+    expect(repositoryOf(`images/moca-microvm@${D}`)).toBe('images/moca-microvm');
   });
 });
 
@@ -101,10 +101,10 @@ describe('the create rule', () => {
 
   it('leaves a registry with no repository list open, as before', () => {
     // The build host's default registry (the curated images) has no list: every repository passes.
-    expect(failed(create(`image-factory/moca-microvm@${D}`, HUB))).toBeUndefined();
-    expect(failed(create(`image-factory/anything@${D}`, HUB))).toBeUndefined();
+    expect(failed(create(`images/moca-microvm@${D}`, HUB))).toBeUndefined();
+    expect(failed(create(`images/anything@${D}`, HUB))).toBeUndefined();
     // And the default policy, with no allowedRepositories at all, behaves exactly as before.
-    expect(failed(create(`image-factory/moca-microvm@${D}`, DEFAULT_POLICY))).toBeUndefined();
+    expect(failed(create(`images/moca-microvm@${D}`, DEFAULT_POLICY))).toBeUndefined();
     expect(failed(create(`docker.io/library/python@${D}`, DEFAULT_POLICY))).toBe('registry');
   });
 
@@ -178,9 +178,9 @@ describe('PUT /v1/policy', () => {
     const before: Policy = {
       ...DEFAULT_POLICY,
       trustedGateRecords: [`sha256:${'b'.repeat(64)}`],
-      quotaBySubject: { 'github:3': { templates: 100, buildsQueued: 10, active: 32 } },
-    } as Policy;
-    await d.policy!.set(before, 'github:admin');
+      quota: { templates: 50, buildsQueued: 5, active: 4 },
+    };
+    await d.policy!.set(before, admin.sub);
     const next = {
       ...before,
       allowedRegistries: [...before.allowedRegistries, 'docker.io'],
@@ -191,9 +191,7 @@ describe('PUT /v1/policy', () => {
     const { policy } = await d.policy!.current();
     expect(policy.allowedRepositories).toEqual({ 'docker.io': ['library/python'] });
     expect(policy.trustedGateRecords).toEqual(before.trustedGateRecords);
-    expect((policy as Policy & { quotaBySubject?: unknown }).quotaBySubject).toEqual(
-      (before as Policy & { quotaBySubject?: unknown }).quotaBySubject,
-    );
+    expect(policy.quota).toEqual(before.quota);
     expect(policy.profiles).toEqual(before.profiles);
   });
 });

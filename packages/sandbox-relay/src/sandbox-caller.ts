@@ -1,8 +1,24 @@
 import { status, type ServerWritableStream } from '@grpc/grpc-js';
-import type { Exec, ExecEvent, ExecRequest } from '@moca/k8s-sandbox';
-import type { SandboxTokenClaims } from '@moca/control-plane';
-import type { Relay, RelayTimers } from './relay.js';
-import { workerReqId } from './sandbox-auth.js';
+import {
+  ExecKind,
+  LeaseOp,
+  SandboxMode,
+  type Exec,
+  type ExecEvent,
+  type ExecRequest,
+  type LeaseControlRequest,
+  type LeaseControlResponse,
+  type LeaseKeepaliveRequest,
+  type ProcessArgs,
+} from '@moca/k8s-sandbox';
+import type { SandboxModeName, SandboxTokenClaims, SetModeClaims } from '@moca/control-plane';
+import {
+  LEASE_PROCESSES_CAPABILITY,
+  WORKER_WITHOUT_PROCESSES,
+  type Relay,
+  type RelayTimers,
+} from './relay.js';
+import { workerReqId, type SetModeVerifier } from './sandbox-auth.js';
 import {
   failExecStream,
   grpcError,
@@ -12,12 +28,55 @@ import {
   type PumpResult,
 } from './exec-stream.js';
 
+const EXEC_MODE: Record<SandboxModeName, SandboxMode> = {
+  'per-exec': SandboxMode.SANDBOX_MODE_PER_EXEC,
+  lease: SandboxMode.SANDBOX_MODE_LEASE,
+  'lease+processes': SandboxMode.SANDBOX_MODE_LEASE_PROCESSES,
+};
+
+/**
+ * An Exec's mode fields, from the verified token (lease-mode spec §8.2). On the sandbox path the
+ * relay is their only setter: whatever the client wrote is overwritten with these, so a client
+ * cannot raise its own lease mode. A token minted before the claims existed was defaulted to
+ * per-exec, 0, 0 by verifySandboxToken.
+ */
+export function claimsToExecMode(
+  claims: Pick<SandboxTokenClaims, 'mode' | 'mode_epoch' | 'idle_timeout_s'>,
+): Pick<Exec, 'mode' | 'modeEpoch' | 'idleTimeoutS'> {
+  return {
+    mode: EXEC_MODE[claims.mode],
+    modeEpoch: claims.mode_epoch,
+    idleTimeoutS: claims.idle_timeout_s,
+  };
+}
+
+/** An Exec kind as the wire, the worker and the audit line name it (lease-mode spec §7). */
+export type ExecKindName =
+  'command' | 'process_start' | 'process_list' | 'process_logs' | 'process_stop';
+
+const EXEC_KIND_NAME: Readonly<Partial<Record<number, ExecKindName>>> = {
+  [ExecKind.EXEC_KIND_COMMAND]: 'command',
+  [ExecKind.EXEC_KIND_PROCESS_START]: 'process_start',
+  [ExecKind.EXEC_KIND_PROCESS_LIST]: 'process_list',
+  [ExecKind.EXEC_KIND_PROCESS_LOGS]: 'process_logs',
+  [ExecKind.EXEC_KIND_PROCESS_STOP]: 'process_stop',
+};
+
+/**
+ * The kind's name, or undefined for a value this relay does not know. ts-proto decodes an enum
+ * value outside the proto's as the raw number (UNRECOGNIZED, -1, included), so anything but 0..4.
+ */
+export function execKindName(kind: ExecKind): ExecKindName | undefined {
+  return EXEC_KIND_NAME[kind];
+}
+
 /**
  * One audit line per sandbox Exec (SBX0 §3.5), on the relay's refusal channel. Who (`sub`, `sbx`,
  * only from a token that VERIFIED), where (`wrk`, the sandbox_id asked for), which (`req_id`, the
- * caller's), how long, how it ended and how much stdout. Never the output, never the token, and the
- * command only as `cmd`, its first 200 bytes, with the operator's SH_SANDBOX_AUDIT_COMMANDS=1.
- * `audit` is the marker a log reader selects on (deploy/sbx/status.sh).
+ * caller's), what (`kind`, and for a process kind `process`: `p<id>`, else the name), how long,
+ * how it ended and how much stdout. Never the output, never the token, and the command (a
+ * process_start's too) only as `cmd`, its first 200 bytes, with the operator's
+ * SH_SANDBOX_AUDIT_COMMANDS=1. `audit` is the marker a log reader selects on (deploy/sbx/status.sh).
  */
 export interface AuditLine {
   audit: 'sandbox_exec';
@@ -27,6 +86,9 @@ export interface AuditLine {
   sbx?: string;
   wrk: string;
   req_id: number;
+  /** `unknown(<n>)` for a kind this relay does not know (the worker's form, ruling P5-R22). */
+  kind?: ExecKindName | `unknown(${number})`;
+  process?: string;
   ms: number;
   outcome: AuditOutcome;
   exit_code?: number;
@@ -43,10 +105,64 @@ export interface AuditLine {
  * - `busy`: the sandbox's in-flight cap refused it;
  * - `error`: any other ExecError, or routing failed (no live worker, a disconnect);
  * - `cancelled`: the client cancelled the call, or Aborted it;
- * - `refused`: UNAUTHENTICATED, PERMISSION_DENIED, ALREADY_EXISTS or INVALID_ARGUMENT, with `reason`.
+ * - `refused`: UNAUTHENTICATED, PERMISSION_DENIED, ALREADY_EXISTS, INVALID_ARGUMENT or
+ *   FAILED_PRECONDITION (a process kind below lease+processes), with `reason`.
  */
 export type AuditOutcome =
   'end' | 'timeout' | 'expired' | 'busy' | 'error' | 'cancelled' | 'refused';
+
+/**
+ * One audit line per LeaseControl (lease-mode spec §8.2), marker `sandbox_lease_control`. `mode`
+ * and `modeEpoch` are a set_mode's, from its set-mode token, and only once that token verified.
+ * Keepalives are not audited: a client may send one every few seconds.
+ */
+export interface LeaseControlAuditLine {
+  audit: 'sandbox_lease_control';
+  ts: string;
+  sub?: string;
+  sbx?: string;
+  wrk: string;
+  op: LeaseOpName;
+  mode?: SandboxModeName;
+  modeEpoch?: number;
+  ms: number;
+  outcome: LeaseControlOutcome;
+  reason?: string;
+}
+
+/**
+ * The op as an audit line names it; `unspecified` for 0 or a value this relay does not know.
+ * `sandbox_deleted` is the control plane's notice that the sandbox is gone: the worker ends the
+ * lease with that reason. Like reset, it takes no mode and no epoch.
+ */
+export type LeaseOpName = 'status' | 'reset' | 'set_mode' | 'sandbox_deleted' | 'unspecified';
+
+/**
+ * - `ok`: the worker answered without an error;
+ * - `failed`: the worker answered with one (FAILED_PRECONDITION; `reason` is its wire string);
+ * - `timeout`: the worker did not answer within the op's timeout (DEADLINE_EXCEEDED);
+ * - `error`: no live worker, the frame could not be written, or it disconnected first (UNAVAILABLE);
+ * - `busy`: the sandbox already had LEASE_CONTROL_MAX_INFLIGHT calls in flight (RESOURCE_EXHAUSTED);
+ * - `cancelled`: the client cancelled the call before the worker answered;
+ * - `refused`: UNAUTHENTICATED, PERMISSION_DENIED or INVALID_ARGUMENT, with `reason`.
+ */
+export type LeaseControlOutcome =
+  'ok' | 'failed' | 'timeout' | 'error' | 'busy' | 'cancelled' | 'refused';
+
+export function leaseOpName(op: LeaseOp): LeaseOpName {
+  switch (op) {
+    case LeaseOp.LEASE_OP_STATUS:
+      return 'status';
+    case LeaseOp.LEASE_OP_RESET:
+      return 'reset';
+    case LeaseOp.LEASE_OP_SET_MODE:
+      return 'set_mode';
+    case LeaseOp.LEASE_OP_SANDBOX_DELETED:
+      return 'sandbox_deleted';
+    default:
+      return 'unspecified';
+  }
+}
 
 /** The worker's timeout form, byte-identical across transports (remote-worker session/loop.go). */
 const WORKER_TIMEOUT_RE = /^timeout:\d+$/;
@@ -55,6 +171,8 @@ const WORKER_TIMEOUT_RE = /^timeout:\d+$/;
 export const AUDIT_COMMAND_BYTES = 200;
 /** The most of a caller-chosen sandbox_id an audit line carries: one request, one bounded line. */
 const AUDIT_WRK_BYTES = 128;
+/** The most of a caller-chosen process id or name an audit line carries, for the same reason. */
+const AUDIT_PROCESS_BYTES = 128;
 
 /** The first `max` bytes of `s` in UTF-8, cut back to a character boundary. */
 function utf8Prefix(s: string, max: number): string {
@@ -69,6 +187,26 @@ function utf8Prefix(s: string, max: number): string {
 /** A command's first 200 bytes, cut on a character boundary. */
 export function commandPreview(command: string): string {
   return utf8Prefix(command, AUDIT_COMMAND_BYTES);
+}
+
+/**
+ * Which process an audit line names: `p<id>` when an id is given, else the name, else nothing (a
+ * process_list, an unnamed process_start). A process_start names only its name: the guest ignores
+ * a caller-supplied id there and assigns its own, so `p<id>` would hide the real name (PR #814
+ * review). Never the process's command; for process kinds only.
+ */
+function auditProcess(kind: ExecKindName | undefined, p: ProcessArgs | undefined) {
+  if (kind === undefined || kind === 'command' || !p) return undefined;
+  const which = kind !== 'process_start' && p.id ? `p${p.id}` : p.name;
+  return which ? utf8Prefix(which, AUDIT_PROCESS_BYTES) : undefined;
+}
+
+/**
+ * The kinds that carry no command: process_list, process_logs and process_stop. The guest
+ * ignores one sent with them, so the relay clears it before forwarding, and never audits it.
+ */
+export function kindCarriesNoCommand(kind: ExecKindName | undefined): boolean {
+  return kind === 'process_list' || kind === 'process_logs' || kind === 'process_stop';
 }
 
 /** Writes the audit lines. Built only on a relay with sandbox keys; `write` absent writes nothing. */
@@ -93,28 +231,39 @@ export function makeAudit(write: ((line: string) => void) | undefined, withComma
      */
     exec(
       t0: number,
-      l: Omit<AuditLine, 'audit' | 'ts' | 'ms' | 'cmd' | 'sub' | 'sbx' | 'wrk'> & {
+      l: Omit<
+        AuditLine,
+        'audit' | 'ts' | 'ms' | 'cmd' | 'sub' | 'sbx' | 'wrk' | 'kind' | 'process'
+      > & {
         wrk: string;
         claims?: SandboxTokenClaims;
         command?: string;
+        kind?: ExecKind;
+        process?: ProcessArgs;
       },
     ): void {
       // A fixed key order (SBX0 §3.5), whatever order the caller built `l` in; absent, never null.
       emit(() => {
         const { claims, command } = l;
+        const kind = l.kind === undefined ? undefined : execKindName(l.kind);
+        const proc = auditProcess(kind, l.process);
         return {
           audit: 'sandbox_exec',
           ts: new Date(t0).toISOString(),
           ...(claims ? { sub: claims.sub, sbx: claims.sbx } : {}),
           wrk: utf8Prefix(l.wrk, AUDIT_WRK_BYTES),
           req_id: l.req_id,
+          ...(l.kind !== undefined ? { kind: kind ?? `unknown(${l.kind})` } : {}),
+          ...(proc !== undefined ? { process: proc } : {}),
           ms: Math.max(0, Date.now() - t0),
           outcome: l.outcome,
           ...(l.exit_code !== undefined ? { exit_code: l.exit_code } : {}),
           ...(l.truncated !== undefined ? { truncated: l.truncated } : {}),
           out_bytes: l.out_bytes,
           ...(l.reason !== undefined ? { reason: l.reason } : {}),
-          ...(withCommands && command !== undefined ? { cmd: commandPreview(command) } : {}),
+          ...(withCommands && command !== undefined && !kindCarriesNoCommand(kind)
+            ? { cmd: commandPreview(command) }
+            : {}),
         };
       });
     },
@@ -134,6 +283,29 @@ export function makeAudit(write: ((line: string) => void) | undefined, withComma
         reason: `the worker did not end the Exec within ${graceS} s of its expiry abort`,
       }));
     },
+    /** One LeaseControl's line. `t0` is when the relay received it. */
+    leaseControl(
+      t0: number,
+      l: Omit<
+        LeaseControlAuditLine,
+        'audit' | 'ts' | 'ms' | 'sub' | 'sbx' | 'mode' | 'modeEpoch'
+      > & {
+        claims?: SandboxTokenClaims;
+        setMode?: SetModeClaims;
+      },
+    ): void {
+      emit(() => ({
+        audit: 'sandbox_lease_control',
+        ts: new Date(t0).toISOString(),
+        ...(l.claims ? { sub: l.claims.sub, sbx: l.claims.sbx } : {}),
+        wrk: utf8Prefix(l.wrk, AUDIT_WRK_BYTES),
+        op: l.op,
+        ...(l.setMode ? { mode: l.setMode.mode, modeEpoch: l.setMode.mode_epoch } : {}),
+        ms: Math.max(0, Date.now() - t0),
+        outcome: l.outcome,
+        ...(l.reason !== undefined ? { reason: l.reason } : {}),
+      }));
+    },
     /** A refused Abort (not an Exec, so a separate marker that Exec statistics skip). */
     abortRefused(wrk: string, reqId: number, reason: string, claims?: SandboxTokenClaims): void {
       emit(() => ({
@@ -150,12 +322,19 @@ export function makeAudit(write: ((line: string) => void) | undefined, withComma
 }
 export type Audit = ReturnType<typeof makeAudit>;
 
-/** The outcome of an Exec that ran to its end (not expired, not cancelled at the call). */
+/**
+ * The outcome of an Exec that ran to its end (not expired, not cancelled at the call). routeExec's
+ * own capability check (P5-R37's backstop, for a worker that re-attached without it after the
+ * check above) is a refusal like that check's, with the same reason (final review P4).
+ */
 function finished(
   r: PumpResult,
   aborted: boolean,
-): Pick<AuditLine, 'outcome' | 'exit_code' | 'truncated'> {
+): Pick<AuditLine, 'outcome' | 'exit_code' | 'truncated' | 'reason'> {
   if (r.cancelled || aborted) return { outcome: 'cancelled' };
+  const thrown = r.thrown as { code?: unknown; message?: unknown } | undefined;
+  if (thrown?.code === status.FAILED_PRECONDITION && thrown.message === WORKER_WITHOUT_PROCESSES)
+    return { outcome: 'refused', reason: WORKER_WITHOUT_PROCESSES };
   if (r.end) return { outcome: 'end', exit_code: r.end.exitCode, truncated: r.end.truncated };
   if (r.execError !== undefined)
     return { outcome: WORKER_TIMEOUT_RE.test(r.execError) ? 'timeout' : 'error' };
@@ -193,6 +372,30 @@ export function armDeadline(
   return () => timers.clearTimeout(handle);
 }
 
+/** How long a LeaseControl status waits for the worker's answer. */
+export const LEASE_STATUS_TIMEOUT_MS = 15_000;
+/**
+ * How long a mutate op (reset, set_mode, sandbox_deleted) waits: the worker's LeaseGraceLimit
+ * (30 min, remote-worker/internal/vmpool/config.go), for which EndLease and SetMode can block, plus
+ * 60 s. Linked to `maxLeaseGraceS` in remote-worker/cmd/microvm-worker/main.go, the largest grace a
+ * worker boots with: raise one only with the other (a contract test on each side reads the other's
+ * literal).
+ */
+export const LEASE_MUTATE_TIMEOUT_MS = 31 * 60_000;
+
+/**
+ * LeaseControl calls in flight per `sbx` (plan 3 ruling R13). Each holds a waiter in the relay for
+ * up to LEASE_MUTATE_TIMEOUT_MS, so without a cap one sandbox could grow the relay's memory without
+ * bound. A cancelled call gives its slot back at once.
+ */
+export const LEASE_CONTROL_MAX_INFLIGHT = 4;
+
+/** The per-op LeaseControl timeouts; tests set short ones (plan 3 ruling R4). */
+export interface LeaseTimeoutsMs {
+  status: number;
+  mutate: number;
+}
+
 /** What the sandbox caller needs from the relay server (SBX0 §3.6). */
 export interface SandboxCallerOpts {
   maxInflight: number;
@@ -205,6 +408,10 @@ export interface SandboxCallerOpts {
   timers?: RelayTimers;
   /** Where the audit lines go (SBX0 §3.5). */
   audit: Audit;
+  /** Verifies a set_mode's set-mode token. Absent, every set_mode is refused. */
+  verifySetMode?: SetModeVerifier;
+  /** Defaults to LEASE_STATUS_TIMEOUT_MS and LEASE_MUTATE_TIMEOUT_MS. */
+  leaseTimeoutsMs?: LeaseTimeoutsMs;
 }
 
 /**
@@ -243,6 +450,8 @@ export function makeSandboxCaller(relay: Relay, opts: SandboxCallerOpts) {
         req_id: e.reqId,
         claims,
         command: e.command,
+        kind: e.kind,
+        process: e.process,
         out_bytes: outBytes,
         ...l,
       });
@@ -263,6 +472,32 @@ export function makeSandboxCaller(relay: Relay, opts: SandboxCallerOpts) {
     if (denied) {
       log({ outcome: 'refused', reason: denied });
       failExecStream(call, grpcError(status.PERMISSION_DENIED, denied));
+      return;
+    }
+    // The kind gate (plan 5), from the token alone, before anything is forwarded: a process kind
+    // runs only on a token whose mode claim is lease+processes. The worker refuses it below that
+    // level too; this is the first line of defence, never the only one.
+    const kind = execKindName(e.kind);
+    if (kind === undefined) {
+      const why = `unknown exec kind ${e.kind}`;
+      log({ outcome: 'refused', reason: why });
+      failExecStream(call, grpcError(status.INVALID_ARGUMENT, why));
+      return;
+    }
+    if (kind !== 'command' && claims.mode !== 'lease+processes') {
+      const why = `processes_not_enabled: this sandbox's mode is ${claims.mode}`;
+      log({ outcome: 'refused', reason: why });
+      failExecStream(call, grpcError(status.FAILED_PRECONDITION, why));
+      return;
+    }
+    // The worker gate (P5-R37), before any slot: a process kind goes only to a worker whose Hello
+    // advertises the capability, since one from before plan 5 would run it as a command. With no
+    // worker attached the Exec goes on to routeExec's own `no live worker`, and routeExec checks
+    // the capability again against the worker it writes to.
+    const caps = kind === 'command' ? undefined : relay.workerCapabilities(sandboxId);
+    if (caps !== undefined && !caps.includes(LEASE_PROCESSES_CAPABILITY)) {
+      log({ outcome: 'refused', reason: WORKER_WITHOUT_PROCESSES });
+      failExecStream(call, grpcError(status.FAILED_PRECONDITION, WORKER_WITHOUT_PROCESSES));
       return;
     }
     const key = ownKey(claims.sbx, e.reqId);
@@ -346,7 +581,15 @@ export function makeSandboxCaller(relay: Relay, opts: SandboxCallerOpts) {
         call,
         relay,
         sandboxId,
-        { ...e, reqId: wid },
+        // keepalive, kind and process are the client's (spec §4, §7; the kind gated above); the
+        // mode fields are only ever the token's. A kind that carries no command has any the
+        // caller sent cleared: the guest ignores it, and nothing need carry it on.
+        {
+          ...e,
+          reqId: wid,
+          ...(kindCarriesNoCommand(kind) ? { command: '' } : {}),
+          ...claimsToExecMode(claims),
+        },
         {
           // Never let the worker's id reach the caller: every frame carries the caller's own.
           toCaller: (ev) => withReqId(ev, e.reqId),
@@ -392,5 +635,132 @@ export function makeSandboxCaller(relay: Relay, opts: SandboxCallerOpts) {
     return entry;
   }
 
-  return { exec: sandboxExec, abort: sandboxAbort };
+  const leaseTimeouts = opts.leaseTimeoutsMs ?? {
+    status: LEASE_STATUS_TIMEOUT_MS,
+    mutate: LEASE_MUTATE_TIMEOUT_MS,
+  };
+  // LeaseControl calls in flight per sbx, sent to the worker and not yet settled.
+  const leaseInflight = new Map<string, number>();
+
+  /**
+   * A sandbox caller's LeaseControl (lease-mode spec §8.2): on its own worker and workspace only,
+   * and a set_mode only with a set-mode token for this same sandbox, whose mode and epoch are the
+   * ones sent. Nothing reaches the worker before every check has passed. At most
+   * LEASE_CONTROL_MAX_INFLIGHT per sbx; `signal` aborting (the client cancelled) withdraws the
+   * call and frees its slot at once. Rejects with the status the call ends with; exactly one audit
+   * line either way.
+   */
+  async function sandboxLeaseControl(
+    claims: SandboxTokenClaims,
+    req: LeaseControlRequest,
+    t0: number,
+    signal?: AbortSignal,
+  ): Promise<LeaseControlResponse> {
+    const op = leaseOpName(req.op);
+    let setMode: SetModeClaims | undefined;
+    const line = (outcome: LeaseControlOutcome, reason?: string) =>
+      audit.leaseControl(t0, {
+        wrk: req.sandboxId,
+        op,
+        outcome,
+        claims,
+        ...(setMode ? { setMode } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+      });
+    // Logs the refusal and returns the error the call ends with: `throw refusal(...)`.
+    const refusal = (code: number, message: string, reason = message) => {
+      line('refused', reason);
+      return grpcError(code, message);
+    };
+
+    if (req.sandboxId !== claims.wrk) {
+      throw refusal(
+        status.PERMISSION_DENIED,
+        "lease control not permitted: sandbox_id is not this token's worker",
+      );
+    }
+    if (op === 'unspecified') throw refusal(status.INVALID_ARGUMENT, 'lease control needs an op');
+    // The cap first, before the set-mode token: saturated, every call is answered busy alike, so
+    // it is no oracle for a token's validity, and no verify work is spent on it. Nothing below
+    // awaits before the slot is taken, so `n` is still current then.
+    const n = leaseInflight.get(claims.sbx) ?? 0;
+    if (n >= LEASE_CONTROL_MAX_INFLIGHT) {
+      line('busy');
+      throw grpcError(
+        status.RESOURCE_EXHAUSTED,
+        `sandbox busy: ${n} lease controls already in flight`,
+      );
+    }
+    let mode = SandboxMode.SANDBOX_MODE_UNSPECIFIED;
+    let modeEpoch = 0;
+    if (op === 'set_mode') {
+      const denied = 'set_mode not permitted: the set-mode token did not verify';
+      if (!req.setModeToken) throw refusal(status.PERMISSION_DENIED, denied, 'no set-mode token');
+      if (!opts.verifySetMode) throw refusal(status.PERMISSION_DENIED, denied, 'no set-mode keys');
+      const v = opts.verifySetMode(req.setModeToken);
+      if (!v.claims) throw refusal(status.PERMISSION_DENIED, denied, v.reason);
+      setMode = v.claims;
+      // Exact equality on all three, as an Exec's: a token for sbx-a never changes sbx-b's lease.
+      // The same message as a token that did not verify (ruling R11): the client learns nothing
+      // about whose token it holds; the audit line says which check refused it.
+      if (setMode.sbx !== claims.sbx || setMode.wrk !== claims.wrk || setMode.wsk !== claims.wsk) {
+        throw refusal(status.PERMISSION_DENIED, denied, 'set-mode token is for another sandbox');
+      }
+      ({ mode, modeEpoch } = claimsToExecMode(setMode));
+    }
+
+    leaseInflight.set(claims.sbx, n + 1);
+    let result;
+    try {
+      result = await relay.routeLeaseControl(
+        req.sandboxId,
+        { workspaceKey: claims.wsk, op: req.op, mode, modeEpoch },
+        op === 'status' ? leaseTimeouts.status : leaseTimeouts.mutate,
+        signal,
+      );
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      const outcome =
+        code === status.DEADLINE_EXCEEDED
+          ? 'timeout'
+          : code === status.CANCELLED
+            ? 'cancelled'
+            : code === status.PERMISSION_DENIED
+              ? 'refused' // the relay's workload check
+              : 'error';
+      line(outcome, (err as Error).message);
+      throw err;
+    } finally {
+      const left = (leaseInflight.get(claims.sbx) ?? 1) - 1;
+      if (left > 0) leaseInflight.set(claims.sbx, left);
+      else leaseInflight.delete(claims.sbx);
+    }
+    if (result.error) {
+      line('failed', result.error);
+      throw grpcError(status.FAILED_PRECONDITION, result.error);
+    }
+    line('ok');
+    return { status: result.status };
+  }
+
+  /**
+   * A sandbox caller's LeaseKeepalive: its own worker only, its own workspace. Not audited. Answered
+   * OK even when the relay coalesces it (LEASE_KEEPALIVE_COALESCE_MS) and writes no frame.
+   */
+  function sandboxLeaseKeepalive(claims: SandboxTokenClaims, req: LeaseKeepaliveRequest): void {
+    if (req.sandboxId !== claims.wrk) {
+      throw grpcError(
+        status.PERMISSION_DENIED,
+        "lease keepalive not permitted: sandbox_id is not this token's worker",
+      );
+    }
+    relay.routeKeepalive(req.sandboxId, claims.wsk);
+  }
+
+  return {
+    exec: sandboxExec,
+    abort: sandboxAbort,
+    leaseControl: sandboxLeaseControl,
+    leaseKeepalive: sandboxLeaseKeepalive,
+  };
 }

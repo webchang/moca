@@ -39,7 +39,7 @@ export interface TurnAuth {
   sandboxSeed?: string;
   /** Where the seed came from (`build`: the pinned build's spec; `declared`: SH_SANDBOX_TEMPLATES). */
   sandboxSeedSource?: 'build' | 'declared';
-  /** The build the session's template resolved to (`sha256:…`, register G19); absent ⇒ any build of it. */
+  /** The build the session's template resolved to (`sha256:…`); absent ⇒ any build of it. */
   sandboxBuildId?: string;
   /** The session's model from the exchange (per-session model spec §5.1); absent ⇒ the deployment default. */
   model?: SessionModelSpec;
@@ -212,6 +212,17 @@ async function exchange(token: string, deps: TurnAuthDeps): Promise<ExchangeResp
     }
     throw new CpError('credential_unavailable', `control plane returned ${res.status}`);
   }
+  return validateExchangeBody(body);
+}
+
+/**
+ * The post-200 validation of a credential-exchange body, shared by the session exchange above and
+ * the DEQUEUE claim (`turn-claim.ts`, #389). Extracted rather than copied: these six checks are the
+ * ones that keep a placeholder from being spent as a real credential, a secret from going to the
+ * wrong endpoint, and a malformed configRef or model from silently running the wrong turn. Two
+ * copies would be two places to forget the seventh.
+ */
+export function validateExchangeBody(body: Record<string, unknown>): ExchangeResponse {
   // An UNKNOWN mode must not default to `direct`: that would send a placeholder upstream as though it
   // were a real credential, which is the failure the tag exists to prevent (spec §3.6).
   if (body.mode !== 'direct' && body.mode !== 'placeholder') {
@@ -338,24 +349,32 @@ export async function resolveTurnAuth(
     ...(typeof resolved.sandboxTier === 'string' && resolved.sandboxTier
       ? { sandboxTier: resolved.sandboxTier }
       : {}),
-    // As for the tier: only a non-empty string is a template; the seed only beside one.
-    ...(typeof resolved.sandboxTemplate === 'string' && resolved.sandboxTemplate
+    ...templateAuth(resolved),
+    ...(resolved.model ? { model: resolved.model } : {}),
+  };
+}
+
+/**
+ * The session's sandbox template, seed and build from a validated exchange body, for TurnAuth: the
+ * session exchange's and the dequeue exchange's alike, so a queued turn runs on the hands an
+ * interactive one would. As for the tier, only a non-empty string is a template; the seed, its
+ * source and the build only beside one.
+ */
+export function templateAuth(
+  resolved: ExchangeResponse,
+): Pick<TurnAuth, 'sandboxTemplate' | 'sandboxSeed' | 'sandboxSeedSource' | 'sandboxBuildId'> {
+  if (typeof resolved.sandboxTemplate !== 'string' || !resolved.sandboxTemplate) return {};
+  return {
+    sandboxTemplate: resolved.sandboxTemplate,
+    ...(typeof resolved.sandboxSeed === 'string' && resolved.sandboxSeed
       ? {
-          sandboxTemplate: resolved.sandboxTemplate,
-          ...(typeof resolved.sandboxSeed === 'string' && resolved.sandboxSeed
-            ? {
-                sandboxSeed: resolved.sandboxSeed,
-                ...(resolved.sandboxSeedSource
-                  ? { sandboxSeedSource: resolved.sandboxSeedSource }
-                  : {}),
-              }
-            : {}),
-          ...(typeof resolved.sandboxBuildId === 'string' && resolved.sandboxBuildId
-            ? { sandboxBuildId: resolved.sandboxBuildId }
-            : {}),
+          sandboxSeed: resolved.sandboxSeed,
+          ...(resolved.sandboxSeedSource ? { sandboxSeedSource: resolved.sandboxSeedSource } : {}),
         }
       : {}),
-    ...(resolved.model ? { model: resolved.model } : {}),
+    ...(typeof resolved.sandboxBuildId === 'string' && resolved.sandboxBuildId
+      ? { sandboxBuildId: resolved.sandboxBuildId }
+      : {}),
   };
 }
 

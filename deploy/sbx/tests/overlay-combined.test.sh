@@ -38,7 +38,7 @@ pass 'renders the supervisor and its Route beside the relay Routes, one API Rout
 # Namespaced only: the scope a namespace grant covers.
 n="$(q '[.[] | select(.kind | test("^(Namespace|ClusterRole|ClusterRoleBinding|SecurityContextConstraints|PersistentVolume|StorageClass|CustomResourceDefinition)$"))] | length')"
 [[ "$n" == 0 ]] || fail "renders $n cluster-scoped objects"
-[[ "$(q '[.[] | .metadata.namespace] | unique | join(",")')" == moca-combined ]] || fail 'more than one namespace'
+[[ "$(q '[.[] | .metadata.namespace] | unique | join(",")')" == moca-sbx-combined ]] || fail 'more than one namespace'
 ! grep -q 'moca-single' "$OUT" || fail 'an address still names the ocp-single placeholder'
 pass 'renders no cluster-scoped object, one namespace, and no address of another'
 
@@ -56,7 +56,7 @@ pass 'puts the control plane on the combined profile, with both profiles'"'"' se
 
 [[ "$(env_of Deployment sandbox-relay sandbox-relay MOCA_RELAY_EXEC_TOKEN)" == '<ref>' ]] || fail 'the relay lost the harness exec token'
 [[ "$(env_of Deployment sandbox-relay sandbox-relay SH_SANDBOX_TOKEN_PUBLIC_KEYS)" == '<ref>' ]] || fail 'the relay has no sandbox keyset'
-[[ "$(env_of Deployment moca-supervisor supervisor SH_RELAY_ADDR)" == sandbox-relay-exec.moca-combined.svc:9444 ]] || fail 'the supervisor does not reach the relay in this namespace'
+[[ "$(env_of Deployment moca-supervisor supervisor SH_RELAY_ADDR)" == sandbox-relay-exec.moca-sbx-combined.svc:9444 ]] || fail 'the supervisor does not reach the relay in this namespace'
 pass 'lets the relay take both Exec callers, and the supervisor reach it in the namespace'
 
 echo 'all ocp-combined overlay tests passed'

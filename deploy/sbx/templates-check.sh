@@ -4,13 +4,13 @@
 # sandbox token's worker). It does nothing unless SBX_LIVE_CHECK=1.
 #
 #   SBX_LIVE_CHECK=1 SBX_API_URL=https://<api host> SBX_CHECK_HOME_A=<home> SBX_CHECK_HOME_B=<home> \
-#     SBX_CHECK_TEMPLATES=default,swe-astropy-14995 deploy/sbx/templates-check.sh
+#     SBX_CHECK_TEMPLATES=default,django-django-11133 deploy/sbx/templates-check.sh
 #
 # Inputs, from the environment only:
 #   SBX_API_URL             https://<api host>, the sandbox control plane
-#   SBX_CHECK_HOME_A, _B    two HOMEs logged in as two different enrolled users (`mocactl sbx login`,
-#                           or deploy/sbx/mint-login.sh); every mocactl runs with HOME set to one of
-#                           them and XDG_CONFIG_HOME / XDG_STATE_HOME unset
+#   SBX_CHECK_HOME_A, _B    two HOMEs logged in as two different enrolled users (`mocactl sbx login`
+#                           in each, as for the live smoke); every mocactl runs with HOME set to one
+#                           of them and XDG_CONFIG_HOME / XDG_STATE_HOME unset
 #   SBX_CHECK_TEMPLATES     two or more template ids, comma-separated, each served by its own worker
 #   SBX_CHECK_PROBE_<ID>    optional, per template (the id upper-cased, dashes as underscores): a
 #                           shell command whose stdout, in a sandbox of that template only, must be
@@ -39,6 +39,7 @@
 # interrupt), and temp files, removed at exit. It never prints a token: tokens go to 0600 files.
 #
 # Exit: 0 every check ok or skipped; 1 a check failed; 2 a usage or settings error.
+# Runs on bash 3.2 (macOS's /bin/bash) as well as bash 4+: no associative arrays, no ${v^^}.
 set -euo pipefail
 
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
@@ -69,7 +70,8 @@ for v in SBX_CHECK_HOME_A SBX_CHECK_HOME_B; do
 done
 HOME_A="$(cd "$SBX_CHECK_HOME_A" && pwd -P)" HOME_B="$(cd "$SBX_CHECK_HOME_B" && pwd -P)"
 [[ "$HOME_A" != "$HOME_B" ]] || die 'SBX_CHECK_HOME_A and SBX_CHECK_HOME_B must be two different users'
-IFS=, read -ra TEMPLATES <<<"${SBX_CHECK_TEMPLATES:-}"
+TEMPLATES=()
+[[ -z "${SBX_CHECK_TEMPLATES:-}" ]] || IFS=, read -ra TEMPLATES <<<"$SBX_CHECK_TEMPLATES"
 ((${#TEMPLATES[@]} >= 2)) || die 'set SBX_CHECK_TEMPLATES to two or more template ids, comma-separated'
 for t in "${TEMPLATES[@]}"; do [[ "$t" =~ $TEMPLATE_RE ]] || die "SBX_CHECK_TEMPLATES: '$t' is not a template id"; done
 EXEC="${SBX_CHECK_EXEC:-1}"
@@ -78,7 +80,7 @@ MOCACTL="${MOCACTL:-$SRC/packages/mocactl/dist/mocactl.mjs}"
 [[ -f "$MOCACTL" ]] || die "no mocactl at $MOCACTL: build it (cd packages/mocactl && npm run build) or set MOCACTL"
 PY="${SBX_CHECK_PYTHON:-python3}"
 for t in jq git node; do command -v "$t" >/dev/null || die "needs $t on PATH"; done
-probe_var() { local v="${1^^}"; printf 'SBX_CHECK_PROBE_%s' "${v//-/_}"; }
+probe_var() { printf 'SBX_CHECK_PROBE_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
 RUN="tc-$(date +%s)-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sbx-templates-check.XXXXXX")"
@@ -141,7 +143,8 @@ else
 fi
 
 # 2. create ----------------------------------------------------------------------------------
-declare -A SBX1 WRK WSK
+# Per template, by its index in TEMPLATES: its first sandbox, that sandbox's worker and workspace key.
+SBX1=() WRK=() WSK=()
 create() { # create a|b TEMPLATE TAG -> SBX_ID
   x "create-$3" as "$1" create --template "$2" --name "$RUN-$3" --json
   SBX_ID=''
@@ -152,9 +155,10 @@ create() { # create a|b TEMPLATE TAG -> SBX_ID
   [[ "$(jq -r '.template' "$LOGS/create-$3.out")" == "$2" ]]
 }
 bad=''
-for t in "${TEMPLATES[@]}"; do
+for i in "${!TEMPLATES[@]}"; do
+  t="${TEMPLATES[$i]}"
   create a "$t" "$t-1" || bad+=" $t: $(lastline "$LOGS/create-$t-1.err")"
-  SBX1[$t]="$SBX_ID"
+  SBX1[i]="$SBX_ID"
 done
 if [[ -n "$bad" ]]; then notok 'create: one sandbox per template, each recording its template' "$bad"; exit 1; fi
 before="$(as a ls --json </dev/null | jq length)"
@@ -182,8 +186,9 @@ envof() { # envof a|b ID -> E_ADDR E_TLS E_WRK E_WSK E_CA
   [[ "$E_WRK" =~ $WORKER_RE && "$E_WSK" =~ $ID_RE ]]
 }
 bad=''
-for t in "${TEMPLATES[@]}"; do
-  if envof a "${SBX1[$t]}"; then WRK[$t]="$E_WRK"; WSK[$t]="$E_WSK"; else bad+=" $t: $(lastline "$LOGS/env-${SBX1[$t]}.err")"; fi
+for i in "${!TEMPLATES[@]}"; do
+  t="${TEMPLATES[$i]}"
+  if envof a "${SBX1[$i]}"; then WRK[i]="$E_WRK"; WSK[i]="$E_WSK"; else bad+=" $t: $(lastline "$LOGS/env-${SBX1[$i]}.err")"; fi
 done
 if [[ -n "$bad" ]]; then
   notok 'routing: each sandbox names its worker' "$bad"
@@ -195,11 +200,11 @@ else
     notok 'routing: every template has its own worker' "workers: ${WRK[*]}"
   elif [[ -z "$SBX_ID" ]] || ! envof a "$SBX_ID"; then
     notok "routing: a second $t0 sandbox" "$(lastline "$LOGS/create-$t0-2.err")"
-  elif [[ "$E_WRK" != "${WRK[$t0]}" || "$E_WSK" == "${WSK[$t0]}" ]]; then
-    notok "routing: two $t0 sandboxes share their worker, not their workspace" "worker $E_WRK vs ${WRK[$t0]}, workspace $E_WSK vs ${WSK[$t0]}"
+  elif [[ "$E_WRK" != "${WRK[0]}" || "$E_WSK" == "${WSK[0]}" ]]; then
+    notok "routing: two $t0 sandboxes share their worker, not their workspace" "worker $E_WRK vs ${WRK[0]}, workspace $E_WSK vs ${WSK[0]}"
   else
     pairs=''
-    for t in "${TEMPLATES[@]}"; do pairs+=" $t->${WRK[$t]}"; done
+    for i in "${!TEMPLATES[@]}"; do pairs+=" ${TEMPLATES[$i]}->${WRK[$i]}"; done
     ok "routing: each template's sandboxes go to its own worker:$pairs; two $t0 sandboxes share it, with their own workspaces"
   fi
 fi
@@ -209,8 +214,9 @@ if [[ "$EXEC" != 1 ]]; then
   skip 'hands: a command in each sandbox, and each template'"'"'s probe' 'SBX_CHECK_EXEC=0 (the control plane alone)'
 else
   bad='' seen=''
-  for t in "${TEMPLATES[@]}"; do
-    x "hello-$t" as a run --sandbox "${SBX1[$t]}" --timeout 300 -- sh -c 'echo "hello $(cat /etc/moca-rootfs-source 2>/dev/null | tr "\n" " ")"'
+  for i in "${!TEMPLATES[@]}"; do
+    t="${TEMPLATES[$i]}"
+    x "hello-$t" as a run --sandbox "${SBX1[$i]}" --timeout 300 -- sh -c 'echo "hello $(cat /etc/moca-rootfs-source 2>/dev/null | tr "\n" " ")"'
     if [[ "$RC" != 0 ]] || ! grep -q '^hello' "$LOGS/hello-$t.out"; then
       bad+=" $t: exit $RC, $(lastline "$LOGS/hello-$t.err")"
       continue
@@ -219,7 +225,7 @@ else
     for p in "${TEMPLATES[@]}"; do
       pv="$(probe_var "$p")"
       [[ -n "${!pv:-}" ]] || continue
-      x "probe-$p-on-$t" as a run --sandbox "${SBX1[$t]}" --timeout 300 -- sh -c "${!pv}"
+      x "probe-$p-on-$t" as a run --sandbox "${SBX1[$i]}" --timeout 300 -- sh -c "${!pv}"
       got="$(tr -d '\r' <"$LOGS/probe-$p-on-$t.out" | tail -n 1)"
       if [[ "$p" == "$t" && "$got" != yes ]]; then bad+=" $p's probe in its own sandbox printed '$got'"; fi
       if [[ "$p" != "$t" && "$got" == yes ]]; then bad+=" $p's probe also said yes in a $t sandbox"; fi
@@ -235,11 +241,11 @@ if ! "$PY" -c 'import grpc, grpc_tools' 2>/dev/null; then
 else
   mkdir -p "$WORK/py"
   "$PY" -m grpc_tools.protoc -I "$SRC/proto" --python_out="$WORK/py" --grpc_python_out="$WORK/py" sandbox/v1/sandbox.proto >"$LOGS/protoc.log" 2>&1
-  (umask 077; as a token "${SBX1[$t0]}" >"$WORK/tok-a" 2>"$LOGS/token-a.err" </dev/null) || true
-  envof a "${SBX1[$t0]}" || true
+  (umask 077; as a token "${SBX1[0]}" >"$WORK/tok-a" 2>"$LOGS/token-a.err" </dev/null) || true
+  envof a "${SBX1[0]}" || true
   ca="$E_CA"; [[ -n "$ca" ]] || ca=-
   # The token for t0's sandbox, sent with t1's worker id and t0's own workspace key.
-  "$PY" - "$WORK/py" "$SRC/docs/api/examples" "$WORK/tok-a" "$E_ADDR" "${WRK[$t1]}" "${WSK[$t0]}" "${E_TLS:-1}" "$ca" \
+  "$PY" - "$WORK/py" "$SRC/docs/api/examples" "$WORK/tok-a" "$E_ADDR" "${WRK[1]:-}" "${WSK[0]:-}" "${E_TLS:-1}" "$ca" \
     >"$LOGS/cross.out" 2>"$LOGS/cross.err" <<'PY' || true
 import sys
 sys.path[:0] = sys.argv[1:3]
@@ -257,14 +263,14 @@ except Exception as e:
 PY
   rm -f "$WORK/tok-a"
   if grep -q 'PERMISSION_DENIED' "$LOGS/cross.out" "$LOGS/cross.err"; then
-    ok "isolation: a $t0 sandbox's token sent to $t1's worker (${WRK[$t1]}) is PERMISSION_DENIED"
+    ok "isolation: a $t0 sandbox's token sent to $t1's worker (${WRK[1]:-}) is PERMISSION_DENIED"
   else
     notok "isolation: a $t0 sandbox's token sent to $t1's worker is refused" "$(lastline "$LOGS/cross.out") $(lastline "$LOGS/cross.err")"
   fi
 fi
-x b-get as b env "${SBX1[$t0]}"
+x b-get as b env "${SBX1[0]}"
 rcget="$RC"
-x b-tok as b token "${SBX1[$t0]}"
+x b-tok as b token "${SBX1[0]}"
 if [[ "$rcget" != 0 && "$RC" != 0 ]] && grep -q 'no such sandbox' "$LOGS/b-get.err" "$LOGS/b-tok.err"; then
   ok "isolation: user B gets 'no such sandbox' for user A's $t0 sandbox (env and token)"
 else

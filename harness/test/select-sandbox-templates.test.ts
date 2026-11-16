@@ -36,7 +36,7 @@ describe('selectPoolSandbox: the template filter', () => {
     expect(sel?.sandboxId).toBe('dj-1');
   });
 
-  it('a session pinned to a build lands only on a worker serving that build (G19)', async () => {
+  it('a session pinned to a build lands only on a worker serving that build', async () => {
     const A = 'sha256:' + 'a'.repeat(64);
     const B = 'sha256:' + 'b'.repeat(64);
     const of = (id: string, build?: string) =>

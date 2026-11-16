@@ -9,10 +9,10 @@ import (
 	"github.com/rossoctl/moca/remote-worker/internal/vmpool"
 )
 
-// templateRecord is the part of template-build.sh's record ("T", schema
-// moca-sbx-template/1) a worker checks its snapshot against at start (PV4, template
-// lifecycle spec §8). The record is what the control plane registers; without this check
-// a worker could serve a snapshot other than the one its template's record names.
+// templateRecord is the part of template-build.sh's template record (schema
+// moca-sbx-template/1) a worker checks its snapshot against at start. The record is what
+// the control plane registers; without this check a worker could serve a snapshot other
+// than the one its template's record names.
 type templateRecord struct {
 	Schema         string `json:"schema"`
 	ID             string `json:"id"`
@@ -28,7 +28,7 @@ const templateRecordSchema = "moca-sbx-template/1"
 
 // verifyTemplateRecord checks the record at path against the snapshot's manifest and this
 // worker's identity. Every mismatch is named; the first one refuses the start. An empty
-// path is no check (a worker installed without a record, as before PV4).
+// path is no check (a worker installed without a record, as before).
 func verifyTemplateRecord(path string, man vmpool.Manifest, snapshot, sandboxID, template string) error {
 	if path == "" {
 		return nil

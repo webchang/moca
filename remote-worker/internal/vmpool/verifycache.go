@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// The verify cache (G50): VerifyWith hashes kernel, rootfs, agent and vmstate in full at
+// The verify cache: VerifyWith hashes kernel, rootfs, agent and vmstate in full at
 // every worker start, several GiB re-read just to re-hash files the build already hashed.
 // With VerifyOptions.Cache set, a file is hashed in full once on this host, and its hash is
 // then trusted for as long as the file's identity is unchanged:

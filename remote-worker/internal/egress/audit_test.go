@@ -297,12 +297,12 @@ func TestJSONSinkConcurrentEmit(t *testing.T) {
 // the proxy injected; this test pins that down so a change is deliberate.
 func TestRedactPathOnRequestLines(t *testing.T) {
 	for line, want := range map[string]string{
-		"GET http://u:p@up.example.com/p?token=s3cret HTTP/1.1":        "/p",
-		"GET http://up.example.com/p?x=1#frag HTTP/1.1":                "/p",
-		"GET /simple/pkg/?api_key=s3cret HTTP/1.1":                     "/simple/pkg/",
-		"GET /dl/tok-0123456789abcdef0123456789abcdef HTTP/1.1":        "/dl/tok-0123456789abcdef0123456789abcdef",
-		"GET /p#frag HTTP/1.1":                                         "/p%23frag",
-		"POST https://user@up.example.com:8443/a%2Fb?sig=abc HTTP/1.1": "/a%2Fb",
+		"GET http://u:p@up.example.test/p?token=s3cret HTTP/1.1":        "/p",
+		"GET http://up.example.com/p?x=1#frag HTTP/1.1":                 "/p",
+		"GET /simple/pkg/?api_key=s3cret HTTP/1.1":                      "/simple/pkg/",
+		"GET /dl/tok-0123456789abcdef0123456789abcdef HTTP/1.1":         "/dl/tok-0123456789abcdef0123456789abcdef",
+		"GET /p#frag HTTP/1.1":                                          "/p%23frag",
+		"POST https://user@up.example.test:8443/a%2Fb?sig=abc HTTP/1.1": "/a%2Fb",
 	} {
 		r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(line + "\r\nHost: up.example.com\r\n\r\n")))
 		if err != nil {
@@ -321,7 +321,7 @@ func TestRedactPathOnRequestLines(t *testing.T) {
 }
 
 // The Event's JSON names are the wire format the control plane stores
-// (packages/control-plane/src/egress-log.ts EVENT_FIELDS, register G42), which
+// (packages/control-plane/src/egress-log.ts EVENT_FIELDS), which
 // refuses any other field. A field added here must be added there, on purpose.
 func TestEventFieldsAreTheWireFormat(t *testing.T) {
 	var names []string

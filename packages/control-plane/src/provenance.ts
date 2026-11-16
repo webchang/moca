@@ -7,8 +7,8 @@ import { SubjectQueue } from './subject-document.js';
 /**
  * Template provenance (template lifecycle spec §7): append-only records, each named by the sha256
  * of its canonical JSON and naming its predecessor's digest in `prev`, so any edit to a stored
- * record breaks the chain. No signatures (the user, 2026-11-03): the chain heads, exported and
- * kept elsewhere, are what an offline verifier compares against.
+ * record breaks the chain. Digests, not signatures: the chain heads, exported and kept elsewhere,
+ * are what an offline verifier compares against.
  *
  * One chain per STREAM: `policy` for the deployment's policy records, `template/<id>` for
  * everything about one template (create, gate, build, check, activate, ...). A record in a
@@ -26,7 +26,10 @@ import { SubjectQueue } from './subject-document.js';
 export const RECORD_SCHEMA = 'moca-provenance-record/1';
 export const EXPORT_SCHEMA = 'moca-provenance-export/1';
 
-/** The record kinds of spec §7.1. */
+/**
+ * The record kinds of spec §7.1. The units that produce each event write its records; a verifier
+ * that predates a kind refuses a store holding one.
+ */
 export const RECORD_KINDS = [
   'policy',
   'create',
@@ -41,20 +44,18 @@ export const RECORD_KINDS = [
   'retire',
   'reject',
   'use',
-  // A sandbox's span on a build (§7.1): written at create (its lease's activate record named) and
-  // when it ends. Added 2026-11-06; a verifier that predates it refuses a store holding one.
+  // A sandbox's span on its template's chain (§7.1): written at create and when it ends.
   'sandbox',
-  // A Moca Pi session's span on a build (§7.1), as `sandbox` for a sandbox: written when a session
-  // pinned through the store is created and deleted. Added 2026-11-06, after `sandbox`.
+  // A Moca Pi session's span on a build (§7.1), as `sandbox` for a sandbox.
   'session',
-  // Enrollment and roles through the API (register G38), on the `members` stream only: a subject
-  // enrolled or unenrolled (`member`), the admin role granted, revoked or lapsed (`role`). Added
-  // 2026-11-08; a verifier that predates them refuses a store holding one.
+  // Enrollment and roles through the API, on the `members` stream only: a subject enrolled or
+  // unenrolled (`member`), the admin role granted, revoked or lapsed (`role`).
   'member',
   'role',
 ] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
+/** `policy`, `members`, or `template/<id>` with a template id as sandbox-config.ts admits it. */
 const STREAM_RE = /^(policy|members|template\/[a-z0-9][a-z0-9-]{0,30})$/;
 /** The kinds that belong to the `members` stream, and the only ones it holds. */
 const MEMBER_KINDS = new Set(['member', 'role']);
@@ -70,7 +71,7 @@ export interface ProvenanceRecord {
   prev: string | null;
   /** RFC 3339, UTC, whole seconds. */
   at: string;
-  /** Who: a subject (`github:…`), `policy` for an automatic decision, or `host:<id>`. */
+  /** Who: a subject (`github:…`), `policy` for an automatic decision, `janitor`, or `host:<id>`. */
   subject: string;
   body: Record<string, unknown>;
 }
@@ -135,20 +136,21 @@ export function sha256Hex(data: string | Buffer): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
+export function recordDigest(r: ProvenanceRecord): string {
+  return `sha256:${sha256Hex(canonicalJson(r))}`;
+}
+
 /**
- * The digest of a build's `build` record in a template's chain (§7.1), found by its handle, else
- * its manifest hash:
- * what a check, a retire, a reject and a host's removal cite as `buildRecord`. Null for a build that
- * never produced one (imported, or retired before it was built).
+ * The digest of a build's `build` record (outcome `built`): what a retire cites as `buildRecord`.
+ * Matched by the build's handle when it has one, so a build that was built and then rejected (its
+ * `buildId` stays its handle, not the manifest hash) still finds its record; by the manifest hash
+ * otherwise. Null for a build that never produced one (imported, or retired before it was built).
  */
 export async function buildRecordOf(
   store: ProvenanceStore,
   template: string,
   build: { buildId: string; handle?: string },
 ): Promise<string | null> {
-  // Matched by the build's handle when it has one, so a build that was built and then rejected
-  // (its buildId stays its handle, not the manifest hash) still finds its record; by the manifest
-  // hash otherwise.
   const r = (await store.chain(`template/${template}`)).find((x) => {
     const body = x.body as { outcome?: string; handle?: string; manifest_hash?: string };
     if (x.kind !== 'build' || body.outcome !== 'built') return false;
@@ -157,10 +159,6 @@ export async function buildRecordOf(
       : body.manifest_hash === build.buildId;
   });
   return r ? recordDigest(r) : null;
-}
-
-export function recordDigest(r: ProvenanceRecord): string {
-  return `sha256:${sha256Hex(canonicalJson(r))}`;
 }
 
 const hexOf = (digest: string): string => digest.slice('sha256:'.length);
@@ -179,7 +177,7 @@ export class ProvenanceStore {
 
   /**
    * Creates the directory tree (0700) and checks it is writable NOW, so a missing or read-only
-   * volume fails the control plane at start, not on the first build's report.
+   * volume fails the control plane at start, not on the first write.
    */
   constructor(opts: { dir: string; now?: () => number }) {
     if (!opts.dir) throw new Error('SH_PROVENANCE_DIR is required for the provenance store');

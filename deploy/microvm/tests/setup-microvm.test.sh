@@ -728,7 +728,7 @@ check "its own workspace and jail roots" "$(val SH_WORKSPACE_ROOT "$TE") $(val S
   "$TPLROOT/$KEY/workspaces $TPLROOT/$KEY/jail"
 check "the same token in the worker env and the relay env" "$(val SANDBOX_TOKEN "$TE")" "$(val "SH_RELAY_TOKEN_$SID" "$TR")"
 check "a token unlike the main worker's" "$([ "$(val SANDBOX_TOKEN "$TE")" != "$(val SANDBOX_TOKEN "$TMP/etc/microvm-worker.env")" ] && echo yes)" "yes"
-check "both env files are 0600" "$(stat -c '%a' "$TE" 2>/dev/null || stat -f '%Lp' "$TE") $(stat -c '%a' "$TR" 2>/dev/null || stat -f '%Lp' "$TR")" "600 600"
+check "both env files are 0600" "$(mode "$TE") $(mode "$TR")" "600 600"
 check "the relay loads its token through its own drop-in" "$(grep -c "^EnvironmentFile=$TR$" "$TMP/units/sh-relay.service.d/51-moca-$SID.conf")" "1"
 check "the instance loads its env through its drop-in" "$(grep -c "^EnvironmentFile=$TE$" "$TMP/units/microvm-worker@$SID.service.d/50-moca-template.conf")" "1"
 check "the token is never in argv" "$(grep -c "$(val SANDBOX_TOKEN "$TE")" "$MOCK_LOG")" "0"
@@ -794,7 +794,11 @@ for f in "etc/microvm-worker-$SID.env" "etc/microvm-relay-$SID.env" "units/sh-re
   "units/microvm-worker@$SID.service.d/50-moca-template.conf" "units/microvm-worker@.service" "units/microvm-tpl.slice"; do
   check "removed $f" "$([ -e "$TMP/$f" ] && echo present || echo gone)" "gone"
 done
-check "the main worker's files stay" "$(cd "$TMP" && ls units/microvm-worker.service etc/microvm-worker.env etc/microvm-relay.env 2>/dev/null | wc -l | tr -d ' ')" "3"
+kept=0
+for f in units/microvm-worker.service etc/microvm-worker.env etc/microvm-relay.env; do
+  if [[ -e "$TMP/$f" ]]; then kept=$((kept + 1)); fi
+done
+check "the main worker's files stay" "$kept" "3"
 check "workspace data is kept" "$([ -f "$TPLROOT/$KEY/workspaces/s-1/kept" ] && echo kept)" "kept"
 check "the instance's slice is stopped too (its VMs are siblings of the unit)" "$(grep -c "^systemctl stop microvm-tpl-$SID.slice$" "$MOCK_LOG")" "1"
 check "the instance is disabled and stopped" "$(grep -c "^systemctl disable --now microvm-worker@$SID.service$" "$MOCK_LOG")" "1"
@@ -807,7 +811,7 @@ reset_host; run >/dev/null
 SHORT="$(mktemp -d /tmp/snp.XXXX)"; mkdir -p "$SHORT/py312-aaaaaaaaaaaa"; printf '{"guest_ram_mb": 256}\n' >"$SHORT/py312-aaaaaaaaaaaa/manifest.json"
 check "exit 0" "$(env -u MICROVM_TPL_SRV "$REAL_BASH" "$SCRIPT" --template py312 --snapshot "$SHORT/py312-aaaaaaaaaaaa" >"$TMP/run.log" 2>&1; echo $?)" "0"
 check "the roots are <snapshot dir>/.tpl/t<12 hex>" "$(val SH_CHROOT_BASE "$TMP/etc/microvm-worker-tpl_py312.env")" "$SHORT/.tpl/$(tkey tpl_py312)/jail"
-# The bm1 case (2026-10-31): /srv/sbx/snapshots/.tpl/<sid> was 116 bytes of API socket path for this
+# The overflow case: /srv/sbx/snapshots/.tpl/<sid> was 116 bytes of API socket path for this
 # id; the key keeps it at 101 under a 23-character snapshot directory.
 p="/srv/sbx/snapshots/.tpl/$(tkey tpl_django_django_11133)/jail/firecracker/vm-99999999999999999999/root/run/firecracker.socket"
 check "the worst-case API socket path under /srv/sbx/snapshots fits" "$([ "${#p}" -lt 108 ] && echo yes || echo "no (${#p})")" "yes"

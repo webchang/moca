@@ -24,7 +24,7 @@
 #
 # --template ID --snapshot DIR (session templates, docs/specs/2026-10-30-session-sandbox-templates-design.md
 # §7): install a SECOND P4 worker beside the main one, serving the snapshot DIR (a directory holding
-# manifest.json, e.g. one template-build.sh wrote) as sandbox template ID. It runs from the template
+# manifest.json, e.g. one build-snapshot.sh wrote) as sandbox template ID. It runs from the template
 # unit microvm-worker@.service as instance tpl_<id with - as _>, in its own slice microvm-tpl-<instance>.slice
 # (each worker sweeps its own parent cgroup at start, so two workers never share one), with its own
 # workspace and jail roots, relay token and env file. The main install must exist first; nothing of
@@ -674,9 +674,10 @@ install_template_unit() {
     "$SCRIPT_DIR/microvm-worker.service" >"$stage/tpl.service"
   # The two lines that keep this worker's VMs apart from the main worker's: if the shipped unit ever
   # renames them, the sed above matches nothing and the instance would sweep the MAIN worker's slice.
-  grep -qx 'Slice=microvm-tpl-%i.slice' "$stage/tpl.service" &&
-    grep -qx 'Environment=SH_PARENT_CGROUP=microvm.slice/microvm-tpl.slice/microvm-tpl-%i.slice' "$stage/tpl.service" ||
+  if ! grep -qx 'Slice=microvm-tpl-%i.slice' "$stage/tpl.service" ||
+    ! grep -qx 'Environment=SH_PARENT_CGROUP=microvm.slice/microvm-tpl.slice/microvm-tpl-%i.slice' "$stage/tpl.service"; then
     die "could not derive the template unit from $SCRIPT_DIR/microvm-worker.service (its Slice= or SH_PARENT_CGROUP= line changed)"
+  fi
   install_if_changed "$stage/tpl.service" "$SH_UNIT_DIR/$TPL_UNIT_SRC" 0644
 }
 
@@ -725,7 +726,7 @@ template_main() {
   # <jail>/firecracker/vm-<20 digits>/root/run/firecracker.socket, is the longest path under it (the
   # egress socket's .../run/v.sock_1025 is shorter) and must fit a Unix socket path (at most 107
   # bytes). So the roots are <snapshot dir>/.tpl/t<12 hex of the sid's sha256>: a short key whatever
-  # the template id (bm1, 2026-10-31: <snapshot dir>/.tpl/<sid> was 116 bytes for a 19-character id).
+  # the template id (<snapshot dir>/.tpl/<sid> overflowed it for a 19-character id).
   local key; key="t$(printf '%s' "$TPL_SID" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
   local root="${TPL_SRV_ROOT:-$snap_dir/.tpl}/$key"
   local longest="$root/jail/firecracker/vm-99999999999999999999/root/run/firecracker.socket"
@@ -743,8 +744,9 @@ template_main() {
   # (install-host.sh's rule for SBX0's workers).
   local need=$(((guest + 32) * 3 + 1024))
   TPL_BUDGET_MB="${TPL_BUDGET_MB:-$need}"
-  [[ "$TPL_BUDGET_MB" =~ ^[1-9][0-9]*$ ]] && ((TPL_BUDGET_MB >= need)) ||
+  if ! [[ "$TPL_BUDGET_MB" =~ ^[1-9][0-9]*$ ]] || ((TPL_BUDGET_MB < need)); then
     die "--budget-mb $TPL_BUDGET_MB cannot hold one session of a ${guest} MiB guest: at least $need MiB"
+  fi
   local port token stage
   port="$(relay_port "$SH_ENV_DIR/relay.env")"
   token="$(env_value "SH_RELAY_TOKEN_$TPL_SID" "$TPL_RELAY_ENV" 2>/dev/null || true)"

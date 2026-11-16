@@ -1,24 +1,25 @@
 # Subject trust for gate records: general-user self-serve for gated profiles
 
-- **Status:** implemented; **deployed** on `moca-sbx-template` 2026-11-09 (image 733eac0d, its stored policy
-  gaining `benchmark-self` and `general-self`); on `moca-combined` 2026-11-09, **deployed, not enabled by policy**
-  (its policy keeps `base` and `benchmark` only) (register G41 (c)).
+- **Status:** implemented ([#738](https://github.com/rossoctl/moca/issues/738)). A deployment whose
+  stored policy predates it gains the two profiles only when an admin adds them (`PUT /v1/policy`);
+  the default policy holds them.
 - **Date:** 2026-11-08
-- **Decisions:** the user, 2026-11-08, in sbx-template's and autobench-moca's sessions, with
-  image-factory's review.
+- **Decisions:** §7, reviewed by a benchmark client and an image builder.
 - **Builds on:** [template lifecycle](2026-11-03-template-lifecycle-and-provenance-design.md) §8 (the
-  policy and its rules); image-factory's general gate (`image-factory/gate/1`, its `docs/GENERAL_GATE.md`).
+  policy and its rules); an image builder's general gate, whose records carry the schema
+  `SH_GATE_RECORD_SCHEMA` names (default `moca-gate-record/1`, the format an image builder writes for
+  Moca).
 
 ## 1. The problem
 
 A gated profile (`benchmark`) requires X1 (a gate record that passed and names the image's digest) and
 X1.trusted (its sha256 listed in the policy's `trustedGateRecords`, which only an admin edits). A
-general user can produce a gate record with image-factory's general gate, but can't make the
+general user can produce a gate record with an image builder's general gate, but can't make the
 deployment trust it. So gated self-serve was open only to the curated image pipeline.
 
-The user's route (2026-11-08):
+The route taken:
 
-1. **(b)** image-factory's general gate tool first: any OCI image, from a small contract, to a gate
+1. **(b)** an image builder's general gate tool first: any OCI image, from a small contract, to a gate
    record in the format Moca reads.
 2. **(c)** this design: per-subject trust in the control plane.
 3. **(a)** gate as a service: deferred.
@@ -27,7 +28,7 @@ The user's route (2026-11-08):
 
 **Trust is decided by who submits a gate record, never by anything inside it.** The record is
 unsigned bytes, and its sha256 is its identity; a claim of origin inside it proves nothing
-(image-factory agrees).
+(the image builder agrees).
 
 - A subject's own gate record counts **for that subject's own templates only**.
 - A template built that way is **self-attested**: visibly so in GET, and on the provenance chain.
@@ -72,8 +73,8 @@ On a `selfAttest` profile, when the record's sha256 is not in `trustedGateRecord
 
 A record in `trustedGateRecords` is trusted on any profile, as before.
 
-**X1.offline (the user's rule, 2026-11-08; the field from image-factory ec4b5a0):** a general-gate
-record (`image-factory/gate/1`) always carries `gate.floor_checked_offline`: true, unless its contract
+**X1.offline:** a general-gate record (of the schema `SH_GATE_RECORD_SCHEMA` names, default
+`moca-gate-record/1`) always carries `gate.floor_checked_offline`: true, unless its contract
 set `network_needed`. `benchmark` and `benchmark-self` require it to be true, and refuse a general-gate
 record without it (fail closed): a benchmark's floor must be checked offline. A curated family record
 (the moca-microvm records the policy already trusts) predates the field, and its gate ran offline, so
@@ -100,10 +101,15 @@ shows `gateFloorCheckedOffline`, and, from a `network_needed` gate, `gateFloorMe
 
 ## 6. Visibility
 
-- A self-attested template is **private**. A create asking for `deployment` visibility, a
-  self-attested build added to a deployment-visible template, and a PATCH to `deployment` are each
-  refused `409 self_attested`, until an admin trusts the record.
-- **The user's decision Q4 (i):** when an admin removes a record's sha256 from `trustedGateRecords`, a
+- A self-attested template is **private**. A create asking for `deployment` visibility and a
+  self-attested build added to a deployment-visible template are each refused `409 self_attested`,
+  until an admin trusts the record. A visibility edit to `deployment` (`PATCH /v1/templates/{id}`) on
+  a template with a self-attested build, registered or on its way there, is refused the same way,
+  and so is an admin's transfer of such a template to another subject (`PUT
+/v1/templates/{id}/owner`): the gate record counts for its submitter's own templates only.
+- A template's **visibility in effect** is `private` while any of its registered builds is
+  self-attested now, whatever is stored, so every list, read and use follows the current policy.
+- **Decision (i):** when an admin removes a record's sha256 from `trustedGateRecords`, a
   deployment-visible template whose registered builds become self-attested falls back to **private on
   read**: a build self-attested at create, and a build made on a `selfAttest` profile while the record
   was trusted, by its submitter or by another subject. Whose record it is stays X1.self.scope's (§4):
@@ -112,7 +118,7 @@ shows `gateFloorCheckedOffline`, and, from a `network_needed` gate, `gateFloorMe
 - So that nothing is silent, `PUT /v1/policy` names the narrowed builds (`narrowed: [{template,
 buildId}]`) in its answer and in its `policy` record.
 
-## 7. The user's decisions (2026-11-08)
+## 7. Decisions
 
 1. **A new profile, not a flag on `benchmark`:** `benchmark` means curated wherever it's cited.
 2. **No sharing without promotion:** a self-attested template reaches no one else on its owner's own
@@ -125,21 +131,25 @@ buildId}]`) in its answer and in its `policy` record.
 ## 8. As built
 
 - `packages/control-plane/src/template-policy.ts`:
-  - the profile fields `selfAttest` and `selfAttestEgress`, validated by `policyProblems`;
+  - the profile fields `selfAttest`, `selfAttestEgress` and `requireOfflineGate`, validated by
+    `policyProblems`;
   - the two default profiles;
-  - in `checkCreate`, the rules of §4 (`X1.self.scope`, `X12.self`, `X1.self.egress`) and `gateTrust`.
+  - in `checkCreate`, the rules of §4 (`X1.self.scope`, `X12.self`, `X1.self.egress`, `X1.offline`),
+    `gateTrust` and `gateFloor`.
 - `packages/control-plane/src/sandbox-handlers.ts`:
   - `attestationOf` and `effectiveVisibility`;
   - `canSee` on the effective visibility, so every list, read and use (`resolveForUse`) follows it;
   - the create's (subject, sha256) lookup, its gate record body, and its visibility refusals;
-  - the PATCH refusal;
+  - the template edit's refusal of `deployment` visibility for a self-attested template;
   - `putPolicy`'s `narrowed`.
 - `PolicyStore.set` takes an `extra` body for the `policy` record, which is never put into the policy.
-- **Tests:** `packages/control-plane/test/subject-trust.test.ts`, including image-factory's
-  `image-factory/gate/1` record shape (no base image, no recipe), and a policy write keeping
-  `quotaBySubject`.
+- `SH_GATE_RECORD_SCHEMA` (`sandbox-config.ts`): the general-gate schema X1.offline reads, default
+  `moca-gate-record/1`; `GET /v1/policy` answers it as `gateRecordSchema` for a client's dry run.
+- **Tests:** `packages/control-plane/test/subject-trust.test.ts`, including the general-gate record
+  shape (no base image, no recipe), the schema setting's default and an override, and a policy write
+  keeping every other field.
 
-## 9. Compatibility
+## 9. Compatibility and limits
 
 - **An older control plane reading a policy that holds these profiles:** `policyProblems` checks only
   each profile's `requires` and `envelope`, so the extra fields are accepted. They are ignored: such a
@@ -151,3 +161,6 @@ buildId}]`) in its answer and in its `policy` record.
   record's cited blob only, so the new fields need no change there.
 - **X1.self.scope is serialized within one control plane process**, as the catalog's own writes are
   per template id: a deployment runs one control plane writing its template store.
+- **What a self-attested record attests is its submitter's word.** X1.offline checks only what can be
+  checked without the image, and nothing re-runs the gate. A gate run by Moca itself (option (a)) is
+  out of scope.

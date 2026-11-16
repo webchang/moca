@@ -10,7 +10,7 @@ import (
 	"github.com/rossoctl/moca/remote-worker/internal/vmpool"
 )
 
-const testDigest = "sha256:3d3e705ff379defc6684c220f97fc8701df4e06fce8fa8841c13d3ff8cef7746"
+const testDigest = "sha256:0123456789ab" + "cdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func recordMan() vmpool.Manifest {
 	return vmpool.Manifest{HashVersion: vmpool.HashVersionAll, Hash: "sha256:h1", GuestRAMMB: 4096,
@@ -20,9 +20,9 @@ func recordMan() vmpool.Manifest {
 func writeRecord(t *testing.T, edit func(map[string]any)) string {
 	t.Helper()
 	r := map[string]any{
-		"schema": "moca-sbx-template/1", "id": "django-django-11133",
-		"worker": "sbx_django_django_11133_3d3e705ff379", "snapshot": "django-django-11133-3d3e705ff379",
-		"image": "registry.example.com/moca-microvm@" + testDigest, "guest_ram_mb": 4096,
+		"schema": "moca-sbx-template/1", "id": "py-tools",
+		"worker": "sbx_py_tools_0123456789ab", "snapshot": "py-tools-0123456789ab",
+		"image": "example/py-tools@" + testDigest, "guest_ram_mb": 4096,
 		"manifest_hash": "sha256:h1",
 	}
 	if edit != nil {
@@ -38,8 +38,8 @@ func writeRecord(t *testing.T, edit func(map[string]any)) string {
 
 func check(t *testing.T, path string, man vmpool.Manifest) error {
 	t.Helper()
-	return verifyTemplateRecord(path, man, "django-django-11133-3d3e705ff379",
-		"sbx_django_django_11133_3d3e705ff379", "django-django-11133")
+	return verifyTemplateRecord(path, man, "py-tools-0123456789ab",
+		"sbx_py_tools_0123456789ab", "py-tools")
 }
 
 func TestTemplateRecordMatches(t *testing.T) {
@@ -70,7 +70,7 @@ func TestTemplateRecordRefusesEachMismatch(t *testing.T) {
 		}, "image digest"},
 		{"image by tag", func(r map[string]any) { r["image"] = "registry.example.com/x:latest" }, "not pinned"},
 		{"egress ca", func(r map[string]any) { r["egress_ca_sha256"] = "sha256:ca" }, "egress_ca_sha256"},
-		{"schema", func(r map[string]any) { r["schema"] = "moca-sbx-template/0" }, "schema"},
+		{"schema", func(r map[string]any) { r["schema"] = "other-template/1" }, "schema"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := check(t, writeRecord(t, tc.edit), recordMan())

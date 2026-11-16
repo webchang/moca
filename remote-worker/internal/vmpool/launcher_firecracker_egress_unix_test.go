@@ -303,11 +303,11 @@ func TestFirecrackerRefusesAnEgressSocketPathTooLong(t *testing.T) {
 }
 
 func TestFirecrackerRefusesAnAPISocketPathTooLong(t *testing.T) {
-	// The API socket is dialled with egress off too. 66 + "/firecracker/vm-<20>/root/run/firecracker.socket"
-	// (61) = 127 bytes: refused. The SBX0 case that hit it: a base of 53 bytes fits only to vm-9.
+	// The API socket is dialled with egress off too. 61 + "/firecracker/vm-<20>/root/run/firecracker.socket"
+	// (64) = 125 bytes: refused. A chroot base named after a long template id hits it.
 	opts := FirecrackerOptions{
 		JailerBin: "/j", FirecrackerBin: "/usr/bin/firecracker", SnapshotDir: "/s",
-		ChrootBase: "/srv/sbx/jail/sbx_scikit_learn_scikit_learn_13439_96d81f0b74e2",
+		ChrootBase: "/srv/sbx/jail/sbx_example_org_example_proj_12345_0123456789ab",
 	}
 	_, err := NewFirecrackerLauncher(opts)
 	if err == nil {
@@ -364,7 +364,7 @@ func TestLauncherFromEnvWiresEgressFromControlSock(t *testing.T) {
 }
 
 // A jailer (or a Firecracker) that fails says why on stdout/stderr; the restore's error carries
-// the tail of it, instead of only the socket timeout (2026-10-31: strace was needed to see it).
+// the tail of it, instead of only the socket timeout.
 func TestFirecrackerRestoreErrorCarriesTheJailerOutput(t *testing.T) {
 	base := shortdir.New(t, "fcout", len("/firecracker/vm-99999999999999999999/root/run/firecracker.socket"))
 	jailer := filepath.Join(base, "jailer")

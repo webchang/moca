@@ -19,6 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 )
 
 // MaxFrame bounds one frame's payload. It equals wexec.ChunkSize (32 KiB), so one
@@ -67,7 +69,60 @@ type Request struct {
 	// NormaliseWorkspace asks the guest to normalise the workspace before the
 	// command runs. omitempty for the same compatibility reason as Lease.
 	NormaliseWorkspace bool `json:"normalise_workspace,omitempty"`
+	// Kind is what the request asks for: a command (empty or RequestKindCommand) or
+	// one of the tracked-process kinds. omitempty, so an old host's request is
+	// byte-identical. An old agent ignores the field and would run Command, so the
+	// host sends a process kind only to a snapshot that advertises lease-processes-v1.
+	Kind string `json:"kind,omitempty"`
+	// Process carries a process kind's arguments. For process_start the command stays
+	// in Command.
+	Process *ProcessArgs `json:"process,omitempty"`
+	// MaxProcesses is the host's SH_LEASE_MAX_PROCESSES, sent on process_start: the
+	// cap on running tracked processes.
+	MaxProcesses int `json:"max_processes,omitempty"`
 }
+
+// Request kinds. RequestKindProcessStopAll is host-only: the worker sends it on a
+// downgrade, and no tool maps to it.
+const (
+	RequestKindCommand        = "command"
+	RequestKindProcessStart   = "process_start"
+	RequestKindProcessList    = "process_list"
+	RequestKindProcessLogs    = "process_logs"
+	RequestKindProcessStop    = "process_stop"
+	RequestKindProcessStopAll = "process_stop_all"
+)
+
+// ProcessArgs are a process kind's arguments (spec §7). Which apply depends on the
+// kind: Name and Cwd for process_start, ID or Name for logs and stop, Tail for logs,
+// Signal for stop.
+type ProcessArgs struct {
+	Name   string `json:"name,omitempty"`
+	ID     string `json:"id,omitempty"`
+	Cwd    string `json:"cwd,omitempty"`
+	Tail   int    `json:"tail,omitempty"`
+	Signal string `json:"signal,omitempty"`
+}
+
+// TrackedProcess is one entry of the agent's tracked-process table, as End carries
+// it. Code is the exit code when State is TrackedExited and the signal number when it
+// is TrackedKilled.
+type TrackedProcess struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	PID           int    `json:"pid"`
+	State         string `json:"state"`
+	Code          int    `json:"code"`
+	StartedUnixMs int64  `json:"started_unix_ms"`
+	MemoryBytes   int64  `json:"memory_bytes"`
+}
+
+// Tracked-process states: running, exited(code) or killed(signal) (spec §7).
+const (
+	TrackedRunning = "running"
+	TrackedExited  = "exited"
+	TrackedKilled  = "killed"
+)
 
 // End is the terminal success frame. Dropped counts are bytes the guest threw away at
 // CapBytes, PER STREAM — the two caps are independent and only stdout's overflow is a
@@ -79,6 +134,9 @@ type End struct {
 	// TeardownFailed reports that the guest could not tear down the command's state
 	// after it exited. omitempty: a clean teardown adds no key.
 	TeardownFailed bool `json:"teardown_failed,omitempty"`
+	// Tracked is the agent's whole tracked-process table, on every lease End, so the
+	// host's mirror of it is never stale. omitempty: an empty table adds no key.
+	Tracked []TrackedProcess `json:"tracked,omitempty"`
 }
 
 func WriteFrame(w io.Writer, k Kind, payload []byte) error {
@@ -129,3 +187,20 @@ func WriteJSON(w io.Writer, k Kind, v any) error {
 }
 
 func DecodeJSON(p []byte, v any) error { return json.Unmarshal(p, v) }
+
+// TimeoutMessage is the KindError payload the agent sends when a command's own timeout
+// fired, the command having been killed first. On a lease Exec the host keeps the lease
+// when this arrives (vmpool's runLease), so it has this one format.
+func TimeoutMessage(timeoutS uint32) string {
+	return "timeout:" + strconv.FormatUint(uint64(timeoutS), 10)
+}
+
+// IsTimeoutMessage reports whether a KindError payload is a TimeoutMessage.
+func IsTimeoutMessage(msg string) bool {
+	n, ok := strings.CutPrefix(msg, "timeout:")
+	if !ok || n == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(n, 10, 32)
+	return err == nil
+}

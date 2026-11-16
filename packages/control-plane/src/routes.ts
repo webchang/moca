@@ -70,7 +70,7 @@ export interface RouteSpec {
    * Mounted only when this feature is on (see RouteFeatures). Absent means always mounted.
    * `requiresEgress` above is the same idea, kept separate because it applies per profile.
    */
-  feature?: 'testUsers';
+  feature?: 'testUsers' | 'grants';
 }
 
 const BOTH: readonly RouteProfile[] = ['harness', 'sandbox'];
@@ -93,6 +93,24 @@ export const ROUTES: readonly RouteSpec[] = [
     sessionScoped: false,
     profiles: BOTH,
     operationId: 'readyz',
+  },
+  // §7's `async_quota_refusals`: the one async metric a worker cannot report, because §4.3 refuses
+  // the submission here and nothing is ever enqueued. HARNESS only -- the sandbox profile runs no
+  // turns, so the number is structurally zero there. Unversioned like the probes above: an operator
+  // surface, not client API, and the same path the supervisor's admin port serves.
+  //
+  // `auth: 'api'` with an admin check inside the handler, NOT `auth: 'none'` like the probes: this
+  // answers how often tenants hit their quota, on the public port. A small activity side channel,
+  // but free to close. The check is in the handler because RouteSpec has no whole-route admin field
+  // and one route does not justify adding one (`listSessions` gates its privileged branch the same
+  // way); a second admin-only route is the moment to lift it into the router.
+  {
+    method: 'GET',
+    path: '/metrics',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: HARNESS,
+    operationId: 'getMetrics',
   },
   // Public by design: a client asks it BEFORE logging in, to learn where the harness is.
   {
@@ -379,7 +397,37 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: HARNESS,
     operationId: 'exchangeTurnCredential',
   },
-  // SBX0 §5.1: the sandbox resource, on the sandbox profile only (sandbox-handlers.ts).
+  /**
+   * MI1 §6.2's grant lifecycle, on the same shared bearer as the two exchanges above because it is
+   * the same hop. Unmounted unless `MOCA_GRANT_SIGNING_KEY` is set, so a deployment that has not
+   * generated the grant ring 404s both paths rather than 500ing on a missing key -- and 404s them
+   * BEFORE the body is parsed, which is the whole reason ADR-0045 puts the gate here.
+   *
+   * §6.2 says `/internal/turn-grants` "replaces `/internal/credentials`". It does not here: nothing
+   * redeems a grant until the `moca-egress` inference listener exists (§8.6), so retiring the
+   * credential exchange now would break every worker for no gain. Both stay; the replacement ships
+   * with the redeemer.
+   */
+  {
+    method: 'POST',
+    path: '/internal/turn-grants',
+    auth: 'exchange',
+    sessionScoped: false,
+    profiles: HARNESS,
+    operationId: 'issueTurnGrants',
+    feature: 'grants',
+  },
+  {
+    method: 'POST',
+    path: '/internal/grants/refresh',
+    auth: 'exchange',
+    sessionScoped: false,
+    profiles: HARNESS,
+    operationId: 'refreshTurnGrants',
+    feature: 'grants',
+  },
+  // Template lifecycle spec §4: the templates, one template, its builds, one build, its tags. On
+  // BOTH profiles (§4.1), so a session's brain and a sandbox client read the same templates.
   {
     method: 'GET',
     path: '/v1/templates',
@@ -388,8 +436,6 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     operationId: 'listTemplates',
   },
-  // Template lifecycle spec §4: one template, its builds, one build, its tags. On BOTH profiles
-  // (§4.1), so a session's brain and a sandbox client read the same templates.
   {
     method: 'GET',
     path: '/v1/templates/{id}',
@@ -422,25 +468,8 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     operationId: 'listTemplateTags',
   },
-  {
-    method: 'POST',
-    path: '/v1/templates/{id}/activate',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    bodyRequired: false,
-    operationId: 'activateTemplate',
-  },
-  {
-    method: 'POST',
-    path: '/v1/templates/{id}/deactivate',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    bodyRequired: false,
-    operationId: 'deactivateTemplate',
-  },
-  // Template lifecycle spec §4, §5.1, §8.1: self-serve create, policy, quota. Both profiles.
+  // Template lifecycle spec §4, §5.1, §8.1: self-serve create, a new build, cancel, the policy and
+  // the caller's quota. On BOTH profiles (§4.1), as the reads.
   {
     method: 'POST',
     path: '/v1/templates',
@@ -468,6 +497,42 @@ export const ROUTES: readonly RouteSpec[] = [
     bodyRequired: false,
     operationId: 'cancelTemplateBuild',
   },
+  // Template lifecycle spec §5.1-§5.2: the owner moves and removes tags and edits the template; an
+  // admin transfers it. On BOTH profiles (§4.1), as the reads.
+  {
+    method: 'POST',
+    path: '/v1/templates/{id}/tags',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'moveTemplateTags',
+  },
+  {
+    method: 'DELETE',
+    path: '/v1/templates/{id}/tags/{tag}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    bodyRequired: false,
+    operationId: 'removeTemplateTag',
+  },
+  {
+    method: 'PATCH',
+    path: '/v1/templates/{id}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'updateTemplate',
+  },
+  {
+    method: 'PUT',
+    path: '/v1/templates/{id}/owner',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'transferTemplateOwner',
+  },
+  // Template lifecycle spec §5.1: retire a whole template, or one build of it.
   {
     method: 'POST',
     path: '/v1/templates/{id}/retire',
@@ -486,6 +551,7 @@ export const ROUTES: readonly RouteSpec[] = [
     bodyRequired: false,
     operationId: 'retireTemplateBuild',
   },
+  // Template lifecycle spec §5.2: an admin rejects a registered build after the fact.
   {
     method: 'POST',
     path: '/v1/templates/{id}/builds/{build}/reject',
@@ -494,89 +560,24 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     operationId: 'rejectTemplateBuild',
   },
+  // Template lifecycle spec §6.3: take, renew or release the caller's activation lease.
   {
-    method: 'PATCH',
-    path: '/v1/templates/{id}',
+    method: 'POST',
+    path: '/v1/templates/{id}/activate',
     auth: 'api',
     sessionScoped: false,
     profiles: BOTH,
-    operationId: 'updateTemplate',
-  },
-  {
-    method: 'PUT',
-    path: '/v1/templates/{id}/owner',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'transferTemplateOwner',
-  },
-  {
-    method: 'PUT',
-    path: '/v1/quota/{subject}',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'putQuota',
-  },
-  // Enrollment and roles through the API (register G38): admin only, on both profiles as the other
-  // admin routes (policy, quota); with no members store (no SH_PROVENANCE_DIR) they answer 400.
-  {
-    method: 'GET',
-    path: '/v1/subjects',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'listSubjects',
-  },
-  {
-    method: 'PUT',
-    path: '/v1/subjects/{subject}',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'enrollSubject',
-  },
-  {
-    method: 'DELETE',
-    path: '/v1/subjects/{subject}',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'unenrollSubject',
-  },
-  {
-    method: 'PUT',
-    path: '/v1/subjects/{subject}/roles/admin',
-    auth: 'api',
-    sessionScoped: false,
     bodyRequired: false,
-    profiles: BOTH,
-    operationId: 'grantAdmin',
-  },
-  {
-    method: 'DELETE',
-    path: '/v1/subjects/{subject}/roles/admin',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'revokeAdmin',
+    operationId: 'activateTemplate',
   },
   {
     method: 'POST',
-    path: '/v1/templates/{id}/tags',
-    auth: 'api',
-    sessionScoped: false,
-    profiles: BOTH,
-    operationId: 'moveTemplateTags',
-  },
-  {
-    method: 'DELETE',
-    path: '/v1/templates/{id}/tags/{tag}',
+    path: '/v1/templates/{id}/deactivate',
     auth: 'api',
     sessionScoped: false,
     profiles: BOTH,
     bodyRequired: false,
-    operationId: 'removeTemplateTag',
+    operationId: 'deactivateTemplate',
   },
   {
     method: 'GET',
@@ -601,6 +602,15 @@ export const ROUTES: readonly RouteSpec[] = [
     sessionScoped: false,
     profiles: BOTH,
     operationId: 'getQuota',
+  },
+  // Template lifecycle spec §5.2: an admin sets the default quota, or one subject's override.
+  {
+    method: 'PUT',
+    path: '/v1/quota/{subject}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'putQuota',
   },
   // Template lifecycle spec §6.1: a KVM host's sbx-host-agent, with its own bearer, for itself only.
   {
@@ -644,6 +654,7 @@ export const ROUTES: readonly RouteSpec[] = [
     maxBodyBytes: 1024 * 1024,
     operationId: 'hostBuildReport',
   },
+  // Template lifecycle spec §6.3: the host's wanted state, and its workers' starts and stops.
   {
     method: 'GET',
     path: '/v1/hosts/{host}/wanted',
@@ -660,7 +671,50 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: BOTH,
     operationId: 'hostWorkerReport',
   },
-  // Register G42: the egress proxy's audit events from the host's journal, into sandboxes' logs.
+  // Enrollment and roles through the API (member-handlers.ts): admin only, on both profiles as the
+  // template routes; with no members store (no SH_PROVENANCE_DIR) they answer 400.
+  {
+    method: 'GET',
+    path: '/v1/subjects',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'listSubjects',
+  },
+  {
+    method: 'PUT',
+    path: '/v1/subjects/{subject}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'enrollSubject',
+  },
+  {
+    method: 'DELETE',
+    path: '/v1/subjects/{subject}',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'unenrollSubject',
+  },
+  {
+    method: 'PUT',
+    path: '/v1/subjects/{subject}/roles/admin',
+    auth: 'api',
+    sessionScoped: false,
+    bodyRequired: false,
+    profiles: BOTH,
+    operationId: 'grantAdmin',
+  },
+  {
+    method: 'DELETE',
+    path: '/v1/subjects/{subject}/roles/admin',
+    auth: 'api',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'revokeAdmin',
+  },
+  // The egress proxy's audit events from the host's journal, into sandboxes' logs.
   {
     method: 'POST',
     path: '/v1/hosts/{host}/egress',
@@ -671,6 +725,7 @@ export const ROUTES: readonly RouteSpec[] = [
     maxBodyBytes: 9 * 1024 * 1024,
     operationId: 'hostEgress',
   },
+  // SBX0 §5.1: the sandbox resource, on the sandbox profile only (sandbox-handlers.ts).
   {
     method: 'POST',
     path: '/v1/sandboxes',
@@ -716,7 +771,7 @@ export const ROUTES: readonly RouteSpec[] = [
     profiles: SANDBOX,
     operationId: 'mintSandboxToken',
   },
-  // Register G42: a sandbox's egress log, for its owner or an admin, as GET /v1/sandboxes/{id}.
+  // A sandbox's egress log, for its owner or an admin, as GET /v1/sandboxes/{id}.
   {
     method: 'GET',
     path: '/v1/sandboxes/{id}/egress',
@@ -725,6 +780,26 @@ export const ROUTES: readonly RouteSpec[] = [
     sandboxScoped: true,
     profiles: SANDBOX,
     operationId: 'getSandboxEgress',
+  },
+  // Lease-mode spec §8.1-§8.2: the owner's user API token only; a sandbox token is refused by typ.
+  {
+    method: 'PUT',
+    path: '/v1/sandboxes/{id}/mode',
+    auth: 'api',
+    sessionScoped: false,
+    sandboxScoped: true,
+    profiles: SANDBOX,
+    operationId: 'setSandboxMode',
+  },
+  {
+    method: 'POST',
+    path: '/v1/sandboxes/{id}/mode-token',
+    auth: 'api',
+    sessionScoped: false,
+    sandboxScoped: true,
+    bodyRequired: false,
+    profiles: SANDBOX,
+    operationId: 'mintSandboxModeToken',
   },
   // The host janitor's read (SBX0 §8.3): what to keep and what to free, nothing else.
   {
@@ -776,6 +851,8 @@ export interface RouteFeatures {
   egress?: boolean;
   /** SH_TEST_USERS > 0: mounts POST /v1/auth/test-token. */
   testUsers?: boolean;
+  /** MOCA_GRANT_SIGNING_KEY is set: mounts the two MI1 §6.2 grant routes. */
+  grants?: boolean;
 }
 
 export function matchRoute(

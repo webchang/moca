@@ -1,9 +1,9 @@
 import { ProvenanceStore } from './provenance.js';
 import { FilePolicyStore } from './template-policy-store.js';
-import { MembersStore } from './members.js';
 import { HostRegistry } from './host-handlers.js';
 import { templateHostsFromEnv } from './host-config.js';
 import type { PolicyStore } from './template-policy.js';
+import { MembersStore } from './members.js';
 import {
   FileTemplateCatalog,
   redisPresenceReader,
@@ -54,6 +54,7 @@ import { RedisSandboxStore, type SandboxRedisLike } from './sandbox-redis.js';
 import { RedisEgressStore, type EgressRedisLike } from './egress-log.js';
 import { readTenancy } from './tenancy.js';
 import { TurnStore } from './turn-store.js';
+import { resultTtlSeconds, TURN_RECORD_TTL_MARGIN_SECONDS } from './turn-record.js';
 import { RedisTurnQueue } from './turn-queue.js';
 import type { ResultRedisLike } from './turn-result.js';
 
@@ -115,18 +116,10 @@ function countEnv(env: NodeJS.ProcessEnv, name: string, def: number): number {
   return Number(v);
 }
 
-/**
- * The turn record's TTL: `LEAF_RESULT_TTL_SECONDS` plus a margin (async fan-out spec §5.1). The
- * record must OUTLIVE its result -- a caller polling a finished turn whose record expired first
- * would read `404 not submitted` for a turn that in fact succeeded. One hour, which is longer than
- * any plausible gap between a result being read and a poll that follows it.
- */
-const TURN_RECORD_TTL_MARGIN_SECONDS = 3_600;
-
 function turnRecordTtlFromEnv(env: NodeJS.ProcessEnv): number {
-  // Matches server.ts:49's parseInt of the same variable: one deployment, one meaning.
-  const result = countEnv(env, 'LEAF_RESULT_TTL_SECONDS', 86_400);
-  return result + TURN_RECORD_TTL_MARGIN_SECONDS;
+  // `resultTtlSeconds` is the one parse of this variable, shared with the worker that writes the
+  // same results (`server.ts:52`): one deployment, one meaning.
+  return resultTtlSeconds(env) + TURN_RECORD_TTL_MARGIN_SECONDS;
 }
 
 /**
@@ -199,7 +192,7 @@ export function hostFromEnv(env: NodeJS.ProcessEnv): string | undefined {
  * (`LoadCredential=`, MI1 §6.7) rather than an env line; everywhere else, as today, from the env.
  */
 // prettier-ignore
-export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN', 'SH_TEST_USER_SECRET', 'SH_OIDC_CLIENT_SECRET'] as const;
+export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN', 'SH_TEST_USER_SECRET', 'SH_OIDC_CLIENT_SECRET', 'MOCA_GRANT_SIGNING_KEY'] as const;
 
 /** The API, session and refresh token lifetimes, shared by both route profiles. */
 function tokenTtlsFromEnv(
@@ -223,6 +216,22 @@ function tokenTtlsFromEnv(
   };
 }
 
+/**
+ * MI1 §15's two grant lifetimes. Read on BOTH profiles -- the grant routes are harness-only, but
+ * `CpConfig` is one type and a profile-specific default here would be a second place to keep the
+ * numbers. Spread like `tokenTtlsFromEnv`, for the same reason.
+ */
+function grantTtlsFromEnv(env: NodeJS.ProcessEnv): Pick<CpConfig, 'grantTtlS' | 'turnMaxS'> {
+  return {
+    // 5 minutes. With no revocation list (§6.2 builds none deliberately), this IS the revocation
+    // latency and the replay window of a stolen grant; the worker refreshes at half-life.
+    grantTtlS: intEnv(env, 'MOCA_GRANT_TTL_S', 300),
+    // 30 minutes, the deployment-wide ceiling on one turn. A turn's caps may ask for less; a caller
+    // asking for more is clamped at mint rather than refused (async spec §5.4).
+    turnMaxS: intEnv(env, 'MOCA_TURN_MAX_S', 1800),
+  };
+}
+
 export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   required(env, 'SH_SESSION_TOKEN_PRIVATE_KEY');
   // The github client id belongs to the github provider only; an oidc deployment has
@@ -236,6 +245,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   const config: CpConfig = {
     ...tokenTtlsFromEnv(env),
     templateHosts: templateHostsFromEnv(env, [env.SH_EXCHANGE_TOKEN ?? ''].filter(Boolean)),
+    ...grantTtlsFromEnv(env),
     exchangeToken: required(env, 'SH_EXCHANGE_TOKEN'),
     defaultInferenceEndpoint: env.SH_DEFAULT_INFERENCE_ENDPOINT || undefined,
     modelCatalogHosts: catalogHostsEnv(env),
@@ -340,6 +350,7 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
       ...(sandbox.egress?.hosts.map((h) => h.token) ?? []),
     ]),
     ...tokenTtlsFromEnv(env),
+    ...grantTtlsFromEnv(env),
     allowOperatorFallback: false,
     injectorConfigured: false,
     sandboxNamespace: 'default',
@@ -466,6 +477,55 @@ export function verifyKeysFromEnv(
   return keys;
 }
 
+/**
+ * The GRANT ring (MI1 §6.1), built only when `MOCA_GRANT_SIGNING_KEY` is set. A SEPARATE key from
+ * the session signer, which is the §6.1 property that a session token can never pass as a grant even
+ * where an `aud` check is forgotten -- sharing one key would leave `typ` as the only thing between
+ * them.
+ *
+ * Undefined when no key is configured, and that absence is load-bearing: it is what unmounts both
+ * grant routes (`server.ts`'s `grants` gate), so an existing deployment boots and behaves exactly as
+ * before. Nothing redeems a grant yet, so there is nothing for it to turn on.
+ *
+ * The signer's label is its own variable name, so a bad key is a boot error naming
+ * `MOCA_GRANT_SIGNING_KEY` rather than sending an operator to edit the session key that is fine.
+ *
+ * `sessionVerifyKeys` is taken so SEPARATENESS is enforced here rather than left to operator
+ * discipline: a kid in both rings means one key signs both tokens, and the §6.1 property this whole
+ * slice leans on is gone with only `typ` left between a session token and a grant. A kid is a sha256
+ * of the SPKI (`keyIdFor`), so equal kid is equal key -- no false positive is possible. The session
+ * map already holds the session signer's own key, so this one check covers both ways an operator
+ * gets there: reusing `SH_SESSION_TOKEN_PRIVATE_KEY` as the grant key, and listing a session public
+ * key in `MOCA_GRANT_PUBLIC_KEYS`. Refusing to boot is right for the reason `makeSigner` refuses a
+ * public key: a deployment cannot discover this at runtime -- every token verifies.
+ */
+export function grantRingFromEnv(
+  env: NodeJS.ProcessEnv,
+  sessionVerifyKeys: Map<string, KeyObject>,
+):
+  | {
+      grantSigner: ReturnType<typeof makeSigner>;
+      grantVerifyKeys: Map<string, KeyObject>;
+    }
+  | undefined {
+  const raw = env.MOCA_GRANT_SIGNING_KEY;
+  if (!raw) return undefined;
+  const grantSigner = makeSigner(raw, 'MOCA_GRANT_SIGNING_KEY');
+  const grantVerifyKeys = parseKeyset(env.MOCA_GRANT_PUBLIC_KEYS, 'MOCA_GRANT_PUBLIC_KEYS');
+  const own = publicKeyFromBase64(grantSigner.publicKeyBase64);
+  grantVerifyKeys.set(keyIdFor(own), own);
+  const shared = [...grantVerifyKeys.keys()].filter((kid) => sessionVerifyKeys.has(kid));
+  if (shared.length > 0) {
+    throw new Error(
+      `the grant key ring shares key ${shared.join(', ')} with the session token ring, which ` +
+        'would let a session token be signed by a grant key (MI1 §6.1 requires separate rings): ' +
+        'generate a new keypair for MOCA_GRANT_SIGNING_KEY, and keep MOCA_GRANT_PUBLIC_KEYS and ' +
+        'SH_SESSION_TOKEN_PUBLIC_KEYS disjoint',
+    );
+  }
+  return { grantSigner, grantVerifyKeys };
+}
+
 export const CREDENTIAL_STORES = ['kubernetes', 'file', 'vault'] as const;
 export type CredentialStoreKind = (typeof CREDENTIAL_STORES)[number];
 
@@ -529,10 +589,13 @@ export function redisClientOptions(url: string) {
 }
 
 /**
- * `SH_PROVENANCE_DIR` (template lifecycle spec §7.2), either profile: a directory on the control
- * plane's persistent volume holding the provenance store and the template catalog. Set, the
- * catalog is the store (SH_SANDBOX_TEMPLATES imported into it once); unset, templates come from
- * SH_SANDBOX_TEMPLATES at every start, as before, and nothing is recorded.
+ * `SH_PROVENANCE_DIR` (template lifecycle spec §3.1, §7.2), either profile: a directory on the
+ * control plane's persistent volume holding the provenance store, the template catalog and the
+ * template policy (policy.json) and the members store (enrollment and roles through the API),
+ * opened together. Set, the catalog is the store (SH_SANDBOX_TEMPLATES imported into it once, each import
+ * a provenance `create` record); unset, templates come from SH_SANDBOX_TEMPLATES at every start, as
+ * before, and nothing is recorded. Each store checks its directory writable here, so a missing or
+ * read-only volume fails the start, not the first write.
  */
 export function templateCatalogFromEnv(
   env: NodeJS.ProcessEnv,
@@ -546,14 +609,17 @@ export function templateCatalogFromEnv(
   const dir = env.SH_PROVENANCE_DIR;
   if (!dir) return {};
   if (!dir.startsWith('/')) throw new Error('SH_PROVENANCE_DIR must be an absolute path');
-  const declared = config.sandbox?.templates ?? config.sessionTemplates ?? [];
   const provenance = new ProvenanceStore({ dir });
   return {
-    templates: new FileTemplateCatalog({ dir, declared, provenance }),
+    templates: new FileTemplateCatalog({
+      dir,
+      declared: config.sandbox?.templates ?? [],
+      provenance,
+    }),
     policy: new FilePolicyStore({ dir, provenance }),
     provenance,
-    // Enrollment and roles through the API (register G38), beside the policy; the settings' lists
-    // are its bootstrap, never edited by it.
+    // Enrollment and roles through the API, beside the catalog; the settings' lists are its
+    // bootstrap, never edited by it.
     members: new MembersStore({
       dir,
       provenance,
@@ -568,6 +634,8 @@ export function templateCatalogFromEnv(
 export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
   const config = configFromEnv(env);
   const signer = makeSigner(env.SH_SESSION_TOKEN_PRIVATE_KEY!);
+  // Named rather than inlined below: the grant ring is checked against it for a shared key.
+  const verifyKeys = verifyKeysFromEnv(env, signer.publicKeyBase64);
   const client = createClient(redisClientOptions(env.REDIS_URL ?? 'redis://127.0.0.1:6379'));
   const sandboxProfile = config.routeProfile === 'sandbox';
   // The sandbox stores, on the sandbox profile and on combined (combined control plane spec §3.5).
@@ -650,7 +718,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
     // test-login route 404, so an ordinary deployment gains no new code path at all.
     ...testUserProvider(env, config),
     signer,
-    verifyKeys: verifyKeysFromEnv(env, signer.publicKeyBase64),
+    verifyKeys,
+    // MI1 §6.1's grant ring, or nothing when no key is configured -- and nothing is what unmounts
+    // both grant routes, so this costs an existing deployment no new code path. Takes the session
+    // ring to refuse a boot where the two share a key, which would collapse §6.1's separation.
+    ...grantRingFromEnv(env, verifyKeys),
     config,
     now: () => Date.now(),
     // A UUID, so a control-plane-minted id is always identical to its leafSessionId sanitisation

@@ -24,6 +24,14 @@
 #   SBX_RETENTION_DAYS      optional; 1-90, default 14: how long a terminated sandbox stays listed
 #   SBX_MAX_PER_SUBJECT, SBX_MAX_TOTAL   optional; live-sandbox quotas, default 3 and 40
 #   SBX_MAX_INFLIGHT        optional; 1-8, default 2: Execs one sandbox may have in flight
+#   SBX_MODES_ALLOWED       optional; default per-exec: the sandbox modes a user may pick, a comma list
+#                           of per-exec, lease and lease+processes (lease-mode spec §8.1). Lease mode
+#                           stays off (per-exec) until the live smoke and the security review's lease
+#                           section (README)
+#   SBX_IDLE_CEILING_S      optional; 300-86400, default 1800: the longest lease idle timeout an owner
+#                           may set, in seconds. Also every worker bundle's SH_LEASE_IDLE_CEILING_S, so
+#                           the control plane and the workers clamp alike; at least 300, the worker's
+#                           default idle timeout, which it refuses to start above its ceiling
 #   SBX_EGRESS_CREDENTIALS  optional; unset, 0 or 1 (SBX0.2b, spec §4.3). 1 turns on user-scoped egress
 #                           credentials: the control plane's file store (a PVC) and credential routes,
 #                           a KEK and one bearer per KVM host in the Secret sbx-egress, and an egress
@@ -34,20 +42,21 @@
 #                           SBX_TEMPLATES_FILE, owned by exactly one host). Unset: one host, kvm,
 #                           owning every template worker
 #   SBX_EGRESS_CREDENTIAL_TTL_SECONDS   optional; 5-300 (the control plane's default is 60)
-#   SBX_TEMPLATE_STORE      optional; unset, 0 or 1 (template lifecycle spec §3.1, §7.2). 1 gives the
-#                           control plane its template store: a PVC for SH_PROVENANCE_DIR (the
-#                           catalog, the policy, the provenance records; SBX_TEMPLATES_FILE is
-#                           imported into it once), and with SBX_TEMPLATE_HOSTS the host agents'
-#                           bearers. Unset or 0 changes nothing; turning it off leaves the PVC in place
-#   SBX_TEMPLATE_HOSTS      optional, with SBX_TEMPLATE_STORE=1: space-separated host ids
-#                           (^[a-z0-9][a-z0-9-]{0,30}$) whose sbx-host-agent may build and run
-#                           templates; one bearer each in the Secret sbx-template-hosts, and a
-#                           host-agent bundle each
 #   SBX_REDIS_IMAGE         optional; repository[:tag]@sha256:<digest>: the image Redis runs instead of the
 #                           base's valkey/valkey:9-alpine. For a namespace whose data a Redis 7.4 wrote
 #                           (RDB format 12, which Valkey 9 cannot read: its AOF load aborts), e.g.
 #                           docker.io/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
 #                           (the pin before #670). Unset: the base's image, as before
+#   SBX_TEMPLATE_STORE      optional; unset, 0 or 1 (template lifecycle spec §3.1, §7.2). 1 gives the
+#                           control plane its template store: a PVC for SH_PROVENANCE_DIR (the
+#                           template catalog and the provenance records; SBX_TEMPLATES_FILE is
+#                           imported into it once, at the first start, and ignored after that), and
+#                           with SBX_TEMPLATE_HOSTS the host agents' bearers. Unset or 0 changes
+#                           nothing; turning it off leaves the PVC in place
+#   SBX_TEMPLATE_HOSTS      optional, with SBX_TEMPLATE_STORE=1: space-separated host ids
+#                           (^[a-z0-9][a-z0-9-]{0,30}$) whose sbx-host-agent may build templates
+#                           (template lifecycle spec §6.1); one bearer each in the Secret
+#                           sbx-template-hosts, and a host-agent bundle each
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
 #   SBX_PROFILE             optional; sandbox (default) or combined. combined renders
 #                           deploy/k8s/overlays/ocp-combined instead of ocp-sbx: one control plane on
@@ -68,7 +77,8 @@
 #                           router's default certificate (API)
 #   SBX_JANITOR_WAIT_MINUTES optional; default max(60, SBX_TOKEN_TTL_MINUTES + 5): how long after a
 #                           sandbox ends the host janitor frees its workspace. Must exceed the token
-#                           lifetime plus the relay's 30 s leeway (spec §8.1, §8.3)
+#                           lifetime plus the relay's 30 s leeway (spec §8.1, §8.3), and, when
+#                           SBX_MODES_ALLOWED names a lease mode, that plus SBX_IDLE_CEILING_S too
 #   SBX_API_CA_FILE         optional; a PEM CA the janitor trusts for the API Route, when that Route's
 #                           certificate (the router's default, say) is not publicly trusted
 # SBX_CLIENTS, increment 1a's static client tokens, is gone and refused.
@@ -76,8 +86,9 @@
 # Re-runnable: every token, password, key and certificate is generated once and kept. A worker
 # dropped from SBX_WORKERS has its token revoked and its bundle deleted; the relay reads worker
 # tokens on each attach, so that acts at once. Both pods read everything else only at boot, so the
-# generated overlay stamps a hash of the settings and the public keyset on both pod templates, and
-# any change to them rolls both. Secret values never reach argv or the log: they travel through jq's
+# generated overlay stamps a hash on each pod template, over what that pod reads (the control
+# plane's over every setting and the public keyset; the relay's over its own settings and the
+# keyset), and a change rolls the pods that read it. Secret values never reach argv or the log: they travel through jq's
 # environment or a builtin printf into a pipe, and messages name keys only.
 #
 # Writes deploy/sbx/.generated/: the applied overlay, workers/<id>/ (worker.env [+ relay-ca.crt],
@@ -85,10 +96,11 @@
 # [+ api-ca.crt], for install-host.sh --janitor) and, with SBX_EGRESS_CREDENTIALS=1, egress/<host id>/
 # (egress.env, egress.token [+ api-ca.crt], for install-host.sh --egress). Copy each bundle straight to its host and delete
 # the copy. With SBX_TEMPLATE_STORE=1 and SBX_TEMPLATE_HOSTS, also host-agent/<host id>/
-# (host-agent.env, host-agent.token [+ api-ca.crt]) for deploy/sbx/host-agent.sh (RUNBOOK §15).
-# Users log in with `mocactl sbx login`; nothing here is handed to them. With SBX_PROFILE=combined all of
-# it goes to deploy/sbx/.generated-<SBX_NAMESPACE>/ instead, with moca-ca.crt (the supervisor Route's
-# self-signed certificate, the CA its clients trust, e.g. NODE_EXTRA_CA_CERTS) beside the other CAs.
+# (host-agent.env, host-agent.token [+ api-ca.crt]) for deploy/sbx/host-agent.sh (the RUNBOOK's host
+# agent section). Users log in with `mocactl sbx login`; nothing here is handed to them. With
+# SBX_PROFILE=combined all of it goes to deploy/sbx/.generated-<SBX_NAMESPACE>/ instead, with
+# moca-ca.crt (the supervisor Route's self-signed certificate, the CA its clients trust, e.g.
+# NODE_EXTRA_CA_CERTS) beside the other CAs.
 set -euo pipefail
 
 SBX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,7 +108,8 @@ GEN="$SBX_DIR/.generated"
 OVERLAY_REL=../../k8s/overlays/ocp-sbx # from $GEN; ocp-combined with SBX_PROFILE=combined (validate)
 # GEN is .generated-<namespace> with SBX_PROFILE=combined (validate), at the same depth, so OVERLAY_REL holds.
 API_ROUTE='sbx-api'
-HOSTS_TO_REINSTALL='' # workers whose SH_WORKSPACE_IDLE this run changes (check_host_idle)
+HOSTS_TO_REINSTALL='' # workers whose SH_WORKSPACE_IDLE or SH_LEASE_IDLE_CEILING_S this run changes
+REINSTALL_SETTINGS='' # which of the two changed, for write_bundles' last warning (check_host_*)
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { echo "deploy/sbx/setup.sh: $*" >&2; exit 1; }
@@ -114,6 +127,8 @@ SUBJECTS_RE='^github:[0-9]+(,github:[0-9]+)*$'
 COUNT6_RE='^[1-9][0-9]{0,5}$'
 COUNT9_RE='^[1-9][0-9]{0,8}$'
 HOST_RE='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'
+MODE_RE='(per-exec|lease|lease\+processes)'
+MODES_RE="^$MODE_RE(,$MODE_RE)*\$"
 
 validate() {
   [[ -z "${SBX_CLIENTS:-}" ]] ||
@@ -157,6 +172,7 @@ validate() {
 
   : "${SBX_LIFETIME_DAYS:=7}" "${SBX_MAX_PER_SUBJECT:=3}" "${SBX_MAX_TOTAL:=40}" "${SBX_MAX_INFLIGHT:=2}"
   : "${SBX_WORKSPACE_IMAGE_MB:=2048}" "${SBX_TOKEN_TTL_MINUTES:=15}" "${SBX_RETENTION_DAYS:=14}"
+  : "${SBX_MODES_ALLOWED:=per-exec}" "${SBX_IDLE_CEILING_S:=1800}"
   [[ "$SBX_LIFETIME_DAYS" =~ ^([1-9]|[12][0-9]|30)$ ]] || die 'SBX_LIFETIME_DAYS must be a whole number of days, 1-30'
   [[ "$SBX_TOKEN_TTL_MINUTES" =~ ^([5-9]|[1-5][0-9]|60)$ ]] || die 'SBX_TOKEN_TTL_MINUTES must be a whole number of minutes, 5-60'
   [[ "$SBX_RETENTION_DAYS" =~ ^([1-9]|[1-8][0-9]|90)$ ]] || die 'SBX_RETENTION_DAYS must be a whole number of days, 1-90'
@@ -176,6 +192,23 @@ validate() {
   [[ -z "${SBX_API_CA_FILE:-}" ]] || { [[ -f "$SBX_API_CA_FILE" && -r "$SBX_API_CA_FILE" ]] && grep -q -- '-----BEGIN CERTIFICATE-----' "$SBX_API_CA_FILE"; } ||
     die 'SBX_API_CA_FILE must name a readable PEM certificate file (the CA the janitor trusts for the API Route)'
   [[ "$SBX_MAX_INFLIGHT" =~ ^[1-8]$ ]] || die 'SBX_MAX_INFLIGHT must be 1-8'
+  # The control plane's modesAllowedFromEnv names, with no spaces; it refuses to boot on any other.
+  [[ "$SBX_MODES_ALLOWED" =~ $MODES_RE ]] ||
+    die 'SBX_MODES_ALLOWED must be a comma list of per-exec, lease and lease+processes, no spaces'
+  # The control plane's floor is 30 s, but the same value is the workers' SH_LEASE_IDLE_CEILING_S, and
+  # a worker refuses to start with a ceiling below its default idle timeout, 300 s.
+  # At most a day: the janitor's wait must outlast it when a lease mode is allowed (below).
+  [[ "$SBX_IDLE_CEILING_S" =~ $COUNT6_RE ]] && ((SBX_IDLE_CEILING_S >= 300 && SBX_IDLE_CEILING_S <= 86400)) ||
+    die "SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400 (a worker's ceiling must be at least its default idle timeout, 300 s)"
+  # A token minted just before a delete reaches the sandbox for its lifetime plus the relay's 30 s
+  # leeway, and each Exec it sends restarts the lease's idle clock, so a lease can stay live that long
+  # plus the idle timeout. The janitor must not free the workspace (and its lease state file) under
+  # a lease still running: its wait must exceed all three (vmpool's retireLeaseState relies on it).
+  if [[ "$SBX_MODES_ALLOWED" == *lease* ]]; then
+    local lease_live_s=$((TOKEN_TTL_S + 30 + SBX_IDLE_CEILING_S))
+    ((JANITOR_AGE_S > lease_live_s)) ||
+      die "SBX_JANITOR_WAIT_MINUTES ($JANITOR_AGE_S s) must exceed the token lifetime plus the 30 s leeway plus SBX_IDLE_CEILING_S ($lease_live_s s) when a lease mode is allowed: the janitor would free a workspace under a lease that is still live; raise it to at least $((lease_live_s / 60 + 1)) minutes"
+  fi
   local v
   for v in SBX_MAX_PER_SUBJECT SBX_MAX_TOTAL SBX_WORKSPACE_IMAGE_MB; do
     [[ "${!v:-}" =~ $COUNT6_RE ]] || die "$v must be a positive whole number of at most six digits"
@@ -191,6 +224,7 @@ validate() {
   WORKSPACE_IDLE_H=$((SBX_LIFETIME_DAYS * 24 + 48))
   ((WORKSPACE_IDLE_H * 3600 > LIFETIME_S)) || die 'SH_WORKSPACE_IDLE must exceed SH_SANDBOX_LIFETIME_SECONDS'
   check_host_idle
+  check_host_ceiling
 
   validate_templates
   validate_egress
@@ -225,7 +259,7 @@ validate_profile() {
   done
   [[ -z "$EGRESS_ON" ]] ||
     die 'SBX_EGRESS_CREDENTIALS=1 is not supported with SBX_PROFILE=combined yet: both would mount SH_CREDENTIAL_KEK'
-  # Pinned by digest, as every image in the namespace (autobench's review): a tag can move under a run.
+  # Pinned by digest, as every image in the namespace: a tag can move under a run.
   [[ "${SBX_SANDBOX_IMAGE:-}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
     die 'SBX_SANDBOX_IMAGE is required with SBX_PROFILE=combined, pinned by digest: repository[:tag]@sha256:<64 hex>'
   [[ "$SBX_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
@@ -236,16 +270,7 @@ validate_profile() {
   SBX_TEMPLATE_STORE=1
 }
 
-# SBX_EGRESS_CREDENTIALS and what it takes (spec §4.3). Sets EGRESS_ON, EGRESS_IDS (host ids, in
-# order), EGRESS_SPEC ("id=w1,w2" per host) and EGRESS_HOSTS_JSON, and checks the hosts against
-# the template workers: each owned by exactly one host, so a bad list is refused before anything is applied.
-EGRESS_ON=''
-EGRESS_IDS=''
-EGRESS_SPEC=''
-EGRESS_HOSTS_JSON=''
-EGRESS_HOST_RE='^[a-z0-9][a-z0-9-]{0,30}$'
-
-# SBX_TEMPLATE_STORE and SBX_TEMPLATE_HOSTS (template lifecycle spec §6.1, §7.2). Sets STORE_ON and
+# SBX_TEMPLATE_STORE and SBX_TEMPLATE_HOSTS (template lifecycle spec §3.1, §6.1, §7.2). Sets STORE_ON,
 # STORE_HOSTS (host ids, in order) and STORE_HOSTS_JSON.
 STORE_ON=''
 STORE_HOSTS=''
@@ -269,6 +294,15 @@ validate_store() {
   # shellcheck disable=SC2086 # one argument per host; ids hold no whitespace
   STORE_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | {id: .}]' --args $STORE_HOSTS)"
 }
+
+# SBX_EGRESS_CREDENTIALS and what it takes (spec §4.3). Sets EGRESS_ON, EGRESS_IDS (host ids, in
+# order), EGRESS_SPEC ("id=w1,w2" per host) and EGRESS_HOSTS_JSON, and checks the hosts against
+# the template workers: each owned by exactly one host, so a bad list is refused before anything is applied.
+EGRESS_ON=''
+EGRESS_IDS=''
+EGRESS_SPEC=''
+EGRESS_HOSTS_JSON=''
+EGRESS_HOST_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 validate_egress() {
   case "${SBX_EGRESS_CREDENTIALS:-}" in
     '' | 0) return 0 ;;
@@ -315,14 +349,14 @@ validate_egress() {
   EGRESS_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | split("=") | {id: .[0], workers: (.[1] | split(","))}]' --args $EGRESS_SPEC)"
 }
 
-# The Secret key of a template host's bearer: packages/control-plane/src/host-config.ts
-# hostTokenEnvName (kvm-a -> SH_HOST_TOKEN_KVM_A), read from $CREDENTIALS_DIRECTORY/<NAME>.
-host_key() { printf 'SH_HOST_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
-
 # The Secret key that carries a host's bearer: packages/control-plane/src/egress-config.ts
 # egressTokenEnvName (kvm-a -> SH_EGRESS_TOKEN_KVM_A), which the control plane reads from
 # $CREDENTIALS_DIRECTORY/<NAME>. tests/setup.test.sh pins one hyphenated id.
 egress_key() { printf 'SH_EGRESS_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+
+# The Secret key of a template host's bearer: packages/control-plane/src/host-config.ts
+# hostTokenEnvName (kvm-a -> SH_HOST_TOKEN_KVM_A), read from $CREDENTIALS_DIRECTORY/<NAME>.
+host_key() { printf 'SH_HOST_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
 # The control plane rolls with a new lifetime at once, but a running worker keeps the
 # SH_WORKSPACE_IDLE it was installed with until install-host.sh is re-run on its host. Raising the
@@ -342,12 +376,35 @@ check_host_idle() {
   done
   [[ -n "$changed" ]] || return 0
   HOSTS_TO_REINSTALL="${changed# }"
+  REINSTALL_SETTINGS=SH_WORKSPACE_IDLE
   local cause='SBX_LIFETIME_DAYS changed'
   [[ " $olds " != *" unset "* ]] || cause='a bundle from before increment 1b carries none'
   if [[ "${SBX_ACK_HOSTS:-}" != 1 ]]; then
     die "SH_WORKSPACE_IDLE changes from${olds} to ${WORKSPACE_IDLE_H}h for worker(s) ${HOSTS_TO_REINSTALL} (${cause}), and a running worker keeps its old value until deploy/sbx/install-host.sh is re-run on its host. Re-run install-host.sh on every host first, or set SBX_ACK_HOSTS=1 to apply now and re-run install-host.sh with the new bundles on every host right after"
   fi
   log "WARNING: SH_WORKSPACE_IDLE changes from${olds} to ${WORKSPACE_IDLE_H}h (SBX_ACK_HOSTS=1): re-run deploy/sbx/install-host.sh with the new bundle on the host of each of: ${HOSTS_TO_REINSTALL}"
+}
+
+# A running worker also keeps the SH_LEASE_IDLE_CEILING_S it was installed with. Unlike the idle, a
+# stale ceiling cannot free a live workspace: the worker only clamps an owner's lease idle timeout to
+# its old ceiling. So a change is a warning, not a refusal, and its hosts join HOSTS_TO_REINSTALL. A
+# bundle from before the ceiling carries none, and install-host.sh gives such a worker 1800 s.
+check_host_ceiling() {
+  local env id old changed='' olds=''
+  for env in "$GEN"/workers/*/worker.env; do
+    [[ -f "$env" ]] || continue
+    id="$(basename "$(dirname "$env")")"
+    [[ " $SBX_WORKERS " == *" $id "* ]] || continue
+    old="$( (grep -E '^SH_LEASE_IDLE_CEILING_S=' "$env" || true) | tail -1 | cut -d= -f2-)"
+    old="${old:-1800}"
+    [[ "$old" != "$SBX_IDLE_CEILING_S" ]] || continue
+    changed+=" $id"
+    [[ " $olds " == *" $old "* ]] || olds+=" $old"
+    [[ " $HOSTS_TO_REINSTALL " == *" $id "* ]] || HOSTS_TO_REINSTALL+="${HOSTS_TO_REINSTALL:+ }$id"
+  done
+  [[ -n "$changed" ]] || return 0
+  REINSTALL_SETTINGS+="${REINSTALL_SETTINGS:+ and }SH_LEASE_IDLE_CEILING_S"
+  log "WARNING: SH_LEASE_IDLE_CEILING_S changes from${olds} to ${SBX_IDLE_CEILING_S} for worker(s)${changed}, and a running worker keeps its old ceiling until deploy/sbx/install-host.sh is re-run on its host with the new bundle"
 }
 
 # The rules of the control plane's parseTemplates (packages/control-plane/src/sandbox-config.ts),
@@ -387,6 +444,25 @@ preflight() {
   # Namespace-scoped read: a shared cluster rarely grants `get namespace`, and this never creates one.
   kc get configmaps -n "$NS" -o name >/dev/null 2>&1 ||
     die "namespace $NS must already exist and be readable (this script creates nothing cluster-scoped)"
+  check_redis_image
+}
+
+# Without SBX_REDIS_IMAGE the overlay runs the base's Valkey 9, which cannot read RDB format 12 (what
+# Redis 7.4 writes): a namespace whose redis StatefulSet runs another image would crash-loop redis-0
+# once switched (#811). So that is refused, before anything is applied; a fresh namespace (no
+# StatefulSet) and one already on Valkey pass. RUNBOOK §2.
+check_redis_image() {
+  [[ -z "${SBX_REDIS_IMAGE:-}" ]] || return 0
+  local json image repo
+  # Captured first (errexit), as in route_cert: a failing get must not read as "no StatefulSet".
+  json="$(kc get statefulset redis -n "$NS" --ignore-not-found -o json)"
+  [[ -n "$json" ]] || return 0
+  image="$(jq -r '(.spec.template.spec.containers // []) | (map(select(.name == "redis")) + .)[0].image // empty' <<<"$json")"
+  [[ -n "$image" ]] || die "could not read the image of StatefulSet redis in $NS"
+  repo="${image%%@*}"
+  [[ "${repo##*/}" != *:* ]] || repo="${repo%:*}"
+  [[ "$repo" != *valkey/valkey* ]] || return 0
+  die "StatefulSet redis in $NS runs $image, not Valkey, and Valkey 9 (the default without SBX_REDIS_IMAGE) cannot read the RDB format 12 Redis 7.4 writes: redis-0 would crash-loop. Until the data is migrated, set SBX_REDIS_IMAGE to that image pinned by digest (repository[:tag]@sha256:<digest>; the running digest: kubectl -n $NS get pod redis-0 -o jsonpath='{.status.containerStatuses[0].imageID}'). See deploy/sbx/RUNBOOK.md §2"
 }
 
 # SBX_PROFILE=combined in an SBX0 namespace would add the harness's keys to its moca-mu1 and switch
@@ -715,7 +791,8 @@ ensure_settings() {
     "SH_SANDBOX_EXEC_ENDPOINT=$SBX_EXEC_HOST:443" 'SH_SANDBOX_TOKEN_ISSUER=sbx-control-plane'
     "SH_SANDBOX_LIFETIME_SECONDS=$LIFETIME_S" "SH_SANDBOX_TOKEN_TTL_SECONDS=$TOKEN_TTL_S"
     "SH_SANDBOX_RETENTION_SECONDS=$RETENTION_S" "SH_SANDBOX_MAX_PER_SUBJECT=$SBX_MAX_PER_SUBJECT"
-    "SH_SANDBOX_MAX_TOTAL=$SBX_MAX_TOTAL" "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT")
+    "SH_SANDBOX_MAX_TOTAL=$SBX_MAX_TOTAL" "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT"
+    "SH_SANDBOX_MODES_ALLOWED=$SBX_MODES_ALLOWED" "SH_SANDBOX_IDLE_CEILING_S=$SBX_IDLE_CEILING_S")
   [[ -z "$ca" ]] || sbx+=("SH_SANDBOX_EXEC_CA=$ca")
   [[ -z "$STORE_ON" ]] || sbx+=("SH_TEMPLATE_HOSTS=$STORE_HOSTS_JSON")
   if [[ -n "$EGRESS_ON" ]]; then
@@ -734,6 +811,7 @@ ensure_settings() {
   [[ -z "$COMBINED" ]] || moca_crt="$(secret_json moca-supervisor-tls)"
   # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
   # token or KEK changes the pod template, so the control plane rolls and rereads its files.
+  # With the store on, the host tokens' Secret likewise: a new or revoked host token rolls it.
   egress='' hosts=''
   [[ -z "$EGRESS_ON" ]] || egress="$(secret_json sbx-egress | jq -cS '.data // {}')"
   [[ -z "$STORE_ON" ]] || hosts="$(secret_json sbx-template-hosts | jq -cS '.data // {}')"
@@ -824,7 +902,6 @@ write_overlay() {
     if [[ -z "$COMBINED" ]] && [[ -n "$EGRESS_ON" || -n "$STORE_ON" ]]; then
       printf 'components:\n'
       [[ -z "$EGRESS_ON" ]] || printf '  - %s/egress-credentials\n' "$OVERLAY_REL"
-      # After egress-credentials: its credentials volume restates every source (sbx-egress optional).
       [[ -z "$STORE_ON" ]] || printf '  - %s/template-store\n' "$OVERLAY_REL"
     fi
     printf 'patches:\n'
@@ -849,29 +926,30 @@ write_overlay() {
     printf '      - { op: add, path: /spec/template/metadata/annotations/sbx.moca.dev~1settings-hash, value: "%s" }\n' "$RELAY_HASH"
     printf 'images:\n'
     image_entry ghcr.io/rossoctl/moca "$SBX_IMAGE"
+    [[ -z "$COMBINED" ]] || image_entry ghcr.io/rossoctl/moca-remote-worker "$SBX_SANDBOX_IMAGE"
     # The base names Valkey; an override renames that image, so the StatefulSet's pod spec is untouched.
     [[ -z "${SBX_REDIS_IMAGE:-}" ]] || image_entry docker.io/valkey/valkey "$SBX_REDIS_IMAGE"
-    [[ -z "$COMBINED" ]] || image_entry ghcr.io/rossoctl/moca-remote-worker "$SBX_SANDBOX_IMAGE"
   } >"$GEN/kustomization.yaml"
 }
 
 # The literal in-cluster addresses ocp-combined writes against its placeholder namespace
 # (patch-addressing.yaml), as strategic-merge patches for this run's namespace. Printed inside
-# write_overlay's `patches:` list. Each names the overlay's own namespace (moca-combined): a strategic
-# merge patch matches an object by the namespace it had before this overlay's namespace: renamed it.
+# write_overlay's `patches:` list. Each names the overlay's own namespace (COMBINED_PLACEHOLDER_NS):
+# a strategic merge patch matches an object by the namespace it had before this overlay renamed it.
+COMBINED_PLACEHOLDER_NS='moca-sbx-combined'
 combined_addresses() {
-  [[ "$NS" != moca-combined ]] || return 0
+  [[ "$NS" != "$COMBINED_PLACEHOLDER_NS" ]] || return 0
   printf '  - patch: |-\n'
-  printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: moca-supervisor, namespace: moca-combined }\n'
+  printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: moca-supervisor, namespace: %s }\n' "$COMBINED_PLACEHOLDER_NS"
   printf '      spec: { template: { spec: { containers: [ { name: supervisor, env: [\n'
   printf '        { name: SH_RELAY_ADDR, value: "sandbox-relay-exec.%s.svc:9444" },\n' "$NS"
   printf '        { name: SH_CONTROL_PLANE_URL, value: "http://moca-control-plane.%s.svc:8080" } ] } ] } } }\n' "$NS"
   printf '  - patch: |-\n'
-  printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: moca-control-plane, namespace: moca-combined }\n'
+  printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: moca-control-plane, namespace: %s }\n' "$COMBINED_PLACEHOLDER_NS"
   printf '      spec: { template: { spec: { containers: [ { name: control-plane, env: [\n'
   printf '        { name: SH_SANDBOX_NAMESPACE, value: "%s" } ] } ] } } }\n' "$NS"
   printf '  - patch: |-\n'
-  printf '      apiVersion: apps/v1\n      kind: StatefulSet\n      metadata: { name: moca-sandbox, namespace: moca-combined }\n'
+  printf '      apiVersion: apps/v1\n      kind: StatefulSet\n      metadata: { name: moca-sandbox, namespace: %s }\n' "$COMBINED_PLACEHOLDER_NS"
   printf '      spec: { template: { spec: { containers: [ { name: sandbox, env: [\n'
   printf '        { name: RELAY_ADDR, value: "sandbox-relay-attach.%s.svc:9443" } ] } ] } } }\n' "$NS"
 }
@@ -924,8 +1002,9 @@ write_bundles() {
       [[ -n "$tok" ]] || die "moca-relay-sandbox-tokens has no token for worker $id: re-run setup.sh"
       mkdir -p "$d"
       # SH_WORKSPACE_IDLE: the lifetime plus two days (SBX0 §5.4); install-host.sh takes it from here.
-      printf 'RELAY_ADDR=%s:443\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\nSH_WORKSPACE_IDLE=%sh\nSH_WORKSPACE_IMAGE_MB=%s\n' \
-        "$SBX_ATTACH_HOST" "$id" "$tok" "$WORKSPACE_IDLE_H" "$SBX_WORKSPACE_IMAGE_MB" >"$d/worker.env"
+      # SH_LEASE_IDLE_CEILING_S: the control plane's SH_SANDBOX_IDLE_CEILING_S, so both clamp alike.
+      printf 'RELAY_ADDR=%s:443\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\nSH_WORKSPACE_IDLE=%sh\nSH_WORKSPACE_IMAGE_MB=%s\nSH_LEASE_IDLE_CEILING_S=%s\n' \
+        "$SBX_ATTACH_HOST" "$id" "$tok" "$WORKSPACE_IDLE_H" "$SBX_WORKSPACE_IMAGE_MB" "$SBX_IDLE_CEILING_S" >"$d/worker.env"
       if [[ -f "$GEN/attach-ca.crt" ]]; then cp "$GEN/attach-ca.crt" "$d/relay-ca.crt"; else rm -f "$d/relay-ca.crt"; fi
     done
     chmod 700 "$GEN" "$GEN"/workers "$GEN"/workers/* 2>/dev/null || true
@@ -936,7 +1015,7 @@ write_bundles() {
   log "worker bundles: $GEN/workers/<id>  (copy to the KVM host, run deploy/sbx/install-host.sh, delete the copy)"
   log "janitor bundle: $GEN/janitor  (copy to every KVM host, run deploy/sbx/install-host.sh --janitor, delete the copy)"
   [[ -z "${HOSTS_TO_REINSTALL:-}" ]] ||
-    log "WARNING: the SH_WORKSPACE_IDLE changed: re-run deploy/sbx/install-host.sh now on the host of each of: $HOSTS_TO_REINSTALL"
+    log "WARNING: $REINSTALL_SETTINGS changed: re-run deploy/sbx/install-host.sh now on the host of each of: $HOSTS_TO_REINSTALL"
 }
 
 # The host janitor's bundle (spec §8.1, §8.3): janitor.env (the API URL and the wait, in seconds;
@@ -998,7 +1077,7 @@ write_egress_bundles() {
   done
 }
 
-# The host-agent bundle of each template host (RUNBOOK §15): host-agent.env (the API URL and the
+# The host-agent bundle of each template host (the RUNBOOK's host agent section): host-agent.env (the API URL and the
 # host id; no secret), host-agent.token (the host's bearer alone, no newline) and, with
 # SBX_API_CA_FILE, api-ca.crt. A host no longer listed loses its directory.
 write_store_bundles() {
@@ -1029,7 +1108,7 @@ write_store_bundles() {
     done
   )
   for id in $STORE_HOSTS; do
-    log "host-agent bundle: $GEN/host-agent/$id  (copy to host $id, install host-agent.sh as RUNBOOK §15 says, delete the copy)"
+    log "host-agent bundle: $GEN/host-agent/$id  (copy to host $id, install host-agent.sh as the RUNBOOK's host agent section says, delete the copy)"
   done
 }
 

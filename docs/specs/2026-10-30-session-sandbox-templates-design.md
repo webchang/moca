@@ -1,12 +1,10 @@
 # Sandbox templates for agent sessions — Design
 
-Version: 1.0 — October 2026
-Status: Implemented on branch `sbx-template` (webchang/moca), accepted live on a Moca-VM on 2026-10-31
-(§8); not yet proposed upstream
+Version: 1.0 — November 2026
+Status: Proposed — issue rossoctl/moca#731
 Builds on (reuse, no redesign): [P6.3](2026-10-04-p6-on-kubernetes-slice3-design.md) (sandbox tiers
 and session-to-sandbox affinity), [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (its
-templates: one `microvm-worker` per snapshot), `deploy/sbx/template-onboarding/ONBOARDING.md` (turning an image into a
-checked snapshot).
+templates: one `microvm-worker` per snapshot).
 
 > **The one-sentence thesis.** A session can name a sandbox template at creation, as it names a
 > tier; every turn then runs on a worker that serves that template's snapshot, and the harness
@@ -21,8 +19,8 @@ checked snapshot).
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | What a template is, to selection       | **A second presence label, `moca.dev/template`**, next to `moca.dev/tier`. A worker advertises it from `SANDBOX_TEMPLATE`. The deployment declares its templates (`SH_SANDBOX_TEMPLATES`, the same JSON list SBX0's control plane reads, with an optional `seed`). Rejected: matching on the snapshot name (it carries a digest and changes with every version); matching on `Hello.image` (a container reference, not an id clients choose). |
 | Who picks a session's template         | **The user, at session creation**, fixed for the session's life, like its tier.                                                                                                                                                                                                                                                                                                                                                               |
-| Where a session with no template lands | **Only on untemplated workers** (the user, 2026-10-30). A plain session never gets a benchmark image (often without network, with another toolchain) by accident.                                                                                                                                                                                                                                                                             |
-| Who seeds a templated workspace        | **The harness, once, on the session's first turn that uses the workspace** (the user, 2026-10-30), so a stock agent starts in the template's repository. SBX0 clients run the seed themselves; agents in Moca sessions do not know to.                                                                                                                                                                                                        |
+| Where a session with no template lands | **Only on untemplated workers.** A plain session never gets a benchmark image (often without network, with another toolchain) by accident.                                                                                                                                                                                                                                                                                                    |
+| Who seeds a templated workspace        | **The harness, once, on the session's first turn that uses the workspace**, so a stock agent starts in the template's repository. SBX0 clients run the seed themselves; agents in Moca sessions do not know to.                                                                                                                                                                                                                               |
 | How the template reaches the selector  | **On the exchange response**, beside the tier, as P6.3 does.                                                                                                                                                                                                                                                                                                                                                                                  |
 | Trust                                  | **As the tier.** The label is the worker's word, from its own environment. A workload sandbox's signed attach binding (`AttachBinding`) has no template: workload sandboxes are not templated in this design, and the relay removes a `moca.dev/template` label from any worker attached with a binding.                                                                                                                                      |
 
@@ -30,11 +28,12 @@ checked snapshot).
 
 **In scope:** the worker label, the relay pass-through (and its removal under a binding), the
 control plane's session field, validation, storage, exchange and discovery, the harness's filter,
-affinity and seed, mocactl's session option, configuration, and tests.
+affinity and seed, mocactl's session option, the VM path's templated worker, configuration, and
+tests.
 
 **Out of scope:** templates for workload sandboxes (Kubernetes provisioner); several templates per
 worker (one worker serves one snapshot, as in SBX0); a per-subject template allow-list; changing a
-session's template after creation; building snapshots (`deploy/sbx/template-onboarding/template-build.sh` does that).
+session's template after creation; building snapshots (`deploy/microvm/build-snapshot.sh` does that).
 
 ## 2. Current state
 
@@ -51,8 +50,8 @@ use it.
 
 `SANDBOX_TEMPLATE` (both `cmd/worker` and `cmd/microvm-worker`): set and non-blank, the worker's
 Hello labels gain `moca.dev/template: <value>`, trimmed. Unset or blank: no label. There is no
-default. `TemplateLabels` sits beside `TierLabels` in `internal/session/labels.go`; the two maps are
-merged.
+default. `TemplateLabels` sits beside `TierLabels` in `internal/session/labels.go`; `Labels` merges
+the two.
 
 ### 3.2 Relay (`packages/sandbox-relay`)
 
@@ -85,19 +84,21 @@ templates`). Omitted: `''`, no template.
 
 `TurnAuth` gains `sandboxTemplate` and `sandboxSeed`; `executeTurn` passes them to
 `acquireTurnSandbox`, which passes `opts.template` to `selectPoolSandbox` and runs the seed (§5).
-Leaf paths and unauthenticated turns pass no template.
+Unauthenticated turns pass no template. The async turn exchange (`POST /internal/turn-credentials`,
+ADR-0047) returns the session's template, seed, seed source and build as the session exchange does
+(2026-11-12), so a queued turn of a templated session runs on its hands (§5.2).
 
 ### 3.5 Affinity
 
-`AffinityEntry` gains `template?: string`. An entry with a template other than the session's is
-followed like an entry with another tier (P6.3 §4 step 2): only to a sandbox in the filtered set.
+The affinity entry is unchanged (a sandbox id and a tier). What changes is how a present affine
+sandbox is judged: one that now serves another template (or none) is outside the session's
+filtered set, and is handled as one moved to another declared tier (§4).
 
 ## 4. Selection (`selectPoolSandbox`)
 
 After P6.3's tier filter, a **template filter**:
 
-- `opts.template` set: keep only records with `labels["moca.dev/template"] === opts.template`. Pods
-  (the `pods` and `both` sources) never carry a template, so they are excluded.
+- `opts.template` set: keep only records with `labels["moca.dev/template"] === opts.template`.
 - `opts.template` unset or `''`: keep only records **without** a `moca.dev/template` label.
 
 The empty-set error (`SandboxPoolEmptyError`) names the template when one was asked
@@ -105,16 +106,19 @@ The empty-set error (`SandboxPoolEmptyError`) names the template when one was as
 SANDBOX_TEMPLATE=X`). Affinity: an affine sandbox that is present but now serves another template
 (or none) is handled exactly like one moved to another declared tier: an immediate reset, no
 grace, with the existing reason `'retiered'`, so the turn stream's `workspace_reset` frame is
-unchanged on the wire (mocactl's notice now says "moved to another tier or template"). Everything
-else in P6.3 §4 is unchanged.
+unchanged on the wire. Everything else in P6.3 §4 is unchanged.
 
-The template filter is applied whenever the records path is on. It needs no deployment setting: a
-deployment whose workers carry no template label is unaffected.
+The template filter needs no deployment setting: a deployment whose workers carry no template label
+is unaffected.
 
-**Leaves and unauthenticated turns** pass no template, so they too run only on untemplated
-workers. A deployment that templates some workers must keep at least one untemplated worker (per
-tier it uses) for them, as the tier design keeps a default tier; with every worker templated, a
-leaf fails with `SandboxPoolEmptyError`, which names no template.
+**Verdict and solve leaves and unauthenticated turns** pass no template, so they run only on
+untemplated workers. A deployment that templates some workers must keep at least one untemplated
+worker (per tier it uses) for them, as the tier design keeps a default tier; with every worker
+templated, such a leaf fails with `SandboxPoolEmptyError`, which names no template. A **prompt
+leaf** of a templated session (a queued turn, or a `/v1/runs` prompt run under its token) passes
+the session's template and build (§5.2). A workload run (`workloadId`) is the exception: it runs on
+its workload's sandboxes, which belong to no template, so it takes none of the session's template,
+build or seed, and returns no patch.
 
 ## 5. The seed
 
@@ -122,9 +126,9 @@ leaf fails with `SandboxPoolEmptyError`, which names no template.
 control plane), a session pinned to a `sha256:` build gets **that build's own `spec.seed`**, which
 every build carries (lifecycle spec §3.2), so a self-serve template, which is in no env list, is
 seeded too; a build with no seed sends none. A store that cannot be read for that build refuses the
-exchange (the data plane retries it), never a turn on an unseeded workspace; only a template or
-build the store does not hold falls back. Otherwise the seed is the declared one in
-`SH_SANDBOX_TEMPLATES`. The exchange sends `sandboxSeedSource` (`build` or `declared`) with the
+exchange (the data plane retries it; a queued turn stays pending), never a turn on an unseeded
+workspace; only a template or build the store does not hold falls back. Otherwise the seed is the
+declared one in `SH_SANDBOX_TEMPLATES`. The exchange sends `sandboxSeedSource` (`build` or `declared`) with the
 seed, and the turn's `sandbox.seed` reports it (`{source, buildId}`), so a client can check that
 its workspace was seeded from the build it pinned.
 
@@ -134,7 +138,7 @@ workspace** (the selection's `podCwd`: `/workspace` on a microVM, `/workspace/<s
 container worker), and only if that workspace is not seeded yet:
 
     cd <workspace> && flock .moca-seed.lock bash -c \
-      '[ -e .moca-seeded ] || { bash -c <seed> >.moca-seed.log 2>&1 && <baseline> && touch .moca-seeded; }'
+      '[ -e .moca-seeded ] || { bash -c <seed> >.moca-seed.log 2>&1 && <baseline> && <exclude> && touch .moca-seeded; }'
 
 - **The marker** (`.moca-seeded`) lives in the workspace, so it travels with it: a session that keeps
   its sandbox is seeded once; a workspace reset (a new, empty workspace) is seeded again.
@@ -143,8 +147,14 @@ container worker), and only if that workspace is not seeded yet:
   unlocked.
 - **A failed seed leaves no marker**, so the next turn runs it again on whatever it left: a seed must
   be safe to re-run (`cp -a` is; a bare `git clone` into the workspace is not).
-- **Output** goes to `.moca-seed.log` in the workspace, never into the turn, so a chatty seed cannot
-  trip the output cap. Only the exit code is read.
+- **Output** goes to `.moca-seed.log` in the workspace, never into the turn's output, so a chatty seed
+  cannot trip the output cap; only the exit code is read. The log is in the agent's own workspace, so
+  the agent can read it: **a seed must not print a secret** (a clone token, say).
+- **Out of a repository's patch:** when the workspace is a git repository (a seeded checkout), the seed
+  adds `/.moca-seeded`, `/.moca-seed.log`, `/.moca-seed.lock` and `/.moca-baseline` to its
+  `info/exclude` (`<exclude>` above, each once; best-effort, a workspace without git is unaffected),
+  so a patch taken with `git add -A` or `git status --porcelain`, or an agent that commits
+  everything, never carries them.
 - **The lease is renewed** while the seed runs, as for the turn, since a seed (a clone, an install) may
   outlast the lease TTL. The worker's timeout is 600 s.
 - **A failed seed** fails the turn with `SandboxSeedError` (a 500, not retryable: the template's image
@@ -156,7 +166,7 @@ container worker), and only if that workspace is not seeded yet:
 
 ### 5.1 The patch, after each turn
 
-A client of a Moca Pi session has no exec on its workspace (the relay's exec Route takes sandbox
+A client of a Moca Pi session has no exec on its workspace (the relay's exec route takes sandbox
 tokens only), so the harness hands the end state back: **after every turn of a templated session
 that leased its sandbox**, before the lease is returned, one exec in the session's workspace:
 
@@ -187,16 +197,38 @@ prints it):
 
 An injected sandbox (a leaf's) is its caller's, and a leaf takes its own patch: neither gets one here.
 
+### 5.2 Queued turns
+
+A queued turn (`POST /v1/sessions/{id}/turns`, ADR-0047) runs as a prompt leaf on whichever worker
+drains it, with the credential and config the dequeue exchange returns. That exchange returns
+`sandboxTemplate`, `sandboxSeed`, `sandboxSeedSource` and `sandboxBuildId` as the session exchange
+does. They are read from the session, not copied onto the turn record, and are a pin all the same:
+a session's template and build are written once, at creation, and no route changes them. The
+worker's claim carries them into the leaf's config, and the prompt leaf then:
+
+- selects only workers of the template, pinned to the build (§4), and fails closed as a turn does;
+- seeds the leased workspace with the same `seedWorkspace` (§5) before the turn, while it renews
+  its lease; a failed seed fails the leaf (`failed`, `error`), and the lease is returned;
+- after a turn that responded, takes the patch with the same capture (§5.1) before it returns the
+  lease, and its result (`responded`) carries `workspace` and, when a seed applied, `seed`
+  (`{source, buildId?}`), as `GET /v1/sessions/{id}/turns/{turnId}`'s `result` and as a `/v1/runs`
+  prompt run's result. A leaf that fails or is aborted carries no patch.
+
+The leaf's workspace is keyed by the leaf's session id, as before; a seed is per workspace (§5).
+
 ## 6. User surface
 
 - mocactl: `--option sandboxTemplate=<id>` (a `SESSION_OPTION_FIELDS` entry; its choices from
   `/v1/discovery`), shown in the session list beside the tier. A value that is not among those
-  choices is sent as given, for the control plane to resolve: on a deployment with a template store,
-  `id`, `id:tag` or `id@sha256:…` (register G37). Its refusals (`unknown_template`,
-  `template_retired`) are shown as the control plane words them; a `409 template_not_active` is
-  waited out after its Retry-After, as for any create (lifecycle spec §6.4).
-- The JSON turn result's `sandbox` gains `template` when the session has one, and `seed`
-  (`{source, buildId?}`) when a seed applied; the result gains `workspace` (§5.1).
+  choices is sent as given, for a control plane that resolves template references itself (for
+  example `id:tag` or `id@<build>`); its refusals are shown as the control plane words them, and a
+  `409 template_not_active` (a template being activated on first use) is waited out after its
+  `Retry-After`, up to 10 minutes.
+- `mocactl run` refuses an empty `--session` (a script whose id lookup came back empty) and says why
+  it waits on a capacity refusal, up to a bound.
+- The JSON turn result's `sandbox` gains `seed` (`{source, buildId?}`) when a seed applied; the
+  result gains `workspace` (§5.1). Both ride on the terminal `done` and `error` frames too, so
+  `mocactl run --json` prints them.
 
 ## 7. Configuration and deployment
 
@@ -206,26 +238,29 @@ An injected sandbox (a leaf's) is its caller's, and a leaf takes its own patch: 
   `deploy/microvm/setup-microvm.sh --template <id> --snapshot <dir> [--budget-mb N] [--egress]`
   installs it from a template unit (`microvm-worker@.service`, instance `tpl_<id>`) in its own slice
   (a worker sweeps its parent cgroup at start, so two never share one), with its own relay token,
-  env file, and workspace and jail roots beside the snapshot; `--uninstall-template <id>` removes
-  exactly that. **Egress on one worker per host:** moca-egress keys VM listeners by id, which every
-  worker reuses (`vm-1`, …), so `--egress` is refused while another worker uses it, until moca-egress
-  scopes ids per worker. (The same limit applies to several egress-on SBX0 workers on one host.) The
-  snapshot is any `template-build.sh` snapshot. SBX0's `deploy/sbx/install-host.sh` does the same for
-  its workers.
+  env file, and workspace and jail roots; `--uninstall-template <id>` removes exactly that.
+  **Egress on one worker per host:** moca-egress keys VM listeners by id, which every worker reuses
+  (`vm-1`, …), so `--egress` is refused while another worker uses it, until moca-egress scopes ids
+  per worker.
 
 ## 8. Testing
 
 - **Workers, Go unit:** `SANDBOX_TEMPLATE` → the label, blank, unset, merged with the tier.
-- **Relay, unit:** the label passes through; it is removed under a binding.
+- **Relay, unit:** the label passes through; it is removed under a binding. **Integration** (Redis):
+  templated and untemplated workers through a real relay; every session stays on a worker of its
+  own kind across turns.
 - **Control plane, unit:** parse (the seed optional and a string), create (unknown, none declared,
-  non-string, omitted), the stored field, the exchange (present only with a template), discovery.
-- **Harness, unit:** the template filter both ways, pods excluded for a template, the error wording,
-  affinity across a template change (an immediate reset), the seed (runs once, skipped with the marker,
-  re-run after a reset, failure).
-- **mocactl, unit:** the option field and request shape.
-- **Acceptance, Moca-VM on bm1:** one untemplated P4 worker and one templated worker; a session with
-  the template lands on the templated worker and finds the repository seeded; a session without
-  lands on the untemplated one. **Passed on 2026-10-31** (templated worker installed with `setup-microvm.sh
---template`, scripted mock model): the templated session ran on the templated worker with the
-  repository seeded, its second turn kept the workspace and did not seed again, the untemplated
-  session ran on the main worker, and an unknown template was refused at creation.
+  non-string, omitted), the stored field, the exchange (present only with a template, fail closed),
+  discovery.
+- **Harness, unit:** the template filter both ways, the error wording, affinity across a template
+  change (an immediate reset), the seed (runs once, skipped with the marker, re-run after a reset,
+  failure, the lease renewed and returned).
+- **mocactl, unit:** the option field and request shape, values passed through, the activation
+  wait, the session list.
+- **VM deploy:** `deploy/microvm/tests/setup-microvm.test.sh` covers `--template` and
+  `--uninstall-template` with stubbed system commands.
+- **Acceptance, on a KVM host:** one untemplated P4 worker and one templated worker; a session with
+  the template lands on the templated worker and finds the repository seeded, and its second turn
+  does not seed again; a session without lands on the untemplated one; an unknown template is
+  refused at creation. `deploy/microvm/mock-anthropic.mjs`'s `TPL-SMOKE-LOOK` prompt makes that check
+  deterministic without a model.

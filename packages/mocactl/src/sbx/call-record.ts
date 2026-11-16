@@ -11,29 +11,28 @@ import {
 import { SseParser } from '../api/sse-parser.js';
 
 /**
- * `--record F` (mocactl templates spec §3.8): one NDJSON line per HTTP attempt a command makes, so a
- * benchmark runner can drop its own client and still compose its provenance links from what
- * mocactl did. Each line: the command and an invocation id, `seq` (the line's number in this
- * invocation) and `try` (1, 2, … for the same method and path in a row: a retry), the method, the
- * path (never the base URL or host), the status or the transport error, the request and answer
- * bodies, their times (UTC, ms) and the Retry-After.
+ * `--record F`: one NDJSON line per HTTP attempt a command makes, so a script that drives mocactl
+ * can keep a record of every call without an HTTP client of its own. Each line: the command and an
+ * invocation id, `seq` (the line's number in this invocation) and `try` (1, 2, … for the same
+ * method and path in a row: a retry), the method, the path (never the base URL or host), the status
+ * or the transport error, the request and answer bodies, their times (UTC, ms) and the Retry-After.
  *
  * NO SECRET reaches the file: a token-named field and a gate record are replaced by their sha256,
  * and so is any string value, under any name, that looks like a JWT or a refresh token, so a token
- * field the API adds later is caught here. Host identifiers and free text (execEndpoint, execCa, an
- * egress event's dial_addr, a build log, a reason's message) are replaced by their length.
+ * field the API adds later is caught here. Host identifiers and free text (execEndpoint, execCa, a
+ * proxy's dial_addr, a log, a reason's message) are replaced by their length.
  *
- * A streamed answer (SSE or NDJSON: a turn, an egress export) is never held back: its line is
- * written when the headers arrive (`stream: true`), the body passes through unchanged, and a
- * `stream_end` line for the same seq gives its bytes, their sha256 and the frames counted, never a
- * frame's contents.
+ * A streamed answer (SSE or NDJSON: a turn, an export) is never held back: its line is written
+ * when the headers arrive (`stream: true`), the body passes through unchanged, and a `stream_end`
+ * line for the same seq gives its bytes, their sha256 and the frames counted, never a frame's
+ * contents.
  *
  * `mocactl run --record F` adds `endpoint` (control-plane or harness: one record spans both) and
  * RUN_LENGTH_FIELDS: a session's prompt, the model's reply and the workspace patch are free text.
  *
  * The file is created 0600 and opened O_APPEND; an existing one with wider permissions is refused.
  * Each line is one write(2): under PIPE_BUF it needs nothing more; past it the write takes a lock
- * file beside F, so concurrent processes (a runner's 28 creates) can share one record.
+ * file beside F, so concurrent processes (a script's parallel commands) can share one record.
  */
 
 /** The refresh token's prefix (control-plane refresh-store.ts REFRESH_TOKEN_PREFIX). */
@@ -61,7 +60,7 @@ const LENGTH_FIELDS = new Set(['execEndpoint', 'execCa', 'dial_addr', 'log', 'ha
  * (`workspace.error`), a transcript (`messages`, `entries`, `history`, `transcript`), output
  * (`output`, `stdout`, `stderr`), a person's `displayName`, a template's `description`, and what
  * names a host (a credential's `hosts` and `endpoint`). Ids, codes, statuses, times, usage and the
- * sandbox placement stay. A set of its own, so the template record keeps every field it had.
+ * sandbox placement stay. A set of its own, so the `sbx` commands' records keep these fields.
  */
 export const RUN_LENGTH_FIELDS: ReadonlySet<string> = new Set([
   'prompt',

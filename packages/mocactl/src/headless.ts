@@ -488,7 +488,7 @@ export async function cmdRun(rt: Runtime, io: Io, opts: RunOptions): Promise<num
 
   // An explicit empty --session is a mistake (a script whose id lookup came back empty), not a
   // request for a new session: starting one silently ran the prompt in a fresh session with no
-  // options (bm1, 2026-10-31).
+  // options.
   if (opts.session !== undefined && opts.session.trim() === '') {
     io.err('--session needs a session id (it was empty); leave it out to start a new session');
     return 2;

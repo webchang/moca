@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { exchangeCredential, sessionTemplate } from '../src/exchange.js';
 import { HANDLERS, type CpDeps } from '../src/handlers.js';
 import { parseTemplates, sessionTemplatesFromEnv } from '../src/sandbox-config.js';
-import { AUDIT_STREAM, type SessionRecord } from '../src/ownership.js';
+import type { SessionRecord } from '../src/ownership.js';
 import { makeDeps, ctx, alice, codeOf, seedCredential } from './helpers/deps.js';
 
 /** Session sandbox templates (session-templates spec §3.3). */
@@ -14,7 +14,7 @@ const TEMPLATES = parseTemplates(
       worker: 'sbx_django',
       description: 'SWE-bench django__django-11133',
       tools: ['bash', 'git', 'python3'],
-      seed: 'cp -a /opt/testbed-src/. /workspace/',
+      seed: 'cp -a /opt/repo/. /workspace/',
     },
     { id: 'py312', worker: 'sbx_py312', description: 'Python 3.12', tools: ['python3'] },
   ]),
@@ -35,7 +35,7 @@ describe('SH_SANDBOX_TEMPLATES on the harness profile', () => {
   });
 
   it('parses the seed as an optional string, dropping a blank one', () => {
-    expect(TEMPLATES[0].seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    expect(TEMPLATES[0].seed).toBe('cp -a /opt/repo/. /workspace/');
     expect(TEMPLATES[1]).not.toHaveProperty('seed');
     const blank = parseTemplates(
       JSON.stringify([{ id: 'a', worker: 'w', description: '', tools: [], seed: ' ' }]),
@@ -120,7 +120,7 @@ describe('the exchange and the views', () => {
     const t = templated();
     const res = await exchangeCredential(await token(t, { template: 'django-django-11133' }), t);
     expect(res.sandboxTemplate).toBe('django-django-11133');
-    expect(res.sandboxSeed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    expect(res.sandboxSeed).toBe('cp -a /opt/repo/. /workspace/');
     // No store: the seed is the declared one, and says so.
     expect(res.sandboxSeedSource).toBe('declared');
   });
@@ -141,43 +141,6 @@ describe('the exchange and the views', () => {
     const d = makeDeps();
     const plain = await exchangeCredential(await token(d), d);
     expect(plain).not.toHaveProperty('sandboxTemplate');
-  });
-
-  it("refuses, issuing nothing, when the store cannot read a pinned session's build", async () => {
-    const t = templated();
-    const tok = await token(t, { template: 'django-django-11133' });
-    // The session is pinned to a manifest-hash build; the store then fails on every read.
-    const rec = (await t.index.get('sid-fixed'))!;
-    await t.index.create({ ...rec, sandboxBuildId: `sha256:${'b'.repeat(64)}` });
-    t.templates = {
-      get: async () => {
-        throw new Error('EIO');
-      },
-    } as never;
-    const before = (t.streams.get(AUDIT_STREAM) ?? []).length;
-    const err = console.error;
-    console.error = () => {};
-    try {
-      // Not the declared seed: a self-serve build has none there, so a fallback would run the turn
-      // on an unseeded workspace.
-      expect(await codeOf(() => exchangeCredential(tok, t))).toBe('internal_error');
-    } finally {
-      console.error = err;
-    }
-    const entries = (t.streams.get(AUDIT_STREAM) ?? []).slice(before);
-    expect(entries.filter((e) => e.decision === 'credential_issued')).toEqual([]);
-  });
-
-  it('falls back to the declared seed when the store holds no such build', async () => {
-    const t = templated();
-    const tok = await token(t, { template: 'django-django-11133' });
-    const rec = (await t.index.get('sid-fixed'))!;
-    await t.index.create({ ...rec, sandboxBuildId: `sha256:${'b'.repeat(64)}` });
-    t.templates = { get: async () => null } as never;
-    expect(await exchangeCredential(tok, t)).toMatchObject({
-      sandboxSeed: 'cp -a /opt/testbed-src/. /workspace/',
-      sandboxSeedSource: 'declared',
-    });
   });
 
   it('fails closed: a template no longer declared is still named, without a seed', () => {

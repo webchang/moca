@@ -77,7 +77,7 @@ describe.each([
   it('appends in order, pages by id, is idempotent by (host, cursor), and seals', async () => {
     const { store, done } = make();
     const exp = Math.floor(Date.now() / 1000) + 3600;
-    const a = await store.append('bm1', 'c1', [group('sbx-a', 3, exp)], 2, 0);
+    const a = await store.append('host-1', 'c1', [group('sbx-a', 3, exp)], 2, 0);
     expect(a).toEqual({
       accepted: 3,
       refused: 2,
@@ -87,9 +87,9 @@ describe.each([
       dropped: 0,
       cursor: 'c1',
     });
-    expect(await store.append('bm1', 'c1', [group('sbx-a', 3, exp)], 2, 0)).toEqual(a);
+    expect(await store.append('host-1', 'c1', [group('sbx-a', 3, exp)], 2, 0)).toEqual(a);
     await store.append(
-      'bm1',
+      'host-1',
       'c2',
       [{ ...group('sbx-a', 2, exp, 3), proxyDropped: 4, invalid: 1 }],
       0,
@@ -108,7 +108,7 @@ describe.each([
     });
     expect(await store.seal('sbx-a', exp)).toBe(true);
     expect(await store.seal('sbx-a', exp)).toBe(false);
-    const late = await store.append('bm1', 'c3', [group('sbx-a', 2, exp)], 0, 0);
+    const late = await store.append('host-1', 'c3', [group('sbx-a', 2, exp)], 0, 0);
     expect(late).toMatchObject({ accepted: 0, refused: 2 });
     await done();
   });
@@ -150,13 +150,13 @@ describe.each([
           })();
     const { store, done } = small;
     const exp = Math.floor(Date.now() / 1000) + 3600;
-    expect(await store.append('bm1', 'c1', [group('sbx-a', 8, exp)], 0, 0)).toMatchObject({
+    expect(await store.append('host-1', 'c1', [group('sbx-a', 8, exp)], 0, 0)).toMatchObject({
       accepted: 6,
       capped: 2,
       overBudget: 0,
     });
     expect(
-      await store.append('bm2', 'c1', [group('sbx-b', 3, exp), group('sbx-c', 2, exp)], 0, 0),
+      await store.append('host-2', 'c1', [group('sbx-b', 3, exp), group('sbx-c', 2, exp)], 0, 0),
     ).toMatchObject({ accepted: 4, overBudget: 1 });
     // The over-budget event is dropped in its own log, which is then incomplete.
     expect(await summarize(store, 'sbx-c')).toMatchObject({
@@ -164,7 +164,7 @@ describe.each([
       droppedBy: { budget: 1 },
       complete: false,
     });
-    expect(await store.append('bm1', 'c2', [group('sbx-d', 1, exp)], 0, 0)).toMatchObject({
+    expect(await store.append('host-1', 'c2', [group('sbx-d', 1, exp)], 0, 0)).toMatchObject({
       accepted: 0,
       overBudget: 1,
     });
@@ -173,7 +173,7 @@ describe.each([
     if (name === 'memory') (store as MemoryEgressStore).expire('sbx-a');
     else await store.expireAt('sbx-a', Math.floor(Date.now() / 1000) - 1);
     // 10 - (3 + 1) = 6 free: sbx-d takes 6, and its 7th is over its own cap of 6, not the budget.
-    expect(await store.append('bm1', 'c3', [group('sbx-d', 7, exp)], 0, 0)).toMatchObject({
+    expect(await store.append('host-1', 'c3', [group('sbx-d', 7, exp)], 0, 0)).toMatchObject({
       accepted: 6,
       capped: 1,
       overBudget: 0,
@@ -223,8 +223,8 @@ describe.each([
       const exp = Math.floor(Date.now() / 1000) + 3600;
       const posts = [];
       for (let i = 0; i < 10; i++) {
-        posts.push(store.append('bm1', `a${i}`, [group(`sbx-a${i}`, 200, exp)], 0, 0));
-        posts.push(store2.append('bm2', `b${i}`, [group(`sbx-b${i}`, 200, exp)], 0, 0));
+        posts.push(store.append('host-1', `a${i}`, [group(`sbx-a${i}`, 200, exp)], 0, 0));
+        posts.push(store2.append('host-2', `b${i}`, [group(`sbx-b${i}`, 200, exp)], 0, 0));
       }
       const answers = await Promise.all(posts);
       const accepted = answers.reduce((n, a) => n + a.accepted, 0);
@@ -245,9 +245,9 @@ describe.each([
       const p = `test:egress:${process.pid}:${randomUUID()}:`;
       const store = new RedisEgressStore(redis, 3600, p, { cap: 100, budgetBytes: 5 * L });
       const now = Math.floor(Date.now() / 1000);
-      await store.append('bm1', 'c1', [group('sbx-old', 5, now + 3600)], 0, 0);
+      await store.append('host-1', 'c1', [group('sbx-old', 5, now + 3600)], 0, 0);
       expect(
-        await store.append('bm1', 'c2', [group('sbx-new', 1, now + 3600)], 0, 0),
+        await store.append('host-1', 'c2', [group('sbx-new', 1, now + 3600)], 0, 0),
       ).toMatchObject({
         accepted: 0,
         overBudget: 1,
@@ -256,7 +256,7 @@ describe.each([
       await store.expireAt('sbx-old', now - 1);
       expect(await client.exists(`${p}sbx-old`)).toBe(0);
       expect(
-        await store.append('bm1', 'c3', [group('sbx-new', 5, now + 3600)], 0, 0),
+        await store.append('host-1', 'c3', [group('sbx-new', 5, now + 3600)], 0, 0),
       ).toMatchObject({
         accepted: 5,
         overBudget: 0,
@@ -306,12 +306,12 @@ describe.each([
     it('names its keys sh:sbx:egress:<id> and :meta, both expiring with the sandbox record', async () => {
       const { store, prefix, done } = isolated();
       const exp = Math.floor(Date.now() / 1000) + 1800;
-      await store.append('bm1', 'c1', [{ ...group('sbx-b', 1, exp), proxyDropped: 1 }], 0, 1);
+      await store.append('host-1', 'c1', [{ ...group('sbx-b', 1, exp), proxyDropped: 1 }], 0, 1);
       for (const k of [`${prefix}sbx-b`, `${prefix}sbx-b:meta`]) {
         expect(await client.expireTime(k)).toBe(exp);
       }
       expect(await client.type(`${prefix}sbx-b`)).toBe('stream');
-      const ttl = await client.ttl(`${prefix}host:bm1`);
+      const ttl = await client.ttl(`${prefix}host:host-1`);
       expect(ttl).toBeGreaterThan(3500);
       await store.expireAt('sbx-b', exp + 60);
       expect(await client.expireTime(`${prefix}sbx-b`)).toBe(exp + 60);
@@ -333,7 +333,7 @@ describe.each([
           m.xAdd(k, '*', { e: batch[j + 2]! });
         await m.exec();
       }
-      const r = await store.append('bm1', 'c1', [group('sbx-c', 3, exp)], 0, 0);
+      const r = await store.append('host-1', 'c1', [group('sbx-c', 3, exp)], 0, 0);
       expect(r).toMatchObject({ accepted: 1, capped: 2 });
       expect(await client.xLen(k)).toBe(EGRESS_LOG_CAP);
       // Memory: what one stored event costs, at the cap (the report's estimate).

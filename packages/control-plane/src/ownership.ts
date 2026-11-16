@@ -56,6 +56,15 @@ export interface CpRedisLike {
   expire(key: string, seconds: number): Promise<unknown>;
   /** A sorted set's cardinality: the per-owner open-turn count the fan-out quota reads (§4.3). */
   zCard(key: string): Promise<number>;
+  /**
+   * One Lua script, server-side. The turn record's state transitions need the read and the write to
+   * be indivisible (`turn-store.ts`'s CAS_STATE_LUA): a `cancel` landing between a claim's read and
+   * its write would otherwise be overwritten, and the worker would run a turn the caller cancelled.
+   *
+   * `script` is always one of this package's own exported constants -- never a caller's string --
+   * which is also what lets the in-memory fake dispatch on identity rather than interpret Lua.
+   */
+  eval(script: string, opts: { keys: string[]; arguments: string[] }): Promise<unknown>;
 }
 
 export interface SessionRecord {
@@ -82,10 +91,10 @@ export interface SessionRecord {
    */
   sandboxTemplate?: string;
   /**
-   * The build `sandboxTemplate`'s default tag resolved to at creation (template lifecycle spec §9),
-   * when the deployment has a template catalog. The harness routes a turn by the worker's
-   * template label, not its build, so this is the build the session was created against, not a
-   * guarantee: with two builds of one template active, a turn may run on either (register G19).
+   * The build `sandboxTemplate` resolved to at creation through the template store (combined
+   * control plane spec §3.4): `id` by its default tag, `id:tag`, or `id@<build id>`. Kept for the
+   * session's life; when it is a manifest hash, a turn runs only on a worker labelled with it.
+   * Absent without a template store.
    */
   sandboxBuildId?: string;
   /**
@@ -113,18 +122,16 @@ export const sessionKey = (sid: string): string => `sh:cp:session:${sid}`;
 export const runtimeKey = (sid: string): string => `sh:cp:session:${sid}:runtime`;
 /** Hashed, so the keyspace itself discloses no logins -- same derivation as the Secret name. */
 export const ownerKey = (subject: string): string => `sh:cp:owner:${subjectHash(subject)}:sessions`;
-/**
- * The sessions pinned to one template build (lifecycle spec §5.1): a retire is refused while one is
- * active, as a sandbox's live record refuses it. The build id is hashed into the key, as the owner is.
- */
-export const buildSessionsKey = (buildId: string): string =>
-  `sh:cp:build:${subjectHash(buildId)}:sessions`;
 
 /** Keys of session DATA the cascade can address by name (plan gap #10). */
 const dataKeys = (sid: string): string[] => [
   `session:${sid}`, // pi log stream       (packages/session-backend/src/redis-backend.ts:6)
   `session:${sid}:seq`, // its position counter (:7)
-  `leaf:result:${sid}`, // leaf result + gate state (harness/src/leaf-result-store.ts:23)
+  // The SYNC `/runs` path's leaf result + gate state (harness/src/leaf-result-store.ts:32), which
+  // is per session because a session has one interactive leaf at a time. An ASYNC turn's result
+  // key carries a turn id too, so it can only be reached by enumerating the session's turns --
+  // TurnStore.deleteSessionTurns, which deleteSession calls right after this cascade.
+  `leaf:result:${sid}`,
 ];
 
 /** Fields the runtime hash may carry. Anything else is dropped on write -- see putRuntime. */
@@ -215,30 +222,6 @@ export class OwnershipIndex {
     await this.guard(() =>
       this.redis.zAdd(ownerKey(rec.owner), { score: rec.createdAt, value: rec.sessionId }),
     );
-    if (rec.sandboxBuildId) {
-      await this.guard(() =>
-        this.redis.zAdd(buildSessionsKey(rec.sandboxBuildId!), {
-          score: rec.createdAt,
-          value: rec.sessionId,
-        }),
-      );
-    }
-  }
-
-  /**
-   * Whether an active session is pinned to this build (lifecycle spec §5.1). A member whose record
-   * is gone or deleting does not count, so a crash between the cascade's steps cannot block a retire.
-   */
-  async hasActiveSessionOnBuild(buildId: string): Promise<boolean> {
-    const ids = await this.guard(() =>
-      this.redis.zRange(buildSessionsKey(buildId), '+inf', '-inf', { BY: 'SCORE', REV: true }),
-    );
-    for (const sid of ids) {
-      const rec = await this.get(sid);
-      if (rec && rec.state === 'active' && !rec.tombstone && rec.sandboxBuildId === buildId)
-        return true;
-    }
-    return false;
   }
 
   async get(sid: string): Promise<SessionRecord | null> {
@@ -383,10 +366,17 @@ export class OwnershipIndex {
     /** The gating rule ids a policy refusal failed, comma-separated (spec §8.1). */
     rules?: string;
     decision: string;
-    /** The error code of a refusal. */
+    /**
+     * The error code of a refusal; on a `sandbox_mode_changed` the policy made (a mode no longer
+     * allowed, downgraded at a token mint), `mode_not_allowed`.
+     */
     reason?: string;
     model?: string;
     fromModel?: string;
+    /** A sandbox mode change (lease-mode spec §8.1): the old and new mode, and the new epoch. */
+    fromMode?: string;
+    toMode?: string;
+    modeEpoch?: number;
   }): Promise<void> {
     await this.guard(() =>
       this.redis.xAdd(
@@ -410,6 +400,9 @@ export class OwnershipIndex {
           ...(entry.reason ? { reason: entry.reason } : {}),
           ...(entry.model ? { model: entry.model } : {}),
           ...(entry.fromModel ? { fromModel: entry.fromModel } : {}),
+          ...(entry.fromMode ? { fromMode: entry.fromMode } : {}),
+          ...(entry.toMode ? { toMode: entry.toMode } : {}),
+          ...(entry.modeEpoch !== undefined ? { modeEpoch: String(entry.modeEpoch) } : {}),
         },
         { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: AUDIT_MAXLEN } },
       ),
@@ -425,9 +418,6 @@ export class OwnershipIndex {
     await this.tombstone(rec.sessionId);
     await this.guard(() => this.redis.del([...dataKeys(rec.sessionId), runtimeKey(rec.sessionId)]));
     await this.guard(() => this.redis.zRem(ownerKey(rec.owner), rec.sessionId));
-    if (rec.sandboxBuildId) {
-      await this.guard(() => this.redis.zRem(buildSessionsKey(rec.sandboxBuildId!), rec.sessionId));
-    }
     await this.guard(() => this.redis.del([sessionKey(rec.sessionId)]));
   }
 }

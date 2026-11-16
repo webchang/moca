@@ -1,13 +1,12 @@
-import { createHash } from 'node:crypto';
 import type { SbxPolicyView } from './api.js';
 
 /**
- * `templates create --dry-run` (mocactl templates spec §3.5): the checks the control plane's policy
- * makes at create (packages/control-plane/src/template-policy.ts `checkCreate`) that need nothing
- * but the inputs and the policy's profiles. Not the gate record's trust (the policy's trusted list),
- * not the registries, not the quotas: the server decides those. Rule ids are the policy's, so a
- * local refusal names the rule the server would; `M7.spec_id` and `M7.spec_image` are the spec's own
- * id and image against the create's.
+ * `templates create --dry-run`: the checks the control plane's policy makes at create
+ * (packages/control-plane/src/template-policy.ts `checkCreate`) that need nothing but the inputs
+ * and the policy's profiles. Not the gate record's trust (the policy's trusted list), not the
+ * registries, not the quotas: the server decides those, and its answer is still the decision. Rule
+ * ids are the policy's, so a local refusal names the rule the server would; `M7.spec_id` and
+ * `M7.spec_image` are the spec's own id and image against the create's.
  */
 
 /** The template id rule (M7), as the policy's TEMPLATE_ID_RE. */
@@ -56,7 +55,7 @@ export interface DryRun {
   results: DryRunResult[];
   /** The first failed rule. */
   failed?: DryRunResult;
-  /** Advice that does not fail the create (G46, G47). */
+  /** Advice that does not fail the create. */
   notes: string[];
 }
 
@@ -86,12 +85,6 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
     pinned,
     'image must be pinned by digest, [host[:port]/]path@sha256:<64 hex> (lowercase path, no tag)',
   );
-  rule('M7.spec_id', s.id === undefined || s.id === input.id, "spec.id must be the create's id");
-  rule(
-    'M7.spec_image',
-    s.image === undefined || s.image === input.image,
-    "spec.image must be the create's image",
-  );
   // guest_ram_mb, or its alias guest_mb: never both, even equal.
   const bothGuest = s.guest_mb !== undefined && s.guest_ram_mb !== undefined;
   const guest = bothGuest ? undefined : (s.guest_ram_mb ?? s.guest_mb);
@@ -102,9 +95,6 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
       ? 'spec takes guest_ram_mb or its alias guest_mb, not both'
       : 'spec.guest_ram_mb (or guest_mb) must be a whole number of MiB, at least 128',
   );
-  // G46: the policy reads either name, but template-build.sh reads only guest_ram_mb.
-  if (s.guest_mb !== undefined && s.guest_ram_mb === undefined)
-    notes.push('write spec.guest_ram_mb rather than guest_mb: the build reads guest_ram_mb (G46)');
   rule('M7.vcpus', int(s.vcpus) && s.vcpus >= 1 && s.vcpus <= 32, 'spec.vcpus must be 1-32');
   rule(
     'M7.workspace',
@@ -156,6 +146,12 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
       `spec.${k} must be true or false`,
     );
   }
+  rule('M7.spec_id', s.id === undefined || s.id === input.id, "spec.id must be the create's id");
+  rule(
+    'M7.spec_image',
+    s.image === undefined || s.image === input.image,
+    "spec.image must be the create's image",
+  );
   rule(
     'M8',
     !(
@@ -210,12 +206,10 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
     );
   }
   // The profile's own rules, as far as the gate record's content and the spec decide them; whether
-  // the policy trusts the record (X1.trusted, and the self-attested rules that follow from it) is
-  // the server's.
+  // the policy trusts the record (X1.trusted) is the server's.
   const req = new Set(profile?.requires ?? []);
   const g = gate as {
-    schema?: unknown;
-    gate?: { passed?: unknown; floor_checked_offline?: unknown };
+    gate?: { passed?: unknown };
     image?: { digest?: unknown };
     observed?: { testbed?: { agent_can_commit?: unknown }; guest?: { git_identity?: unknown } };
   } | null;
@@ -234,14 +228,6 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
       g !== null && g.image?.digest === digest,
       'the gate record is for another image',
     );
-    if (profile?.requireOfflineGate !== false) {
-      const v = g?.gate?.floor_checked_offline;
-      rule(
-        'X1.offline',
-        g === null || (g.schema === 'image-factory/gate/1' ? v === true : v !== false),
-        `the ${profileName} profile needs the gate's floor checked offline (the record's run needed the network)`,
-      );
-    }
   }
   if (req.has('X10') && s.source_record_digest === undefined)
     rule('X10', false, `the ${profileName} profile needs spec.source_record_digest (X10)`);
@@ -279,17 +265,8 @@ export function dryRun(input: DryRunInput, policy: SbxPolicyView['policy']): Dry
   // not trust it: said, not refused, since the server admits it too.
   if (profile && !req.has('X1') && input.gateRecord !== undefined)
     notes.push(
-      `the ${profileName} profile requires no gate record (X1): it is checked and stored with the build, not trusted (a self profile trusts its owner's)`,
-    );
-  // G47: a build host whose build-snapshot.sh predates the fix fails a git-less image's identity check.
-  if (Array.isArray(s.tools) && !s.tools.includes('git') && s.skip_git_identity_check !== true)
-    notes.push(
-      "the spec's tools have no git: if the image has none, set skip_git_identity_check (a build host before G47's fix refuses a git-less image)",
+      `the ${profileName} profile requires no gate record (X1): it is checked and stored with the build, not trusted`,
     );
   const failed = results.find((r) => !r.passed);
   return { profile: profileName, results, notes, ...(failed ? { failed } : {}) };
 }
-
-/** A gate record's sha256 as the policy computes it: the file's bytes. */
-export const gateRecordSha256 = (gateRecord: string): string =>
-  `sha256:${createHash('sha256').update(Buffer.from(gateRecord, 'utf8')).digest('hex')}`;

@@ -5,13 +5,13 @@
         [--egress SANDBOX_ID=FILE ...]
 
 EXPORT.json is the control plane's provenance export (schema moca-provenance-export/1). Needs only
-Python 3's standard library and the file: no MOCA, no cluster, no network. Checks every record's
+Python 3's standard library and the file: no Moca, no cluster, no network. Checks every record's
 digest (the sha256 of its canonical JSON), every stream's seq and prev chain up to its listed head
 and count, every blob against its sha256, that each check cites a policy record and each gate a
 blob of the export. An export can only prove itself consistent; --head compares a stream's head
 with one kept elsewhere, which is what catches an export that dropped its latest records.
 
---egress (register G42, optional) checks a sandbox's egress log, as `GET /v1/sandboxes/{id}/egress
+--egress (optional) checks a sandbox's egress log, as `GET /v1/sandboxes/{id}/egress
 ?format=ndjson` returned it, against the export: the sha256 of FILE's bytes and its line count must
 be the `egress` of the newest `sandbox` record of that sandbox naming one (its end record, or a later
 `state: egress` record). It prints the log's `dropped` and `complete` as recorded, with the reasons

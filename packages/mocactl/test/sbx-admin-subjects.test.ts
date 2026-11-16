@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { parseUntil, sbxMain } from '../src/sbx/cli.js';
 import { fakeCp, setup } from './helpers/sbx.js';
 
-// Register G38: `mocactl sbx admin subjects …`, enrollment and roles through the API.
+// `mocactl sbx admin subjects …`: enrollment and roles through the API.
 
 const SUBJECT = {
   subject: 'github:9',

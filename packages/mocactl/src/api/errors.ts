@@ -14,14 +14,8 @@ export class ApiError extends Error {
   readonly reason?: string;
   /** `policy_refused`: the gating rule the create failed (`M7.id`, `X10`, ...). */
   readonly rule?: string;
-  /** `quota_exceeded` on a template create or activation: which quota (`buildsQueued`, ...). */
+  /** `quota_exceeded` on a template create: which quota (`templates` or `buildsQueued`). */
   readonly quota?: string;
-  /** `template_unavailable`, `no_active_slot`, `template_not_active`: the build's readiness. */
-  readonly readiness?: string;
-  /** Why an `unavailable` build waits (`not_held`, `no_slot`, `memory`, `memfile_mismatch`). */
-  readonly readinessReason?: string;
-  /** The build's place in its host's start line, when the body names it (register G43). */
-  readonly queuePosition?: number;
   constructor(
     readonly source: ErrorSource,
     readonly status: number,
@@ -36,24 +30,16 @@ export class ApiError extends Error {
     this.name = 'ApiError';
     this.causeCode = causeCode;
     if (reason !== undefined) this.reason = reason;
-    for (const k of DETAIL_KEYS)
-      if (details[k] !== undefined) Object.assign(this, { [k]: details[k] });
+    if (details.rule !== undefined) this.rule = details.rule;
+    if (details.quota !== undefined) this.quota = details.quota;
   }
 }
 
-/** The body fields a template refusal carries beside its code (template lifecycle spec §8.1, §6.3). */
+/** The body fields a template refusal carries beside its code (openapi Error `rule`, `quota`). */
 export interface ApiErrorDetails {
   rule?: string;
   quota?: string;
-  readiness?: string;
-  readinessReason?: string;
-  queuePosition?: number;
 }
-const DETAIL_KEYS = ['rule', 'quota', 'readiness', 'readinessReason', 'queuePosition'] as const;
-
-/** The codes whose `reason` is the build's readinessReason (openapi Error.reason). */
-const READINESS_CODES = new Set(['no_active_slot', 'template_unavailable', 'template_not_active']);
-const READINESS_REASONS = new Set(['not_held', 'no_slot', 'memory', 'memfile_mismatch']);
 
 export class TurnCancelledError extends Error {
   constructor() {
@@ -77,20 +63,8 @@ export async function errorFromResponse(source: ErrorSource, res: Response): Pro
       if (typeof body.reason === 'string') reason = body.reason;
     } else if (typeof body.reason === 'string') code = body.reason;
     if (typeof body.message === 'string') message = body.message;
-    for (const k of ['rule', 'quota', 'readiness', 'readinessReason'] as const) {
-      if (typeof body[k] === 'string') details[k] = body[k];
-    }
-    if (Number.isSafeInteger(body.queuePosition))
-      details.queuePosition = body.queuePosition as number;
-    // The Error body names a readiness reason `reason` (no_active_slot `memory`, ...): kept under its
-    // own name too, so a client branches on one field whichever the route used.
-    if (
-      !details.readinessReason &&
-      reason &&
-      READINESS_CODES.has(code) &&
-      READINESS_REASONS.has(reason)
-    )
-      details.readinessReason = reason;
+    if (typeof body.rule === 'string') details.rule = body.rule;
+    if (typeof body.quota === 'string') details.quota = body.quota;
   } catch {
     /* non-JSON body (e.g. a proxy's HTML page): keep http_<status>. */
   }

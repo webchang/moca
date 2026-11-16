@@ -39,10 +39,10 @@ const (
 //
 // Two hash versions. Version 1 (HashVersion absent) hashes kernel + rootfs + agent only
 // (spec §5.5), so every other field, and vmstate and memfile, could be edited without
-// the hash noticing. Version 2 (template lifecycle spec §8, PV2-PV3) hashes every field
-// and every file, so Hash identifies the whole build and can serve as its build id.
-// A version-1 manifest still verifies under its own rule: snapshots built before
-// version 2 keep working until they are rebuilt.
+// the hash noticing. Version 2 hashes every field and every file, so Hash identifies
+// the whole build and can serve as its build id. A version-1 manifest still verifies
+// under its own rule: snapshots built before version 2 keep working until they are
+// rebuilt.
 type Manifest struct {
 	HashVersion  int       `json:"hash_version,omitempty"`
 	Image        string    `json:"image"`
@@ -58,19 +58,19 @@ type Manifest struct {
 	RootfsSHA256 string `json:"rootfs_sha256"`
 	AgentSHA256  string `json:"agent_sha256"`
 	// Version 2 only. vmstate is small and is checked at every start; memfile is the
-	// guest's whole RAM (4 GiB for a SWE-bench template), so the worker re-reads it only
-	// when asked (VerifyOptions.Memfile), and an offline verifier always.
+	// guest's whole RAM (several GiB for a typical template), so the worker re-reads it
+	// only when asked (VerifyOptions.Memfile).
 	VMStateSHA256 string `json:"vmstate_sha256,omitempty"`
 	MemfileSHA256 string `json:"memfile_sha256,omitempty"`
 	// cloud-hypervisor's snapshot config (ch-config.json), which restore replays; empty
 	// for Firecracker. Version 2 only.
 	CHConfigSHA256 string `json:"ch_config_sha256,omitempty"`
-	// The sha256 of the egress CA's DER, when the rootfs trusts one (SBX0.2b). Outside the
-	// hash in version 1; inside it in version 2.
+	// The sha256 of the egress CA's DER, when the rootfs trusts one. Outside the hash in
+	// version 1; inside it in version 2.
 	EgressCASHA256 string `json:"egress_ca_sha256,omitempty"`
 	// The image digest build-rootfs.sh recorded in the rootfs's /etc/moca-rootfs-source,
 	// copied here so a template record's image can be checked against it without mounting
-	// the rootfs (PV4). Version 2 only; empty for a rootfs built some other way.
+	// the rootfs. Version 2 only; empty for a rootfs built some other way.
 	SourceImageDigest string `json:"source_image_digest,omitempty"`
 	// Hash: see HashVersion. Version 1 does NOT cover vmstate or memfile: they change on
 	// every rebuild even when nothing behavioural did. Version 2 does, because it names
@@ -88,6 +88,19 @@ type Manifest struct {
 // (deploy/microvm/build-snapshot.sh). A worker refuses lease mode without it.
 const FeatureLeaseV1 = "lease-v1"
 
+// FeatureLeaseProcessesV1 marks an image built for lease level 2, tracked processes:
+// the sbxp<n> identities (uids 20000..20003, group sbx-ws, HOME /tmp/sbx-proc/<uid>) and
+// an agent started with that tracked uid range, with cgroup.kill proved in the guest
+// (deploy/microvm/build-snapshot.sh). Firecracker builds only, always beside lease-v1. A
+// worker refuses a process kind (process_start, list, logs, stop) without it.
+const FeatureLeaseProcessesV1 = "lease-processes-v1"
+
+// FeatureBalloonFPRV1 marks a snapshot whose VM carries a virtio-balloon in free-page
+// reporting mode only (amount 0, never inflated): the guest returns the pages it frees, so
+// an idle lease's measured charge follows its working set rather than its peak (spec §6).
+// Firecracker builds only; a restored VM keeps reporting. Lease mode works without it.
+const FeatureBalloonFPRV1 = "balloon-fpr-v1"
+
 // HasFeature reports whether the snapshot advertises f.
 func (m Manifest) HasFeature(f string) bool {
 	return slices.Contains(m.Features, f)
@@ -104,7 +117,7 @@ type VerifyOptions struct {
 	// Memfile re-hashes the memory file too (version 2): a full read of the guest's RAM
 	// image, seconds per GiB, so off by default (SH_VERIFY_MEMFILE=1 turns it on).
 	Memfile bool
-	// Cache, if set, is the path of a verify cache file (verifycache.go, G50): a file whose
+	// Cache, if set, is the path of a verify cache file (verifycache.go): a file whose
 	// identity is unchanged since a full hash on this host matched the manifest is not
 	// hashed again. Empty: every file is hashed in full, every time. The comparison against
 	// the manifest is made either way, and a bad cache only costs a full hash.

@@ -529,7 +529,7 @@ describe('sandboxTemplateField (session-templates spec §6)', () => {
     expect(r).toEqual({ status: 'ready', values: { sandboxTemplate: '' }, request: {} });
   });
 
-  it('sends an undeclared value as given, for the control plane to resolve (G37: id@build, id:tag)', async () => {
+  it('sends an undeclared value as given, for the control plane to resolve (id@build, id:tag)', async () => {
     for (const v of [
       'django-django-11133@sha256:' + 'a'.repeat(64),
       'py312:stable',

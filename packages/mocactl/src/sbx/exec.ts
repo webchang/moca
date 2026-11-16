@@ -4,6 +4,10 @@ import {
   SandboxExecConn,
   type Exec,
   type ExecConnOptions,
+  type LeaseOpName,
+  type LeaseStatusView,
+  type ProcessCall,
+  type SandboxModeName,
   type SandboxTokenGrant,
   type TokenFn,
 } from '@moca/sandbox-client';
@@ -13,11 +17,41 @@ import { sanitizeRemote } from '../core/sanitize.js';
 import type { SandboxApiClient, SbxToken } from './api.js';
 import { failed, type SbxCtx } from './commands.js';
 
-/** Builds the gRPC connection; a seam so tests run the commands against a fake. */
-export type ExecFactory = (o: ExecConnOptions) => { exec: Exec; close(): void };
+/**
+ * A connection's lease calls (spec §8.3), as `SandboxExecConn` has them: an abort of `signal`
+ * cancels the call, a LeaseControlError `cancelled` (P4-R12).
+ */
+export type LeaseControlFn = (
+  op: LeaseOpName,
+  setModeToken?: string,
+  opts?: { signal?: AbortSignal },
+) => Promise<LeaseStatusView>;
+
+/**
+ * Builds the gRPC connection; a seam so tests run the commands against a fake. `process` (plan 5)
+ * is optional so that a fake for commands that make no process call need not have one.
+ */
+export type ExecFactory = (o: ExecConnOptions) => {
+  exec: Exec;
+  close(): void;
+  leaseControl: LeaseControlFn;
+  leaseKeepalive: () => Promise<void>;
+  process?: ProcessCall;
+};
 const realFactory: ExecFactory = (o) => {
   const c = new SandboxExecConn(o);
-  return { exec: c.exec, close: c.close };
+  return {
+    exec: c.exec,
+    close: c.close,
+    leaseControl: c.leaseControl,
+    leaseKeepalive: c.leaseKeepalive,
+    process: c.process,
+  };
+};
+
+/** A connection without process calls (a test fake) fails a process call plainly. */
+const noProcess: ProcessCall = async () => {
+  throw new Error('this connection has no process calls');
 };
 
 /** Seconds of token life a held token must keep beyond what the connection asks (spec §6.5). */
@@ -49,6 +83,22 @@ export function jwtTimes(token: string): { iat: number; exp: number } | undefine
   }
 }
 
+/**
+ * The `mode` claim of a sandbox token, read WITHOUT verifying it: informational only (which mode the
+ * token was minted for; the relay and worker enforce it). Anything else is per-exec.
+ */
+export function jwtMode(token: string): SandboxModeName {
+  const payload = token.split('.')[1];
+  if (!payload) return 'per-exec';
+  try {
+    const m = (JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { mode?: unknown })
+      .mode;
+    return m === 'lease' || m === 'lease+processes' ? m : 'per-exec';
+  } catch {
+    return 'per-exec';
+  }
+}
+
 /** What the connection needs of a minted token: `lifetimeS` is `exp − iat`, 0 if unreadable. */
 export function grantOf(t: SbxToken): SandboxTokenGrant {
   const times = jwtTimes(t.token);
@@ -66,31 +116,81 @@ export function sandboxTokenFn(
   api: SandboxApiClient,
   id: string,
   now: () => number = Date.now,
-): { token: TokenFn; first(): Promise<SbxToken> } {
+  /** Called with each token minted, before any caller gets it (`sbx mcp` reads its mode). */
+  onMint?: (t: SbxToken) => void,
+): {
+  token: TokenFn;
+  first(signal?: AbortSignal): Promise<SbxToken>;
+  /** A fresh mint now, whatever is held; `signal` stops this caller's wait (and its request). */
+  force(signal?: AbortSignal): Promise<SbxToken>;
+} {
   let cur: SbxToken | undefined;
   let pending: Promise<SbxToken> | undefined;
-  const mint = () =>
-    (pending ??= api.mintSandboxToken(id).then(
-      (t) => ((pending = undefined), (cur = t)),
+  const mint = (signal?: AbortSignal) => untilAborted(mintShared(signal), signal);
+  const mintShared = (signal?: AbortSignal) =>
+    (pending ??= api.mintSandboxToken(id, signal ? { signal } : {}).then(
+      (t) => {
+        pending = undefined;
+        cur = t;
+        onMint?.(t);
+        return t;
+      },
       (err: unknown) => {
         pending = undefined;
         throw err;
       },
     ));
-  const get = async (force: boolean, minValidS: number): Promise<SbxToken> => {
+  const get = async (
+    force: boolean,
+    minValidS: number,
+    signal?: AbortSignal,
+  ): Promise<SbxToken> => {
     const need = Math.max(MIN_LEFT_S, minValidS);
-    if (force || !cur || cur.expiresAt - now() / 1000 < need) return mint();
+    if (force || !cur || cur.expiresAt - now() / 1000 < need) return mint(signal);
     return cur;
   };
   return {
     token: async ({ force, minValidS }) => grantOf(await get(force, minValidS)),
-    first: () => get(false, MIN_LEFT_S),
+    first: (signal?: AbortSignal) => get(false, MIN_LEFT_S, signal),
+    force: (signal?: AbortSignal) => get(true, MIN_LEFT_S, signal),
   };
+}
+
+/**
+ * `p`, or its signal's abort reason once `signal` aborts first: a caller that joined a mint
+ * another caller started stops waiting on its own cancel, without cancelling the mint.
+ */
+function untilAborted<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 export interface OpenedExec {
   exec: Exec;
   close(): void;
+  leaseControl: LeaseControlFn;
+  leaseKeepalive(): Promise<void>;
+  /** The process calls (plan 5, spec §7). */
+  process: ProcessCall;
+  /**
+   * Mints a fresh sandbox token now, as the next Exec would after a refusal (P5-R29). `signal`
+   * (a cancelled tool call's) aborts it.
+   */
+  remint(signal?: AbortSignal): Promise<void>;
   /** The first token, minted before dialing: where to dial and which worker and workspace. */
   token: SbxToken;
   /** The token's lifetime (`exp − iat`), 0 if unreadable: the default timeout is this minus 60. */
@@ -110,15 +210,21 @@ export async function openExec(
     backstopMarginS?: number;
     /** The sandbox's expiresAt, when the caller already has it; else looked up if need be. */
     sandboxExpiresAt?: number;
+    /** Called with each sandbox token minted, the first included. */
+    onToken?: (t: SbxToken) => void;
+    /** The connection's `Exec.keepalive` (default false). */
+    keepalive?: ExecConnOptions['keepalive'];
+    /** Aborts the opening's requests: the first token mint and the expiry lookup. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<OpenedExec> {
-  const t = sandboxTokenFn(api, id);
-  const first = await t.first();
+  const t = sandboxTokenFn(api, id, Date.now, o.onToken);
+  const first = await t.first(o.signal);
   let sandboxExpiresAt = o.sandboxExpiresAt;
   const life = grantOf(first).lifetimeS;
   if (sandboxExpiresAt === undefined && life > 0 && life < SHORT_TOKEN_S) {
     // Best effort: without it, a short token is only reported as a short lifetime.
-    sandboxExpiresAt = await api.getSandbox(id).then(
+    sandboxExpiresAt = await api.getSandbox(id, o.signal ? { signal: o.signal } : {}).then(
       (s) => s.expiresAt,
       () => undefined,
     );
@@ -132,8 +238,20 @@ export async function openExec(
     token: t.token,
     ...(o.backstopMarginS !== undefined ? { backstopMarginS: o.backstopMarginS } : {}),
     ...(sandboxExpiresAt ? { sandboxExpiresAt } : {}),
+    ...(o.keepalive !== undefined ? { keepalive: o.keepalive } : {}),
   });
-  return { exec: c.exec, close: c.close, token: first, lifetimeS: grantOf(first).lifetimeS };
+  return {
+    exec: c.exec,
+    close: c.close,
+    leaseControl: c.leaseControl,
+    leaseKeepalive: c.leaseKeepalive,
+    process: c.process ?? noProcess,
+    remint: async (signal?: AbortSignal) => {
+      await t.force(signal);
+    },
+    token: first,
+    lifetimeS: grantOf(first).lifetimeS,
+  };
 }
 
 /** `sbx run`'s exit for a sandbox failure: neither the command's code nor its timeout. */
@@ -141,8 +259,8 @@ export const EXIT_SANDBOX_FAILED = 125;
 /** `sbx run`'s exit for a command that timed out or was killed (spec §6.1). */
 export const EXIT_KILLED = 124;
 /**
- * `sbx run`'s exit when the sandbox refused the command before it started, every try (register
- * G36): the relay's in-flight cap or the template worker's capacity (`memory-budget:`,
+ * `sbx run`'s exit when the sandbox refused the command before it started, every try: the
+ * relay's in-flight cap or the template worker's capacity (`memory-budget:`,
  * `max-runs:`, `busy: queue full`). Nothing ran, so a caller may run it again later. 75 is
  * sysexits' EX_TEMPFAIL.
  */

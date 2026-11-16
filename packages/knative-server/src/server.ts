@@ -20,7 +20,7 @@ import {
   readResult,
 } from '@moca/harness/leaf-result-store';
 import { beginRunLease, reapOrphanedRuns } from '@moca/harness/run-lease';
-import { CpError, statusFor } from '@moca/control-plane';
+import { CpError, resultTtlSeconds, statusFor } from '@moca/control-plane';
 import {
   authorizeRunRead,
   resolveTurnAuth,
@@ -46,7 +46,12 @@ const SSE_HEADERS = {
   Connection: 'keep-alive',
   'X-Accel-Buffering': 'no', // belt-and-suspenders for any nginx fronting Kourier (Envoy ignores it)
 };
-const RESULT_TTL_SECONDS = parseInt(process.env.LEAF_RESULT_TTL_SECONDS ?? '86400', 10);
+// Exported (#389): the async leaf worker writes results through the same store with the same
+// TTL, because two result stores in one process would be two connections and two TTLs for one
+// key space. `resultTtlSeconds` is the control plane's own parse of the variable, shared rather
+// than repeated: a local `parseInt` read a blank or typo'd value as NaN, which Redis rejects on
+// every `EX`, so a malformed TTL broke result writes here while refusing to boot there.
+export const RESULT_TTL_SECONDS = resultTtlSeconds(process.env);
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -465,8 +470,8 @@ const NO_CAPACITY = new Set([
  * One log line for a /turn that answered 503, naming the cause. A 503 is an expected capacity
  * signal, so it was never logged, and the reasons it covers are not alike: a full pool clears by
  * waiting, but an empty TIER (no worker of it attached) never does, and the client sees the same
- * "no capacity, retry" for both (bm1, 2026-10-31: a session retried an empty tier for 10 minutes
- * with nothing in any log saying why). The log keeps each class's own text, the host's admission arithmetic of a
+ * "no capacity, retry" for both (a session could retry an empty tier for minutes with nothing in
+ * any log saying why). The log keeps each class's own text, the host's admission arithmetic of a
  * mid-turn refusal included (operators read it); forLog keeps it on one line.
  */
 export function logTurnCapacity(where: string, sessionId: string | undefined, err: unknown): void {
@@ -1023,7 +1028,9 @@ function rejectInvalidConfigRef(body: any, res: ServerResponse): boolean {
 }
 
 let resultStore: RedisResultStore | undefined;
-function getResultStore(): RedisResultStore {
+// Exported (#389): the async leaf worker writes its results through this same store, so one
+// connection and one TTL serve both the sync and async leaf paths for one key space.
+export function getResultStore(): RedisResultStore {
   if (!resultStore) resultStore = new RedisResultStore(process.env.REDIS_URL);
   return resultStore;
 }

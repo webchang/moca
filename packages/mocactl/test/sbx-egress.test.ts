@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { sbxMain } from '../src/sbx/cli.js';
 import { fakeCp, SBX, setup } from './helpers/sbx.js';
 
-// Register G42: `mocactl sbx egress SANDBOX [--json | --ndjson]`. example.com hosts only.
+// `mocactl sbx egress [ID] [--json | --ndjson | --verify]`. example.com hosts only.
 const E1 = {
   time: '2026-11-08T12:00:00Z',
   via: 'moca-egress',
@@ -38,7 +38,7 @@ const summary = (over: Record<string, unknown> = {}) => ({
 });
 const PATH = `/v1/sandboxes/${SBX}/egress`;
 
-describe('mocactl sbx egress (G42)', () => {
+describe('mocactl sbx egress', () => {
   it('prints the summary per host, then completeness and the digest', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
@@ -285,11 +285,13 @@ describe('mocactl sbx egress (G42)', () => {
     expect(io.errs.join('\n')).toMatch(/no such sandbox/);
   });
 
-  it('refuses --json with --ndjson, --ndjson elsewhere, and a malformed id, before any request', async () => {
+  it('refuses --json with --ndjson, --verify with --ndjson, either elsewhere, and a malformed id, before any request', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({});
     const run = (argv: string[]) => sbxMain(argv, env, io, { home, fetchImpl: cp.fetchImpl });
     expect(await run(['egress', SBX, '--json', '--ndjson'])).toBe(2);
+    expect(await run(['egress', SBX, '--verify', '--ndjson'])).toBe(2);
+    expect(await run(['ls', '--verify'])).toBe(2);
     expect(await run(['ls', '--ndjson'])).toBe(2);
     expect(await run(['egress', '../../etc'])).toBe(2);
     expect(await run(['egress', SBX, 'extra'])).toBe(2);

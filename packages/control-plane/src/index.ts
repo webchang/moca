@@ -18,13 +18,19 @@ export {
 export {
   DEFAULT_SANDBOX_ISSUER,
   SANDBOX_CLOCK_LEEWAY_S,
+  SANDBOX_MODE_TOKEN_TTL_S,
+  SANDBOX_MODE_TOKEN_TYP,
   SANDBOX_SCOPE_EXEC,
   SANDBOX_TOKEN_AUDIENCE,
   SANDBOX_TOKEN_TYP,
   mintSandboxToken,
+  mintSetModeToken,
   verifySandboxToken,
+  verifySetModeToken,
   type SandboxMintInput,
   type SandboxTokenClaims,
+  type SetModeClaims,
+  type SetModeMintInput,
 } from './sandbox-token.js';
 export {
   ATTACH_CLOCK_LEEWAY_S,
@@ -148,12 +154,16 @@ export { projectResources, resolveSandbox, type SandboxView } from './resources.
 // The store's SandboxView is aliased: resources.ts's SandboxView (a session's sandbox tier) owns the name.
 export {
   MemorySandboxStore,
+  SANDBOX_MODE_NAMES,
   isLive,
+  isSandboxModeName,
   viewOf,
   type CreateOutcome,
   type DeleteOutcome,
   type SandboxLimits,
+  type SandboxModeName,
   type SandboxRecord,
+  type SetModeResult,
   type SandboxState,
   type SandboxStore,
   type SandboxView as SandboxStoreView,
@@ -178,6 +188,7 @@ export {
   checkStaticBearer,
   exchangeCredential,
   placeholderFor,
+  sessionFromToken,
   refuseMisdirectedSecret,
   resolveInference,
   targetOf,
@@ -186,6 +197,42 @@ export {
   type ResolvedInference,
 } from './exchange.js';
 export { exchangeTurnCredential, type TurnExchangeResponse } from './turn-exchange.js';
+export {
+  DEFAULT_GRANT_ISSUER,
+  GRANT_AUDIENCES,
+  GRANT_TYP,
+  INFERENCE_GRANT_AUDIENCE,
+  SANDBOX_GRANT_AUDIENCE,
+  mintGrants,
+  turnExp,
+  verifyGrant,
+  type GrantAudience,
+  type GrantClaims,
+  type GrantMintInput,
+  type InferenceGrantClaims,
+  type SandboxGrantClaims,
+} from './grant.js';
+export { issueTurnGrants, refreshTurnGrants, type TurnGrantsResponse } from './grant-exchange.js';
+export { TurnStore, type TurnStoreOptions } from './turn-store.js';
+export {
+  isTerminalState,
+  TURN_STATES,
+  isMintedTurnId,
+  turnKey,
+  resultTtlSeconds,
+  TURN_RECORD_TTL_MARGIN_SECONDS,
+  type TurnCaps,
+  type TurnRecord,
+  type TurnState,
+} from './turn-record.js';
+export {
+  LEAF_QUEUE_GROUP,
+  LEAF_QUEUE_STREAM,
+  MemoryTurnQueue,
+  RedisTurnQueue,
+  type TurnQueue,
+} from './turn-queue.js';
+export { asyncCounters, countAsync, resetAsyncCounters, type AsyncCounter } from './counters.js';
 export { buildHandler, startControlPlane } from './server.js';
 export {
   CREDENTIAL_STORES,
@@ -194,6 +241,7 @@ export {
   depsFromEnv,
   portFromEnv,
   redisClientOptions,
+  templateCatalogFromEnv,
   verifyKeysFromEnv,
   type CredentialStoreKind,
 } from './main.js';
@@ -205,6 +253,7 @@ export {
   canonicalJson,
   recordDigest,
   verifyExport,
+  type AppendInput,
   type ProvenanceExport,
   type ProvenanceRecord,
   type RecordKind,
@@ -227,17 +276,22 @@ export {
   type TemplateDoc,
 } from './template-catalog.js';
 export {
+  DEFAULT_GATE_RECORD_SCHEMA,
+  DEFAULT_OWNED,
   DEFAULT_POLICY,
   POLICY_SCHEMA,
   PROFILE_RULES,
   TEMPLATE_ID_RE,
   checkCreate,
+  ownedLimit,
   policyDigest,
   policyProblems,
   registryOf,
-  repositoryOf,
   repositoryAllowed,
+  repositoryOf,
+  type CheckOptions,
   type CheckResult,
+  type CreateInput,
   type Policy,
   type PolicyStore,
   type Profile,

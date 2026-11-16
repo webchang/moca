@@ -11,10 +11,10 @@ spec:
       containers:
         - name: supervisor
           env:
-            - { name: SH_RELAY_ADDR, value: 'sandbox-relay-exec.moca-combined.svc:9444' }
+            - { name: SH_RELAY_ADDR, value: 'sandbox-relay-exec.moca-sbx-combined.svc:9444' }
             - {
                 name: SH_CONTROL_PLANE_URL,
-                value: 'http://moca-control-plane.moca-combined.svc:8080',
+                value: 'http://moca-control-plane.moca-sbx-combined.svc:8080',
               }
 ---
 apiVersion: apps/v1
@@ -26,7 +26,7 @@ spec:
       containers:
         - name: control-plane
           env:
-            - { name: SH_SANDBOX_NAMESPACE, value: moca-combined }
+            - { name: SH_SANDBOX_NAMESPACE, value: moca-sbx-combined }
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -37,4 +37,4 @@ spec:
       containers:
         - name: sandbox
           env:
-            - { name: RELAY_ADDR, value: 'sandbox-relay-attach.moca-combined.svc:9443' }
+            - { name: RELAY_ADDR, value: 'sandbox-relay-attach.moca-sbx-combined.svc:9443' }

@@ -24,7 +24,7 @@ import {
 } from '../src/egress-log.js';
 import { admin, alice, bob, codeOf, ctx, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
 
-// Register G42: per-sandbox egress records through the API
+// Per-sandbox egress records through the API
 // (docs/specs/2026-11-08-sandbox-egress-records-design.md).
 
 const EX = resolve(__dirname, '../../../deploy/sbx/template-onboarding/examples');
@@ -160,7 +160,7 @@ const ndjsonOf = async (d: TestDeps, id: string) =>
 
 const sha = (s: string) => `sha256:${createHash('sha256').update(s).digest('hex')}`;
 
-describe('POST /v1/hosts/{host}/egress (G42)', () => {
+describe('POST /v1/hosts/{host}/egress', () => {
   it("stores a sandbox's events exactly as the proxy wrote them, and refuses the rest", async () => {
     const d = await setup();
     const a = await create(d, 't1');
@@ -356,7 +356,7 @@ describe('POST /v1/hosts/{host}/egress (G42)', () => {
   });
 });
 
-describe('GET /v1/sandboxes/{id}/egress (G42)', () => {
+describe('GET /v1/sandboxes/{id}/egress', () => {
   it('is for the owner and admins only, as GET /v1/sandboxes/{id}', async () => {
     const d = await setup();
     const a = await create(d, 't1');
@@ -457,7 +457,7 @@ describe('GET /v1/sandboxes/{id}/egress (G42)', () => {
   });
 });
 
-describe("the sandbox's end record names its egress log (G42)", () => {
+describe("the sandbox's end record names its egress log", () => {
   const ends = async (d: TestDeps, id: string) =>
     (await d.provenance!.chain('template/t1')).filter(
       (r) =>

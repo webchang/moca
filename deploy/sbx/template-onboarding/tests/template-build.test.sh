@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015 # `check && check || fail`: fail is the only fallback, by design
 # Tests for deploy/sbx/template-onboarding/template-build.sh with podman, df and the two builders mocked: the spec checks
 # (each refused before anything is pulled), the names, the flags build-snapshot.sh gets, the guest
 # verify command (run here under bash), the record, the free-space check, the digest check, and the
@@ -66,24 +67,24 @@ mkdir -p "$MOCK_STATE" "$TMP/agent"
 : >"$TMP/vmlinux"
 BUILD="$SRC/deploy/sbx/template-onboarding/template-build.sh"
 
-# The spec of a SWE-bench instance, as image-factory's records give it.
+# The spec of a benchmark instance, as an image builder's records give it.
 spec() {
   jq -n --arg image "registry.example.invalid/moca-microvm@$DIGEST" '{
-    schema: "moca-sbx-template-spec/1", id: "astropy-astropy-14995", image: $image,
+    schema: "moca-sbx-template-spec/1", id: "acme-widget-1234", image: $image,
     guest_ram_mb: 4096, vcpus: 2, guest_home: "/tmp/home", skip_git_identity_check: true,
     egress: false, seed: "cp -a /opt/testbed-src/. /workspace/",
     probe: {cmd: "cd /testbed && pytest -rA tests/test_public.py", timeout_s: 900, expect_rc: 0, expect: ["\\b42 passed\\b"]},
-    description: "SWE-bench astropy__astropy-14995 at its baseline", tools: ["bash", "git", "python3"]}' |
+    description: "a benchmark instance at its baseline", tools: ["bash", "git", "python3"]}' |
     jq "${1:-.}" "${@:2}" >"$TMP/spec.json"
 }
 run() { : >"$MOCK_LOG"; bash "$BUILD" "$TMP/spec.json" --kernel "$TMP/vmlinux" --agent "$TMP/agent" "$@" >"$TMP/out" 2>&1; }
-NAME=astropy-astropy-14995-aaaaaaaaaaaa
-WORKER=sbx_astropy_astropy_14995_aaaaaaaaaaaa
+NAME=acme-widget-1234-aaaaaaaaaaaa
+WORKER=sbx_acme_widget_1234_aaaaaaaaaaaa
 
 # 1. Spec errors: exit 2, naming the field, before podman or a builder runs.
 bad=(
-  '.id = "Astropy__astropy-14995" => id'
-  '.id = "scikit-learn-scikit-learn-134960" => id'
+  '.id = "Acme__widget-1234" => id'
+  '.id = "acme-widget-acme-widget-12345678" => id'
   '.image = "registry.example.invalid/moca-microvm:latest" => image must be pinned'
   '.guest_ram_mb = 64 => guest_ram_mb'
   '.vcpus = 0 => vcpus'
@@ -122,14 +123,14 @@ want_args="$(printf '%s\n' --kernel "$TMP/vmlinux" --rootfs "$SBX_SRV/build/$NAM
 grep -qx -- --skip-git-identity-check "$A" && grep -qx -- --guest-home "$A" && grep -qx /tmp/home "$A" ||
   fail 'build-snapshot did not get --skip-git-identity-check and --guest-home /tmp/home'
 grep -A1 -x -- --verify-timeout-s "$A" | tail -n1 | grep -qx 900 || fail 'the probe timeout is not --verify-timeout-s'
-# G50's seed: SBX0's own worker binary (never Moca's /usr/local/bin one), the cache under SBX_SRV.
+# The verify cache's seed: SBX0's own worker binary (never Moca's /usr/local/bin one), the cache under SBX_SRV.
 grep -A1 -x -- --worker-bin "$A" | tail -n1 | grep -qx /usr/local/libexec/sbx/microvm-worker ||
   fail "build-snapshot's --worker-bin is not SBX0's worker binary"
 grep -qx "$SBX_SRV/verify-cache" "$MOCK_STATE/snapshot-cache-dir" ||
   fail "build-snapshot's SH_VERIFY_CACHE_DIR is not under SBX_SRV: $(cat "$MOCK_STATE/snapshot-cache-dir")"
 R="$SBX_SRV/templates/$NAME.json"
 [[ -f "$R" ]] || fail 'no record written'
-jq -e --arg w "$WORKER" --arg n "$NAME" '.schema == "moca-sbx-template/1" and .id == "astropy-astropy-14995"
+jq -e --arg w "$WORKER" --arg n "$NAME" '.schema == "moca-sbx-template/1" and .id == "acme-widget-1234"
   and .worker == $w and .snapshot == $n and .manifest_hash == "h1" and .egress == false
   and .seed == "cp -a /opt/testbed-src/. /workspace/" and .min_budget_mb == 13408' "$R" >/dev/null ||
   fail "the record is wrong: $(cat "$R")"
@@ -172,6 +173,7 @@ spec '.seed = "false"'
 run || fail 'the seed spec did not build'
 rc=0; run_verify || rc=$?
 [[ "$rc" == 90 ]] && grep -q 'the seed failed' "$TMP/vout" || fail "a failing seed gave $rc: $(cat "$TMP/vout")"
+# shellcheck disable=SC2016 # $c is jq's variable
 spec '.probe.cmd = $c' --arg c "echo \"it's\" \"\\\"quoted\\\"\" \"\$HOME\" '\$HOME'; echo '42 passed in 1s'"
 run || fail 'the quoting spec did not build'
 run_verify || fail "quotes and \$ in the probe broke the verify command: $(cat "$TMP/vout")"
@@ -255,13 +257,13 @@ spec '.image = "team/moca-microvm@'"$DIGEST"'"'
 run --force --registry registry.example.invalid:5000 || fail "--registry failed: $(cat "$TMP/out")"
 grep -qx "podman pull registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail "--registry did not prefix the pull: $(grep pull "$MOCK_LOG")"
 grep -q -- "--image registry.example.invalid:5000/team/moca-microvm@$DIGEST" "$MOCK_LOG" || fail 'build-rootfs did not get the pulled reference'
-# G49: the guest's /etc/moca-rootfs-source names the spec's host-free image, never the pull reference.
+# The guest's /etc/moca-rootfs-source names the spec's host-free image, never the pull reference.
 grep -q -- "--source-name team/moca-microvm@$DIGEST --require" "$MOCK_LOG" || fail "build-rootfs did not get the host-free source name: $(grep build-rootfs "$MOCK_LOG")"
 jq -e --arg i "team/moca-microvm@$DIGEST" '.image == $i' "$SBX_SRV/templates/$NAME.json" >/dev/null || fail 'the record does not keep the spec image (host-free)'
 spec
 run --force --registry other.example.invalid || fail '--registry with a hosted image failed'
 grep -qx "podman pull registry.example.invalid/moca-microvm@$DIGEST" "$MOCK_LOG" || fail '--registry changed an image that names its registry'
-pass '--registry pulls a host-free image from HOST and keeps the record and the guest'"'"'s source file host-free (G49); a hosted image is pulled as is'
+pass '--registry pulls a host-free image from HOST and keeps the record and the guest'"'"'s source file host-free; a hosted image is pulled as is'
 
 # 8. egress true: no --no-egress in the hint; a curated template's spec needs no seed.
 spec '.egress = true | .seed = ""'
@@ -320,9 +322,9 @@ pass 'guest_home_gitconfig: off by default, passed through, recorded; refused wi
 
 # 11. --gate-record (governance/GATING-RULES.md X1, X5, X10, X12): the gate record is checked against
 # the spec before anything is pulled, and its evidence is carried in the template record.
-gate() { # gate [jq filter]: a gate record as image-factory writes one, for this test's image
-  jq -n --arg d "$DIGEST" '{schema: "image-factory/moca-microvm/1",
-    image: {repository: "image-factory/moca-microvm", digest: $d},
+gate() { # gate [jq filter]: a gate record as an image builder writes one, for this test's image
+  jq -n --arg d "$DIGEST" '{schema: "example-builder/moca-microvm/1",
+    image: {repository: "images/moca-microvm", digest: $d},
     testbed_image: {digest: "sha256:'"$(printf 'e%.0s' {1..64})"'"},
     recipe: {dockerfile_sha256: "d1", platform_layer_sha256: "p1", emitter: "oci-moca-microvm/1"},
     builder: {arch: "x86_64", engine: "podman", network: "host"}, built_at: "2026-10-15T00:00:00Z",
@@ -332,20 +334,20 @@ gate() { # gate [jq filter]: a gate record as image-factory writes one, for this
 }
 spec ".source_record_digest = \"$DIGEST\" | .probe_status = \"vm\" | .proved_in_vm = true"
 gate
-run --force --gate-record "$TMP/gate.json" --gate-commit c3ea3a4 || fail "a passing gate record failed: $(cat "$TMP/out")"
+run --force --gate-record "$TMP/gate.json" --gate-commit abc1234 || fail "a passing gate record failed: $(cat "$TMP/out")"
 R="$SBX_SRV/templates/$NAME.json"
 jq -e --arg d "$DIGEST" '.source_record_digest == $d and .probe_status == "vm" and .proved_in_vm == true
   and .skip_git_identity_check == true and .gate_record.passed == true and .gate_record.network == "none"
-  and .gate_record.schema == "image-factory/moca-microvm/1" and .gate_record.commit == "c3ea3a4"
+  and .gate_record.schema == "example-builder/moca-microvm/1" and .gate_record.commit == "abc1234"
   and .gate_record.commits_refused == true and (.gate_record.sha256 | startswith("sha256:"))
   and .gate_record.recipe.dockerfile_sha256 == "d1" and (.gate_record.base_digest | startswith("sha256:eee"))' "$R" >/dev/null ||
   fail "the record lacks the gate evidence: $(jq -c '{source_record_digest, gate_record}' "$R")"
-G1="$(jq -r .gate_record.sha256 "$R")"
+GATE_SHA1="$(jq -r .gate_record.sha256 "$R")"
 # The same snapshot cited against a changed gate record: the record is rewritten, the snapshot is not.
 gate '.built_at = "2026-10-16T00:00:00Z"'
 run --gate-record "$TMP/gate.json" || fail 'a changed gate record failed'
 ! grep -q build-snapshot "$MOCK_LOG" || fail 'a changed gate record rebuilt the snapshot'
-[[ "$(jq -r .gate_record.sha256 "$R")" != "$G1" ]] || fail 'a changed gate record was not written into the record'
+[[ "$(jq -r .gate_record.sha256 "$R")" != "$GATE_SHA1" ]] || fail 'a changed gate record was not written into the record'
 pass '--gate-record: the evidence (passed, how, base, recipe, builder, sha256, commit, commits refused) lands in the record; a new gate record rewrites it without a rebuild'
 
 refused() { # refused WHY SPEC_FILTER GATE_FILTER [ARGS]: exit 2, saying WHY, before any pull
@@ -360,11 +362,11 @@ refused 'build it with --gate-record' "$OK" .
 refused 'did not pass (X1)' "$OK" '.gate.passed = false' --gate-record "$TMP/gate.json"
 refused "is for image sha256:000" "$OK" '.image.digest = "sha256:'"$(printf '0%.0s' {1..64})"'"' --gate-record "$TMP/gate.json"
 refused 'does not show commits refused' "$OK" '.observed.testbed.agent_can_commit = "yes"' --gate-record "$TMP/gate.json"
-refused 'does not show commits refused' "$OK" '.observed.guest.git_identity = "SWE-bench <s@x>"' --gate-record "$TMP/gate.json"
-# Fails closed: a record that never measured the guest's identity is no evidence (image-factory, 2026-11-03).
+refused 'does not show commits refused' "$OK" '.observed.guest.git_identity = "Builder <b@example.invalid>"' --gate-record "$TMP/gate.json"
+# Fails closed: a record that never measured the guest's identity is no evidence.
 refused 'does not show commits refused' "$OK" 'del(.observed.guest.git_identity)' --gate-record "$TMP/gate.json"
 refused 'does not show commits refused' "$OK" 'del(.observed.guest)' --gate-record "$TMP/gate.json"
-refused 'needs --gate-record' . . --gate-commit c3ea3a4
+refused 'needs --gate-record' . . --gate-commit abc1234
 pass '--gate-record refuses, before any pull: a source_record_digest that is not the image (X10), a gated spec built without its record, a failed gate (X1), another image, commits not refused under skip_git_identity_check (X5, X12), --gate-commit alone'
 
 # A spec with no source_record_digest and no --gate-record builds as before, with no gate_record.

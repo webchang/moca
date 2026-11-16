@@ -96,7 +96,6 @@ describe('HarnessClient.streamTurn', () => {
     const sandbox = {
       id: 'w',
       tier: 'microvm',
-      template: 't',
       seed: { source: 'build', buildId: 'b' },
     };
     const workspace = { baseline: 'abc', patch: 'diff\n', patchSha256: 'sha256:x', patchBytes: 5 };

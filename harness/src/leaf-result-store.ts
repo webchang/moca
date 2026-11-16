@@ -2,6 +2,7 @@ import { createClient, type RedisClientType } from 'redis';
 import { resilientClientOptions, swallowRedisErrors } from '@moca/session-backend';
 import type { Verdict } from './verdict.js';
 import type { LeafResult, LeafUsage } from './run-leaf.js';
+import type { TurnSeed, TurnWorkspace } from './run-turn.js';
 
 export interface LeafResultRecord {
   status: 'done' | 'failed' | 'aborted' | 'paused' | 'solved' | 'responded';
@@ -13,6 +14,9 @@ export interface LeafResultRecord {
   usage: LeafUsage | null; // solve/prompt cumulative token usage (for run cost pricing); null otherwise
   sessionId: string; // RAW (un-sanitized) id, for caller correlation
   ts: string;
+  /** A templated session's prompt leaf only (session-templates spec §5.1); absent otherwise. */
+  seed?: TurnSeed;
+  workspace?: TurnWorkspace;
 }
 
 /** Minimal structural Redis surface — lets unit tests inject an in-memory fake. */
@@ -21,8 +25,16 @@ export interface RedisLike {
   get(key: string): Promise<string | null>;
 }
 
-export function resultKey(leafSessionId: string): string {
-  return `leaf:result:${leafSessionId}`;
+/**
+ * With `turnId`, THIS TURN's result; without it, the session's — the shape the synchronous `/runs`
+ * path has always used, where one session has one leaf at a time.
+ *
+ * An async session does not: §4.3 lets one session hold several queued turns at once, as long as
+ * their `idempotencyKey`s differ. Under one key per session those siblings overwrite each other, so
+ * `GET …/turns/A` could answer `done` with B's body. The turn id is what makes each answer its own.
+ */
+export function resultKey(leafSessionId: string, turnId?: string): string {
+  return turnId ? `leaf:result:${leafSessionId}:${turnId}` : `leaf:result:${leafSessionId}`;
 }
 
 /** Map a terminal LeafResult to the persisted record. `rawSessionId` is the un-sanitized envelope id. */
@@ -46,7 +58,14 @@ export function toResultRecord(
   if (result.status === 'solved')
     return { ...base, status: 'solved', patch: result.patch, usage: result.usage ?? null };
   if (result.status === 'responded')
-    return { ...base, status: 'responded', text: result.text, usage: result.usage ?? null };
+    return {
+      ...base,
+      status: 'responded',
+      text: result.text,
+      usage: result.usage ?? null,
+      ...(result.seed ? { seed: result.seed } : {}),
+      ...(result.workspace ? { workspace: result.workspace } : {}),
+    };
   if (result.status === 'paused') {
     return {
       ...base,
@@ -67,15 +86,17 @@ export async function writeResult(
   leafSessionId: string,
   record: LeafResultRecord,
   ttlSeconds: number,
+  turnId?: string,
 ): Promise<void> {
-  await redis.set(resultKey(leafSessionId), JSON.stringify(record), { EX: ttlSeconds });
+  await redis.set(resultKey(leafSessionId, turnId), JSON.stringify(record), { EX: ttlSeconds });
 }
 
 export async function readResult(
   redis: RedisLike,
   leafSessionId: string,
+  turnId?: string,
 ): Promise<LeafResultRecord | null> {
-  const raw = await redis.get(resultKey(leafSessionId));
+  const raw = await redis.get(resultKey(leafSessionId, turnId));
   if (!raw) return null;
   try {
     return JSON.parse(raw) as LeafResultRecord;

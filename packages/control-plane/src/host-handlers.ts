@@ -5,8 +5,10 @@ import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
 import { activationLock } from './activation-lock.js';
 import {
+  hostManaged,
   liveLeases,
   place,
+  rejectedByAdmin,
   unattachedPlaced,
   wantedBuilds,
   type HostMemory,
@@ -31,8 +33,9 @@ import {
  * is the one whose token was presented, so a host reports only for itself.
  *
  *   POST /v1/hosts/{host}/inventory          what it holds (by manifest hash), its limits and, from
- *                                            an agent of register G39 on, its memory
+ *                                            an agent with memory-aware placement, its memory
  *   POST /v1/hosts/{host}/builds/claim       up to N queued builds, oldest first, subjects in turn
+ *   GET  /v1/hosts/{host}/blobs/{digest}     a gate record a claimed build cites, byte for byte
  *   POST /v1/hosts/{host}/builds/{build}/log      log entries for a build it claimed
  *   POST /v1/hosts/{host}/builds/{build}/report   a step: building, probing, built (with T and S), failed
  *
@@ -40,17 +43,20 @@ import {
  * this host claimed. On `built` it checks the build record against the create's request and the
  * policy (§8.2) and registers or rejects the build, automatically, with a `check` record.
  *
- *   GET  /v1/hosts/{host}/wanted             the builds this host should run (placed on it, first
- *                                            leased first), those it holds that it should stop (no
- *                                            lease left), and, of `run`, those not attached yet
- *                                            (`starting`, register G43: the agent's start limit)
- *                                            and those kept in its idle grace (`graced`, G43)
- *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
+ *   GET  /v1/hosts/{host}/wanted             the builds this host should run (leased and placed on
+ *                                            it, first leased first), those it holds that it should
+ *                                            stop (no lease left, no live sandbox), of `run` those
+ *                                            not attached yet (`starting`, for the start limit),
+ *                                            those kept in its idle grace (`graced`), and the
+ *                                            retired ones it should remove (worker and snapshot,
+ *                                            no live sandbox)
+ *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached |
+ *                                            removed, reason?}
  *   POST /v1/hosts/{host}/egress             {events, cursor}: the egress proxy's audit events, as it
- *                                            wrote them, into each sandbox's egress log (register G42)
+ *                                            wrote them, into each sandbox's egress log
  *
  * Readiness itself is never taken from a report: `active` is the relay's attached record (§3.3).
- * The reports are provenance: who ran what, where, when.
+ * The worker reports are provenance: who ran what, where, when.
  */
 
 const MANIFEST_HASH_RE = /^sha256:[0-9a-f]{64}$/;
@@ -62,9 +68,9 @@ const CURSOR_RE = /^[\x21-\x7e]{1,512}$/;
  * The spec a host agent hands template-build.sh for a claimed build. The API takes the guest's size as
  * `guest_mb` or `guest_ram_mb` (policy M7.guest reads either), but template-build.sh reads only
  * `guest_ram_mb`, so a create that named `guest_mb` passed the policy and then failed the build's own
- * spec check (the guide window, 2026-11-09). The job always names `guest_ram_mb`, with the value the
- * policy checked (`guest_mb ?? guest_ram_mb`, as M7 and the build's S.guest_ram_mb check read it);
- * `guest_mb` is dropped from it. The job's `id` and `image` are always the template's and the
+ * spec check. The job always names `guest_ram_mb`, with the value the policy checked
+ * (`guest_mb ?? guest_ram_mb`, as M7 and the build's S.guest_ram_mb check read it); `guest_mb` is
+ * dropped from it. The job's `id` and `image` are always the template's and the
  * create's, whatever the spec carries.
  */
 export function buildJobSpec(
@@ -96,7 +102,7 @@ async function hostWorkers(deps: CpDeps, host: string): Promise<Set<string>> {
 const endOf = (r: SandboxRecord) => r.deletedAt ?? r.expiresAt;
 
 /**
- * The sandboxes whose egress events this host may ship (register G42): every sandbox on a worker of
+ * The sandboxes whose egress events this host may ship: every sandbox on a worker of
  * a build this host holds (hostSandboxes), live or ended less than EGRESS_GRACE_S ago
  * (egressAccepts). hostEgress accepts events for exactly these, and hostWanted hands their workspace
  * keys to the agent (`egressSids`), which sends nothing else, so the events of the proxy's other
@@ -142,157 +148,18 @@ export interface HostState {
     diskFreeGb: number;
     diskFloorGb: number;
   };
-  /** The agent's start limit and measured start time (register G43); absent from an older agent. */
-  start?: HostStart;
   /**
-   * SBX_IDLE_GRACE_S as its agent reports it (register G43, the idle grace); absent from an older
-   * agent, which is a grace of 0 (off).
-   */
-  idleGraceSeconds?: number;
-  /**
-   * The inventory's `memory` (register G39), as far as it is well-formed; absent from an older
-   * agent, and then its host is placed by activeLimit alone.
+   * The inventory's `memory` (memory-aware placement), as far as it is well-formed; absent from an
+   * older agent, and then its host is placed by activeLimit alone.
    */
   memory?: HostMemory;
-}
-
-const WORKER_ID_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MEM_LIST_MAX = 1024;
-
-/** A non-negative finite number (PSI is a percentage with decimals). */
-const nonNegNum = (v: unknown): number | undefined =>
-  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
-
-/**
- * The inventory's `memory` object, field by field: what is malformed is dropped, never guessed.
- * MemTotal, MemAvailable and the floor are kept only all three together (the memory test needs
- * each); the lists keep only well-formed worker ids and manifest hashes.
- */
-export function parseHostMemory(raw: unknown): HostMemory | undefined {
-  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw))
-    return undefined;
-  const m = raw as Record<string, unknown>;
-  const out: HostMemory = {};
-  const total = nonNeg(m.memTotalMib);
-  const avail = nonNeg(m.memAvailableMib);
-  const floor = nonNeg(m.memFloorMib);
-  if (total !== undefined && total > 0 && avail !== undefined && floor !== undefined) {
-    out.totalMib = total;
-    out.availableMib = avail;
-    out.floorMib = floor;
-  }
-  const psi = nonNegNum(m.memPressureFull10);
-  if (psi !== undefined) out.pressureFull10 = psi;
-  const limit = nonNegNum(m.memPressureLimit);
-  if (limit !== undefined && limit > 0) out.pressureLimit = limit;
-  if (Array.isArray(m.runningWorkers)) {
-    out.running = m.runningWorkers
-      .filter((w): w is string => typeof w === 'string' && WORKER_ID_RE.test(w))
-      .slice(0, MEM_LIST_MAX);
-  }
-  const vc = m.vmCommittedMib;
-  if (vc && typeof vc === 'object' && !Array.isArray(vc)) {
-    out.vmCommittedMib = {};
-    for (const [w, v] of Object.entries(vc as Record<string, unknown>).slice(0, MEM_LIST_MAX)) {
-      const n = nonNeg(v);
-      if (WORKER_ID_RE.test(w) && n !== undefined) out.vmCommittedMib[w] = n;
-    }
-  }
-  if (Array.isArray(m.memfileMismatch)) {
-    out.memfileMismatch = m.memfileMismatch
-      .filter((h): h is string => typeof h === 'string' && MANIFEST_HASH_RE.test(h))
-      .slice(0, MEM_LIST_MAX);
-  }
-  return out;
-}
-
-/**
- * The hosts as their agents last reported (§6.1), as placement reads them: fresh ones only (at most
- * HOST_STALE_S old), with memory.
- */
-export function hostViewsOf(deps: CpDeps): HostView[] {
-  return freshHosts(deps).map(([id, h]) => ({
-    id,
-    holds: h.holds,
-    activeLimit: h.limits.activeLimit,
-    at: h.at,
-    running: h.running,
-    ...(h.memory ? { memory: h.memory } : {}),
-    ...(h.start ? { start: h.start } : {}),
-    ...(h.idleGraceSeconds ? { idleGraceSeconds: h.idleGraceSeconds } : {}),
-  }));
-}
-
-/**
- * The workers with a live sandbox, or with a recent turn of a session pinned to their build
- * (HostRegistry.sessionUse): never stopped under one, so they drain and keep their slot. A session
- * keeps a worker that runs; it never starts one (only a lease does).
- */
-export async function busyWorkers(deps: CpDeps, nowS: number): Promise<Set<string>> {
-  const busy = new Set<string>();
-  if (deps.sandboxes) {
-    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
-  }
-  for (const w of deps.hosts?.sessionWorkers(nowS) ?? []) busy.add(w);
-  return busy;
-}
-
-/**
- * A turn of a session pinned to a host-managed build (its credential exchange) keeps that build's
- * worker for the hold (sessionHoldSeconds) from now, as a live sandbox keeps its worker, so the
- * worker outlives the first-use lease while the session is in use. Only when the session's owner
- * is enrolled for sandboxes (the rule first-use leases follow, combined spec §3.4): a turn of a
- * subject who is not runs while the worker is up but extends nothing, so it cannot keep a build
- * running after every lease on it has gone (deactivate, the host's capacity). Best effort: a
- * failure is logged and never fails the turn. Reads the catalog only for the first turn of a hold.
- */
-export async function holdPinnedWorker(
-  rec: { owner: string; sandboxBuildId?: string },
-  deps: CpDeps,
-): Promise<void> {
-  const build = rec.sandboxBuildId;
-  const hosts = deps.hosts;
-  if (!hosts || !deps.templates || !build?.startsWith('sha256:')) return;
-  try {
-    const m = await membershipNow(deps, rec.owner, deps.identity.rolesFor(rec.owner));
-    if (!isEnrolledForSandbox(rec.owner, m.roles, deps.config, m.enrolled)) return;
-    const nowS = seconds(deps);
-    let worker = hosts.sessionWorker(build, nowS);
-    if (worker === undefined) {
-      worker = (await deps.templates.list())
-        .flatMap((d) => d.builds)
-        .find((b) => b.buildId === build && b.status === 'registered')?.worker;
-    }
-    if (worker) hosts.markSessionUse(build, worker, nowS + hosts.sessionHoldSeconds(build, nowS));
-  } catch (err) {
-    console.error(
-      `[control-plane] holding the worker of build ${build} for a session turn failed: ` +
-        `${(err as Error)?.message ?? String(err)}`,
-    );
-  }
-}
-
-/** The most an idle grace is taken at: a day (a malformed or larger figure is dropped). */
-const GRACE_MAX = 86_400;
-
-/** The inventory limits' idleGraceSeconds (register G43): a whole number 0..GRACE_MAX, else none. */
-export function parseIdleGrace(l: Record<string, unknown>): number | undefined {
-  const g = nonNeg(l.idleGraceSeconds);
-  return g !== undefined && g <= GRACE_MAX ? g : undefined;
-}
-
-/** The most a start limit or a start time is taken at (a malformed figure is dropped, not capped). */
-const START_MAX = 1_000_000;
-
-/**
- * The inventory limits' startConcurrency and startSeconds (register G43): a concurrency of at least
- * 1, and seconds only beside it. Neither from an older agent: then no start line for its host.
- */
-export function parseHostStart(l: Record<string, unknown>): HostStart | undefined {
-  const c = nonNeg(l.startConcurrency);
-  if (c === undefined || c < 1 || c > START_MAX) return undefined;
-  const sec = nonNegNum(l.startSeconds);
-  return { concurrency: c, ...(sec !== undefined && sec <= START_MAX ? { seconds: sec } : {}) };
+  /** The agent's start limit and measured start time (§6.5); absent from an older agent. */
+  start?: HostStart;
+  /**
+   * SBX_IDLE_GRACE_S as its agent reports it (§6.5, the idle grace); absent from an older agent,
+   * which is a grace of 0 (off).
+   */
+  idleGraceSeconds?: number;
 }
 
 /** In-memory host state; the inventory is re-sent on every poll, so a restart loses nothing durable. */
@@ -349,8 +216,76 @@ export class HostRegistry {
  * --wanted-only timer re-sends it every 15 s). A host whose agent died or was removed then takes no
  * new placement and no activeLimit slot, and a deployment whose every host is silent reads
  * readiness from the workers' presence alone, as before any host reported.
+ *
+ * Two steps with activation.ts's memoryStaleS (60 s): after about 60 s without an inventory, the
+ * memory brake (`stale`) already stops new starts on a host that reports its memory, while it keeps
+ * what it runs; at HOST_STALE_S the host leaves placement entirely.
  */
 export const HOST_STALE_S = 360;
+
+/** The hosts as their agents last reported (§6.1), as placement reads them: fresh ones only, with memory. */
+export function hostViewsOf(deps: CpDeps): HostView[] {
+  return freshHosts(deps).map(([id, h]) => ({
+    id,
+    holds: h.holds,
+    activeLimit: h.limits.activeLimit,
+    at: h.at,
+    running: h.running,
+    ...(h.memory ? { memory: h.memory } : {}),
+    ...(h.start ? { start: h.start } : {}),
+    ...(h.idleGraceSeconds ? { idleGraceSeconds: h.idleGraceSeconds } : {}),
+  }));
+}
+
+/**
+ * The workers with a live sandbox, or with a recent turn of a session pinned to their build
+ * (HostRegistry.sessionUse): never stopped under one, so they drain and keep their slot. A session
+ * keeps a worker that runs; it never starts one (only a lease does).
+ */
+export async function busyWorkers(deps: CpDeps, nowS: number): Promise<Set<string>> {
+  const busy = new Set<string>();
+  if (deps.sandboxes) {
+    for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
+  }
+  for (const w of deps.hosts?.sessionWorkers(nowS) ?? []) busy.add(w);
+  return busy;
+}
+
+/**
+ * A turn of a session pinned to a host-managed build (its credential exchange) keeps that build's
+ * worker for the hold (sessionHoldSeconds) from now, as a live sandbox keeps its worker, so the
+ * worker outlives the first-use lease while the session is in use. Only when the session's owner
+ * is enrolled for sandboxes (the rule first-use leases follow, combined spec §3.4): a turn of a
+ * subject who is not runs while the worker is up but extends nothing, so it cannot keep a build
+ * running after every lease on it has gone (deactivate, the host's capacity). Best effort: a
+ * failure is logged and never fails the turn. Reads the catalog only for the first turn of a hold.
+ */
+export async function holdPinnedWorker(
+  rec: { owner: string; sandboxBuildId?: string },
+  deps: CpDeps,
+): Promise<void> {
+  const build = rec.sandboxBuildId;
+  const hosts = deps.hosts;
+  if (!hosts || !deps.templates || !build?.startsWith('sha256:')) return;
+  try {
+    // The owner's roles and store enrollment now, as a request of theirs would be evaluated.
+    const m = await membershipNow(deps, rec.owner, deps.identity.rolesFor(rec.owner));
+    if (!isEnrolledForSandbox(rec.owner, m.roles, deps.config, m.enrolled)) return;
+    const nowS = seconds(deps);
+    let worker = hosts.sessionWorker(build, nowS);
+    if (worker === undefined) {
+      worker = (await deps.templates.list())
+        .flatMap((d) => d.builds)
+        .find((b) => b.buildId === build && b.status === 'registered')?.worker;
+    }
+    if (worker) hosts.markSessionUse(build, worker, nowS + hosts.sessionHoldSeconds(build, nowS));
+  } catch (err) {
+    console.error(
+      `[control-plane] holding the worker of build ${build} for a session turn failed: ` +
+        `${(err as Error)?.message ?? String(err)}`,
+    );
+  }
+}
 
 /** The hosts whose last inventory is at most HOST_STALE_S old, by id. */
 export function freshHosts(deps: CpDeps): [string, HostState][] {
@@ -376,6 +311,79 @@ const hostOf = (ctx: RequestCtx): string => {
 
 const nonNeg = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
+
+/** The most a start limit or a start time is taken at (a malformed figure is dropped). */
+const START_MAX = 1_000_000;
+
+/**
+ * The inventory limits' startConcurrency and startSeconds (§6.5): a concurrency of at least 1, and
+ * seconds only beside it. Neither from an older agent: then no start line for its host.
+ */
+export function parseHostStart(l: Record<string, unknown>): HostStart | undefined {
+  const c = nonNeg(l.startConcurrency);
+  if (c === undefined || c < 1 || c > START_MAX) return undefined;
+  const sec = nonNegNum(l.startSeconds);
+  return { concurrency: c, ...(sec !== undefined && sec <= START_MAX ? { seconds: sec } : {}) };
+}
+
+/** The most an idle grace is taken at: a day (a malformed or larger figure is dropped). */
+const GRACE_MAX = 86_400;
+
+/** The inventory limits' idleGraceSeconds (§6.5): a whole number 0..GRACE_MAX, else none. */
+export function parseIdleGrace(l: Record<string, unknown>): number | undefined {
+  const g = nonNeg(l.idleGraceSeconds);
+  return g !== undefined && g <= GRACE_MAX ? g : undefined;
+}
+
+const WORKER_ID_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MEM_LIST_MAX = 1024;
+
+/** A non-negative finite number (PSI is a percentage with decimals). */
+const nonNegNum = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+
+/**
+ * The inventory's `memory` object, field by field: what is malformed is dropped, never guessed.
+ * MemTotal, MemAvailable and the floor are kept only all three together (the memory test needs
+ * each); the lists keep only well-formed worker ids and manifest hashes.
+ */
+export function parseHostMemory(raw: unknown): HostMemory | undefined {
+  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw))
+    return undefined;
+  const m = raw as Record<string, unknown>;
+  const out: HostMemory = {};
+  const total = nonNeg(m.memTotalMib);
+  const avail = nonNeg(m.memAvailableMib);
+  const floor = nonNeg(m.memFloorMib);
+  if (total !== undefined && total > 0 && avail !== undefined && floor !== undefined) {
+    out.totalMib = total;
+    out.availableMib = avail;
+    out.floorMib = floor;
+  }
+  const psi = nonNegNum(m.memPressureFull10);
+  if (psi !== undefined) out.pressureFull10 = psi;
+  const limit = nonNegNum(m.memPressureLimit);
+  if (limit !== undefined && limit > 0) out.pressureLimit = limit;
+  if (Array.isArray(m.runningWorkers)) {
+    out.running = m.runningWorkers
+      .filter((w): w is string => typeof w === 'string' && WORKER_ID_RE.test(w))
+      .slice(0, MEM_LIST_MAX);
+  }
+  const vc = m.vmCommittedMib;
+  if (vc && typeof vc === 'object' && !Array.isArray(vc)) {
+    out.vmCommittedMib = {};
+    for (const [w, v] of Object.entries(vc as Record<string, unknown>).slice(0, MEM_LIST_MAX)) {
+      const n = nonNeg(v);
+      if (WORKER_ID_RE.test(w) && n !== undefined) out.vmCommittedMib[w] = n;
+    }
+  }
+  if (Array.isArray(m.memfileMismatch)) {
+    out.memfileMismatch = m.memfileMismatch
+      .filter((h): h is string => typeof h === 'string' && MANIFEST_HASH_RE.test(h))
+      .slice(0, MEM_LIST_MAX);
+  }
+  return out;
+}
 
 /** Finds the build a host refers to by handle or build id, in a template it claimed it for. */
 async function claimedBuild(
@@ -468,12 +476,14 @@ function registrationResults(
 const REPORTABLE = new Set<TemplateBuild['status']>(['building', 'probing', 'built']);
 
 /**
- * The build ids and workers of every build whose use has not ended (not retired, not rejected), in
- * every template. An ended build that shares either with one (the same snapshot built again, a twin
- * in another template, a worker id reused, or one worker id two builds from one image share) names
- * a snapshot or worker still needed: it is never stopped or removed for its retire or reject (that
- * build's own entries decide whether the worker runs), its `removed` is refused, and it reports
- * `shared` (sandbox-handlers.ts buildBody).
+ * The build ids and workers of every build that is neither retired nor rejected, in every template.
+ * A retired or admin-rejected build that shares either with one (the same snapshot built again, a
+ * twin in another template, a worker id reused, or one worker id two builds from one image share)
+ * names a snapshot or worker still needed: it is never stopped or removed for the retire or the
+ * reject (that build's own entries decide whether the worker runs), a retired one's `removed` is
+ * refused, and it reports no capacity to wait out (sandbox-handlers.ts buildBody). A rejected build
+ * (by policy or by an admin) keeps nothing: a retired build that shares its snapshot only with one
+ * is removed as any retired build is, though the rejected build itself is never in `remove`.
  */
 export function liveSnapshots(docs: { builds: TemplateBuild[] }[]): (b: TemplateBuild) => boolean {
   const ids = new Set<string>();
@@ -497,7 +507,7 @@ function reportable(y: TemplateBuild, host: string): void {
 
 export const HOST_HANDLERS: Record<string, Handler> = {
   /**
-   * The egress proxy's audit events from this host's journal (register G42). An event is stored in
+   * The egress proxy's audit events from this host's journal. An event is stored in
    * a sandbox's log only when its `sid` is the workspace key (`wsk`) of a sandbox on a worker of a
    * build this host holds, and the sandbox has not ended more than EGRESS_GRACE_S ago; every other
    * event is refused and counted. An event naming such a sandbox that is not exactly a proxy Event
@@ -588,14 +598,46 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     return { status: 200, body: answer };
   },
 
+  /**
+   * The wanted state (§6.3, §6.5): `run`, the registered builds this host holds that are leased
+   * and placed on it (the same placement activate judges by), in start order; `stop`, the ones it
+   * holds with no live lease and no idle grace, or that it runs while placement keeps them on
+   * another host; `starting`, those placed but not yet attached; and `graced`, those kept running
+   * through their idle grace (see wantedAnswer). `stop` also lists the retired builds it holds
+   * (§5.1: no longer wanted, never run again), and the ones an admin rejected after the fact
+   * (§5.2), which are stopped as retired ones are, except one whose snapshot or worker a build that
+   * is neither retired nor rejected shares (liveSnapshots): that build's entries decide. A worker in
+   * `run` for one build is never in `stop` for another that shares its worker id. A worker is never
+   * stopped under a live sandbox: it drains first, so a build with one is in no stop list. `remove`
+   * (§6.1 step 7): the retired builds it holds with no live sandbox, listed in `stop` too, so the
+   * agent stops a running worker before it uninstalls it and deletes the snapshot. A build an admin
+   * rejected is in `stop` only, never in `remove`. A build imported from SH_SANDBOX_TEMPLATES (not
+   * hostManaged) is in no list, retired, rejected or not: the deployment runs its worker.
+   * `egressSids`: the workspace keys of the sandboxes whose egress events the agent ships
+   * (hostSandboxes), and no others.
+   */
   hostWanted: async (ctx, deps) => {
     const host = hostOf(ctx);
     const nowS = seconds(deps);
-    const views = hostViewsOf(deps);
     const grace = (deps.hosts?.get(host)?.idleGraceSeconds ?? 0) > 0;
-    return wantedAnswer(deps, host, nowS, views, grace);
+    const answer = await wantedAnswer(deps, host, nowS, hostViewsOf(deps), grace);
+    const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
+      .map((r) => r.wsk)
+      .sort();
+    return { ...answer, body: { ...answer.body, egressSids } };
   },
 
+  /**
+   * A worker started (`attached`: its unit is running), not started (`refused`, with why: not
+   * installed, or the start failed) or stopped (`detached`), for a registered build this host
+   * holds (`detached` also for a retired or admin-rejected one, whose worker `stop` lists): an
+   * `activate` or `deactivate` record by the host, except a refusal repeating the host's last one
+   * for a build still in its `run` (answered `recorded: null`). Or a retired build's worker and
+   * snapshot removed from the host (`removed`, §6.1 step 7; not taken for an admin-rejected build,
+   * which `remove` never lists): a `retire` record by the host citing the build record, and the
+   * host no longer holds it (its `heldBy` drops the host at once; the next inventory says the
+   * same). Readiness still comes from the relay.
+   */
   hostWorkerReport: async (ctx, deps) => {
     const host = hostOf(ctx);
     const { cat, prov } = catalogOf(deps);
@@ -610,43 +652,43 @@ export const HOST_HANDLERS: Record<string, Handler> = {
       throw new CpError('invalid_request', 'event must be attached, refused, detached or removed');
     }
     const buildId = typeof b.buildId === 'string' ? b.buildId : '';
-    // `removed` is reported for a retired build (§6.1 step 7); the others for a registered one, and
-    // `detached` for a retired one too: on a host with an idle grace (register G43), a retired
-    // build's running worker is stopped before its removal.
-    const want =
+    // A retired build's worker is stopped (§5.1), so `detached` is taken for one too, and for a
+    // build an admin rejected after the fact (§5.2), whose worker is stopped as a retired one's.
+    // `removed` is taken for a retired build only: an admin-rejected build is never in `remove`.
+    const ok = (x: TemplateBuild) =>
       event === 'removed'
-        ? 'retired or rejected'
-        : event === 'detached'
-          ? 'registered, retired or rejected'
-          : 'registered';
-    const ok = (x: { status: string }) =>
-      event === 'removed'
-        ? x.status === 'retired' || x.status === 'rejected'
-        : event === 'detached'
-          ? x.status === 'registered' || x.status === 'retired' || x.status === 'rejected'
-          : x.status === 'registered';
+        ? x.status === 'retired'
+        : x.status === 'registered' ||
+          (event === 'detached' && (x.status === 'retired' || rejectedByAdmin(x)));
     const docs = await cat.list();
     const doc = docs.find((d) => d.builds.some((x) => x.buildId === buildId && ok(x)));
     if (!doc || deps.hosts?.get(host)?.holds[buildId] === undefined) {
-      throw new CpError('not_found', `no ${want} build this host holds`);
+      throw new CpError(
+        'not_found',
+        event === 'removed'
+          ? 'no retired build this host holds'
+          : event === 'detached'
+            ? 'no registered, retired or rejected build this host holds'
+            : 'no registered build this host holds',
+      );
     }
+    const target = doc.builds.find((x) => x.buildId === buildId && ok(x))!;
     // The wanted state never asks for this one's removal; a report of it would drop the live
     // build's host from its heldBy.
-    const target = doc.builds.find((x) => x.buildId === buildId && ok(x))!;
     if (event === 'removed' && liveSnapshots(docs)(target)) {
       throw new CpError(
         'build_in_use',
-        'a build whose use has not ended shares this snapshot or worker; it is not removed',
+        'a build neither retired nor rejected shares this snapshot or worker; it is not removed',
       );
     }
     const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;
     // What the host runs, as placement counts it, without waiting for its next inventory: started
-    // (attached) runs; stopped (detached), not started (refused) and removed do not. The memory
-    // report's runningWorkers stay as the inventory said: they are what its MemAvailable reflects,
-    // and a worker started since is pending on that side until the next inventory (place()).
+    // (attached) runs; stopped (detached) and not started (refused) do not.
     const st = deps.hosts!.get(host)!;
     const others = st.running.filter((x) => x !== buildId);
     st.running = event === 'attached' ? [...others, buildId] : others;
+    // The memory report's runningWorkers stay as the inventory said: they are what its MemAvailable
+    // reflects. A worker started since is pending on that side until the next inventory (place()).
     // A refusal the same as this host's last one for a build it is still asked to run (the agent
     // retries every 15 s: a worker not installed, a unit whose start keeps failing) is not appended
     // again: the template's stream is append-only provenance, and would grow by one record a poll.
@@ -674,6 +716,13 @@ export const HOST_HANDLERS: Record<string, Handler> = {
         ...(reason ? { reason } : {}),
       },
     });
+    // The snapshot is gone from the host: it no longer holds the build, so `heldBy` drops it now
+    // rather than at the agent's next inventory.
+    if (event === 'removed') {
+      const holds = { ...st.holds };
+      delete holds[buildId];
+      st.holds = holds;
+    }
     return { status: 200, body: { recorded: event } };
   },
 
@@ -958,11 +1007,12 @@ export const HOST_HANDLERS: Record<string, Handler> = {
 };
 
 /**
- * The wanted answer (§6.3), for GET /v1/hosts/{host}/wanted. `grace`: the host has an idle grace
- * (register G43): its graced builds stay in `run` and are listed in `graced`; a graced worker
- * displaced for a wanted build is re-checked for a lease at stop time, under the activation lock
- * (so a lease being taken is written, or not yet begun). A retired build is listed in `stop`
- * beside `remove` on every host, so its running worker is stopped before its removal.
+ * The wanted answer (§6.3), for GET /v1/hosts/{host}/wanted: `run` in the wanted order (first
+ * leased first, the order the agent starts them in), `stop`, `starting` (§6.5) and `remove`
+ * (§6.1 step 7). `grace`: the
+ * host has an idle grace (§6.5): its graced builds stay in `run` and are listed in `graced`, and a
+ * graced worker displaced for a wanted build is re-checked for a lease at stop time, under the
+ * activation lock (so a lease being taken is written, or not yet begun).
  */
 async function wantedAnswer(
   deps: CpDeps,
@@ -976,35 +1026,40 @@ async function wantedAnswer(
   const mine = deps.hosts?.get(host);
   // A worker is never stopped under a live sandbox (§6.3): it drains first, and keeps its slot.
   const busy = await busyWorkers(deps, nowS);
-  // Read-only: the same placement takeLease judges by (hostViewsOf), for the wanted answer. With a
-  // grace on any host it also says which unleased builds keep their running worker there
-  // (`graced`); `busy` is passed for every host's answer, so they all agree on it.
+  // Read-only: the same placement takeLease judges by (hostViewsOf). With a grace on any host it
+  // also says which unleased builds keep their running worker there (`graced`).
   const p = place(docs, views, nowS, busy);
   const run: Record<string, unknown>[] = [];
   const stop: Record<string, unknown>[] = [];
-  // Retired builds this host still holds, with no live sandbox on their worker (§6.1 step 7): the
-  // agent stops and uninstalls the worker and removes the snapshot. Never one with a live sandbox.
   const remove: Record<string, unknown>[] = [];
-  const shared = liveSnapshots(docs);
-  // Register G43: the unleased builds this host keeps running in its idle grace, after `run`'s
-  // wanted ones (the agent starts nothing for them: their units run).
+  // The unleased builds this host keeps running in its idle grace, after `run`'s wanted ones (the
+  // agent starts nothing for them: their units run).
   const keep: Record<string, unknown>[] = [];
   const displaced: Record<string, unknown>[] = [];
+  const shared = liveSnapshots(docs);
+  // The workers with a sandbox whose egress events this host may still ship (live, or ended less
+  // than EGRESS_GRACE_S ago: egressAccepts). A retired build's worker among them is stopped but not
+  // yet removed: its `removed` drops the build from the host's holds, and with it the host's right
+  // to ship those sandboxes' last events (hostSandboxes), which the agent sends after the removal.
+  const egressOpen = new Set(
+    egressAccepts(await hostSandboxes(deps, host, nowS), nowS).map((r) => r.worker),
+  );
   for (const d of docs) {
     for (const b of d.builds) {
-      if (!mine || mine.holds[b.buildId] === undefined) continue;
+      if (!mine || mine.holds[b.buildId] === undefined || !hostManaged(b)) continue;
       const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
-      // Rejected after the fact by an admin (§5.2) ends a build's use as a retire does.
-      if (b.status === 'retired' || (b.status === 'rejected' && b.reason?.rule === 'admin')) {
-        // Its snapshot or worker serves a build whose use has not ended: left alone (that build's
-        // own entries decide whether its worker runs), never stopped or removed for this one.
+      // A retired build has no lease and is never placed or graced: once its worker is idle (no
+      // live sandbox, no pinned session's hold) it is stopped, then removed from the host with its
+      // snapshot. A build an admin rejected after the fact (§5.2) is stopped as a retired one is,
+      // but is never removed: it is in `stop` only.
+      if (b.status === 'retired' || rejectedByAdmin(b)) {
+        // Its snapshot or worker serves a build that is not ended: left alone (that build's own
+        // entries decide whether its worker runs).
         if (shared(b)) continue;
+        if (mine.refused) delete mine.refused[b.buildId];
         if (b.worker && !busy.has(b.worker)) {
-          // Listed in `stop` too, with or without a grace: the agent stops it if its unit runs,
-          // before the removal in the same run (which skips a running worker). A retire also ends
-          // a grace at once, so a graced worker's removal is never held for it.
           stop.push(entry);
-          remove.push(entry);
+          if (b.status === 'retired' && !egressOpen.has(b.worker)) remove.push(entry);
         }
         continue;
       }
@@ -1017,25 +1072,25 @@ async function wantedAnswer(
         keep.push(entry);
         continue;
       }
-      // Out of this host's `run`: a refusal it reports for this build again is a new episode.
       if (mine.refused) delete mine.refused[b.buildId];
       if (busy.has(b.worker)) continue;
+      // Stopped when no lease is left (a displaced graced worker re-checked below), or when it runs
+      // here while placement keeps it on another host (one worker id on two hosts): this host's copy
+      // stops. "Runs here" is the union placement reads: a held build marked running, or its worker
+      // in the memory report's runningWorkers.
       if (liveLeases(b, nowS).length === 0) {
         if (p.displaced.get(b.buildId) === host) displaced.push(entry);
         else stop.push(entry);
-      } else {
-        // Leased, but placed on another host while it runs here (one worker id on two hosts):
-        // this host's copy stops. "Runs here" is the union placement reads: a held build marked
-        // running, or its worker in the memory report's runningWorkers.
-        const runsHere =
-          mine.running.includes(b.buildId) ||
-          (b.worker !== '' && (mine.memory?.running ?? []).includes(b.worker));
-        if (runsHere) stop.push(entry);
+        continue;
       }
+      const runsHere =
+        mine.running.includes(b.buildId) ||
+        (b.worker !== '' && (mine.memory?.running ?? []).includes(b.worker));
+      if (runsHere) stop.push(entry);
     }
   }
-  // A graced worker displaced for a wanted build (G43) is the one stop nobody asked for: at stop
-  // time, the catalog is read again under the activation lock (no lease half-written), and a build
+  // A graced worker displaced for a wanted build is the one stop nobody asked for: at stop time,
+  // the catalog is read again under the activation lock (no lease half-written), and a build
   // leased since keeps its worker running.
   if (displaced.length > 0) {
     await activationLock(cat).run('activation', async () => {
@@ -1048,8 +1103,8 @@ async function wantedAnswer(
       }
     });
   }
-  // The agent starts `run` in order, as many as its start limit allows (register G43): first
-  // leased first, the order placement uses, so the oldest activations start first.
+  // The agent starts `run` in order, as many as its start limit allows: first leased first, the
+  // order placement uses, so the oldest activations start first.
   const order = new Map(wantedBuilds(docs, nowS).map((w, i) => [w.build.buildId, i]));
   run.sort((a, b) => order.get(a.buildId as string)! - order.get(b.buildId as string)!);
   // The graced builds stay in `run` (their units keep running), soonest grace end first, and are
@@ -1060,9 +1115,14 @@ async function wantedAnswer(
       ((a.buildId as string) < (b.buildId as string) ? -1 : 1),
   );
   run.push(...keep);
-  // Register G43: of `run`, the builds whose worker is not attached to the relay (its presence, as
-  // readiness reads it); the agent counts those whose unit it runs as starting. Absent when the
-  // presence cannot be read: the agent then counts its own recent starts.
+  // One worker id can serve two builds (two builds of one template from one image): a worker in
+  // `run` for one (wanted or graced) is never in `stop` for the other, or every poll would stop and
+  // restart it. A retired build in `remove` shares no worker with a build in `run` (liveSnapshots).
+  const runs = new Set(run.map((e) => e.worker));
+  const stops = stop.filter((e) => !runs.has(e.worker));
+  // Of `run`, the builds whose worker is not attached to the relay (its presence, as readiness
+  // reads it); the agent counts those whose unit it runs as starting. Absent when the presence
+  // cannot be read: the agent then counts its own recent starts.
   let starting: string[] | undefined;
   if (deps.presence) {
     try {
@@ -1076,23 +1136,14 @@ async function wantedAnswer(
       starting = undefined;
     }
   }
-  // Register G42: the workspace keys whose egress events the agent ships, and no others.
-  const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
-    .map((r) => r.wsk)
-    .sort();
-  // One worker id can serve two registered builds (two builds of one template from one image):
-  // a worker in `run` for one is never in `stop` for the other, or every poll would stop and
-  // restart it. An ended build in `remove` shares no worker with a build in `run` (liveSnapshots).
-  const runs = new Set(run.map((e) => e.worker));
   return {
     status: 200,
     body: {
       run,
-      stop: stop.filter((e) => !runs.has(e.worker)),
+      stop: stops,
       remove,
       ...(starting ? { starting } : {}),
       ...(grace ? { graced: keep.map((x) => x.buildId as string) } : {}),
-      egressSids,
     },
   };
 }

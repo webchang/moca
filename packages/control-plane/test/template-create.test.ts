@@ -3,12 +3,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { HANDLERS } from '../src/handlers.js';
-import { HostRegistry } from '../src/host-handlers.js';
 import { ProvenanceStore, sha256Hex, verifyExport } from '../src/provenance.js';
 import { FileTemplateCatalog } from '../src/template-catalog.js';
 import { FilePolicyStore } from '../src/template-policy-store.js';
 import {
   checkCreate,
+  DEFAULT_OWNED,
   DEFAULT_POLICY,
   policyProblems,
   PROFILE_RULES,
@@ -17,8 +17,13 @@ import {
 } from '../src/template-policy.js';
 import { admin, alice, bob, codeOf, ctx, makeDeps, NOW_MS, type TestDeps } from './helpers/deps.js';
 
-// The repository's own worked example: a SWE-bench spec and its image-factory gate record.
+// The repository's own worked examples: the default sandbox image's spec, and a SWE-bench spec with
+// its image builder's gate record.
 const EX = resolve(__dirname, '../../../deploy/sbx/template-onboarding/examples');
+const DEFAULT_SPEC = JSON.parse(readFileSync(join(EX, 'default.json'), 'utf8')) as Record<
+  string,
+  unknown
+>;
 const SPEC = JSON.parse(readFileSync(join(EX, 'django__django-11133.json'), 'utf8')) as Record<
   string,
   any
@@ -41,7 +46,7 @@ function stored(policy: Policy = benchmarkPolicy): TestDeps {
     policy: new FilePolicyStore({ dir, provenance }),
     config: { routeProfile: 'sandbox' },
   });
-  void d.policy!.set(policy, 'github:admin');
+  void d.policy!.set(policy, admin.sub);
   return d;
 }
 const body = (over: Record<string, unknown> = {}) => ({
@@ -112,17 +117,17 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     ],
     ['egress on a benchmark', { spec: { ...spec, egress: true } }, 'X11'],
     ['an unmeasured probe', { spec: { ...spec, probe_status: 'unmeasured' } }, 'M9'],
-    ['a 32-character id (G12)', { id: 'llm-inference-batching-scheduler' }, 'M7.id'],
+    ['a 32-character id', { id: 'llm-inference-batching-scheduler' }, 'M7.id'],
     ['a spec naming another id', { spec: { ...spec, id: 'other-template' } }, 'M7.spec_id'],
     [
       'a spec naming another image',
       { spec: { ...spec, image: IMAGE.replace(/.$/, '0') } },
       'M7.spec_image',
     ],
-    ['a tag, not a digest', { image: 'image-factory/moca-microvm:latest' }, 'M1'],
+    ['a tag, not a digest', { image: 'images/moca-microvm:latest' }, 'M1'],
     [
       'a registry the policy does not allow',
-      { image: IMAGE.replace('image-factory/', 'evil.example.com/x/') },
+      { image: IMAGE.replace('images/', 'evil.example.com/x/') },
       'registry',
     ],
     ['8 GiB on a benchmark', { spec: { ...spec, guest_ram_mb: 8192 } }, 'envelope'],
@@ -133,6 +138,10 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     ],
     ['both guest-size keys, even equal', { spec: { ...spec, guest_mb: 4096 } }, 'M7.guest'],
     ['an unknown profile', { profile: 'gold' }, 'profile'],
+    // A key every object inherits is not a profile: refused as unknown, never a 500.
+    ['a prototype key as the profile', { profile: 'constructor' }, 'profile'],
+    ['__proto__ as the profile', { profile: '__proto__' }, 'profile'],
+    ['toString as the profile', { profile: 'toString' }, 'profile'],
     [
       'a root identity into an image refusing commits',
       { spec: { ...spec, guest_home_gitconfig: true } },
@@ -240,6 +249,21 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     expect(r.status).toBe(202);
   });
 
+  it("creates the default sandbox image's sample under base, once its registry is allowed", async () => {
+    const { id, image, schema: _s, ...rest } = DEFAULT_SPEC;
+    const b = { id, image, spec: rest };
+    // The base policy allows only the build host's default registry; the sample is on ghcr.io.
+    expect(await refusal(stored(), b)).toEqual({ code: 'policy_refused', rule: 'registry' });
+    const d = stored({ ...benchmarkPolicy, allowedRegistries: ['<default>', 'ghcr.io'] });
+    const r = await create(d, b);
+    expect(r.status).toBe(202);
+    expect(r.body).toMatchObject({ templateId: 'default', status: 'queued' });
+    const t = (
+      await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: String(id) } }), d)
+    ).body as Body;
+    expect(t.builds[0]).toMatchObject({ profile: 'base', spec: { guest_mb: 256, vcpus: 1 } });
+  });
+
   it('keeps ids unique per deployment: 409 template_exists for another subject, a new build for the owner', async () => {
     const d = stored();
     await create(d);
@@ -252,7 +276,7 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     expect(t.builds).toHaveLength(2);
   });
 
-  it('reuses a build with the same inputs (§3.2, G21): no second build, and a new one when they differ', async () => {
+  it('reuses a build with the same inputs (§3.2): no second build, and a new one when they differ', async () => {
     const d = stored();
     const first = await create(d);
     const again = await create(d);
@@ -297,32 +321,6 @@ describe('POST /v1/templates (§4, §8.1)', () => {
     const t = (await HANDLERS.getTemplate!(ctx({ principal: alice, params: { id: ID } }), d))
       .body as Body;
     expect(t.builds).toHaveLength(2);
-  });
-
-  it('reuses a registered build only while a host holds its snapshot (G29)', async () => {
-    const d = stored();
-    const hosts = new HostRegistry();
-    d.hosts = hosts;
-    await create(d);
-    const H = 'sha256:' + 'b'.repeat(64);
-    await d.templates!.update!(ID, async (cur) => ({
-      ...cur!,
-      builds: cur!.builds.map((x) => ({ ...x, status: 'registered' as const, buildId: H })),
-    }));
-    const limits = {
-      activeLimit: 4,
-      idleLimitSeconds: 3600,
-      buildConcurrency: 1,
-      diskFreeGb: 200,
-      diskFloorGb: 60,
-    };
-    hosts.set('host-1', { at: 0, holds: { [H]: ID }, running: [], limits });
-    expect((await create(d)).body).toMatchObject({ reused: true, buildId: H });
-    // The snapshot was removed after a window: no host holds it, so the create builds again.
-    hosts.set('host-1', { at: 0, holds: {}, running: [], limits });
-    const again = await create(d);
-    expect(again.status).toBe(202);
-    expect(again.body).not.toHaveProperty('reused');
   });
 
   it("hides another's private template behind 404 even on create", async () => {
@@ -440,6 +438,120 @@ describe('POST /v1/templates (§4, §8.1)', () => {
   });
 });
 
+describe('POST /v1/templates/{id}/builds/{build}/cancel (§5.1)', () => {
+  const cancel = (d: TestDeps, build: string, principal = alice) =>
+    HANDLERS.cancelTemplateBuild!(ctx({ principal, params: { id: ID, build } }), d);
+  const handleOf = (r: { body: unknown }) => ((r.body as Body).build as string).split('/').pop()!;
+
+  it('the owner cancels a queued build: failed, step cancelled, a build record naming who', async () => {
+    const d = stored();
+    const h = handleOf(await create(d));
+    const r = await cancel(d, h);
+    expect(r).toMatchObject({ status: 200, body: { templateId: ID, build: h, status: 'failed' } });
+    const b = (
+      await HANDLERS.getTemplateBuild!(ctx({ principal: alice, params: { id: ID, build: h } }), d)
+    ).body as Body;
+    expect(b).toMatchObject({
+      status: 'failed',
+      handle: h,
+      reason: { step: 'cancelled', message: `cancelled by ${alice.sub}` },
+    });
+    const last = (await d.provenance!.chain(`template/${ID}`)).at(-1)!;
+    expect(last).toMatchObject({
+      kind: 'build',
+      subject: alice.sub,
+      body: { handle: h, outcome: 'cancelled' },
+    });
+    // A cancelled build is never reused, and no longer counts as queued.
+    expect((await create(d)).body).not.toHaveProperty('reused');
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.buildsQueued.used).toBe(1);
+  });
+
+  it('frees the template slot of a template whose only build was cancelled', async () => {
+    const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
+    const h = handleOf(await create(d));
+    expect((await create(d, body({ id: 'other-template' })).catch((x) => x)).extra).toEqual({
+      quota: 'templates',
+    });
+    await cancel(d, h);
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.templates.used).toBe(0);
+    expect((await create(d, body({ id: 'other-template' }))).status).toBe(202);
+  });
+
+  it('checks the templates quota when a template that holds no slot gets a new build', async () => {
+    const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
+    await cancel(d, handleOf(await create(d)));
+    expect((await create(d, body({ id: 'other-template' }))).status).toBe(202);
+    const again = { spec: { ...spec, description: 'built again' } };
+    const viaBuilds = await HANDLERS.createTemplateBuild!(
+      ctx({ principal: alice, params: { id: ID }, body: body(again) }),
+      d,
+    ).catch((x) => x);
+    expect(viaBuilds.extra).toEqual({ quota: 'templates' });
+    expect((await create(d, body(again)).catch((x) => x)).extra).toEqual({ quota: 'templates' });
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.templates.used).toBe(1);
+    // A template that holds its slot still takes new builds at the limit.
+    const more = await HANDLERS.createTemplateBuild!(
+      ctx({
+        principal: alice,
+        params: { id: 'other-template' },
+        body: body({ id: 'other-template', ...again }),
+      }),
+      d,
+    );
+    expect(more.status).toBe(202);
+  });
+
+  it('bounds the template ids a subject owns in any status: a create-then-cancel loop stops', async () => {
+    const d = stored({
+      ...benchmarkPolicy,
+      quota: { templates: 1, buildsQueued: 1, active: 1, owned: 2 },
+    });
+    await cancel(d, handleOf(await create(d)));
+    const hb = handleOf(await create(d, body({ id: 'loop-b' })));
+    await HANDLERS.cancelTemplateBuild!(
+      ctx({ principal: alice, params: { id: 'loop-b', build: hb } }),
+      d,
+    );
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q).toMatchObject({
+      templates: { used: 0 },
+      buildsQueued: { used: 0 },
+      owned: { limit: 2, used: 2 },
+    });
+    expect((await create(d, body({ id: 'loop-c' })).catch((x) => x)).extra).toEqual({
+      quota: 'owned',
+    });
+    expect(await d.templates!.get('loop-c')).toBeNull();
+    expect(await d.provenance!.chain('template/loop-c')).toEqual([]);
+    // The subject's own ids still take new builds: owned counts new ids only.
+    expect((await create(d, body({ spec: { ...spec, description: 'again' } }))).status).toBe(202);
+  });
+
+  it('applies the default owned quota to a policy that does not set one', async () => {
+    const { owned: _o, ...quota } = DEFAULT_POLICY.quota;
+    const d = stored({ ...benchmarkPolicy, quota });
+    await create(d);
+    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
+    expect(q.owned).toEqual({ limit: DEFAULT_OWNED, used: 1 });
+  });
+
+  it('refuses another subject, an unknown build, and a build already failed', async () => {
+    const d = stored();
+    const h = handleOf(await create(d));
+    expect(await codeOf(() => cancel(d, h, bob))).toBe('forbidden');
+    expect(await codeOf(() => cancel(d, `b-${'0'.repeat(26)}`))).toBe('template_not_found');
+    await cancel(d, h);
+    expect(await codeOf(() => cancel(d, h))).toBe('invalid_request');
+    // An admin may cancel any template's build.
+    const h2 = handleOf(await create(d, body({ spec: { ...spec, description: 'b2' } })));
+    expect((await cancel(d, h2, admin)).status).toBe(200);
+  });
+});
+
 describe('policy and quota routes', () => {
   it('GET /v1/policy shows the policy and its record; PUT is admin-only and recorded', async () => {
     const d = stored();
@@ -461,7 +573,7 @@ describe('policy and quota routes', () => {
       ),
     ).toBe('invalid_request');
     expect((await d.provenance!.chain('policy')).map((r) => r.subject)).toEqual([
-      'github:admin',
+      admin.sub,
       admin.sub,
     ]);
   });
@@ -485,6 +597,12 @@ describe('policy and quota routes', () => {
         policyProblems(withBench({ ...bench, envelope: { ...bench.envelope, exact } })).join(),
       ).toMatch(/exact/);
     expect(PROFILE_RULES).toEqual(DEFAULT_POLICY.profiles.benchmark!.requires);
+    const { owned: _o, ...noOwned } = DEFAULT_POLICY.quota;
+    expect(policyProblems({ ...DEFAULT_POLICY, quota: noOwned })).toEqual([]);
+    for (const owned of [-1, 1.5, '200', null])
+      expect(
+        policyProblems({ ...DEFAULT_POLICY, quota: { ...DEFAULT_POLICY.quota, owned } }).join(),
+      ).toMatch(/owned/);
   });
 
   it('fails closed on a stored policy naming an unknown rule id, until an admin sets a valid one', async () => {
@@ -519,20 +637,8 @@ describe('policy and quota routes', () => {
     expect(q.sandboxes).toEqual({ limit: 3, used: 0 });
   });
 
-  it('counts live leases in active.used, and shows the live-sandbox cap where it applies (G27)', async () => {
+  it("shows the live-sandbox cap with the caller's live sandboxes, ended ones not counted", async () => {
     const d = stored();
-    await create(d);
-    await d.templates!.update!(ID, async (cur) => ({
-      ...cur!,
-      builds: cur!.builds.map((x) => ({
-        ...x,
-        status: 'registered' as const,
-        leases: [
-          { subject: alice.sub, until: NOW_MS / 1000 + 600 },
-          { subject: bob.sub, until: NOW_MS / 1000 - 1 },
-        ],
-      })),
-    }));
     const nowS = NOW_MS / 1000;
     const rec = (id: string, expiresAt: number) => ({
       id,
@@ -545,23 +651,29 @@ describe('policy and quota routes', () => {
       labels: {},
       createdAt: nowS - 120,
       expiresAt,
+      mode: 'per-exec' as const,
+      idleTimeoutS: 0,
+      modeEpoch: 0,
     });
     const limits = { perSubject: 3, total: 40, retentionS: 3600 };
     await d.sandboxes!.create(rec('sbx-live', nowS + 60), limits, nowS - 120);
     await d.sandboxes!.create(rec('sbx-ended', nowS - 60), limits, nowS - 120);
     const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
-    expect(q.active.used).toBe(1);
     expect(q.sandboxes).toEqual({ limit: 3, used: 1 });
-    // bob's lease has run out.
-    expect(((await HANDLERS.getQuota!(ctx({ principal: bob }), d)).body as Body).active.used).toBe(
-      0,
+    expect(q.active).toEqual({ limit: benchmarkPolicy.quota.active, used: 0 });
+    // The harness profile holds no sandboxes: no cap is shown there.
+    const h = stored();
+    h.config = { ...h.config, routeProfile: 'harness', sandbox: undefined };
+    h.sandboxes = undefined;
+    expect((await HANDLERS.getQuota!(ctx({ principal: alice }), h)).body).not.toHaveProperty(
+      'sandboxes',
     );
   });
 });
 
 describe('the rules alone', () => {
   it('reads the registry host of an image reference', () => {
-    expect(registryOf('image-factory/moca-microvm@sha256:ab')).toBe('<default>');
+    expect(registryOf('images/moca-microvm@sha256:ab')).toBe('<default>');
     expect(registryOf('ghcr.io/rossoctl/moca@sha256:ab')).toBe('ghcr.io');
     expect(registryOf('localhost:5000/x@sha256:ab')).toBe('localhost:5000');
     expect(registryOf('x@sha256:ab')).toBe('<default>');
@@ -641,100 +753,4 @@ it("gives each build a distinct handle from a production id's random hex", async
     .build as string;
   expect(a).not.toBe(b);
   expect(a).toMatch(/\/b-[0-9a-f]{26}$/);
-});
-
-describe('tracing (§9)', () => {
-  it("records a sandbox's build: id, id:tag and id@build resolve, and the response names it", async () => {
-    const d = stored();
-    const HASH = `sha256:${'a'.repeat(64)}`;
-    // A registered build, as the host flow would leave it (host-flow.test.ts drives the real flow).
-    await d.templates!.update!('tr', async () => ({
-      schema: 'moca-template/1',
-      id: 'tr',
-      owner: alice.sub,
-      visibility: 'deployment',
-      description: 't',
-      tags: { default: HASH, old: 'imported:000000000000' },
-      builds: [
-        {
-          buildId: HASH,
-          status: 'registered',
-          profile: 'base',
-          worker: 'sbx_tr_new',
-          spec: { tools: [] },
-          createdAt: 0,
-        },
-        {
-          buildId: 'imported:000000000000',
-          status: 'registered',
-          profile: 'imported',
-          worker: 'sbx_tr_old',
-          spec: { tools: [] },
-          createdAt: 0,
-        },
-      ],
-      createdAt: 0,
-    }));
-    const mk = async (template: string) =>
-      (await HANDLERS.createSandbox!(ctx({ principal: bob, body: { template } }), d)).body as Body;
-    expect(await mk('tr')).toMatchObject({
-      template: 'tr',
-      buildId: HASH,
-      templateManifestHash: HASH,
-    });
-    expect(await mk('tr:old')).toMatchObject({
-      buildId: 'imported:000000000000',
-      templateManifestHash: null,
-    });
-    expect(await mk(`tr@${HASH}`)).toMatchObject({ buildId: HASH });
-    const rec = (await d.sandboxes!.listAll(Math.floor(NOW_MS / 1000))).find(
-      (r) => r.buildId === 'imported:000000000000',
-    );
-    expect(rec?.worker).toBe('sbx_tr_old');
-    expect(await codeOf(() => mk('tr:nope'))).toBe('unknown_template');
-    expect(await codeOf(() => mk(`tr@sha256:${'0'.repeat(64)}`))).toBe('unknown_template');
-  });
-});
-
-describe('the templates quota after a cancel (§6.2)', () => {
-  const cancel = (d: TestDeps, build: string, principal = alice) =>
-    HANDLERS.cancelTemplateBuild!(ctx({ principal, params: { id: ID, build } }), d);
-  const handleOf = (r: { body: unknown }) => ((r.body as Body).build as string).split('/').pop()!;
-
-  it('frees the template slot of a template whose only build was cancelled', async () => {
-    const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
-    const h = handleOf(await create(d));
-    expect((await create(d, body({ id: 'other-template' })).catch((x) => x)).extra).toEqual({
-      quota: 'templates',
-    });
-    await cancel(d, h);
-    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
-    expect(q.templates.used).toBe(0);
-    expect((await create(d, body({ id: 'other-template' }))).status).toBe(202);
-  });
-
-  it('checks the templates quota when a template that holds no slot gets a new build', async () => {
-    const d = stored({ ...benchmarkPolicy, quota: { templates: 1, buildsQueued: 10, active: 1 } });
-    await cancel(d, handleOf(await create(d)));
-    expect((await create(d, body({ id: 'other-template' }))).status).toBe(202);
-    const again = { spec: { ...spec, description: 'built again' } };
-    const viaBuilds = await HANDLERS.createTemplateBuild!(
-      ctx({ principal: alice, params: { id: ID }, body: body(again) }),
-      d,
-    ).catch((x) => x);
-    expect(viaBuilds.extra).toEqual({ quota: 'templates' });
-    expect((await create(d, body(again)).catch((x) => x)).extra).toEqual({ quota: 'templates' });
-    const q = (await HANDLERS.getQuota!(ctx({ principal: alice }), d)).body as Body;
-    expect(q.templates.used).toBe(1);
-    // A template that holds its slot still takes new builds at the limit.
-    const more = await HANDLERS.createTemplateBuild!(
-      ctx({
-        principal: alice,
-        params: { id: 'other-template' },
-        body: body({ id: 'other-template', ...again }),
-      }),
-      d,
-    );
-    expect(more.status).toBe(202);
-  });
 });

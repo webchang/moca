@@ -1,3 +1,4 @@
+import type { SandboxModeName } from '@moca/sandbox-client';
 import { ControlPlaneClient } from '../api/control-plane.js';
 
 /** The sandbox service's HTTP API (SBX0 §5.1), on top of the control-plane client's auth and retry. */
@@ -5,6 +6,12 @@ export interface SbxTemplate {
   id: string;
   description: string;
   tools: string[];
+  /** The default build's readiness (template lifecycle spec §3.3); absent from an older control plane. */
+  readiness?: string | null;
+  /** Why the default build is `unavailable` (template lifecycle spec §6.2); only then. */
+  readinessReason?: SbxReadinessReason;
+  /** tag -> build id; absent from an older control plane. */
+  tags?: Record<string, string>;
 }
 
 export interface SbxSandbox {
@@ -18,7 +25,47 @@ export interface SbxSandbox {
   expiresAt: number;
   terminatedAt: number | null;
   labels: Record<string, string>;
+  /** The sandbox's mode (lease-mode spec §8.1). */
+  mode: SandboxModeName;
+  /** The lease idle timeout in seconds; 0 = the worker's default. */
+  idleTimeoutS: number;
+  /** Raised by every accepted mode change; 0 for per-exec from create, 1 for a lease mode. */
+  modeEpoch: number;
 }
+
+/** The mode fields as a control plane from before modes answers them: absent. */
+type WireSandbox<T extends SbxSandbox> = Omit<T, 'mode' | 'idleTimeoutS' | 'modeEpoch'> &
+  Partial<Pick<SbxSandbox, 'mode' | 'idleTimeoutS' | 'modeEpoch'>>;
+
+/**
+ * A sandbox with its mode fields: a control plane from before modes sends none, which is a per-exec
+ * sandbox at epoch 0 with the worker's idle timeout (lease-mode spec §8.1).
+ */
+function withMode<T extends SbxSandbox>(s: WireSandbox<T>): T {
+  return {
+    ...s,
+    mode: s.mode === 'lease' || s.mode === 'lease+processes' ? s.mode : 'per-exec',
+    idleTimeoutS: s.idleTimeoutS ?? 0,
+    modeEpoch: s.modeEpoch ?? 0,
+  } as T;
+}
+
+/** The body of a sandbox create (openapi `POST /v1/sandboxes`). */
+export interface SbxSandboxCreate {
+  template: string;
+  name?: string;
+  labels?: Record<string, string>;
+  /** Default per-exec; a lease mode must be allowed by the deployment (403 `mode_not_allowed`). */
+  mode?: SandboxModeName;
+  /** Omitted: the worker's default (stored as 0). */
+  idleTimeoutS?: number;
+}
+
+/** What a create answers: the sandbox, and the build it was served (template lifecycle spec §9). */
+export type SbxCreated = SbxSandbox & {
+  buildId?: string | null;
+  templateManifestHash?: string | null;
+};
 
 export interface SbxToken {
   token: string;
@@ -33,7 +80,14 @@ export interface SbxToken {
  * `/v1/discovery` as the sandbox service reads it (SBX0 §4.1). Only `profile` is relied on: a
  * control plane that predates profiles omits it and is a harness (MOCA) one.
  */
-/** A subject as `GET /v1/subjects` lists it (register G38). */
+export interface SbxDiscovery {
+  profile?: string;
+}
+
+/** A template quota (openapi Quota, template lifecycle spec §6.2); owned is optional. */
+export type SbxQuota = { templates: number; buildsQueued: number; active: number; owned?: number };
+
+/** A subject as `GET /v1/subjects` lists it (enrollment and roles through the API). */
 export interface SbxSubject {
   subject: string;
   enrolled: boolean;
@@ -43,30 +97,10 @@ export interface SbxSubject {
   roles: { role: string; source: 'env' | 'api'; until: number | null; by: string | null }[];
 }
 
-export interface SbxDiscovery {
-  profile?: string;
-}
+/** Why placement left a wanted build waiting (openapi ReadinessReason, template lifecycle spec §6.2). */
+export type SbxReadinessReason = 'not_held' | 'no_slot' | 'memory' | 'memfile_mismatch';
 
-/** What a retire answers (lifecycle spec §5.1): each build retired, with its retire record. */
-export interface SbxRetired {
-  templateId: string;
-  subject: string;
-  status: 'retired';
-  builds?: { build: string; buildId: string | null; readiness: 'retired'; record: string | null }[];
-  build?: string;
-  buildId?: string | null;
-  record?: string | null;
-}
-
-/** What a tag move answers (lifecycle spec §5.1). */
-export interface SbxTagsMoved {
-  templateId: string;
-  subject: string;
-  buildId: string;
-  tags: { tag: string; buildId: string; before: string | null; record: string | null }[];
-}
-
-/** A sandbox's egress log, a page at a time (register G42): the proxy's events as it wrote them. */
+/** A sandbox's egress log, a page at a time: the proxy's events as it wrote them. */
 export interface SbxEgressPage {
   events: Record<string, unknown>[];
   next: string | null;
@@ -74,6 +108,7 @@ export interface SbxEgressPage {
   summary: SbxEgressSummary | null;
 }
 
+/** The log's summary (openapi EgressSummary): per destination host, completeness and digest. */
 export interface SbxEgressSummary {
   byHost: Record<
     string,
@@ -87,34 +122,42 @@ export interface SbxEgressSummary {
   sha256: string;
 }
 
-/** A build's readiness reason (openapi ReadinessReason, register G39): why it waits. */
-export type SbxReadinessReason = 'not_held' | 'no_slot' | 'memory' | 'memfile_mismatch';
-
 /** One build of a template (openapi TemplateBuild, template lifecycle spec §3.2, §3.3). */
 export interface SbxBuild {
   buildId: string;
-  handle: string;
+  /** The `b-<26 hex>` handle its create answered (its buildId for an imported build). */
+  handle?: string;
   status: string;
   profile: string;
   readiness: string | null;
+  /** Present only with readiness `unavailable`: why it is not placed. */
   readinessReason?: SbxReadinessReason;
-  /** Register G43: waiting for a start slot on its host, and its place in the host's start line. */
+  /** Only while `activating` on a host that reports its start limit (§6.5): waiting for a start slot. */
   queued?: boolean;
+  /** With `queued`: its 1-based place in the host's start line. */
   queuePosition?: number;
-  /** Register G43: in its host's idle grace, until `gracedUntil`. */
+  /** Only while in its host's idle grace (§6.5), until `gracedUntil` (epoch seconds). */
   graced?: true;
   gracedUntil?: number;
-  reason: { message: string; step?: string; rule?: string; code?: string } | null;
-  attestation?: 'deployment' | 'self';
-  heldBy: string[] | null;
+  capacity: { running: number | null; inUse: number | null } | null;
+  lastUsedAt: number | null;
   /**
-   * A retired build whose snapshot or worker a build that is not retired shares: no host removes
-   * it for the retire. Absent from an older control plane.
+   * The hosts whose last inventory holds its snapshot (template lifecycle spec §6.1); null without
+   * host agents; absent from an older control plane.
+   */
+  heldBy?: string[] | null;
+  /**
+   * A retired build whose snapshot or worker a build neither retired nor rejected shares: its
+   * worker is kept for that build, never stopped for the retire. Absent from an older control
+   * plane.
    */
   shared?: boolean;
   tags: string[];
   createdAt: number;
   provenance: string | null;
+  /** On a `failed` or `rejected` build, why (`step` `cancelled` for a cancel); null otherwise. */
+  reason?: { message: string; step?: string; rule?: string } | null;
+  /** On GET /v1/templates/{id} and the builds routes. */
   spec?: {
     guest_mb?: number;
     vcpus?: number;
@@ -124,40 +167,91 @@ export interface SbxBuild {
   };
 }
 
+/** An activation lease (POST /v1/templates/{id}/activate, template lifecycle spec §6.3). */
+export interface SbxLease {
+  templateId: string;
+  buildId: string;
+  /** Epoch seconds. */
+  leaseUntil: number;
+  /** The host it is placed on; null while no host agent has reported. */
+  host: string | null;
+}
+
+/** One build a retire answered for (openapi RetiredBuild, template lifecycle spec §5.1). */
+export interface SbxRetiredBuild {
+  /** The build's handle. */
+  build: string;
+  /** Null for a build retired before it registered. */
+  buildId: string | null;
+  readiness: 'retired';
+  /** The retire record written now; null when it was already retired. */
+  record: string | null;
+}
+
+/** What a retire answers: a whole template's (`builds`), or one build's (its fields inline). */
+export interface SbxRetired extends Partial<SbxRetiredBuild> {
+  templateId: string;
+  subject: string;
+  status: 'retired';
+  builds?: SbxRetiredBuild[];
+}
+
 /** A template with its builds (openapi Template). */
 export interface SbxTemplateFull extends SbxTemplate {
   owner: string | null;
   visibility: 'private' | 'deployment';
-  attestation?: 'deployment' | 'self';
   onboarding: string | null;
   readiness: string | null;
-  readinessReason?: SbxReadinessReason;
   tags: Record<string, string>;
   builds: SbxBuild[];
 }
 
-/** One KVM host as `GET /v1/templates` reports it (template lifecycle spec §6.2, G39, G43). */
+/** POST /v1/templates/{id}/tags's answer (template lifecycle spec §5.1). */
+export interface SbxTagsMoved {
+  templateId: string;
+  subject: string;
+  buildId: string;
+  /** `before`: the build the tag named until now (null: new); `record`: null when unchanged. */
+  tags: { tag: string; buildId: string; before: string | null; record: string | null }[];
+}
+
+/** One KVM host as `GET /v1/templates` reports it (template lifecycle spec §6.2). */
 export interface SbxHost {
   id: string;
   active: { limit: number; used: number };
   idleLimitSeconds: number;
   disk: { freeGb: number; floorGb: number };
-  memory?: { headroomMib: number; brake: string | null; usedMib: number; totalMib: number };
-  idleGraceSeconds?: number;
-  graced?: number;
+  /** Only from a host agent that reports its memory: placement's figures, in MiB. */
+  memory?: {
+    totalMib: number;
+    availableMib: number;
+    floorMib: number;
+    usedMib: number;
+    headroomMib: number;
+    pressureFull10: number | null;
+    pressureLimit: number | null;
+    brake: 'pressure' | 'stale' | null;
+    runningWorkers: number;
+    memfileMismatch: string[];
+    reportedAt: number;
+  };
+  /** Only from a host agent that reports its start limit (§6.5): the limit, start time, start line. */
   start?: {
     concurrency: number;
     seconds: number | null;
     starting: number | null;
     queued: number | null;
   };
+  /** Only from a host agent that sets an idle grace (§6.5): its length, and the builds in it now. */
+  idleGraceSeconds?: number;
+  graced?: number;
 }
 
 /** What a create answers (openapi TemplateQueued): the build to follow. */
 export interface SbxQueued {
   templateId: string;
   buildId: string | null;
-  /** The build's path, `/v1/templates/{id}/builds/{handle}`. */
+  /** The build's path, `/v1/templates/{id}/builds/{handle}` (or its buildId once registered). */
   build: string;
   status: string;
   reused?: boolean;
@@ -175,23 +269,22 @@ export interface SbxTemplateCreate {
 }
 
 export type SbxLimitUse = { limit: number; used: number };
+
+/** `GET /v1/quota`: the caller's template quotas and use, and on the sandbox profile its live-sandbox cap. */
 export interface SbxQuotaView {
   subject: string;
   templates: SbxLimitUse;
   buildsQueued: SbxLimitUse;
   active: SbxLimitUse;
+  /** Template ids owned in any status (a lifetime cap); absent from an older control plane. */
+  owned?: SbxLimitUse;
+  ownedSource?: 'subject' | 'default';
   sandboxes?: SbxLimitUse;
-  quotaSource?: 'subject' | 'default';
 }
 
-export type SbxQuota = { templates: number; buildsQueued: number; active: number };
-
-/** A policy profile (openapi Policy.profiles), as much of it as mocactl reads. */
+/** A policy profile (openapi Policy.profiles). */
 export interface SbxProfile {
   requires: string[];
-  selfAttest?: boolean;
-  selfAttestEgress?: boolean;
-  requireOfflineGate?: boolean;
   envelope: {
     maxGuestMb: number;
     maxVcpus: number;
@@ -200,15 +293,16 @@ export interface SbxProfile {
   };
 }
 
+/** `GET /v1/policy` (openapi PolicyView): profiles for a dry run, quotas for a quota write. */
 export interface SbxPolicyView {
   policy: {
     schema: string;
     profiles: Record<string, SbxProfile>;
     defaultProfile: string;
     allowedRegistries: string[];
-    allowedRepositories?: Record<string, string[]>;
     trustedGateRecords: string[];
     quota: SbxQuota;
+    /** The per-subject overrides (a quota write reads them, §5.2). */
     quotaBySubject?: Record<string, SbxQuota>;
   };
   digest: string;
@@ -224,7 +318,7 @@ export class SandboxApiClient extends ControlPlaneClient {
     return (await this.json<{ templates: SbxTemplate[] }>('GET', '/v1/templates')).templates;
   }
 
-  /** The KVM hosts' limits and use, the `hosts` block of `GET /v1/templates` (§6.2). */
+  /** The KVM hosts' limits and use: the `hosts` block of `GET /v1/templates` (§6.2). */
   async listHosts(): Promise<SbxHost[]> {
     return (await this.json<{ hosts?: SbxHost[] }>('GET', '/v1/templates')).hosts ?? [];
   }
@@ -242,64 +336,7 @@ export class SandboxApiClient extends ControlPlaneClient {
     );
   }
 
-  /** Create a template, or a new build of one's own (lifecycle spec §4): `POST /v1/templates`. */
-  createTemplate(body: SbxTemplateCreate): Promise<SbxQueued> {
-    return this.json('POST', '/v1/templates', { body });
-  }
-
-  /** A new build of one's own template: `POST /v1/templates/{id}/builds` (the body's id ignored). */
-  createTemplateBuild(id: string, body: SbxTemplateCreate): Promise<SbxQueued> {
-    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/builds`, { body });
-  }
-
-  /** Withdraw a queued, building or probing build (register G22). */
-  cancelTemplateBuild(
-    id: string,
-    build: string,
-  ): Promise<{ templateId: string; build: string; status: 'failed' }> {
-    return this.json(
-      'POST',
-      `/v1/templates/${encodeURIComponent(id)}/builds/${encodeURIComponent(build)}/cancel`,
-    );
-  }
-
-  /** Take or renew the caller's lease on a registered build (§6.3). */
-  activateTemplate(
-    id: string,
-    body: { build?: string; leaseSeconds?: number },
-  ): Promise<{ templateId: string; buildId: string; leaseUntil: number; host: string | null }> {
-    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/activate`, { body });
-  }
-
-  /** Release the caller's lease; `stopNow` skips the host's idle grace (register G43). */
-  deactivateTemplate(
-    id: string,
-    body: { stopNow?: boolean },
-  ): Promise<{ templateId: string; released: number }> {
-    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/deactivate`, { body });
-  }
-
-  /** The caller's template quotas and use, and the live-sandbox cap (§6.2, register G27). */
-  getQuota(): Promise<SbxQuotaView> {
-    return this.json('GET', '/v1/quota');
-  }
-
-  /** The deployment's template policy (§8): profiles, registries, quotas, and its digest. */
-  getPolicy(): Promise<SbxPolicyView> {
-    return this.json('GET', '/v1/policy');
-  }
-
-  /** Retire a template, or one build of it (lifecycle spec §5.1): `POST …/retire` or `DELETE …/builds/{b}`. */
-  retireTemplate(id: string, opts: { build?: string; reason?: string } = {}): Promise<SbxRetired> {
-    const t = encodeURIComponent(id);
-    return opts.build
-      ? this.json('DELETE', `/v1/templates/${t}/builds/${encodeURIComponent(opts.build)}`)
-      : this.json('POST', `/v1/templates/${t}/retire`, {
-          body: opts.reason !== undefined ? { reason: opts.reason } : {},
-        });
-  }
-
-  /** Move tags onto a build (lifecycle spec §5.1): `POST /v1/templates/{id}/tags`. */
+  /** Move tags onto a registered build (lifecycle spec §5.1): `POST /v1/templates/{id}/tags`. */
   moveTemplateTags(id: string, tags: string[], build: string): Promise<SbxTagsMoved> {
     return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/tags`, {
       body: { tags, build },
@@ -338,8 +375,71 @@ export class SandboxApiClient extends ControlPlaneClient {
     return this.json('PUT', `/v1/templates/${encodeURIComponent(id)}/owner`, { body: { owner } });
   }
 
+  /** Take or renew the caller's activation lease on a build (`POST /v1/templates/{id}/activate`). */
+  activateTemplate(
+    id: string,
+    body: { tag?: string; build?: string; leaseSeconds?: number },
+  ): Promise<SbxLease> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/activate`, { body });
+  }
+
   /**
-   * Set a subject's quota, or the default; null removes a subject's override (spec §5.2; admins).
+   * Release the caller's activation leases on a template (`POST /v1/templates/{id}/deactivate`);
+   * `stopNow` skips the host's idle grace.
+   */
+  deactivateTemplate(
+    id: string,
+    body: { stopNow?: boolean } = {},
+  ): Promise<{ templateId: string; released: number }> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/deactivate`, { body });
+  }
+
+  /**
+   * Retire a template (`POST /v1/templates/{id}/retire`), or one build of it (`DELETE
+   * /v1/templates/{id}/builds/{build}`, which takes no reason).
+   */
+  retireTemplate(id: string, opts: { build?: string; reason?: string } = {}): Promise<SbxRetired> {
+    const t = encodeURIComponent(id);
+    return opts.build !== undefined
+      ? this.json('DELETE', `/v1/templates/${t}/builds/${encodeURIComponent(opts.build)}`)
+      : this.json('POST', `/v1/templates/${t}/retire`, {
+          body: opts.reason !== undefined ? { reason: opts.reason } : {},
+        });
+  }
+
+  /** Create a template, or a new build of one's own (lifecycle spec §4): `POST /v1/templates`. */
+  createTemplate(body: SbxTemplateCreate): Promise<SbxQueued> {
+    return this.json('POST', '/v1/templates', { body });
+  }
+
+  /** A new build of one's own template: `POST /v1/templates/{id}/builds` (the body's id ignored). */
+  createTemplateBuild(id: string, body: SbxTemplateCreate): Promise<SbxQueued> {
+    return this.json('POST', `/v1/templates/${encodeURIComponent(id)}/builds`, { body });
+  }
+
+  /** Withdraw a queued, building or probing build (the owner, or an admin). */
+  cancelTemplateBuild(
+    id: string,
+    build: string,
+  ): Promise<{ templateId: string; build: string; status: 'failed' }> {
+    return this.json(
+      'POST',
+      `/v1/templates/${encodeURIComponent(id)}/builds/${encodeURIComponent(build)}/cancel`,
+    );
+  }
+
+  /** The caller's template quotas and use, and the live-sandbox cap (§6.2). */
+  getQuota(): Promise<SbxQuotaView> {
+    return this.json('GET', '/v1/quota');
+  }
+
+  /** The deployment's template policy (§8): profiles, registries, quotas, and its digest. */
+  getPolicy(): Promise<SbxPolicyView> {
+    return this.json('GET', '/v1/policy');
+  }
+
+  /**
+   * Set a subject's quota, or the default; null removes a subject's override (§5.2; admins).
    * `expect`, when given, is the value read before: the control plane writes only if the target's
    * quota is that now, else `409 quota_changed` with nothing written. It goes as `?expect=` its
    * JSON (`null` for no override), percent-encoded by the URL's searchParams.
@@ -350,6 +450,7 @@ export class SandboxApiClient extends ControlPlaneClient {
     expect?: SbxQuota | null,
   ): Promise<{
     target: string;
+    subject: string;
     quota: SbxQuota | null;
     before: SbxQuota | null;
     policy: string;
@@ -361,53 +462,25 @@ export class SandboxApiClient extends ControlPlaneClient {
     });
   }
 
-  /** Every enrolled subject, with its roles (enrollment and roles spec §4, register G38; admins). */
-  async listSubjects(): Promise<SbxSubject[]> {
-    return (await this.json<{ subjects: SbxSubject[] }>('GET', '/v1/subjects')).subjects;
-  }
-
-  /** Enroll a subject (G38; admins). */
-  enrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
-    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}`, {
-      body: { enrolled: true },
-    });
-  }
-
-  /** Unenroll a subject enrolled through the API (G38; admins). */
-  unenrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
-    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}`);
-  }
-
-  /** Grant the admin role, optionally until an epoch second (G38; admins). */
-  grantAdmin(subject: string, until?: number): Promise<SbxSubject & { record: string | null }> {
-    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`, {
-      body: until === undefined ? {} : { until },
-    });
-  }
-
-  /** Revoke an API-granted admin role (G38; admins). */
-  revokeAdmin(subject: string): Promise<SbxSubject & { record: string | null }> {
-    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`);
-  }
-
-  createSandbox(body: {
-    template: string;
-    name?: string;
-    labels?: Record<string, string>;
-  }): Promise<SbxSandbox & { buildId?: string | null; templateManifestHash?: string | null }> {
-    return this.json('POST', '/v1/sandboxes', { body });
+  async createSandbox(body: SbxSandboxCreate): Promise<SbxCreated> {
+    return withMode(await this.json<WireSandbox<SbxCreated>>('POST', '/v1/sandboxes', { body }));
   }
 
   async listSandboxes(opts: { all?: boolean } = {}): Promise<SbxSandbox[]> {
     return (
-      await this.json<{ sandboxes: SbxSandbox[] }>('GET', '/v1/sandboxes', {
+      await this.json<{ sandboxes: WireSandbox<SbxSandbox>[] }>('GET', '/v1/sandboxes', {
         query: { all: opts.all ? '1' : undefined },
       })
-    ).sandboxes;
+    ).sandboxes.map(withMode);
   }
 
-  getSandbox(id: string): Promise<SbxSandbox> {
-    return this.json('GET', `/v1/sandboxes/${encodeURIComponent(id)}`);
+  /** `signal` aborts the request (`rm`'s bounded lease step). */
+  async getSandbox(id: string, opts: { signal?: AbortSignal } = {}): Promise<SbxSandbox> {
+    return withMode(
+      await this.json<WireSandbox<SbxSandbox>>('GET', `/v1/sandboxes/${encodeURIComponent(id)}`, {
+        signal: opts.signal,
+      }),
+    );
   }
 
   deleteSandbox(id: string): Promise<{ id: string; state: 'terminated'; reason: string }> {
@@ -432,7 +505,64 @@ export class SandboxApiClient extends ControlPlaneClient {
     return Buffer.from(await res.arrayBuffer());
   }
 
-  mintSandboxToken(id: string): Promise<SbxToken> {
-    return this.json('POST', `/v1/sandboxes/${encodeURIComponent(id)}/token`);
+  /** `signal` aborts the request (`rm`'s bounded lease step). */
+  mintSandboxToken(id: string, opts: { signal?: AbortSignal } = {}): Promise<SbxToken> {
+    return this.json('POST', `/v1/sandboxes/${encodeURIComponent(id)}/token`, {
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Change the mode (lease-mode spec §8.1): `PUT /v1/sandboxes/{id}/mode`. Every accepted call
+   * raises the epoch. An omitted `idleTimeoutS` is stored as 0, not kept. The set-mode token is for
+   * one `LeaseControl set_mode`, never cached (M8).
+   */
+  async setSandboxMode(
+    id: string,
+    body: { mode: SandboxModeName; idleTimeoutS?: number },
+  ): Promise<{ sandbox: SbxSandbox; setModeToken: string }> {
+    const r = await this.json<{ sandbox: WireSandbox<SbxSandbox>; setModeToken: string }>(
+      'PUT',
+      `/v1/sandboxes/${encodeURIComponent(id)}/mode`,
+      { body },
+    );
+    return { sandbox: withMode(r.sandbox), setModeToken: r.setModeToken };
+  }
+
+  /**
+   * A set-mode token for the mode and epoch the record holds now, raising nothing (spec §8.2):
+   * `POST /v1/sandboxes/{id}/mode-token`. What a lease create sends, since the create answers none.
+   */
+  mintSandboxModeToken(id: string): Promise<{ setModeToken: string }> {
+    return this.json('POST', `/v1/sandboxes/${encodeURIComponent(id)}/mode-token`);
+  }
+
+  /** Every enrolled subject, with its roles (enrollment and roles spec §4; admins). */
+  async listSubjects(): Promise<SbxSubject[]> {
+    return (await this.json<{ subjects: SbxSubject[] }>('GET', '/v1/subjects')).subjects;
+  }
+
+  /** Enroll a subject (an admin named in the settings). */
+  enrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}`, {
+      body: { enrolled: true },
+    });
+  }
+
+  /** Unenroll a subject enrolled through the API (an admin named in the settings). */
+  unenrollSubject(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}`);
+  }
+
+  /** Grant the admin role, optionally until an epoch second (an admin named in the settings). */
+  grantAdmin(subject: string, until?: number): Promise<SbxSubject & { record: string | null }> {
+    return this.json('PUT', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`, {
+      body: until === undefined ? {} : { until },
+    });
+  }
+
+  /** Revoke an API-granted admin role (an admin named in the settings). */
+  revokeAdmin(subject: string): Promise<SbxSubject & { record: string | null }> {
+    return this.json('DELETE', `/v1/subjects/${encodeURIComponent(subject)}/roles/admin`);
   }
 }

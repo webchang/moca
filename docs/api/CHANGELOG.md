@@ -1,156 +1,624 @@
-# API changelog
-
-Two documents, two versions: the control plane's [openapi.yaml](openapi.yaml) (below) and the data
-plane's [harness-openapi.yaml](harness-openapi.yaml) ([its section](#data-plane-harness-openapiyaml)).
-
-## Control plane (openapi.yaml)
+# Control-plane API changelog
 
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
-### 1.14.0
+## 1.21.0
 
-Review fixes from the upstream template and enrollment PRs, brought into this document. No route is
-added or removed.
+Admins set template quotas per subject, and reject a registered build after the fact
+([#748](https://github.com/rossoctl/moca/issues/748)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §5.2. Every
+change is additive; the routes mount on both route profiles and need `SH_PROVENANCE_DIR` (else
+`400 invalid_request`).
 
-- `DELETE /v1/subjects/{subject}` refuses a subject holding a live admin grant with the new error
-  code `admin_granted` (409; revoke the role first): the grant keeps it enrolled, so the unenroll
-  would change nothing.
-- A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from the settings and any
-  role); enrolling a subject the settings enroll writes nothing (`record: null`).
-- A grant's `until` is at most 366 days ahead (`400 invalid_request` beyond), so a value in epoch
-  milliseconds is refused rather than read as a grant that never lapses.
-- The template quotas count what holds a slot: `templates` counts a template only while one of its
-  builds is registered or on its way there (one whose builds all failed, were cancelled or retired
-  holds none, and a new build of it is checked against the quota like a new id), `buildsQueued`
-  counts probing builds too, and a build an admin adds to another
-  subject's template is charged to the template's owner. A create's quota check and write hold one
-  lock per subject, so concurrent creates for different ids never pass one check together.
-- A template spec names its guest size once: `guest_ram_mb`, or its alias `guest_mb` alone. A spec
-  with both is refused `422 policy_refused` (`M7.guest`), even when equal; the alias is stored as
-  `guest_ram_mb`, the key the build reads, in the `create` record, the build's request and the reuse
-  key.
-- Under every profile, a create whose spec names a gate record (`source_record_digest`), or that
-  sends one, is refused unless that record passed (`X1`) and is for this image (`X1.image`); only
-  `X1.trusted` stays a profile requirement. `X12` refuses any `skip_git_identity_check: true` that
-  no gate record showing commits refused backs. Upgrade note: on `base` an unbacked skip is now
-  refused: a client sends a gate record showing commits refused (X5: `agent_can_commit: "no"`,
-  `git_identity: "none"`), or drops the skip, and the build host's git identity check then needs git
-  with an identity in the image.
-- M1 takes the distribution reference grammar: an optional `host[:port]/`, then lowercase path
-  components, then `@sha256:<64 hex>`, at most 255 characters before the `@`. A tag beside the
-  digest is refused, and so are references such as `Images/x`, `-x`, `a//b` or `../x`. Registry
-  hosts compare case-insensitively (`allowedRegistries` and the image's host).
-- `PUT /v1/policy` refuses a profile `requires` id outside X1, X10, X11, X12, X14, X15 (the ids
-  the check acts on) and an `envelope.exact` that is not two positive whole numbers. A stored policy
-  naming an unknown id, or with such an `exact`, fails closed when read, until an admin sets a
-  valid one: read `GET /v1/policy` and fix it before upgrading.
-- A tag is looked up as the template's own property everywhere (moving, removing, `id:tag`, the tag
-  list), so a tag named like an `Object.prototype` member (`constructor`) is a tag like any other;
-  `DELETE …/tags/{tag}` refuses a name outside the tag grammar with `400 invalid_request`.
-- Every template change (a tag moved or removed, an edit, an owner transfer, a cancelled build) is
-  stored only once its records are on the chain, and its owner's check is made again under the
-  template's lock: a record that fails to append refuses the change, and an owner transfer landing
-  in between refuses the old owner's change. A create retries under the new owner's quota lock when
-  a transfer lands between its read and its write. `PATCH /v1/templates/{id}` refuses a description
-  holding a lone surrogate with `400 invalid_request`.
-- An activation's default lease is the largest `idleLimitSeconds` of the hosts that hold the build
-  (not of every host), or 3600 when none reports one, clamped to 60-86400: a host's idle limit
-  outside the range never refuses a request that named no lease. Only an explicit `leaseSeconds` is
-  range-checked, and one that is not a whole number is refused rather than replaced by the
-  default.
+- New PUT /v1/quota/{subject} (admin): `subject` is `default` (the deployment default) or a subject,
+  `github:<numeric id>` or `oidc:<provider sub>` (never `test:<n>`), for an override; the body is a
+  Quota, or `null` to remove a subject's override (the default is never removed). Each change is a
+  new `policy` record naming the admin. Answers `{target, subject, quota, before, policy, record}`:
+  the quota now and before (null: no override), the new policy's digest and the record's. Enforced
+  at once on creates, queued builds and activations. A quota holds `templates`, `buildsQueued` and
+  `active`, and optionally `owned` (another key is `400 invalid_request`); a body without `owned`
+  leaves the target's `owned` as it is. An optional `?expect=` (JSON: the quota the client read,
+  `null` for no override) makes the write a compare-and-set on all four counters (an unset `owned`
+  matches only an unset one): when the target's quota is not that value now, nothing is written and
+  the answer is the new code `409 quota_changed`.
+- Policy gains `quotaBySubject`, the per-subject overrides of `quota`, keyed by subject; a key that
+  is not a subject, or a malformed quota, is `400 invalid_request`. An override's `owned` is
+  optional: without it, the subject's `owned` is the default's (else 200).
+- PUT /v1/policy gains an optional `?expect=`, the `digest` GET /v1/policy answered: the write is
+  made only if the policy's digest is that value now, else nothing is written or recorded and the
+  answer is the new code `409 policy_changed`, whose `digest` is the policy's now. So a policy
+  written from an older read never drops a quota (or policy) another admin wrote since. An `expect`
+  that is not `sha256:` and 64 lowercase hex digits is `400 invalid_request`. Without it, the
+  policy is stored as sent, as before.
+- GET /v1/quota answers the limits that apply to the caller (its override, else the default) and
+  gains `quotaSource`, `subject` or `default`, and `ownedSource`, the same for `owned` alone (an
+  override may leave `owned` to the default).
+- New POST /v1/templates/{id}/builds/{build}/reject `{reason}` (admin; the reason is required): a
+  registered build becomes `rejected` with `reason.rule` `admin`, its activation leases go, a host
+  holding it finds it in the wanted state's `stop` (as a retired build, but never in `remove`: its
+  worker is stopped, not removed, and no `removed` report is taken for it) and its `detached`
+  report is taken, and a sandbox create naming it answers `400 unknown_template`. A `reject` record
+  names the admin, `from`, the reason and `buildRecord` (the digest of the build's `build` record).
+  Answers `{templateId, subject, build, buildId, record, status: rejected}`; idempotent
+  (`record: null`). Refused `409 build_in_use` while a live sandbox runs on the build; any status
+  but `registered` is `400 invalid_request`. Not reversible.
+- A rejected build (by policy or by an admin) keeps no snapshot or worker for a retired build that
+  shares it: the retired build is stopped and removed as any retired build is (no longer `shared`),
+  while the rejected build itself is only stopped.
+
+## 1.20.0
+
+Enrollment and the admin role through the API
+([#739](https://github.com/rossoctl/moca/issues/739)), per the
+[enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md). Every change is
+additive; without `SH_PROVENANCE_DIR` nothing changes.
+
+- New GET /v1/subjects (every enrolled subject with its roles, each with `source: env | api`),
+  PUT and DELETE /v1/subjects/{subject} (enroll with `{"enrolled": true}`, unenroll), and PUT and
+  DELETE /v1/subjects/{subject}/roles/admin (grant, with an optional `until` in epoch seconds, at
+  most 366 days ahead; revoke), on both route profiles. Any admin reads the list; only an admin named in
+  `SH_ADMIN_SUBJECTS` changes it (`403 forbidden` otherwise). The same holds for a PUT /v1/policy
+  that widens the policy (a trusted gate record, a registry or a repository added; a profile added
+  or loosened: a rule dropped from `requires`, `requireOfflineGate` off, `selfAttest` or
+  `selfAttestEgress` on, an envelope bound raised or removed, its `exact` size changed or removed;
+  or a `defaultProfile` that accepts more): an admin by an API grant may narrow it (a profile
+  removed is a narrowing) and change its quotas. Each change answers the subject with
+  the `record` it wrote (null when nothing changed). With no store the routes answer
+  `400 invalid_request`. A `Subject` carries `storeEnrolled` (the store's own enrollment, apart from
+  the settings and any role); enrolling a subject the settings enroll writes nothing
+  (`record: null`).
+- A subject on these routes is `github:<numeric id>` or `oidc:<provider sub>` (the sub pattern the
+  OIDC login verifies); `test:<n>` and anything else is `400 invalid_request`. New `Subject` schema.
+- New error codes `bootstrap_subject` (409: unenrolling or revoking a subject the settings enroll or
+  make admin) and `self_revoke` (409: an admin revoking its own role).
+- With a store, roles and enrollment are evaluated per request: the control plane replaces a
+  verified token's `roles` with the subject's roles now, so a grant, a revoke or a lapsed `until`
+  takes effect at the subject's next request. The login, the refresh and the egress owner check use
+  the same evaluation. Without a store the token's claims stand, as before.
+- Each change is a record on a new `members` provenance stream: `member {subject, enrolled, before}`
+  and `role {subject, role, state: granted | revoked | expired, until, before}`, naming the acting
+  admin (`control-plane` for an `expired`, written once). `verify-provenance.py` and `verifyExport`
+  accept the two kinds on that stream only.
+
+## 1.19.0
+
+The host agent removes a retired build's worker and snapshot
+([#743](https://github.com/rossoctl/moca/issues/743)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.1 step 7.
+Every change is additive.
+
+- GET /v1/hosts/{host}/wanted gains `remove`: the retired builds the host holds with no live sandbox
+  and no pinned session's hold on their worker, each also in `stop`; while a sandbox that ended on
+  the worker is still in `egressSids` (less than 600 s ago), it is in `stop` only, so its last
+  egress events are still taken. The agent stops a running worker, then uninstalls it
+  (`install-host.sh --uninstall --keep-shared`: its own files only), deletes the snapshot and its template record, and reports it. A
+  worker with a live sandbox is in no list, nor is a retired build whose build id or worker a build
+  that is not retired shares (in any template): its snapshot or worker is still needed.
+- POST /v1/hosts/{host}/workers/report takes `removed` for a retired build the host holds: a `retire`
+  record by `host:<id>` with `event: removed` and `buildRecord` (the digest of the build's `build`
+  record). The host no longer holds the build, so TemplateBuild's `heldBy` drops it at once, before
+  the host's next inventory. A `removed` for a build the wanted state leaves out because a build not
+  retired shares it is refused `409 build_in_use`.
+
+## 1.18.0
+
+Retire a template, or one build of it ([#749](https://github.com/rossoctl/moca/issues/749)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §5.1. Every
+change is additive; the routes mount on both route profiles and need `SH_PROVENANCE_DIR` (else
+`400 invalid_request`).
+
+- New POST /v1/templates/{id}/retire `{reason?}` (the owner, or an admin): every build not yet
+  retired becomes `retired`, its activation leases go, and each writes a `retire` record naming the
+  caller, `from` (the status before), `buildRecord` (the digest of the build's `build` record, null
+  for one never built) and the reason; earlier records stay. Answers
+  `{templateId, subject, status, builds}`, each build a new `RetiredBuild`
+  `{build, buildId, readiness, record}`. Idempotent: an already retired build is listed with
+  `record: null` and no second record. Not reversible: a new build is the way back, and the id
+  stays its owner's.
+- New DELETE /v1/templates/{id}/builds/{build}: retires one build, by build id or handle, answering
+  one `RetiredBuild` with `templateId`, `subject` and `status`.
+- New codes: `409 build_in_use`, a retire refused while a live sandbox runs on the build;
+  `410 template_retired`, a sandbox create or an activation naming a retired build, a tag of one, or
+  a template whose every build is retired (was `400 unknown_template` or `409 template_unavailable`).
+- Readiness gains `retired` (Template, TemplateBuild). TemplateBuild gains `heldBy`, the hosts whose
+  last inventory holds its snapshot, a host gone silent too (null without host agents). A retired build whose worker still
+  holds a presence record reports `capacity` `{running, inUse}`, as an active one does (null once
+  its worker is stopped; `running: null` when presence cannot be read). TemplateBuild gains
+  `shared`, true for a retired build whose snapshot or worker a build that is not retired also
+  uses: its worker is kept for that build, and its `capacity` is null.
+- GET /v1/hosts/{host}/wanted: `stop` also lists the retired builds the host holds with no live
+  sandbox, except a `shared` one; and one worker id is never in both `run` and `stop` (two
+  registered builds from one image share it); POST /v1/hosts/{host}/workers/report takes `detached` for a retired build. Removing a
+  retired build's worker and snapshot from its host is not part of this version.
+
+## 1.17.0
+
+A session's seed from its build, its workspace's patch, its records, and its queued turns on its
+template ([#751](https://github.com/rossoctl/moca/issues/751)), per the
+[session templates spec](../specs/2026-10-30-session-sandbox-templates-design.md) §5-§5.2 and the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §7.1.
+Additive.
+
+- POST /internal/credentials: for a session pinned to a manifest-hash build through the template
+  store, `sandboxSeed` is that build's own `spec.seed` (none when the build has none), and
+  `sandboxSeedSource` (`build` or `declared`) is sent with any seed.
+- POST /internal/turn-credentials returns `sandboxTemplate`, `sandboxSeed`, `sandboxSeedSource` and
+  `sandboxBuildId` as POST /internal/credentials does, so a queued turn of a templated session runs
+  on its template's workers, pinned to its build, and seeded.
+- GET /v1/sessions/{id}/turns/{turnId}: a `responded` result of a templated session carries
+  `workspace` (the patch after the turn) and, with a seed, `seed` (`{source, buildId?}`).
+- With a template store, a session whose template resolved through it writes a `session` record on
+  `template/<id>` at creation (`state: created`, with its build, manifest hash and lease) and at
+  delete (`state: terminated`, `reason: deleted`, `endedAt`).
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.3.0: a templated
+session's turn result (and its terminal `done` and `error` frames) carries `workspace`
+(`TurnWorkspace`: the patch from the seed's baseline commit, whole or refused over
+`SH_TURN_PATCH_MAX_BYTES`, never cut) and `sandbox.seed`; a `/v1/runs` prompt run of a templated
+session runs on its template and its `responded` result carries both too.
+
+## 1.16.0
+
+Sessions and sandboxes from one combined control plane
+([#750](https://github.com/rossoctl/moca/issues/750)), per the
+[combined control plane spec](../specs/2026-11-05-combined-control-plane-design.md). Additive: the
+`harness` and `sandbox` profiles answer as before.
+
+- `SH_ROUTE_PROFILE=combined` mounts every route of both profiles. Its GET /v1/discovery answers
+  `profile: "combined"` with the harness fields plus `execEndpoint` and `execCa`.
+- On `combined` login is open, as on `harness`; the sandbox routes and the template writes need an
+  enrolled subject (`403 not_enrolled` otherwise, test users included), and the template, policy and
+  quota reads take any logged-in subject. Its API tokens carry the harness issuer.
+- With a template store (`SH_PROVENANCE_DIR`), POST /v1/sessions resolves `sandbox.template` through
+  it as POST /v1/sandboxes does: `id`, `id:tag` or `id@sha256:…`, else 400 `unknown_template`; the
+  build is kept for the session's life. `sandbox.activate` (default true) and activation on first
+  use apply: 409 `template_not_active` with Retry-After, or `no_active_slot`,
+  `template_unavailable`. Only a subject enrolled for sandboxes starts an activation; on `combined`
+  another subject waits (409) on one already starting and is refused (`403 not_enrolled`) on a
+  template nobody is starting. The activation is the create's last check, so a create refused for
+  another reason holds no lease.
+- The `Session` view adds `sandboxBuildId` and `templateManifestHash` beside `sandboxTemplate`.
+- POST /internal/credentials returns `sandboxBuildId` for a session pinned to a manifest-hash build.
+  Each exchange of such a session (and of its queued turns) keeps that build's worker running for
+  the hosts' idle limit from the turn, as a live sandbox does (GET /v1/hosts/{host}/wanted leaves it
+  out of `stop`), when the session's subject is enrolled for sandboxes; it starts no worker and
+  takes no lease. A turn of a subject not enrolled runs while the worker is up but extends nothing.
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.2.0: a session pinned
+to a build runs only on workers labelled `moca.dev/build` with it, and its turn is refused (503
+`sandbox_unavailable`) when none is attached.
+
+## 1.15.0
+
+Sandbox templates for agent sessions
+([#731](https://github.com/rossoctl/moca/issues/731)), per the
+[session templates spec](../specs/2026-10-30-session-sandbox-templates-design.md). Additive: a
+deployment that does not set `SH_SANDBOX_TEMPLATES` on the harness profile answers exactly as
+before.
+
+- POST /v1/sessions accepts `sandbox.template`, fixed for the session's life. A non-string is
+  400 `invalid_request`; so is an id the deployment does not declare (the message lists the
+  declared ids), and any template on a deployment that declares none.
+- The `Session` view gains `sandboxTemplate` (null for none) on a deployment that declares
+  templates, and for any session that named one.
+- GET /v1/discovery gains `sandboxTemplates: [{id, description, tools}]`, the declared templates
+  without their seeds; absent when none are declared.
+- POST /internal/credentials returns `sandboxTemplate` and `sandboxSeed` for a session that named a
+  template, and neither otherwise. A template the deployment no longer declares is still returned,
+  without a seed, so its turns are refused rather than run on an untemplated worker.
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.1.0: authenticated
+turns take the session's template from the control plane, a failed seed is a 500, and
+`workspace_reset`'s `retiered` also covers a sandbox that now serves another template.
+
+## 1.14.0
+
+Per-sandbox egress records ([#752](https://github.com/rossoctl/moca/issues/752)), per the
+[egress records spec](../specs/2026-11-08-sandbox-egress-records-design.md): what a sandbox reached
+through the KVM host's egress proxy, readable through the API and named in the sandbox's provenance.
+Every change is additive.
+
+- New GET /v1/sandboxes/{id}/egress?after=&limit= (the owner or an admin, as GET /v1/sandboxes/{id})
+  gives `{events, next, summary}`. The events are the proxy's audit events exactly as it wrote them
+  (new `EgressEvent` schema), in arrival order. `summary` (new `EgressSummary` schema) is
+  `{byHost: {host: {count, decisions, bytesUp, bytesDown}}, total, dropped, droppedBy: {proxy, cap,
+budget, invalid}, complete, sealed, sha256}`, on the first page (no `after`); null on the pages
+  after it.
+- `?format=ndjson` gives the whole log as `application/x-ndjson`: each event's canonical JSON, each
+  followed by `\n`. Its sha256 is `summary.sha256`.
+- New POST /v1/hosts/{host}/egress `{events, cursor, oversized?}` (host bearer): the host agent's
+  batches of up to 1000 events and its journal cursor, idempotent by (host, cursor), answering
+  `{accepted, refused, capped, overBudget, invalid, dropped, cursor}`. A log holds at most 10,000
+  events and 4 MiB of lines, and all logs together at most 64 MiB of lines; the rest count as
+  dropped.
+- GET /v1/hosts/{host}/wanted gains `egressSids`, the workspace keys whose events the host ships (the
+  set the egress route accepts); the agent sends no other sandbox's or session's events.
+- The `sandbox` provenance record that ends a sandbox (`state: terminated`) gains
+  `egress: {events, sha256, dropped, droppedBy, complete}`. Events that arrive in the 600 s after the
+  end are still taken; if any did, one more `sandbox` record with `state: egress` names the final
+  log. No record kind is added.
+
+## 1.13.0
+
+Pacing template workers' cold starts ([#745](https://github.com/rossoctl/moca/issues/745)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.5: a
+KVM host starts at most `SBX_START_CONCURRENCY` (default 4) workers at once, an activation waiting
+for a start slot says so, and an optional idle grace (`SBX_IDLE_GRACE_S`, default 0, off) keeps a
+released build's worker running for a while. The start limit is the host agent's, so it holds with
+an older control plane too. Every change is additive.
+
+- `GET /v1/hosts/{host}/wanted` gains `starting: [buildId]`: the builds of `run` whose worker is not
+  attached to the relay (its presence, as readiness reads it), in `run`'s order. `run` is now in the
+  wanted order, first leased first. Without `starting` (an older control plane, or the presence
+  unreadable) the agent counts its own starts of the last `SBX_START_WINDOW_S` (default 300). With
+  `starting`, a listed worker counts for `SBX_START_WINDOW_S` at most: one not attached after it is
+  stuck (an error line each run) and holds no start slot.
+- `POST /v1/hosts/{host}/inventory`'s `limits` take optional `startConcurrency`, `startSeconds` (the
+  mean of the agent's last cold starts, start to attach) and `idleGraceSeconds` (0-86400). Without
+  them (an older agent) nothing changes; an older control plane ignores them.
+- A build `activating` on such a host gains `queued` and `queuePosition` (1-based, among its host's
+  placed, wanted builds not attached yet, first leased first); `queued` is true beyond the host's
+  `startConcurrency`.
+- `409 template_not_active`'s Retry-After is `ceil(ceil(queuePosition / startConcurrency) ×
+startSeconds)` when the host reports both; else 30 s, as before. A queued activation stays
+  `activating` longer than before: a client polls with a timeout sized for the host's whole start
+  line.
+- A build whose worker already runs on a holder needs no start: it stays there (1.12.0's sticky
+  placement), whether or not the host reports memory figures; a graced build leased again too.
+- The idle grace runs from the build's last lease end (a release's time, or an expired lease's
+  `until`), for a worker the agent reports running with no live sandbox, while the host has room
+  under `activeLimit` beside the workers it counts (`active.used`: graced ones are counted apart)
+  and its memory headroom (a graced worker counts as running there). A wanted
+  build that needs the slot or the memory displaces the graced worker that ends soonest; the stop is
+  re-checked for a lease, under the activation lock, when the wanted answer is made. The wanted
+  answer gains `graced: [buildId]` for a host with a grace: the graced builds, kept in `run` after
+  the wanted ones (the agent starts none of them).
+- `POST /v1/templates/{id}/deactivate` takes an optional `stopNow: true`: with no lease left, the
+  build skips the grace (stopped at the next poll); the `deactivate` record carries `stopNow: true`.
+- Builds gain `graced: true` and `gracedUntil` (epoch seconds) while in a grace; a create on a
+  graced build takes the caller's lease and is served at once.
+- `GET /v1/templates`' hosts gain `start: {concurrency, seconds, starting, queued}`, only for a host
+  whose agent reports it, and `idleGraceSeconds` and `graced` (a count) for a host whose agent sets
+  a grace.
+
+## 1.12.0
+
+Placement of template workers by host memory ([#744](https://github.com/rossoctl/moca/issues/744)),
+per the [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+§6.2: a new worker starts on a host only if the host has the memory for it, whatever its
+`activeLimit` says. Nothing running is evicted. Every change is additive.
+
+- `POST /v1/hosts/{host}/inventory` takes an optional `memory: {memTotalMib, memAvailableMib,
+memFloorMib, memPressureFull10, memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
+  Without it (an older agent) the host is placed by `activeLimit` alone, as before; an older control
+  plane ignores it.
+- A build costs its guest RAM (`spec.guest_mb`) plus 128 MiB, or 4096 + 128 with no recorded guest size.
+  A host's headroom is `min(total − floor − used, available − floor − pending starts)`, where `used`
+  counts its running workers, their VMs' committed memory and the builds placed there not started yet.
+  A host whose last inventory is older than 60 s, or whose PSI `full avg10` is above its limit, takes
+  no new start. A build in a host's `memfileMismatch` is never placed there.
+- `409 no_active_slot` gains `reason: memory` when a holder under its active limit lacks the memory
+  (Retry-After unchanged); at the active limit it answers as before, with no `reason`.
+  `409 template_unavailable` gains `reason: memfile_mismatch` when every holder reports the build's
+  memory file wrong. `409 template_not_active` with readiness `unavailable` carries the reason too.
+- Templates and builds gain `readinessReason` (`not_held | no_slot | memory | memfile_mismatch`),
+  present only with readiness `unavailable`; new `ReadinessReason` schema.
+- `GET /v1/templates`' hosts gain `memory: {totalMib, availableMib, floorMib, usedMib, headroomMib,
+pressureFull10, pressureLimit, brake, runningWorkers, memfileMismatch, reportedAt}`, only for a
+  host whose agent reports it; `floorMib` is the effective floor.
+
+## 1.11.0
+
+Activation leases and the hosts' wanted state ([#742](https://github.com/rossoctl/moca/issues/742)),
+per the [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+§6.2-§6.4. Every change is additive; the template routes mount on both route profiles and need
+`SH_PROVENANCE_DIR` (else `400 invalid_request`).
+
+- New POST /v1/templates/{id}/activate `{tag?, build?, leaseSeconds?}`: takes or renews the caller's
+  activation lease on a registered build (60-86400 s; default the largest `idleLimitSeconds` of
+  the hosts that hold it, clamped to 60-86400, else 3600; renewed by calling again, without limit) and answers
+  `{templateId, buildId, leaseUntil, host}`. A build is wanted running only while a lease stands; a
+  leased build is never evicted. Each grant is an `activate` record; the lease stores its digest. Refusals keep
+  no lease: `409 template_unavailable` (no registered build under that reference, or no reporting
+  host holds it), `409 no_active_slot` with `Retry-After` (every holder at its `activeLimit` with
+  leased builds; the wait is until a build placed on one of its holders loses its last lease), `429 quota_exceeded` with `quota: active`. The quota and placement check, the
+  record and the lease write run one activation at a time across all templates.
+- New POST /v1/templates/{id}/deactivate `{all?}`: drops the caller's leases on the template (an
+  admin with `all: true`, everyone's), answering `{templateId, released}`, with a `deactivate`
+  record when any is dropped.
+- New GET /v1/hosts/{host}/wanted (host bearer): `run`, the leased builds placed on this host within
+  its `activeLimit`, and `stop`, the builds it holds with no lease and no live sandbox (and a leased
+  build it runs while placement keeps it on another host); new `WantedWorker` schema. Placement is
+  sticky (a running build stays on its host) and counts every worker that stays running on a host:
+  leased builds placed or running there, and unleased ones draining a live sandbox.
+- POST /v1/hosts/{host}/inventory: each `holds` entry gains `running` (boolean, default false):
+  whether the build's worker unit runs on the host.
+- New POST /v1/hosts/{host}/workers/report `{buildId, event, reason?}` (host bearer): `attached`,
+  `refused` or `detached`, recorded as `activate` or `deactivate` records by `host:<host>` (a
+  `refused` repeating the host's last one for a build still in its `run` is not recorded again:
+  `recorded: null`);
+  readiness still comes from the relay.
+- POST /v1/sandboxes: activation on first use. With `SH_TEMPLATE_HOSTS` set, a create on a
+  registered build that is not `active` takes the caller's lease (`reason: first_use` on its record;
+  refused as activate would be) and answers `409 template_not_active` with `readiness` and
+  `Retry-After: 30`; a caller already holding a live lease on the build is only answered the
+  wait (no renewal, no record per retry). New body field `activate` (default true; false starts nothing). No sandbox
+  record is kept while waiting. Without template hosts, nothing changes. A template imported from
+  `SH_SANDBOX_TEMPLATES` is never gated, and activate refuses it with `400 invalid_request`: the
+  deployment runs its worker, and its readiness is that worker's presence alone. The `sandbox` record's
+  `lease` is now the digest of the caller's `activate` record (null without a lease).
+- Readiness gains `activating`, `deactivating` and `unavailable` (Template, TemplateBuild); before
+  any host reports it is the presence alone, as before.
+- GET /v1/templates: `hosts` lists each reporting host's `active {limit, used}` (`used`: the
+  workers placement counts on it), `idleLimitSeconds`
+  and `disk {freeGb, floorGb}`. A host whose last inventory is over 6 minutes old is left out of
+  it and of placement until it reports again.
+- GET /v1/quota: `active.used` counts the builds the caller holds a live lease on.
+- New error codes `no_active_slot`, `template_unavailable` and `template_not_active` (409); the
+  Error schema gains `readiness`, and `quota` the value `active`.
+
+## 1.10.0
+
+Template host agents and their routes ([#741](https://github.com/rossoctl/moca/issues/741)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.1 and
+§8.2. Every change is additive; the routes mount on both route profiles, need `SH_PROVENANCE_DIR`
+for the builds (else `400 invalid_request`), and answer only a host listed in `SH_TEMPLATE_HOSTS`
+(else `401 unauthorized`).
+
+- New security scheme `hostToken`: one template host's bearer, `SH_HOST_TOKEN_<ID>`. The host in
+  the path must be the one whose token is presented; no user, admin, janitor or egress token is
+  accepted.
+- New POST /v1/hosts/{host}/inventory: what the host holds (`holds`, each a `template` and its
+  `manifestHash`) and its limits (`limits`: `activeLimit`, `idleLimitSeconds`, `buildConcurrency`,
+  `diskFreeGb`, `diskFloorGb`).
+- New POST /v1/hosts/{host}/builds/claim `{max}`: up to 4 queued builds, oldest first and subjects
+  in turn, each moved to `building` and held by the host, with its job: the template id, the
+  handle, the image and the spec as `template-build.sh` reads it (the template's id and the create's
+  image always win over the spec's own; the guest size is always `guest_ram_mb`, the value the
+  policy checked), and the gate record's path when the create had one.
+- New GET /v1/hosts/{host}/blobs/{digest}: a stored document (a gate record) by sha256, base64 of
+  its exact bytes.
+- New POST /v1/hosts/{host}/builds/{build}/log (at most 200 entries a call; a build keeps its
+  last 1000) and POST /v1/hosts/{host}/builds/{build}/report, whose `event` is `building` or
+  `probing`; `failed` with `step` and `message`; or `built` with `templateRecord` and `manifest`,
+  each file as a string. A report answers only a build this host claimed (else `404 not_found`);
+  a failed or cancelled build takes no more. On `built` the control plane stores both files,
+  writes a `build` record, checks them against the create's request and registers the build (its
+  `buildId` becomes the manifest hash; a template's first registered build takes `default`) or
+  rejects it with `reason.rule`, writing a `check` record (`at: registration`) either way.
+
+## 1.9.0
+
+A subject's own gate record, trusted for its own templates, and repositories allowed per registry
+([#738](https://github.com/rossoctl/moca/issues/738)), per the
+[subject trust spec](../specs/2026-11-08-subject-trust-gate-records-design.md). Trust is decided by
+who submits a gate record, never by anything inside it. Every change is additive.
+
+- `Profile` adds `selfAttest`, `selfAttestEgress` and `requireOfflineGate`. The default policy adds
+  `benchmark-self` (the `benchmark` rules, no network) and `general-self` (no X11; `spec.egress` may
+  be true, the KVM host's allowlisted egress); `benchmark` stays curated (its records must be in
+  `trustedGateRecords`).
+- On a `selfAttest` profile, a record not in `trustedGateRecords` passes `X1.trusted` for the
+  creating subject's own templates. New create rules, each in the `check` record and named by a
+  `422 policy_refused`: `X1.self.scope` (another subject already self-attested the same sha256;
+  a build made while the record was trusted claims nothing, and a build that failed releases its
+  claim),
+  `X12.self` (the record must show commits refused, whatever the spec), `X1.self.egress`
+  (`spec.egress` false unless the profile allows it) and `X1.offline`.
+- `X1.offline`: on a profile that requires X1 (unless `requireOfflineGate: false`, as on
+  `general-self`), a general-gate record needs `gate.floor_checked_offline: true` (fail closed); a
+  curated family record predates the field and passes. The general-gate schema is the setting
+  `SH_GATE_RECORD_SCHEMA` (default `moca-gate-record/1`; a malformed value refuses to boot), and
+  GET /v1/policy answers it as `gateRecordSchema`, so a client's dry run applies the rule as the
+  deployment does (an older control plane without the field reads as the default).
+- The `gate` provenance record's `source` adds `self`, with `scope`: the subject the record counts
+  for, the template's owner (the submitter, except on an admin's build for another subject's
+  template).
+- `Template` and `TemplateBuild` add `attestation` (`deployment | self`), recomputed on every read
+  from the current policy: `self` for a build made on a `selfAttest` profile whose record is not
+  trusted now, whatever its trust at create. `TemplateBuild` adds `gateFloorCheckedOffline`, and
+  `gateFloorMetOffline` for a gate from a `network_needed` contract. A template with a registered
+  self-attested build reads `visibility: private`, whatever is stored.
+- New error code `self_attested` (409): a self-attested create asking for `deployment`
+  visibility, or a self-attested build added to a deployment-visible template. PATCH
+  /v1/templates/{id} answers the same refusal for `visibility: deployment` on a template with a
+  self-attested build, registered or on its way there, and PUT /v1/templates/{id}/owner for a
+  transfer of such a template to another subject.
+- PUT /v1/policy: a removal from `trustedGateRecords` that makes builds of deployment-visible
+  templates self-attested names them as `narrowed: [{template, buildId}]` in its answer and in its
+  `policy` record; those templates read as private from then on, and their owners keep using them.
+- `Policy` adds the optional `allowedRepositories`: per registry host (as the policy reads it,
+  Docker Hub as `docker.io`), the repositories a create may name there, each an exact path
+  (`library/python`) or a prefix (`library/*`), matched on whole path segments; a Docker Hub
+  official name reads as `library/<name>`. New create rule `registry.repository`, which also
+  refuses there an image path outside the entries' grammar (uppercase, or an empty, `.` or `..`
+  segment). A registry with
+  no list allows every repository, as before; a registry listed there must also be in
+  `allowedRegistries`. Its keys compare case-insensitively, as `allowedRegistries` does.
+
+## 1.8.0
+
+Template tags, edits and owner transfer through the API
+([#747](https://github.com/rossoctl/moca/issues/747)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §5.1-§5.2.
+Every change is additive; the new routes mount on both route profiles and need `SH_PROVENANCE_DIR` (else
+`400 invalid_request`). Each change writes a provenance record naming the new value and the one before.
+
+- New POST /v1/templates/{id}/tags `{tags, build}` (the owner, or an admin): moves 1-16 tags onto a registered build of
+  the template, by build id or handle, without a rebuild. New sandboxes and sessions naming `id:tag` (and the bare `id`,
+  for `default`) get the new build; those already created keep theirs. A `tag` record per tag that changes
+  (`{tag, buildId, before}`); a tag already on the build answers `record: null`.
+- New DELETE /v1/templates/{id}/tags/{tag} (the owner, or an admin): removes a tag; its build is not deleted. `default`
+  is moved, never removed (`400 invalid_request`); a tag name outside the tag grammar is `400 invalid_request`
+  too. A `tag` record with `buildId: null`.
+- New PATCH /v1/templates/{id} `{description?, visibility?}` (the owner, or an admin): a `visibility` record
+  (`{field, value, before}`) per field that changes. A description holding a lone surrogate is `400 invalid_request`.
+- New PUT /v1/templates/{id}/owner `{owner}` (an admin): the new owner, `github:<numeric id>` or `oidc:<provider sub>`
+  (never `test:<n>`), must be enrolled. A template the deployment declared (`owner: null`) can be handed to a subject
+  the same way (`before: null`), who can then build, tag and edit it; a restart does not undo it. An `owner` record
+  (`{owner, before}`).
+- Every template change (a tag moved or removed, an edit, an owner transfer, a cancelled build) is stored only once its
+  records are on the chain: a record that fails to append refuses the change. The owner's check is made again under the
+  template's lock, so a change by an owner the template was transferred away from meanwhile is refused (`403`).
+
+## 1.7.0
+
+Session grants: the key ring, the token format and the two lifecycle endpoints of
+[MI1](../specs/2026-09-28-moca-multi-user-isolation-design.md) §6.1-§6.2, which discharge
+[#388](https://github.com/rossoctl/moca/issues/388) items 1-2 and the `turn_exp` half of
+[#387](https://github.com/rossoctl/moca/issues/387)'s M2.
+
+- New POST /internal/turn-grants, behind the existing `exchangeToken` scheme: a worker presents the
+  session token it was handed with the turn and gets the turn's two grants. The response is two
+  signed grants, the turn's absolute `turnExp`, the `exp` to refresh at, and the session's bundle
+  digest. **No credential and no secret is in it** — the inference grant names the session's
+  credential and the sandbox grant names its `sandbox-egress` credentials, by name (§7.2). A grant is
+  a capability spent at an enforcement point, not a secret.
+- New POST /internal/grants/refresh: a worker presents either half mid-turn and gets a fresh pair.
+  `turn_exp` is carried forward unchanged, so no number of refreshes extends a turn, and a refresh
+  past it is refused outright rather than clamped. A fresh **issue** does start a new window:
+  `turn_exp` is anchored to the call, and nothing yet identifies a turn to anchor to, so the bound
+  on a caller holding a live session token is that token's lifetime. Anchoring issuance to the turn
+  record is the redeemer's slice, where `turn_exp` first enforces anything. The session is re-read rather than echoed, so a
+  credential or bundle changed mid-turn takes effect at the next refresh and a session tombstoned
+  mid-turn stops refreshing (404 `session_not_found`, the same answer another user's session gives).
+- New `TurnGrants` schema and the error code `grant_invalid` (401): one code for every way a grant can
+  fail — bad signature, wrong `typ`, unknown `kid`, wrong audience, wrong issuer, expired, or past
+  `turn_exp` — because a caller's only move on any of them is to get a new grant. The `message` does
+  name the failed check, for whoever is debugging a verifier; the route is behind the shared bearer.
+- Both routes are **unmounted unless `MOCA_GRANT_SIGNING_KEY` is set**, and 404 before the body is
+  read (ADR-0045's shape). A deployment that has not generated the grant ring behaves exactly as
+  before. New configuration: `MOCA_GRANT_SIGNING_KEY`, `MOCA_GRANT_PUBLIC_KEYS`, `MOCA_GRANT_TTL_S`
+  (300) and `MOCA_TURN_MAX_S` (1800), in
+  [configuration.md](../reference/configuration.md#control-plane).
+- The grants are signed by a **separate key ring** from session tokens, with header
+  `typ: moca-grant+jwt`, so a session token can never pass as a grant even where an `aud` check is
+  forgotten (§6.1). Note for any out-of-tree verifier: `aud: moca-sandbox` now names two different
+  tokens — the sandbox grant and SBX0's sandbox access token — and only `typ` separates them. The
+  cross-language vectors are at
+  `packages/control-plane/test/fixtures/grant-vectors.json` (§12.2); they pin the verifier side and
+  carry the public key only.
+
+Interim, and named as such: **nothing redeems a grant yet.** The `moca-egress` inference listener and
+§6.3's `/internal/token` are a later slice, so /internal/credentials and /internal/turn-credentials
+both stay (§6.2's "replaces /internal/credentials" lands with the redeemer), workers never verify a
+grant, and `MOCA_TENANCY=multi` still refuses async turns. There is no revocation list by design:
+`MOCA_GRANT_TTL_S` is the revocation latency.
+
+## 1.6.0
+
+Sandbox modes ([lease-mode spec](../specs/2026-11-08-sbx-lease-mode-design.md) §8.1–§8.2), served
+only on the `sandbox` route profile.
+
+- `Sandbox` gains `mode` (`per-exec`, `lease` or `lease+processes`), `idleTimeoutS` (0 = the worker's
+  default) and `modeEpoch`. A sandbox created `per-exec` starts at epoch 0, one created in a lease
+  mode at 1.
+- POST /v1/sandboxes accepts `mode` (default `per-exec`) and `idleTimeoutS` (30 to
+  `SH_SANDBOX_IDLE_CEILING_S`, whose default is 1800; omitted, the worker's default of 300 s; an
+  explicit 0 is 400 `invalid_request`).
+- New PUT /v1/sandboxes/{id}/mode: changes the mode and the idle timeout, raises `modeEpoch` by 1 on
+  every accepted call, audits `sandbox_mode_changed`, and returns the sandbox with a `setModeToken`
+  for the client's `LeaseControl set_mode`.
+- New POST /v1/sandboxes/{id}/mode-token: a `setModeToken` for the mode and epoch the record holds
+  now, raising nothing.
+- Both mode routes are owner only (an admin gets 404 on another user's sandbox) and take only the
+  owner's user API token; a sandbox token is a 401. A set-mode token is a JWT with
+  `typ: moca-sandbox-mode+jwt`, valid 300 s.
+- New error code `mode_not_allowed` (403): a lease mode the deployment's `SH_SANDBOX_MODES_ALLOWED`
+  (default `per-exec`, so no lease mode until an operator lists one) does not list. `per-exec` is
+  always allowed.
+- Sandbox tokens gain the claims `mode`, `mode_epoch` and `idle_timeout_s`. A token without them
+  reads as `per-exec`, epoch 0.
+- Narrowing the policy downgrades existing sandboxes at their next token mint. A sandbox token or
+  `mode-token` minted for a sandbox whose lease mode `SH_SANDBOX_MODES_ALLOWED` no longer lists first
+  sets it to `per-exec` at the next epoch, audited as `sandbox_mode_changed` with the reason
+  `mode_not_allowed`. A lowered `SH_SANDBOX_IDLE_CEILING_S` clamps the `idle_timeout_s` claim; the
+  stored `idleTimeoutS` and the epoch are unchanged.
+
+## 1.5.0
+
+Self-serve template create, gated by policy ([#737](https://github.com/rossoctl/moca/issues/737)),
+per the [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+§4 and §8. Every change is additive; all new routes mount on both route profiles and need
+`SH_PROVENANCE_DIR` (else `400 invalid_request`).
+
+- New POST /v1/templates `{id, image, spec, gateRecord?, profile?, visibility?}`: any enrolled
+  client creates a template from an image pinned by digest. The deployment's policy checks it before
+  anything is queued; an admitted create answers `202 {templateId, buildId: null, build, status:
+queued}`, `build` being the build's path under a `b-<26 hex>` handle, and writes `create`, `gate`
+  (with a gate record) and `check` provenance records. A create with the same image, spec, profile
+  and gate record sha256 as a build of the caller's own template that is registered or on its way
+  answers that build with `reused: true` (`200` when registered, `202` before); a failed or rejected
+  build is never reused.
+- New POST /v1/templates/{id}/builds (the owner, or an admin: a new image or spec, the same body and
+  answers) and POST /v1/templates/{id}/builds/{build}/cancel (the owner, or an admin: a queued,
+  building or probing build becomes `failed` with `reason.step` `cancelled`, and a `build` record).
+- New GET /v1/policy (any enrolled client) and PUT /v1/policy (an admin; each change a `policy`
+  record naming who), with the `Policy` (`moca-template-policy/1`: profiles with their rules and
+  size envelope, allowed registries, trusted gate records by sha256, quotas) and `PolicyView`
+  schemas. The default policy has a `base` and a `benchmark` profile.
+- New GET /v1/quota: the caller's limits and use (`templates`, owned with a build registered or on
+  its way there, a new build of one that holds no slot checked like a new id; `buildsQueued`,
+  queued, building or probing; `active`; `owned`, template ids owned in any status, a failed or
+  cancelled-only one included, 200 when the policy does not set it), and on the sandbox profile the
+  live-sandbox cap (`sandboxes`). `owned` counts retired ids too, and a retired id is never served
+  again, so it is in effect a lifetime cap per subject: a user who retires as they go reaches it in
+  time, and only an admin raises it.
+- New error codes `policy_refused` (422, with `rule`, the gating rule's id from
+  `deploy/sbx/template-onboarding/governance/GATING-RULES.md`) and `template_exists` (409: ids are
+  unique per deployment, the first creator owns one). `quota_exceeded` on a create names the quota
+  (`quota`: `templates`, `buildsQueued` or `owned`). The `Error` schema adds `rule` and `quota`.
+- `TemplateBuild` adds `handle` (the create's handle; equal to `buildId` for an imported build) and
+  `reason` (why a build failed or was rejected), and GET /v1/templates/{id}/builds/{build} also
+  finds a build by its handle.
 - A refused create is recorded as a `check` provenance record only on an existing template's stream
-  the caller may write (its own, or an admin's adding a build); a refusal on another subject's id is
-  only answered, and one on an id no template holds writes one audit line instead
+  the caller may write; a refusal on an id no template holds writes one audit line instead
   (`template_create_refused`, with the subject, `templateId` and the failed `rules`).
-- A build made on a `selfAttest` profile with a gate record now stores `selfAttestProfile`, trusted
-  or not at create, and its `attestation` is `self` whenever its record is not trusted now: a trust
-  removal narrows such a build (its template private to its owner) whatever the order of events.
-- `X1.self.scope` counts only builds self-attested at create (the record untrusted then), keyed on
-  the template's owner; a claim is held unless its build failed, and two creates sending one
-  untrusted record at once are serialized, so never both claim it. The `gate` record's `scope` is
-  the template's owner (the submitter, except on an admin's build for another subject's template).
-- From a registry the policy lists repositories for (`allowedRepositories`), an image path outside
-  the entries' grammar (uppercase, or an empty, `.` or `..` segment) is refused (`registry.repository`,
-  saying the path is malformed) before it is matched, so the policy and the build host's puller read
-  one path the same way.
-- A template imported from `SH_SANDBOX_TEMPLATES` (its build `imported:<12 hex>`, which no host's
-  inventory can hold) is never gated by activation: a sandbox create on it serves whenever its
-  worker is attached, its readiness is its worker's presence alone, it is never placed, run or
-  stopped by the wanted state, and activate refuses it with `400 invalid_request` (the deployment
-  runs its worker; it takes no lease). Before, once a host was configured, such a template was
-  refused `template_not_active` for good.
-- Placement, the hosts block of `GET /v1/templates` and the default lease leave out any host
-  whose last inventory is older than 360 s (`HOST_STALE_S`, three build polls), until it reports
-  again: a host whose agent died or was removed takes no new placement and no slot. When every
-  host is silent, readiness is the workers' presence alone.
-- Placement counts the workers a host runs: each `holds` entry of an inventory may carry `running`
-  (its worker unit runs), kept current between inventories by the host's `attached`, `detached`
-  and `refused` reports. Placement is sticky (a wanted build already running on a holder stays
-  there), and a host's count starts with the workers that stay running on it: the wanted builds it
-  runs and the unleased ones still draining a live sandbox. `active.used` in the hosts block shows
-  that count. A leased build that runs on a host while placement keeps it on another is in that
-  host's `stop` (never under a live sandbox), so one worker id does not stay on two hosts. With
-  memory figures, a worker started since the inventory (an attached report) is counted as pending,
-  since the host's MemAvailable cannot show it yet.
-- `409 no_active_slot`'s `Retry-After` is the seconds until the soonest a build placed on one of
-  this build's holders loses its last live lease (when its slot frees), not the earliest end of any
-  lease in the catalog; 60 when no lease gives that time.
-- Activation on first use takes the lease only when the caller holds no live lease on the build: a
-  retry under its own lease is answered `409 template_not_active` with the readiness and
-  `Retry-After`, and writes nothing (no renewal, no new `activate` record per retry). Another
-  subject's first use still takes its own lease.
-- A host's `refused` worker report that repeats its last one for the build (the same reason) while
-  the build stays in the host's `run` is not recorded again (`recorded: null`): the agent retries
-  every 15 s, and the template's stream is append-only. A different reason, any other report for
-  the build, or the build leaving the host's `run` starts a new episode, recorded again.
-- A retire and an admin's reject run their in-use check, their records and their catalog write
-  under the activation lock and the template's use lock, on the template as read under those
-  locks; an activation re-reads its build's status under the activation lock (a build retired since
-  is `410 template_retired`, one rejected `409 template_unavailable`), and a sandbox create stores
-  its sandbox under the template's use lock after one last status read (`410 template_retired`, or
-  `400 unknown_template` for a build no longer registered). So no lease, sandbox or `activate`
-  record lands on a build that a racing retire or reject ends, and no build is retired or rejected
-  under a sandbox. Creates on different templates do not wait on each other.
-- `build_in_use` is judged by build: a live sandbox counts for the build it resolved to, so a
-  sandbox on one build does not block retiring another build that shares its worker (a record
-  without a build id still counts for every build on its worker). Each `retire` or `reject` record
-  is written inside the catalog update, so a record that cannot be written leaves the build as it
-  was; its `buildRecord` is the build's `build` record matched by handle, so a build built and then
-  rejected cites it too.
-- The wanted state never stops or removes a retired or admin-rejected build whose snapshot
-  (manifest hash) or worker a build whose use has not ended shares, in any template: that build's
-  own entries decide whether the worker runs, a host's `removed` report of it is refused
-  `409 build_in_use`, and `TemplateBuild` reports `shared: true` (`retire --wait` is then done at
-  once). One worker id is never in both `run` and `stop`. A retired or admin-rejected build's
-  worker still draining a live sandbox counts against its host's activeLimit. `heldBy` lists every
-  host as last reported, a silent one too. A `T.unique` rejection naming a retired build says how to
-  rebuild.
-- **A retired or admin-rejected build is listed in `stop` beside `remove` on every host:** before, only on a host with an idle grace, so on a host without one a worker running when its build was retired was never stopped (the agent skips the removal of a running worker), nor removed.
-- **Two quota writes made together keep both changes:** `PUT /v1/quota/{subject}`'s read, change and write of the policy are now one step of the policy store, so two admins' writes for two subjects never drop each other's change while both answer 200.
-- **A quota holds the three counters only:** `PUT /v1/quota/{subject}` refuses a quota with a key beyond `templates`, `buildsQueued` and `active` (400 `invalid_request`) and stores a new object of those three; `PUT /v1/policy` refuses an override with another key too. A stored policy whose override carries another key no longer reads as valid (the policy read fails closed): rewrite the override before upgrading.
-- **A quota write can be a compare-and-set:** `PUT /v1/quota/{subject}` takes an optional `?expect=` (JSON: the quota the client read, `null` for no override). When the target's quota is not that value now, nothing is written and the answer is the new code `409 quota_changed`. `mocactl sbx templates quota` sends the value it read and, on `quota_changed`, reads again and reports the value now (exit 1, nothing written), instead of finding the change only after its write had landed.
-- **A session's activation on first use is enrolled-only, and the create's last check:** on `combined` any login may create a session, but `POST /v1/sessions` took a first-use activation lease for any caller, getting round the enrolled-only activate route. Now only a subject enrolled for sandboxes takes one; another waits (409 `template_not_active`) on a build already starting and is refused (`403 not_enrolled`) on one nobody is starting. The activation runs after the `configRef`, credential and model checks, so a create refused for another reason holds no lease.
-- **The egress lookup and the egress destination check hold on `combined`:** `/v1/egress/credential` gated the sandbox owner with the login gate, open on `combined`, so the check did nothing there; it now uses the sandbox route gate. The `destination_conflict` check for `sandbox-egress` credentials ran only on `sandbox`; it now keys on the consumer on both profiles that serve sandboxes.
-- **A pinned session's turns keep its build's worker running:** each credential exchange of a session pinned to a host-managed build, when the session's subject is enrolled for sandboxes, keeps that build's worker for the hosts' idle limit from the turn, as a live sandbox does (`GET /v1/hosts/{host}/wanted` leaves it out of `stop`). Before, the worker was stopped once the first-use lease ran out and later turns found none. A hold starts no worker and takes no lease; a subject not enrolled extends nothing.
-- **An imported build's session records read as a sandbox's, best effort:** a session on a template imported from `SH_SANDBOX_TEMPLATES` now gets `templateManifestHash: null` (not its `imported:` build id) in its `created` record, and its `terminated` record at delete (the delete side wrote one only for a `sha256:` build). Both are written after the change they record, best effort: a failed append is logged and the create or delete stands, instead of a 500 for a session that exists (or is gone).
-- **Egress log budgets count bytes, kept as a running total:** a sandbox's egress log holds at most 10,000 events and 4 MiB of lines, and all logs together at most 64 MiB of lines (a line may be up to 8 KiB, its `host` and `path` from the guest); the rest count as dropped. The total is a running sum, and a post costs its own events plus the logs whose expiry has passed, not the number of logs retained.
-- **The egress log's summary comes with its first page only:** `GET /v1/sandboxes/{id}/egress` computed the summary over the whole log on every JSON page, so paging a full log through read it about a hundred times. The summary is now on the first page (no `after`) and null on the pages after it.
 
-### 1.13.0
+Upgrade note (the policy fails closed):
 
-The member, owner and quota routes take an OIDC subject as well as a GitHub one (#701's `oidc:<sub>`,
-adapted on our side before filing, joint list D2): `PUT`/`DELETE /v1/subjects/{subject}` and its role
-routes, `PUT /v1/templates/{id}/owner`'s `owner`, `PUT /v1/quota/{subject}` and the policy's
-`quotaBySubject` keys accept `github:<numeric id>` or `oidc:<provider sub>` (the same sub pattern login
-verifies). `test:<n>` is still refused there. The `Subject` schema's and the five path and body patterns
-widen to match; no field or route is added or removed, and a GitHub deployment sees no change.
+- X12 applies under every profile, `base` included: a `skip_git_identity_check: true` that no gate
+  record backs is refused (`422 policy_refused`, rule `X12`). A `base` client sends a gate record
+  showing commits refused (X5: `agent_can_commit: "no"`, `git_identity: "none"`), or drops the skip:
+  the build host's git identity check then needs git with an identity in the image, or no git at all
+  once the build-snapshot change in [#757](https://github.com/rossoctl/moca/pull/757) is in.
+- A stored policy (`<SH_PROVENANCE_DIR>/policy.json`) that names a rule id outside the ones the
+  check acts on (X1, X10, X11, X12, X14, X15), or an `envelope.exact` that is not two positive whole
+  numbers, is refused when it is read: every create and every read of the policy or the quota fails
+  until an admin PUTs a valid policy, instead of the policy silently enforcing nothing. So read
+  `GET /v1/policy` and fix it **before** upgrading: afterwards only `PUT /v1/policy` succeeds (the
+  file itself stays readable on the volume).
 
-### 1.12.0
+## 1.4.0
 
-Merged from upstream (rossoctl/moca), which released these as its own 1.3.0: this document's 1.3.0
-was already the template routes, so they arrive here as 1.12.0: a client sees `info.version` go
-from 1.11.0 to 1.12.0. Nothing else changes.
+The template store and its read API ([#736](https://github.com/rossoctl/moca/issues/736)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §3-§4.
+Every change is additive.
+
+- GET /v1/templates mounts on both route profiles (it was `sandbox` only), so a Moca Pi brain and a
+  stock agent read the same templates. Its first fields (`id`, `description`, `tools`) are unchanged;
+  each template adds `owner` (null for one the deployment declared), `visibility`, `onboarding`,
+  `readiness`, `tags` and `builds`, and the list adds a `hosts` block, empty until a later issue's
+  host agent reports.
+- New GET /v1/templates/{id}, GET /v1/templates/{id}/builds, GET /v1/templates/{id}/builds/{build}
+  (each build with its own `spec`, seed included) and GET /v1/templates/{id}/tags (each tag's build,
+  and when and by whom it was set), on both profiles.
+- New `Template` and `TemplateBuild` schemas. A build's `readiness` comes from the relay's presence
+  records: `active` with its `capacity`, `inactive`, or `unknown` when presence cannot be read.
+  An imported build's id is `imported:<12 hex>`; a built one's is `sha256:<manifest hash>`.
+- POST /v1/sandboxes takes `template` as `id`, `id:tag` or `id@<build id>`, resolved to one
+  registered build at creation and kept for the sandbox's life; an unknown one is still
+  `400 unknown_template`. The `Sandbox` schema adds `buildId` and `templateManifestHash` (null for an
+  imported build, which names no snapshot).
+- New error code `template_not_found` (404): an unknown template or build, or a `private` template
+  the caller does not own.
+- `SH_PROVENANCE_DIR` keeps the templates in a store on a persistent volume, with the provenance
+  records ([#730](https://github.com/rossoctl/moca/issues/730)): `SH_SANDBOX_TEMPLATES` is imported
+  into an empty store once and ignored after that. Unset, templates come from the env list at every
+  start, as before.
+
+## 1.3.0
 
 Async turns: the owner-scoped submission API
 ([#387](https://github.com/rossoctl/moca/issues/387)) and the dequeue-time credential exchange
@@ -169,7 +637,12 @@ Async turns: the owner-scoped submission API
   the turn id it read off the queue and gets back the credential resolved from the turn record. No
   credential and no bearer token ever travels in the work queue (MI1 §6.5). A pure read — it does not
   move the turn to `running`. The `turnId` must be the `t-<uuid>` shape the control plane mints;
-  anything else is 400 `invalid_request`, refused before Redis is read.
+  anything else is 400 `invalid_request`, refused before Redis is read. The response also carries
+  the `envelope` the worker runs, with the turn's `sessionId` attached, so a claim is one round trip.
+- New GET /metrics, admin-only: `counters.async_quota_refusals`, the count of submissions refused
+  with 429 `async_quota_exhausted`. The control plane reports it because it is the side that refuses
+  them — a worker never sees a submission that was never enqueued (§7). Process-local and reset by a
+  restart; with more than one replica each request reports one replica's share.
 - New error codes `turn_not_cancellable` (409, cancelling a turn that is not queued),
   `turn_not_claimable` (409, claiming a cancelled or terminal turn), `turn_not_found` (404),
   `async_quota_exhausted` (429, `MOCA_ASYNC_QUEUED_PER_OWNER` non-terminal turns already held),
@@ -180,214 +653,18 @@ Async turns: the owner-scoped submission API
 - `async: true` on the harness's own turn route stays removed and still answers 400 `async_removed`;
   these routes are its replacement.
 
+Upgrade note: `LEAF_RESULT_TTL_SECONDS` is now read by the harness tier through the control plane's
+own strict parse, because both write the same result keys and a drained turn's result must outlive
+nothing less than its record. A value that is not a positive integer refuses to BOOT there, where a
+lenient `parseInt` used to read it as `NaN` and fail every result write instead. Surrounding
+whitespace is trimmed, so an env file's trailing space or CRLF still boots; blank still means the
+default (86400).
+
 Interim, and named as such: /internal/turn-credentials returns a resolved credential rather than the
 MI1 S2 grants, there is no `turn_exp`, and `MOCA_TENANCY=multi` refuses async at both the submission
 and the claim. M2 mints grants for both audiences with a `turn_exp` and lifts that gate.
 
-### 1.11.0
-
-A create's spec that names an `id` or `image` other than the create's own is refused (gating rule M7,
-the follow-up to G46): `POST /v1/templates` (and a new build) answers `422 policy_refused` with `rule:
-M7.spec_id` or `M7.spec_image`, recorded as a `check` like any rule. The build job takes both from the
-create's own fields (G46's fix), so a different copy in the spec was silently ignored; now it is refused.
-A spec that carries the same values, such as a gate record's template block sent unchanged, passes as
-before. No field or route is added or removed.
-
-### 1.10.0
-
-The idle grace of template workers ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md)
-§4, register G43): on a KVM host with `SBX_IDLE_GRACE_S` set (default 0, off), a released build's
-worker is kept running for that long after its last lease ends, so a use soon after is warm. Off,
-nothing changes.
-
-- `POST /v1/hosts/{host}/inventory`'s `limits` take an optional `idleGraceSeconds` (0-86400). Absent
-  (an older agent), malformed or 0: no grace; an older control plane ignores it.
-- The grace runs from the build's last lease end (a release's time, or an expired lease's `until`),
-  for a worker the agent reports running (`runningWorkers`) with no live sandbox, while the host has
-  room under `activeLimit` and its memory headroom (a graced worker counts as running there). A
-  wanted build that needs the slot or the memory displaces the graced worker that ends soonest; the
-  stop is re-checked for a lease when the wanted answer is made.
-- `GET /v1/hosts/{host}/wanted` gains `graced: [buildId]` for a host with a grace: the graced builds,
-  kept in `run` after the wanted ones (the agent starts none of them). A retired or rejected build is
-  then also listed in `stop` beside `remove`, so its removal is not held for a grace.
-- `POST /v1/templates/{id}/deactivate` takes an optional `stopNow: true`: with no lease left, the
-  build skips the grace (stopped at the next poll); the `deactivate` record carries `stopNow: true`.
-- Builds gain `graced: true` and `gracedUntil` (epoch seconds) while in a grace. `GET /v1/templates`'
-  hosts gain `idleGraceSeconds` and `graced` (a count) for a host whose agent sets a grace.
-- `POST /v1/hosts/{host}/workers/report` takes `detached` for a retired or rejected build too.
-
-### 1.9.0
-
-Pacing template workers' cold starts ([cold-start pacing spec](../specs/2026-11-09-cold-start-pacing-design.md),
-register G43): a KVM host starts at most `SBX_START_CONCURRENCY` (default 4) workers at once, and an
-activation waiting for a start slot says so. The start limit is the host agent's, so it holds with an
-older control plane too. Nothing running is stopped.
-
-- `GET /v1/hosts/{host}/wanted` gains `starting: [buildId]`: the builds of `run` whose worker is not
-  attached to the relay (its presence, as readiness reads it), in `run`'s order. `run` is now in the
-  wanted order, first leased first. Without `starting` (an older control plane, or the presence
-  unreadable) the agent counts its own starts of the last `SBX_START_WINDOW_S` (default 300).
-- `POST /v1/hosts/{host}/inventory`'s `limits` take optional `startConcurrency` and `startSeconds`
-  (the mean of the agent's last cold starts, start to attach). Without them (an older agent) nothing
-  changes; an older control plane ignores them.
-- A build `activating` on such a host gains `queued` and `queuePosition` (1-based, among its host's
-  placed, wanted builds not attached yet, first leased first); `queued` is true beyond the host's
-  `startConcurrency`.
-- `409 template_not_active`'s Retry-After is `ceil(ceil(queuePosition / startConcurrency) ×
-startSeconds)` when the host reports both; else 30 s, as before. A queued activation stays
-  `activating` longer than before: a client polls with a timeout sized for the host's whole start line.
-- `GET /v1/templates`' hosts gain `start: {concurrency, seconds, starting, queued}`, only for a host
-  whose agent reports it.
-- Placement prefers a holder whose agent reports the build's worker running (`runningWorkers`),
-  whether or not it reports memory figures (in 1.8.0, only one that did).
-
-### 1.8.0
-
-Memory-aware placement of template workers ([memory-aware placement spec](../specs/2026-11-09-memory-aware-placement-design.md),
-register G39): a new worker starts on a host only if the host has the memory for it, whatever its
-`activeLimit` says. Nothing running is evicted.
-
-- `POST /v1/hosts/{host}/inventory` takes an optional `memory: {memTotalMib, memAvailableMib,
-memFloorMib, memPressureFull10, memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
-  Without it (an older agent) the host is placed by `activeLimit` alone, as before; an older control
-  plane ignores it.
-- A build costs its guest RAM (`spec.guest_mb`) plus 128 MiB, or 4096 + 128 with no recorded guest size.
-  A host's headroom is `min(total − floor − used, available − floor − pending starts)`, where `used`
-  counts its running workers, their VMs' committed memory and the builds placed there not started yet.
-  A host whose last inventory is older than 60 s, or whose PSI `full avg10` is above its limit, takes
-  no new start. A build in a host's `memfileMismatch` is never placed there.
-- `409 no_active_slot` gains `reason: memory` when a holder under its active limit lacks the memory
-  (Retry-After unchanged); at the active limit it answers as before, with no `reason`.
-  `409 template_unavailable` gains `reason: memfile_mismatch` when every holder reports the build's
-  memory file wrong. `409 template_not_active` with readiness `unavailable` carries the reason too.
-- Templates and builds gain `readinessReason` (`not_held | no_slot | memory | memfile_mismatch`),
-  present only with readiness `unavailable`.
-- `GET /v1/templates`' hosts gain `memory: {totalMib, availableMib, floorMib, usedMib, headroomMib,
-pressureFull10, pressureLimit, brake, runningWorkers, memfileMismatch, reportedAt}`, only for a
-  host whose agent reports it; `floorMib` is the effective floor.
-
-### 1.7.0
-
-Per-sandbox egress records (register G42): what a sandbox reached through the KVM host's egress
-proxy, readable through the API and named in the sandbox's provenance.
-
-- `GET /v1/sandboxes/{id}/egress?after=&limit=` (the owner or an admin, as `GET /v1/sandboxes/{id}`)
-  gives `{events, next, summary}`. The events are the proxy's audit events exactly as it wrote them
-  (`EgressEvent`), in arrival order. `summary` is `{byHost: {host: {count, decisions, bytesUp,
-bytesDown}}, total, dropped, droppedBy: {proxy, cap, budget, invalid}, complete, sealed, sha256}`.
-- `?format=ndjson` gives the whole log as `application/x-ndjson`: each event's canonical JSON, each
-  followed by `\n`. Its sha256 is `summary.sha256`.
-- `POST /v1/hosts/{host}/egress` (`hostToken`): the host agent's batches of up to 1000 events and its
-  journal cursor, idempotent by (host, cursor).
-- `GET /v1/hosts/{host}/wanted` gains `egressSids`, the workspace keys whose events the host ships (the
-  set the egress route accepts); the agent sends no other sandbox's or session's events.
-- The `sandbox` provenance record that ends a sandbox (`state: terminated`) gains
-  `egress: {events, sha256, dropped, droppedBy, complete}`. Events that arrive in the 600 s after the end are
-  still taken; if any did, one more `sandbox` record with `state: egress` names the final log. No
-  record kind is added.
-
-### 1.6.0
-
-A per-registry repository allowlist in the template policy, so a registry can be opened to named
-repositories only (the onboarding guide's general-user samples on Docker Hub).
-
-- The policy gains an optional `allowedRepositories: {registry: [repository, …]}`. Each entry is an exact
-  repository path or a `prefix/*`, matched on whole path segments. A registry with no entry allows every
-  repository, as before.
-- A create from a listed registry but an unlisted repository is refused `422 policy_refused`, rule
-  `registry.repository`.
-- `index.docker.io` reads as `docker.io`. A reference with no host stays `<default>`, the build host's
-  own registry, never Docker Hub.
-
-### 1.5.0
-
-Per-subject trust for gate records ([subject trust spec](../specs/2026-11-08-subject-trust-gate-records-design.md),
-register G41 (c)).
-
-- Policy profiles may carry `selfAttest` and `selfAttestEgress`. The default policy gains
-  `benchmark-self` (the benchmark rules, offline) and `general-self` (no X11; the KVM host's
-  allowlisted egress allowed).
-- On a `selfAttest` profile, a gate record the policy does not trust is accepted for the creating
-  subject's own template. New policy rules: `X1.self.scope` (another subject's record),
-  `X12.self` (commits always refused), `X1.self.egress` (egress where the profile forbids it).
-- `attestation` (`deployment | self`) on templates and builds, recomputed from the current policy.
-- `X1.offline`: on a profile that requires X1, a general-gate record (`image-factory/gate/1`) needs
-  `gate.floor_checked_offline: true` (fail closed); a curated family record predates the field and
-  passes. A profile with `requireOfflineGate: false` (`general-self`) accepts either. Builds show
-  `gateFloorCheckedOffline`, and `gateFloorMetOffline` for a gate from a `network_needed` contract.
-- New error code `self_attested` (409): deployment visibility for a template with a self-attested
-  build, at create or by PATCH.
-- PUT /v1/policy answers `narrowed`, the builds a trust removal makes private; the `policy` record
-  names them too. A template's `visibility` is the one in effect.
-- The `gate` provenance record's body: `source` `trusted | self | client`, `scope` for `self`, and
-  `policy` (the policy record at create).
-
-### 1.4.0
-
-Enrollment and roles through the API ([enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md),
-register G38). On both route profiles, when the deployment keeps a template store (`SH_PROVENANCE_DIR`). The list: any admin; every change: an admin named in `SH_ADMIN_SUBJECTS` (others `403 forbidden`).
-
-- New GET /v1/subjects: every enrolled subject with its roles, each with `source: env | api`, and
-  an admin grant's `until`.
-- New PUT and DELETE /v1/subjects/{subject} (enroll, unenroll), and PUT and DELETE
-  /v1/subjects/{subject}/roles/admin (grant, with an optional `until` in epoch seconds; revoke).
-- The settings stay the bootstrap: `SH_ALLOWED_SUBJECTS` and `SH_ADMIN_SUBJECTS` can't be changed
-  here (`409 bootstrap_subject`), and an admin can't revoke its own role (`409 self_revoke`).
-- **Behaviour change:** with a template store, roles and enrollment are evaluated per request. A
-  token's `roles` claim reports what held when it was minted; a grant, revoke or lapsed `until`
-  takes effect at the subject's next request.
-- New provenance stream `members`, with record kinds `member` and `role`. An older
-  `verify-provenance.py` refuses a store holding them.
-- New `Subject` schema; new error codes `bootstrap_subject` (409) and `self_revoke` (409).
-
-### 1.3.0
-
-Templates as a store with a lifecycle, self-serve and gated by policy, built and run by host agents,
-with provenance ([template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md);
-[combined control plane spec](../specs/2026-11-05-combined-control-plane-design.md)). Every route below
-is served on both route profiles, `sandbox` and `harness` (so also `combined`), and only when the
-deployment keeps a template store (`SH_PROVENANCE_DIR`).
-
-- **The catalog:** GET /v1/templates now lists the store's templates (owned, visible, or the
-  deployment's), with `readiness` per build (`inactive`, `activating`, `active`, `deactivating`,
-  `retired`). New GET /v1/templates/{id}, GET /v1/templates/{id}/builds, GET
-  /v1/templates/{id}/builds/{build} (`heldBy`: the hosts holding it; its spec, seed included) and
-  GET /v1/templates/{id}/tags. A template is referenced as `id`, `id:tag` or `id@sha256:…`.
-- **Self-serve creates:** new POST /v1/templates (create, from an image and a spec) and POST
-  /v1/templates/{id}/builds (a new build), each checked against the policy at create; POST
-  /v1/templates/{id}/builds/{build}/cancel.
-- **The policy and quotas:** new GET and PUT /v1/policy (admin): allowed registries, profiles,
-  trusted gate records, quotas. New GET /v1/quota (with `quotaSource`) and PUT
-  /v1/quota/{subject|default} (admin).
-- **Activation by lease:** new POST /v1/templates/{id}/activate and /deactivate. A sandbox or a
-  session on a template that is not active is refused `409 template_not_active` with Retry-After,
-  and its lease is taken (first use) unless `activate: false`.
-- **The lifecycle:**
-  - new POST /v1/templates/{id}/tags and DELETE /v1/templates/{id}/tags/{tag};
-  - PATCH /v1/templates/{id} (description, visibility);
-  - PUT /v1/templates/{id}/owner (admin; a template the deployment declares can be handed to a
-    subject);
-  - POST /v1/templates/{id}/builds/{build}/reject (admin);
-  - POST /v1/templates/{id}/retire and DELETE /v1/templates/{id}/builds/{build} (retire).
-- **The host agents:**
-  - new POST /v1/hosts/{host}/inventory, /builds/claim, /builds/{build}/log, /builds/{build}/report
-    and /workers/report;
-  - GET /v1/hosts/{host}/wanted (start, stop, remove) and /blobs/{digest};
-  - all behind the new `hostToken` scheme (`SH_TEMPLATE_HOSTS`).
-- **Sessions:** POST /v1/sessions takes `sandbox.template`, resolved like a sandbox's (`id`, `id:tag`,
-  `id@sha256:…`), and records `sandboxBuildId`. GET /v1/sessions/{id} shows `sandboxTemplate`,
-  `sandboxBuildId` and `templateManifestHash`.
-- **New error codes:**
-  - 404 `template_not_found`;
-  - 409 `template_exists`, `template_not_active`, `template_unavailable`, `no_active_slot` and
-    `build_in_use` (a retire under a live sandbox or an active pinned session);
-  - 410 `template_retired`;
-  - 422 `policy_refused` (the failing rule named).
-- **Provenance records** on each template's chain: `create`, `gate`, `build`, `check`, `policy`,
-  `activate`, `deactivate`, `retire`, `reject`, `owner`, `sandbox` and `session`, each cross-record
-  reference a record digest. An older `verify-provenance.py` refuses a store holding the newer kinds.
-
-### 1.2.0
+## 1.2.0
 
 The sandbox service's routes ([SBX0 spec](../specs/2026-10-15-sbx0-internal-sandbox-service-design.md) §5.1),
 served only by a control plane on the `sandbox` route profile (`SH_ROUTE_PROFILE=sandbox`); a moca
@@ -407,7 +684,7 @@ control plane answers 404 for all of them.
   profile (a subject not in, or since removed from, `SH_ALLOWED_SUBJECTS`); a refused refresh also
   revokes that login.
 
-### 1.1.0
+## 1.1.0
 
 Per-session model selection ([spec](../specs/2026-10-14-per-session-model-selection-design.md)).
 
@@ -415,22 +692,3 @@ Per-session model selection ([spec](../specs/2026-10-14-per-session-model-select
 - /internal/credentials returns the session's `model` when it names one.
 - POST /v1/sessions accepts `model`; the session view shows it; new PATCH /v1/sessions/{id} switches it.
 - New GET /v1/models and GET /v1/sessions/{id}/models.
-
-## Data plane (harness-openapi.yaml)
-
-### 1.1.0
-
-A session on a sandbox template ([session templates spec](../specs/2026-10-30-session-sandbox-templates-design.md) §5, §5.1).
-
-- `TurnResult.sandbox` gains `template` (the session's template) and `seed` (`{source: build |
-declared, buildId?}`: where the workspace's seed came from; `buildId` is the pinned build when the
-  source is `build`).
-- `TurnResult.workspace`, on a templated session's turn: the workspace's end state as a diff from
-  the seed's baseline commit (`baseline`, `patch` or `patchBase64`, `patchSha256`, `patchBytes`),
-  never truncated: over `SH_TURN_PATCH_MAX_BYTES` (default 4 MiB) the patch is left out and
-  `patchRefused: too_large` set; `error` alone when the capture failed (the turn still succeeds).
-- The terminal `done` and `error` frames carry `sandbox` and `workspace` too.
-
-### 1.0.0
-
-The first versioned data-plane document.

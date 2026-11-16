@@ -59,8 +59,9 @@ export const EGRESS_HANDLERS: Record<string, Handler> = {
       });
       throw new CpError('no_credential', 'no credential for this destination');
     };
-    const m = await membershipNow(deps, owner, deps.identity.rolesFor(owner));
     // The route gate, not the login gate: on `combined` login is open, the sandbox service is not.
+    // Roles and store enrollment now, as a request of the owner's would be.
+    const m = await membershipNow(deps, owner, deps.identity.rolesFor(owner));
     if (!isEnrolledForSandbox(owner, m.roles, deps.config, m.enrolled)) return none();
 
     // 3. Credentials: one element per (credential, matching destination entry).

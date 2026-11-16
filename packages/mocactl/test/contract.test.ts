@@ -92,13 +92,13 @@ const USED: Array<{ method: string; path: string; reads?: string[]; sends?: stri
 // The same for `mocactl sbx`'s SandboxApiClient (SBX0 §5.1), beyond the calls it inherits.
 const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: string[] }> = [
   { method: 'get', path: '/v1/discovery', reads: ['profile'] },
-  // `sbx hosts` reads the same list's `hosts` block (mocactl templates spec §3.1).
-  { method: 'get', path: '/v1/templates', reads: ['templates', 'hosts'] },
+  { method: 'get', path: '/v1/templates', reads: ['templates'] },
   {
     method: 'post',
     path: '/v1/sandboxes',
-    reads: ['id', 'template', 'expiresAt'],
-    sends: ['template', 'name', 'labels'],
+    // `create --seed` reads the build it was served (template lifecycle spec §9).
+    reads: ['id', 'template', 'expiresAt', 'buildId', 'mode', 'idleTimeoutS', 'modeEpoch'],
+    sends: ['template', 'name', 'labels', 'mode', 'idleTimeoutS'],
   },
   { method: 'get', path: '/v1/sandboxes', reads: ['sandboxes'] },
   { method: 'get', path: '/v1/sandboxes/{id}', reads: ['id', 'state', 'reason', 'expiresAt'] },
@@ -108,20 +108,51 @@ const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: 
     path: '/v1/sandboxes/{id}/token',
     reads: ['token', 'expiresAt', 'execEndpoint', 'wrk', 'wsk', 'execCa'],
   },
-  // `mocactl sbx egress` (register G42); its --ndjson reads the same route's NDJSON body.
+  // `mocactl sbx egress`; its --ndjson reads the same route's NDJSON body.
   { method: 'get', path: '/v1/sandboxes/{id}/egress', reads: ['events', 'next', 'summary'] },
-  // The template lifecycle routes `mocactl sbx templates` calls (lifecycle spec §5).
+  // Lease mode (lease-mode spec §8.1, §8.2): `create --mode`, and the set-mode token it sends.
+  {
+    method: 'put',
+    path: '/v1/sandboxes/{id}/mode',
+    reads: ['sandbox', 'setModeToken'],
+    sends: ['mode', 'idleTimeoutS'],
+  },
+  { method: 'post', path: '/v1/sandboxes/{id}/mode-token', reads: ['setModeToken'] },
+  // `sbx templates show` and `create --seed` (template lifecycle spec §4).
+  {
+    method: 'get',
+    path: '/v1/templates/{id}',
+    reads: ['id', 'owner', 'visibility', 'onboarding', 'readiness', 'tags', 'builds'],
+  },
+  {
+    method: 'get',
+    path: '/v1/templates/{id}/builds/{build}',
+    reads: [
+      'buildId',
+      'handle',
+      'status',
+      'readiness',
+      'capacity',
+      'heldBy',
+      'shared',
+      'reason',
+      'tags',
+      'spec',
+    ],
+  },
+  // `sbx templates retire` (template lifecycle spec §5.1).
   {
     method: 'post',
     path: '/v1/templates/{id}/retire',
-    reads: ['templateId', 'subject', 'builds', 'status'],
+    reads: ['templateId', 'subject', 'status', 'builds'],
     sends: ['reason'],
   },
   {
     method: 'delete',
     path: '/v1/templates/{id}/builds/{build}',
-    reads: ['templateId', 'subject', 'status'],
+    reads: ['templateId', 'build', 'buildId', 'record', 'status'],
   },
+  // `sbx templates tag`, `untag`, `edit` and `transfer` (template lifecycle spec §5.1-§5.2).
   {
     method: 'post',
     path: '/v1/templates/{id}/tags',
@@ -145,69 +176,7 @@ const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: 
     reads: ['templateId', 'owner', 'before', 'record'],
     sends: ['owner'],
   },
-  {
-    method: 'put',
-    path: '/v1/quota/{subject}',
-    reads: ['target', 'quota', 'before', 'policy', 'record'],
-  },
-  // Enrollment and roles (register G38): the change routes answer a Subject plus its record (allOf).
-  { method: 'get', path: '/v1/subjects', reads: ['subjects'] },
-  { method: 'put', path: '/v1/subjects/{subject}', sends: ['enrolled'] },
-  { method: 'delete', path: '/v1/subjects/{subject}' },
-  { method: 'put', path: '/v1/subjects/{subject}/roles/admin', sends: ['until'] },
-  { method: 'delete', path: '/v1/subjects/{subject}/roles/admin' },
-  // The whole client path (mocactl templates spec §3.1-§3.4).
-  {
-    method: 'post',
-    path: '/v1/templates',
-    reads: ['templateId', 'buildId', 'build', 'status', 'reused'],
-    sends: ['id', 'image', 'spec', 'profile', 'gateRecord', 'visibility'],
-  },
-  {
-    method: 'post',
-    path: '/v1/templates/{id}/builds',
-    reads: ['templateId', 'buildId', 'build', 'status'],
-    sends: ['image', 'spec', 'profile', 'gateRecord'],
-  },
-  {
-    method: 'get',
-    path: '/v1/templates/{id}',
-    reads: [
-      'id',
-      'owner',
-      'visibility',
-      'onboarding',
-      'readiness',
-      'readinessReason',
-      'tags',
-      'builds',
-    ],
-  },
-  {
-    method: 'get',
-    path: '/v1/templates/{id}/builds/{build}',
-    reads: [
-      'buildId',
-      'handle',
-      'status',
-      'readiness',
-      'readinessReason',
-      'queued',
-      'queuePosition',
-      'graced',
-      'gracedUntil',
-      'reason',
-      'attestation',
-      'heldBy',
-      'tags',
-      'spec',
-    ],
-  },
-  {
-    method: 'post',
-    path: '/v1/templates/{id}/builds/{build}/cancel',
-    reads: ['templateId', 'build', 'status'],
-  },
+  // `sbx templates activate` and `deactivate` (template lifecycle spec §6.3).
   {
     method: 'post',
     path: '/v1/templates/{id}/activate',
@@ -218,22 +187,53 @@ const SBX_USED: Array<{ method: string; path: string; reads?: string[]; sends?: 
     method: 'post',
     path: '/v1/templates/{id}/deactivate',
     reads: ['templateId', 'released'],
-    sends: ['stopNow'],
+  },
+  // The authoring commands: create, build, follow, cancel, quota, policy (template lifecycle spec §4, §8).
+  {
+    method: 'post',
+    path: '/v1/templates',
+    reads: ['templateId', 'buildId', 'build', 'status', 'reused'],
+    sends: ['id', 'image', 'spec', 'profile', 'gateRecord', 'visibility'],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/builds',
+    reads: ['templateId', 'buildId', 'build', 'status', 'reused'],
+    sends: ['image', 'spec', 'profile', 'gateRecord'],
+  },
+  {
+    method: 'post',
+    path: '/v1/templates/{id}/builds/{build}/cancel',
+    reads: ['templateId', 'build', 'status'],
   },
   {
     method: 'get',
     path: '/v1/quota',
-    reads: ['subject', 'templates', 'buildsQueued', 'active', 'sandboxes', 'quotaSource'],
+    reads: ['subject', 'templates', 'buildsQueued', 'active', 'sandboxes'],
   },
   { method: 'get', path: '/v1/policy', reads: ['policy', 'digest', 'record'] },
+  // `sbx templates quota` (template lifecycle spec §5.2): read the policy (above), then write it as
+  // a compare-and-set (`?expect=`), refused 409 quota_changed if it changed in between.
+  {
+    method: 'put',
+    path: '/v1/quota/{subject}',
+    reads: ['target', 'quota', 'before', 'policy', 'record'],
+  },
+  // `sbx admin subjects`: the change routes answer a Subject plus its record (allOf).
+  { method: 'get', path: '/v1/subjects', reads: ['subjects'] },
+  { method: 'put', path: '/v1/subjects/{subject}', sends: ['enrolled'] },
+  { method: 'delete', path: '/v1/subjects/{subject}' },
+  { method: 'put', path: '/v1/subjects/{subject}/roles/admin', sends: ['until'] },
+  { method: 'delete', path: '/v1/subjects/{subject}/roles/admin' },
 ];
 
 // The fields of each Sandbox and template `mocactl sbx ls` / `templates` print.
 const SBX_SANDBOX_READS = ['id', 'owner', 'name', 'template', 'state', 'reason', 'expiresAt'];
-const SBX_TEMPLATE_READS = ['id', 'description', 'tools'];
+const SBX_TEMPLATE_READS = ['id', 'description', 'tools', 'readiness', 'tags'];
 
 // Codes the client branches on (api/errors.ts, core/session-manager.ts, sbx/commands.ts).
 const CODES_USED = [
+  'template_retired',
   'token_required',
   'token_invalid',
   'token_expired',
@@ -254,14 +254,12 @@ const CODES_USED = [
   'model_catalog_unavailable',
   'not_enrolled',
   'sandbox_not_found',
-  // The template commands (sbx/templates.ts, mocactl templates spec §3.2-§3.7).
+  // `sbx templates show` reports it as itself (sbx/commands.ts OWN_404).
   'template_not_found',
+  // The authoring commands (sbx/templates.ts): an id another's, a refusal's rule, a full queue.
   'template_exists',
-  'template_not_active',
-  'no_active_slot',
-  'template_unavailable',
-  'quota_exceeded',
   'policy_refused',
+  'quota_exceeded',
   'async_quota_exhausted',
   'turn_not_cancellable',
   // `sbx templates quota`: the write's compare-and-set found the quota changed (sbx/commands.ts).
@@ -309,7 +307,7 @@ describe('control-plane contract (docs/api/openapi.yaml)', () => {
 
   it('covers every call the client makes', async () => {
     const reply = () => json({ credentials: [], sessions: [], nextCursor: null });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 43 }, () => reply));
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 33 }, () => reply));
     const c = new ControlPlaneClient('http://cp', () => 't', fetch);
     const invokedMethods = new Set<string>();
     const handler: ProxyHandler<ControlPlaneClient> = {
@@ -404,7 +402,7 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     },
   );
 
-  it('the egress summary holds the fields sbx egress prints (G42)', () => {
+  it('the egress summary holds the fields sbx egress prints', () => {
     const s = resolveSchema(openapi.components.schemas.EgressSummary);
     for (const f of ['byHost', 'total', 'dropped', 'complete', 'sha256'])
       expect(Object.keys(s.properties)).toContain(f);
@@ -428,12 +426,35 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     }
   });
 
+  it('the error body holds the fields a template refusal is read by', () => {
+    const e = resolveSchema(openapi.components.schemas.Error);
+    for (const f of ['rule', 'quota']) expect(Object.keys(e.properties)).toContain(f);
+  });
+
+  it('the policy holds the fields sbx policy prints and the dry run reads', () => {
+    const p = resolveSchema(openapi.components.schemas.Policy);
+    for (const f of [
+      'profiles',
+      'defaultProfile',
+      'allowedRegistries',
+      'trustedGateRecords',
+      'quota',
+    ])
+      expect(Object.keys(p.properties)).toContain(f);
+    const profile = p.properties.profiles.additionalProperties;
+    for (const f of ['requires', 'envelope']) expect(Object.keys(profile.properties)).toContain(f);
+    const env = profile.properties.envelope;
+    for (const f of ['maxGuestMb', 'maxVcpus', 'maxWorkspaceMb', 'exact'])
+      expect(Object.keys(env.properties)).toContain(f);
+  });
+
   it('covers every call SandboxApiClient adds', async () => {
-    const reply = () => json({ templates: [], sandboxes: [] });
-    const { fetch, calls } = scriptedFetch(...Array.from({ length: 40 }, () => reply));
+    const reply = () => json({ templates: [], sandboxes: [], sandbox: {} });
+    const { fetch, calls } = scriptedFetch(...Array.from({ length: 33 }, () => reply));
     const c = new SandboxApiClient('http://cp', () => 't', fetch);
     await c.sandboxDiscovery();
     await c.listTemplates();
+    await c.listHosts();
     await c.createSandbox({ template: 'node22' });
     await c.listSandboxes();
     await c.getSandbox('ID');
@@ -441,28 +462,29 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
     await c.mintSandboxToken('ID');
     await c.sandboxEgress('ID');
     await c.sandboxEgressNdjson('ID');
-    await c.retireTemplate('TID');
-    await c.retireTemplate('TID', { build: 'BID' });
+    await c.setSandboxMode('ID', { mode: 'lease' });
+    await c.mintSandboxModeToken('ID');
+    await c.getTemplate('TID');
+    await c.getTemplateBuild('TID', 'BID');
     await c.moveTemplateTags('TID', ['default'], 'BID');
     await c.removeTemplateTag('TID', 'TAG');
     await c.updateTemplate('TID', { visibility: 'private' });
     await c.transferTemplateOwner('TID', 'github:1');
+    await c.activateTemplate('TID', {});
+    await c.deactivateTemplate('TID');
+    await c.retireTemplate('TID');
+    await c.retireTemplate('TID', { build: 'BID' });
+    await c.createTemplate({ id: 'x', image: 'i', spec: {} });
+    await c.createTemplateBuild('TID', { image: 'i', spec: {} });
+    await c.cancelTemplateBuild('TID', 'BID');
+    await c.getQuota();
+    await c.getPolicy();
     await c.putQuota('SUBJ', null);
     await c.listSubjects();
     await c.enrollSubject('SUBJ');
     await c.unenrollSubject('SUBJ');
     await c.grantAdmin('SUBJ', 1);
     await c.revokeAdmin('SUBJ');
-    await c.listHosts();
-    await c.getTemplate('TID');
-    await c.getTemplateBuild('TID', 'BID');
-    await c.createTemplate({ id: 'x', image: 'i', spec: {} });
-    await c.createTemplateBuild('TID', { image: 'i', spec: {} });
-    await c.cancelTemplateBuild('TID', 'BID');
-    await c.activateTemplate('TID', {});
-    await c.deactivateTemplate('TID', {});
-    await c.getQuota();
-    await c.getPolicy();
     const seen = calls.map(
       (k) =>
         `${k.method.toLowerCase()} ${new URL(k.url).pathname
@@ -481,6 +503,7 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
       new Set([
         'sandboxDiscovery',
         'listTemplates',
+        'listHosts',
         'createSandbox',
         'listSandboxes',
         'getSandbox',
@@ -488,27 +511,28 @@ describe('sandbox-service contract (docs/api/openapi.yaml, SBX0 §5.1)', () => {
         'mintSandboxToken',
         'sandboxEgress',
         'sandboxEgressNdjson',
-        'retireTemplate',
+        'setSandboxMode',
+        'mintSandboxModeToken',
+        'getTemplate',
+        'getTemplateBuild',
         'moveTemplateTags',
         'removeTemplateTag',
         'updateTemplate',
         'transferTemplateOwner',
+        'activateTemplate',
+        'deactivateTemplate',
+        'retireTemplate',
+        'createTemplate',
+        'createTemplateBuild',
+        'cancelTemplateBuild',
+        'getQuota',
+        'getPolicy',
         'putQuota',
         'listSubjects',
         'enrollSubject',
         'unenrollSubject',
         'grantAdmin',
         'revokeAdmin',
-        'listHosts',
-        'getTemplate',
-        'getTemplateBuild',
-        'createTemplate',
-        'createTemplateBuild',
-        'cancelTemplateBuild',
-        'activateTemplate',
-        'deactivateTemplate',
-        'getQuota',
-        'getPolicy',
       ]),
     );
   });

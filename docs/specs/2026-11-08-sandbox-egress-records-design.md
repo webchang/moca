@@ -1,15 +1,12 @@
 # Per-sandbox egress records through the API
 
-- **Status:** design accepted (the user, 2026-11-08: the three proposals in §6); implemented (merged 6b4ce998);
-  the control plane **deployed** on both ykt3 namespaces 2026-11-09 (image 2810c77f); the host agent's
-  shipping installed since the guide window (2026-11-09) and **verified live** at the G49 window
-  (2026-11-11): with moca-egress started for one egress template, the host agent shipped each of two
-  sandboxes' events (an allowed host reached, another refused), the control plane served them, and each
-  log verified offline against its sandbox's end record (`verify-provenance.py --egress`; register
-  G42). §3-§5 describe the build.
+- **Status:** proposed with [#752](https://github.com/rossoctl/moca/issues/752); implemented (the
+  control plane, then the host agent, the verifier and `mocactl sbx egress`). Shipping events has
+  been exercised by tests, not yet live with events: on the deployments run so far `moca-egress` was
+  off, so the logs were empty and complete. §3-§5 describe the build.
 - **Date:** 2026-11-08
-- **Asked by:** the user, 2026-11-08: "per-sandbox egress records available through Moca API
-  operations … a key requirement for Moca". A benchmark grader voids a rep for a download its rules
+- **Asked for:** per-sandbox egress records available through Moca API operations, a key
+  requirement for benchmark use. A benchmark grader voids a rep for a download its rules
   forbid, so it must be able to see what a sandbox reached.
 - **Builds on:** [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md) (sandboxes, the janitor),
   [template lifecycle and provenance](2026-11-03-template-lifecycle-and-provenance-design.md) §7
@@ -45,7 +42,7 @@ provenance.
 - A sandbox's end record names a **digest of its egress log**, so the egress is part of what the
   provenance chain proves, and a copy can be checked offline.
 - No credential Moca injects is exposed: credentials are names only, and paths are logged without
-  query, fragment or userinfo. **The limit (the user, 2026-11-09, register G44):** a secret a guest
+  query, fragment or userinfo. **The limit:** a secret a guest
   puts in a URL path segment is logged as sent; the proxy is unchanged.
 - The proxy's hot path is untouched. Shipping is off the proxy, and losing events is counted, never
   silent.
@@ -61,12 +58,12 @@ provenance.
 - **Collection, on the host:** in its `--wanted-only` runs (the 15 s wanted-state timer), the host
   agent reads the proxy's journal (`journalctl -u moca-egress.service -o json`, after its cursor in
   `$SBX_SRV/egress.cursor`) and posts the events unchanged, in batches of up to 1000 and within a
-  time budget per run. It never acts on the proxy, and is off unless `moca-egress.service` is
-  enabled.
+  time budget per run (at most 10 batches, within 120 s). It never acts on the proxy, and is off unless `moca-egress.service` is
+  active.
   - **Only this host's sandboxes' events leave the host:** the wanted answer lists `egressSids`, the
     workspace keys of the sandboxes on its workers' builds, and the agent sends only those, plus the
     proxy's `audit_dropped` counts. One proxy may also serve other workloads' VMs (Moca's own P6
-    sessions), whose events stay on the host.
+    sessions), whose events stay on the host, counted only.
   - `POST /v1/hosts/{host}/egress` `{events, cursor, oversized?}`, behind the host token; idempotent
     by (host, cursor). An event over 8 KiB is not sent; only its `sid`, as `oversized`.
   - A failed post keeps the batch and the cursor for the next run. A batch refused as malformed
@@ -132,13 +129,15 @@ provenance.
 | `GET /v1/hosts/{host}/wanted`                 | a host agent, as itself (existing) | gains `egressSids`                                                  |
 
 Errors: 404 `sandbox_not_found` for an unknown sandbox or another subject's, as for the other sandbox
-routes. CLI: `mocactl sbx egress <sandbox> [--json | --ndjson]`.
+routes. CLI: `mocactl sbx egress [ID] [--json | --ndjson | --verify]`.
 
 ## 5. Effects on what exists
 
 - **The host agent:** the egress step in `--wanted-only` runs; no new unit, timer or setting. New
   0600 files under `$SBX_SRV` (cursor, mark, pending batch, `egress.rejected/`); `rm -rf /srv/sbx`
   removes them.
+- **After a control-plane rollout,** the sweep may seal older sandboxes' empty logs once
+  (append-only, 0 events); expected, no guard proposed.
 - **The janitor's sweep** also seals ended logs (above). A workspace's removal doesn't touch its
   egress log.
 - **Rollback:** deploy the control plane first. An older one answers 404 on the egress route, and the
@@ -147,7 +146,7 @@ routes. CLI: `mocactl sbx egress <sandbox> [--json | --ndjson]`.
 - **Graders:** read `…/egress` for each rep's sandbox, or check the exported log against the end
   record. A log marked incomplete is the grader's call (§6).
 
-## 6. Decisions (the user, 2026-11-08)
+## 6. Decisions
 
 1. **Who may read a sandbox's egress:** the sandbox's owner and admins, the same as the other
    sandbox routes. No separate grader role.

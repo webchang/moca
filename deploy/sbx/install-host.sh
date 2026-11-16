@@ -4,23 +4,22 @@
 #
 #   sudo deploy/sbx/install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress]
 #   sudo deploy/sbx/install-host.sh --uninstall WORKER_ID [--keep-shared]
-#   sudo deploy/sbx/install-host.sh --uninstall-shared
 #   sudo deploy/sbx/install-host.sh --janitor JANITOR_BUNDLE_DIR
 #   sudo deploy/sbx/install-host.sh --uninstall-janitor
 #   sudo deploy/sbx/install-host.sh --egress EGRESS_BUNDLE_DIR | --uninstall-egress | --egress-ca-out
 #
 # BUNDLE_DIR is deploy/sbx/.generated/workers/<id> from deploy/sbx/setup.sh. IMAGE names a golden
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
-# When template-build.sh's record for it exists ($SBX_SRV/templates/IMAGE.json), the worker env names
-# it (SH_TEMPLATE_RECORD) and the worker checks the record against its snapshot and its own id at
-# every start, refusing a mismatch (template lifecycle spec §8, PV4), and SANDBOX_TEMPLATE is the
-# record's id (the worker's moca.dev/template label, which Moca Pi sessions select by).
-# Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
-# moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
+# When deploy/sbx/template-onboarding/template-build.sh wrote a template record for IMAGE
+# ($SBX_SRV/templates/IMAGE.json), the worker env carries SH_TEMPLATE_RECORD and SANDBOX_TEMPLATE, so
+# the worker checks that record against its snapshot at start; a record for another worker is refused.
+# Needs firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md; moca-egress:
+# CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress), and microvm-worker.
 # SBX_WORKER_BIN (an absolute path; default /usr/local/libexec/sbx/microvm-worker, SBX0's own build)
 # is the microvm-worker SBX0's workers run, never deploy/microvm's /usr/local/bin one, so SBX0 beside
-# Moca's own P4 worker never runs or replaces the binary that one runs; a missing one is refused
-# before systemd (template-build.sh's verify-cache seed uses the same default, G50).
+# a P4 worker never runs or replaces the binary that one runs; a missing one is refused before systemd.
+# The worker's guest RAM (SH_GUEST_RAM_MB) is the snapshot's (guest_ram_mb in its manifest.json), and
+# --budget-mb must hold one session of it.
 #
 # Guest egress (#623, P4.1): a worker install also installs and starts moca-egress, the host's
 # allowlisted egress proxy, before the worker, and wires the worker to its control socket
@@ -33,25 +32,24 @@
 #   - The binary is the operator's, like microvm-worker: a missing /usr/local/bin/moca-egress is
 #     refused before anything is written or systemd is touched.
 #   - $SBX_ENV_DIR/moca-egress.env (the allowlist; no secret, 0644) is written ONLY when absent,
-#     seeded from MOCA_EGRESS_ALLOW in the environment or else the GitHub hosts, so an operator's
-#     edit survives a re-run. Restart moca-egress by hand after editing it or rebuilding the binary.
+#     seeded from MOCA_EGRESS_ALLOW in the environment or else deploy/sbx/egress-allow.env beside
+#     this script, so an operator's edit survives a re-run. Restart moca-egress by hand after
+#     editing it or rebuilding the binary.
 #   - The worker's Wants=/After=moca-egress.service is its own drop-in,
 #     sbx-worker@<id>.service.d/egress.conf, never the shared unit's.
 #   - --no-egress installs the worker without MOCA_EGRESS_CONTROL_SOCK, the drop-in or an egress unit,
 #     so it never starts any moca-egress.service the host has; --egress warns only about egress workers.
 #
-# Touches ONLY its own files: the template unit, sbx.slice, sbx-<id>.slice, $SBX_ENV_DIR, and the
+# Touches ONLY its own files: the template unit, its ExecStopPost= helper
+# $SBX_LIBEXEC_DIR/sbx-reap-vms.sh, sbx.slice, sbx-<id>.slice, $SBX_ENV_DIR, and the
 # worker's directories under $SBX_SRV. Never another install on the same host. Every file it writes
 # is listed in $SBX_ENV_DIR/manifest, and --uninstall is the undo (spec §8.2): it removes the
-# worker's files and, once no worker is left in the manifest, the shared template unit and
+# worker's files and, once no worker is left in the manifest, the shared template unit, its helper,
 # sbx.slice and the moca-egress unit it installed (and its env file, unless the operator edited it). It leaves workspace data in place (the janitor, or the operator, removes that).
 # --keep-shared removes only the worker's own files, even for the last worker: the shared units,
 # moca-egress and its credential injection stay for the next worker (the host agent's removal of a
 # retired build runs it so, so a client's retire never takes a host's egress setup). A plain
-# --uninstall of the same id afterwards removes them, once no worker is left; so does
-# --uninstall-shared, which takes no id: it removes what the manifest lists as shared (the template
-# unit, sbx.slice, the read-ahead with its recorded value written back, and moca-egress), and is
-# refused while the manifest still names a worker.
+# --uninstall of the same id afterwards removes them, once no worker is left.
 #
 # --egress takes deploy/sbx/.generated/egress (egress.env, egress.token [+ api-ca.crt]) and turns on
 # credential injection in the moca-egress this script installed (spec §6.2; refused beside a
@@ -64,6 +62,12 @@
 # the drop-in, token and api CA and KEEPS the CA (snapshots are built with it). Once the drop-in
 # exists, a worker install refuses a snapshot whose manifest.json egress_ca_sha256 is not the CA's.
 #
+# SBX_WORKER_AT_BOOT (0 or 1, default 1) says whether the worker's unit is enabled for boot. With 1 a
+# host boot starts every installed worker, as before. With 0 the unit is installed and started now but
+# disabled, so a boot starts none of them: set it under a host agent, which starts and stops workers
+# from the control plane's wanted state (#796). Every re-install applies the value it is given, so a
+# unit an earlier install enabled is disabled by a re-install with 0. An empty value is refused.
+#
 # --janitor takes deploy/sbx/.generated/janitor (janitor.env, janitor.token [+ api-ca.crt]) and
 # installs the host janitor (spec §8.3): $SBX_LIBEXEC_DIR/sbx-janitor.sh, $SBX_ENV_DIR/janitor.env
 # and janitor.token (0600), sbx-janitor.service and .timer (enabled). Its files are their own
@@ -74,12 +78,12 @@
 # $SBX_SRV to SBX_READ_AHEAD_KB (default 512; 0 leaves the device alone), so a cold start reads its
 # snapshot's memory file in larger requests. A sysfs write does not survive a reboot, so it installs
 # $SBX_LIBEXEC_DIR/sbx-read-ahead.sh (which finds the device by path at every run) and the oneshot
-# sbx-read-ahead.service (enabled; the workers are ordered after it), then runs the script once. The
-# device's value before the first install is kept in $SBX_ENV_DIR/read-ahead.orig; the last worker's
-# uninstall (or a re-run with SBX_READ_AHEAD_KB=0) writes it back and removes the three files, the
-# manifest kind `readahead <path>`. A $SBX_SRV on no block device (tmpfs, overlay), or a value the
-# device does not take, is a warning, never a failed install. The setting is device-wide: everything
-# else on that device reads ahead as much.
+# sbx-read-ahead.service (enabled, whatever SBX_WORKER_AT_BOOT says; the workers are ordered after
+# it), then runs the script once. The device's value before the first install is kept in
+# $SBX_ENV_DIR/read-ahead.orig; the last worker's uninstall (or a re-run with SBX_READ_AHEAD_KB=0)
+# writes it back and removes the three files, the manifest kind `readahead <path>`. A $SBX_SRV on no
+# block device (tmpfs, overlay), or a value the device does not take, is a warning, never a failed
+# install. The setting is device-wide: everything else on that device reads ahead as much.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,8 +93,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SBX_LIBEXEC_DIR:=/usr/local/libexec}"
 : "${SBX_ATTACH_TIMEOUT:=120}"
 : "${SBX_ATTACH_SETTLE:=5}"
-: "${SBX_MOUNTINFO:=/proc/self/mountinfo}" # the mount table remove_legacy_jail checks
 : "${SBX_BIN_DIR:=/usr/local/bin}"
+# Only an unset value defaults (no colon): an explicit empty one is refused in main, not read as 1.
+: "${SBX_WORKER_AT_BOOT=1}"
 # The worker binary the template unit runs: SBX0's own build, never deploy/microvm's /usr/local/bin
 # one (see the header).
 : "${SBX_WORKER_BIN:=/usr/local/libexec/sbx/microvm-worker}"
@@ -100,11 +105,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # override exists for tests only. The wait is as setup-microvm.sh's.
 : "${MOCA_EGRESS_SOCKET:=/run/moca-egress/control.sock}"
 : "${MOCA_EGRESS_READY_TIMEOUT:=30}"
-: "${DEFAULT_EGRESS_ALLOW:=api.github.com,github.com,codeload.github.com,objects.githubusercontent.com}"
+# LEGACY_EGRESS_ALLOW is the GitHub-only default from before egress-allow.env existed: the
+# fallback for a copy of this script without the file (default_egress_allow warns when it is
+# used), and, in remove_egress, a seed an older script wrote still counts as unedited.
+LEGACY_EGRESS_ALLOW='api.github.com,github.com,codeload.github.com,objects.githubusercontent.com'
+# The default guest-egress allowlist: the MOCA_EGRESS_ALLOW= line of egress-allow.env beside this
+# script (a systemd EnvironmentFile, so comments are allowed), resolved lazily from egress_seed.
+default_egress_allow() {
+  local v
+  v="$(sed -n 's/^MOCA_EGRESS_ALLOW=//p' "$SCRIPT_DIR/egress-allow.env" 2>/dev/null | tail -1)" || v=''
+  if [[ -n "$v" ]]; then
+    printf '%s\n' "$v"
+  else
+    printf 'deploy/sbx/install-host.sh: no MOCA_EGRESS_ALLOW line in %s; falling back to the GitHub hosts\n' \
+      "$SCRIPT_DIR/egress-allow.env" >&2
+    printf '%s\n' "$LEGACY_EGRESS_ALLOW"
+  fi
+}
 # A bundle from deploy/sbx/setup.sh carries SH_WORKSPACE_IDLE (the sandbox lifetime plus two days,
-# spec §5.4) and SH_WORKSPACE_IMAGE_MB. A bundle without the idle predates that rule and is refused;
-# the image size defaults to microvm-worker's own.
+# spec §5.4), SH_WORKSPACE_IMAGE_MB and SH_LEASE_IDLE_CEILING_S (the control plane's
+# SH_SANDBOX_IDLE_CEILING_S, lease-mode spec §8.1). A bundle without the idle predates that rule and
+# is refused; the image size and the idle ceiling default to microvm-worker's own, which are also
+# setup.sh's (a bundle from before the lease policy came from a control plane on the same 1800 s).
 DEFAULT_IMAGE_MB=2048
+DEFAULT_IDLE_CEILING_S=1800
 DEFAULT_BUDGET_MB=8192
 # The unit's own values (sbx-worker@.service: SH_STANDBY_DEPTH, SH_MEMORY_RESERVE_MB) and the VMM's
 # fixed per-VM cost outside guest RAM (vmpool.DefaultVMOverheadBytes), for check_snapshot_ram.
@@ -115,7 +139,7 @@ die() { echo "deploy/sbx/install-host.sh: $*" >&2; exit 1; }
 
 env_value() { (grep -E "^$1=" "$2" 2>/dev/null || true) | tail -1 | cut -d= -f2-; }
 
-BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' KEEP_SHARED='' UNINSTALL_SHARED='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS='' EGRESS_BUNDLE='' UNINSTALL_EGRESS='' EGRESS_CA_OUT=''
+BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' KEEP_SHARED='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS='' EGRESS_BUNDLE='' UNINSTALL_EGRESS='' EGRESS_CA_OUT=''
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -123,7 +147,6 @@ parse_args() {
     --budget-mb) [[ $# -ge 2 ]] || die '--budget-mb needs a value'; BUDGET_MB="$2"; shift 2 ;;
     --uninstall) [[ $# -ge 2 ]] || die '--uninstall needs a worker id'; UNINSTALL="$2"; shift 2 ;;
     --keep-shared) KEEP_SHARED=1; shift ;;
-    --uninstall-shared) UNINSTALL_SHARED=1; shift ;;
     --janitor) [[ $# -ge 2 ]] || die '--janitor needs the janitor bundle directory'; JANITOR="$2"; shift 2 ;;
     --uninstall-janitor) UNINSTALL_JANITOR=1; shift ;;
     --no-egress) NO_EGRESS=1; shift ;;
@@ -142,9 +165,9 @@ record() { mkdir -p "$SBX_ENV_DIR"; touch "$SBX_ENV_DIR/manifest"; grep -qxF "$1
 
 # jail_dir ID -> the worker's jailer --chroot-base-dir. Keyed by a 12-hex digest of the id, not
 # the id: a Unix socket path holds at most 107 bytes, the VM's API socket is
-# <base>/firecracker/vm-<up to 20 digits>/root/run/firecracker.socket (61 bytes after the base), and a
+# <base>/firecracker/vm-<up to 20 digits>/root/run/firecracker.socket (64 bytes after the base), and a
 # worker id can be 52 (sbx_ + a 31-character template + _ + 12 hex). With the id, a long template's
-# worker failed every restore from vm-10 on (2026-10-31). The digest keeps two workers apart.
+# worker failed every restore from vm-10 on. The digest keeps two workers apart.
 jail_dir() {
   local h
   h="$(printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
@@ -163,15 +186,7 @@ remove_legacy_jail() {
     log "left in place: $old (named like a current jail; remove it by hand if it is $1's old one)"
     return 0
   fi
-  # A mount under it (a VM's chroot left mounted) is never recursed into: the jail is left, and GNU
-  # rm also stays on its file system.
-  if [[ -r "$SBX_MOUNTINFO" ]] && awk -v p="$old/" 'index($5 "/", p) == 1 { f = 1 } END { exit !f }' "$SBX_MOUNTINFO"; then
-    log "left in place: $old (a file system is mounted under it; unmount it, then remove it by hand)"
-    return 0
-  fi
-  local one=()
-  ! rm --one-file-system -f -- "$old/.sbx-rm-probe" 2>/dev/null || one=(--one-file-system)
-  rm -rf ${one[@]+"${one[@]}"} -- "$old"
+  rm -rf -- "$old"
   log "removed $old (this worker's jail from before the jail path was keyed by a digest of the id)"
 }
 
@@ -220,7 +235,12 @@ egress_forget() {
   mv "$SBX_ENV_DIR/manifest.new" "$SBX_ENV_DIR/manifest"
 }
 
-egress_seed() { printf 'MOCA_EGRESS_ALLOW=%s\n' "${MOCA_EGRESS_ALLOW:-$DEFAULT_EGRESS_ALLOW}"; }
+# egress_seed: what a fresh moca-egress.env is seeded with. MOCA_EGRESS_ALLOW from the
+# environment wins, then DEFAULT_EGRESS_ALLOW, then default_egress_allow (the file, or the
+# legacy GitHub hosts with a warning). Resolved here, lazily, so that warning prints only
+# when the default is actually consumed: a --no-egress run, or one with MOCA_EGRESS_ALLOW
+# exported, never seeds and so never warns.
+egress_seed() { printf 'MOCA_EGRESS_ALLOW=%s\n' "${MOCA_EGRESS_ALLOW:-${DEFAULT_EGRESS_ALLOW:-$(default_egress_allow)}}"; }
 
 # wait_egress_ready: the worker's startup probe Registers over moca-egress's control socket, so a
 # moca-egress that exits at boot (a bad moca-egress.env) would otherwise surface much later, as the
@@ -341,15 +361,7 @@ snapshot_ca_fingerprint() {
   sed -n 's/.*"egress_ca_sha256"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$m" | head -1
 }
 
-# check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
 # snapshot_guest_ram_mb IMAGE -> the guest_ram_mb recorded in the snapshot's manifest.json, or nothing.
-# record_template_id IMAGE -> the id in template-build.sh's record for IMAGE, or nothing.
-record_template_id() {
-  local r="$SBX_SRV/templates/$1.json"
-  [[ -f "$r" ]] || return 0
-  sed -n 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"\([a-z0-9][a-z0-9-]*\)".*/\1/p' "$r" | head -1
-}
-
 snapshot_guest_ram_mb() {
   local m="$SBX_SRV/snapshots/$1/manifest.json"
   [[ -f "$m" ]] || return 0
@@ -371,6 +383,7 @@ check_snapshot_ram() {
     die "--budget-mb $BUDGET_MB cannot hold one session of snapshot $SNAPSHOT (guest $W_GUEST_MB MiB): it needs at least $need MiB ((guest + $VM_OVERHEAD_MB) x (1 + $STANDBY_DEPTH standbys) + the $MEMORY_RESERVE_MB reserve)"
 }
 
+# check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
 check_snapshot_ca() {
   [[ -f "$(egress_dropin)" ]] || return 0
   local crt m want got
@@ -445,8 +458,7 @@ warn_untrusting_workers() {
     id="$(basename "$f" .env)"
     img="$(env_value SH_SNAPSHOT_IMAGE "$f")"
     [[ -n "$img" ]] || continue
-    # A --no-egress worker's guest has no network, so it never meets the CA: no warning for it
-    # (bm1, 2026-10-31: eight offline SWE-bench workers each got one).
+    # A --no-egress worker's guest has no network, so it never meets the CA: no warning for it.
     [[ -n "$(env_value MOCA_EGRESS_CONTROL_SOCK "$f")" ]] || continue
     got="$(snapshot_ca_fingerprint "$img")"
     [[ -n "$got" && "$got" == "$want" ]] ||
@@ -480,15 +492,21 @@ uninstall_egress_credentials() {
   fi
 }
 
+# The template unit, sbx.slice and the unit's ExecStopPost= helper ($SBX_LIBEXEC_DIR/sbx-reap-vms.sh,
+# #795: it ends the VMs a stopped worker left in its slice). All three are shared by every worker, so
+# all three are `unit` lines: remove_shared_units removes them with the last worker.
 install_units() {
-  install -d -m 0755 "$SBX_UNIT_DIR"
+  install -d -m 0755 "$SBX_UNIT_DIR" "$SBX_LIBEXEC_DIR"
   install -m 0644 "$SCRIPT_DIR/sbx.slice" "$SBX_UNIT_DIR/sbx.slice"
+  install -m 0755 "$SCRIPT_DIR/reap-vms.sh" "$SBX_LIBEXEC_DIR/sbx-reap-vms.sh"
   sed -e "s#^EnvironmentFile=/etc/sbx/#EnvironmentFile=$SBX_ENV_DIR/#" \
+    -e "s#^ExecStopPost=-/usr/local/libexec/#ExecStopPost=-$SBX_LIBEXEC_DIR/#" \
     -e "s#^ExecStart=/usr/local/bin/microvm-worker\$#ExecStart=$SBX_WORKER_BIN#" "$SCRIPT_DIR/sbx-worker@.service" \
     >"$SBX_UNIT_DIR/sbx-worker@.service"
   chmod 0644 "$SBX_UNIT_DIR/sbx-worker@.service"
   record "unit $SBX_UNIT_DIR/sbx.slice"
   record "unit $SBX_UNIT_DIR/sbx-worker@.service"
+  record "unit $SBX_LIBEXEC_DIR/sbx-reap-vms.sh"
 }
 
 # ---- snapshot read-ahead (see the header) ----
@@ -563,28 +581,11 @@ remove_read_ahead() {
   systemctl daemon-reload || true
 }
 
-# check_template_record WORKER_ID: when template-build.sh wrote a record for the snapshot
-# ($SBX_SRV/templates/<snapshot>.json), the worker is wired to it (SH_TEMPLATE_RECORD and
-# SANDBOX_TEMPLATE, below), so it checks the record against its snapshot at every start. The record
-# must be a template record and name this worker: a bundle of another worker is refused here, before
-# anything is written or systemd is touched, rather than left to crash-loop. No record (a snapshot
-# built without template-build.sh): no check, as before.
-check_template_record() {
-  local rec="$SBX_SRV/templates/$SNAPSHOT.json" tid worker
-  [[ -e "$rec" ]] || return 0
-  command -v jq >/dev/null || die "needs jq on PATH to read the template record $rec"
-  [[ "$(jq -r '.schema // empty' "$rec" 2>/dev/null)" == moca-sbx-template/1 ]] ||
-    die "$rec is not a template record (schema moca-sbx-template/1, from template-build.sh)"
-  tid="$(jq -r '.id // empty' "$rec")" worker="$(jq -r '.worker // empty' "$rec")"
-  [[ "$tid" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "$rec has no valid template id"
-  [[ "$worker" == "$1" ]] ||
-    die "the template record $rec is for worker ${worker:-<none>}, not this bundle's $1: pass the bundle of $worker, or the snapshot of $1"
-}
-
 # validate_worker reads and checks the bundle and the flags, setting W_ID, W_ADDR, W_TOK, W_IDLE,
-# W_IMAGE_MB and (check_snapshot_ram) W_GUEST_MB. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
+# W_IMAGE_MB, W_IDLE_CEILING and (check_snapshot_ram) W_GUEST_MB, and (check_template_record) W_RECORD and
+# W_TEMPLATE. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
 validate_worker() {
-  local env="$BUNDLE/worker.env" id addr tok idle image_mb
+  local env="$BUNDLE/worker.env" id addr tok idle image_mb ceiling
   [[ -f "$env" ]] || die "no $env: pass the bundle directory deploy/sbx/setup.sh wrote (workers/<id>)"
   id="$(env_value SANDBOX_ID "$env")"
   valid_id "$id" || die "SANDBOX_ID in $env is not a valid worker id"
@@ -600,21 +601,75 @@ validate_worker() {
   image_mb="$(env_value SH_WORKSPACE_IMAGE_MB "$env")"
   image_mb="${image_mb:-$DEFAULT_IMAGE_MB}"
   [[ "$image_mb" =~ ^[1-9][0-9]*$ ]] || die "SH_WORKSPACE_IMAGE_MB in $env must be a whole number of MiB"
-  [[ "$SBX_WORKER_BIN" == /* && -x "$SBX_WORKER_BIN" ]] ||
-    die "no worker binary $SBX_WORKER_BIN: build it with CGO_ENABLED=0 go build -o $SBX_WORKER_BIN ./remote-worker/cmd/microvm-worker (SBX_WORKER_BIN must be an absolute path)"
+  # Plain path characters only: it is written into ExecStart with sed, where # or & would break it.
+  [[ "$SBX_WORKER_BIN" =~ ^/[A-Za-z0-9._/-]+$ && -x "$SBX_WORKER_BIN" ]] ||
+    die "no worker binary $SBX_WORKER_BIN: build it with CGO_ENABLED=0 go build -o $SBX_WORKER_BIN ./remote-worker/cmd/microvm-worker (SBX_WORKER_BIN must be an absolute path of plain characters: letters, digits, . _ - /)"
+  ceiling="$(env_value SH_LEASE_IDLE_CEILING_S "$env")"
+  ceiling="${ceiling:-$DEFAULT_IDLE_CEILING_S}"
+  # At least 300 s: microvm-worker refuses to start with a ceiling below its default idle timeout.
+  # At most 86400 s, setup.sh's cap: the janitor's wait must outlast it when a lease mode is allowed.
+  [[ "$ceiling" =~ ^[1-9][0-9]{0,5}$ ]] && ((ceiling >= 300 && ceiling <= 86400)) ||
+    die "SH_LEASE_IDLE_CEILING_S in $env must be a whole number of seconds, 300-86400"
   [[ -n "$SNAPSHOT" ]] || die '--snapshot IMAGE is required'
   [[ "$SNAPSHOT" =~ ^[A-Za-z0-9._-]+$ ]] || die '--snapshot must be a directory name'
   [[ -d "$SBX_SRV/snapshots/$SNAPSHOT" ]] || die "no snapshot $SBX_SRV/snapshots/$SNAPSHOT (build it with deploy/microvm/build-snapshot.sh)"
   [[ "$BUDGET_MB" =~ ^[1-9][0-9]*$ ]] && ((BUDGET_MB > 1024)) || die '--budget-mb must be a whole number of MiB above 1024 (the unit reserve)'
+  # It goes into a sed replacement and the unit's ExecStopPost= line (install_units).
+  [[ "$SBX_LIBEXEC_DIR" =~ $PLAIN_PATH_RE ]] || die "SBX_LIBEXEC_DIR='$SBX_LIBEXEC_DIR' must be a plain absolute path"
+  [[ -f "$SCRIPT_DIR/reap-vms.sh" ]] || die "no $SCRIPT_DIR/reap-vms.sh beside this script (the unit's ExecStopPost= helper): copy deploy/sbx whole"
   check_snapshot_ca
   check_snapshot_ram
   check_jail_path "$id"
+  check_lease_state "$id"
   check_template_record "$id"
-  W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb"
+  W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb" W_IDLE_CEILING="$ceiling"
+}
+
+# check_lease_state WORKER_ID: the worker's .lease-state, if there is one, is a real directory (as the
+# janitor requires before it removes a state file there), so clear_boot_marker never reaches through a
+# symlink. A refusal comes before anything is written.
+check_lease_state() {
+  local dir="$SBX_SRV/workspaces/$1/.lease-state"
+  [[ -e "$dir" || -L "$dir" ]] || return 0
+  [[ -d "$dir" && ! -L "$dir" ]] ||
+    die "$dir is a symlink or not a directory: move it aside (the worker keeps its lease state files there), then re-run"
+  [[ ! -d "$dir/.boot" || -L "$dir/.boot" ]] || die "$dir/.boot is a directory: remove it, then re-run"
+}
+
+# clear_boot_marker WORKER_ID: deletes the worker's lease boot marker, .lease-state/.boot, before the
+# worker (re)starts. A worker built before the marker never writes lease=off, so after a rollback past
+# it a marker could still say lease=on, and the next lease-on boot would trust root_wrote = false on
+# states a lease-off boot made untrue (ruling R7). With no marker, that boot marks root_wrote on every
+# known state, conservatively. A symlinked marker goes as the link (rm never follows it); the
+# directory itself was checked by check_lease_state.
+clear_boot_marker() {
+  local f="$SBX_SRV/workspaces/$1/.lease-state/.boot"
+  [[ -e "$f" || -L "$f" ]] || return 0
+  rm -f -- "$f"
+}
+
+# check_template_record WORKER_ID: when template-build.sh wrote a record for the snapshot
+# ($SBX_SRV/templates/<snapshot>.json), the worker is wired to it (SH_TEMPLATE_RECORD and
+# SANDBOX_TEMPLATE, its template id), so it checks the record against its snapshot at every start.
+# The record must name this worker: a bundle of another worker is refused here, before anything is
+# written, rather than left to crash-loop. No record (a snapshot built without template-build.sh):
+# no check, as before. Sets W_RECORD and W_TEMPLATE (empty without a record).
+check_template_record() {
+  local rec="$SBX_SRV/templates/$SNAPSHOT.json" tid worker
+  W_RECORD='' W_TEMPLATE=''
+  [[ -e "$rec" ]] || return 0
+  command -v jq >/dev/null || die "needs jq on PATH to read the template record $rec"
+  [[ "$(jq -r '.schema // empty' "$rec" 2>/dev/null)" == moca-sbx-template/1 ]] ||
+    die "$rec is not a template record (schema moca-sbx-template/1, from template-build.sh)"
+  tid="$(jq -r '.id // empty' "$rec")" worker="$(jq -r '.worker // empty' "$rec")"
+  [[ "$tid" =~ ^[A-Za-z0-9._-]+$ ]] || die "$rec has no valid template id"
+  [[ "$worker" == "$1" ]] ||
+    die "the template record $rec is for worker ${worker:-<none>}, not this bundle's $1: pass the bundle of $worker, or the snapshot of $1"
+  W_RECORD="$rec" W_TEMPLATE="$tid"
 }
 
 install_worker() {
-  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" guest_mb="$W_GUEST_MB" ca='' tpl=''
+  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" guest_mb="$W_GUEST_MB" ceiling="$W_IDLE_CEILING" ca=''
   install -d -m 0700 "$SBX_ENV_DIR" "$SBX_ENV_DIR/workers"
   if [[ -f "$BUNDLE/relay-ca.crt" ]]; then
     grep -q -- '-----BEGIN CERTIFICATE-----' "$BUNDLE/relay-ca.crt" || die "$BUNDLE/relay-ca.crt holds no PEM certificate"
@@ -623,23 +678,20 @@ install_worker() {
     record "file $ca"
   fi
   install -d -m 0700 "$SBX_SRV/workspaces/$id" "$(jail_dir "$id")"
+  clear_boot_marker "$id"
   (
     umask 077
     {
       printf 'RELAY_ADDR=%s\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\n' "$addr" "$id" "$tok"
       [[ -z "$ca" ]] || printf 'RELAY_CA_FILE=%s\n' "$ca"
       printf 'SH_SNAPSHOT_DIR=%s\nSH_SNAPSHOT_IMAGE=%s\nSH_GUEST_RAM_MB=%s\n' "$SBX_SRV/snapshots" "$SNAPSHOT" "$guest_mb"
-      [[ ! -f "$SBX_SRV/templates/$SNAPSHOT.json" ]] || printf 'SH_TEMPLATE_RECORD=%s\n' "$SBX_SRV/templates/$SNAPSHOT.json"
-      # The record's template id as the worker's moca.dev/template label, so Moca Pi sessions naming
-      # the template find it (session-templates spec §3.1; combined control plane spec §3.4).
-      # Sandboxes route by worker id and ignore it.
-      tpl="$(record_template_id "$SNAPSHOT")"
-      [[ -z "$tpl" ]] || printf 'SANDBOX_TEMPLATE=%s\n' "$tpl"
+      [[ -z "$W_RECORD" ]] || printf 'SH_TEMPLATE_RECORD=%s\nSANDBOX_TEMPLATE=%s\n' "$W_RECORD" "$W_TEMPLATE"
       printf 'SH_WORKSPACE_ROOT=%s\nSH_CHROOT_BASE=%s\n' "$SBX_SRV/workspaces/$id" "$(jail_dir "$id")"
       printf 'SH_PARENT_CGROUP=sbx.slice/sbx-%s.slice\n' "$id"
-      # G50's verify cache under SBX0's own tree, where template-build.sh's seed writes it.
+      # The verify cache under SBX0's own tree, where template-build.sh's seed writes it.
       printf 'SH_VERIFY_CACHE_DIR=%s\n' "$SBX_SRV/verify-cache"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_WORKSPACE_IDLE=%s\nSH_WORKSPACE_IMAGE_MB=%s\n' "$BUDGET_MB" "$idle" "$image_mb"
+      printf 'SH_LEASE_IDLE_CEILING_S=%s\n' "$ceiling"
       [[ -n "$NO_EGRESS" ]] || printf 'MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock\n'
     } >"$SBX_ENV_DIR/workers/$id.env"
   )
@@ -660,9 +712,14 @@ install_worker() {
   fi
   record "worker sbx-worker@$id $SBX_ENV_DIR/workers/$id.env $SBX_UNIT_DIR/sbx-$id.slice"
   systemctl daemon-reload
-  # enable, then exactly one restart: a first install starts the unit, a re-install picks up the new
-  # env file once (enable --now followed by restart would start a fresh unit twice).
-  systemctl enable "sbx-worker@$id.service"
+  # enable (or disable, with SBX_WORKER_AT_BOOT=0), then exactly one restart: a first install starts
+  # the unit, a re-install picks up the new env file once (enable --now followed by restart would start
+  # a fresh unit twice). disable is what makes a re-install with 0 undo an earlier install's enable.
+  if [[ "$SBX_WORKER_AT_BOOT" == 1 ]]; then
+    systemctl enable "sbx-worker@$id.service"
+  else
+    systemctl disable "sbx-worker@$id.service"
+  fi
   # A worker that crash-looped into `failed` (StartLimitBurst, e.g. a missing snapshot) refuses a
   # restart with "start request repeated too quickly" until reset; a re-run after the fix is how an
   # operator brings it back (as deploy/microvm/setup-microvm.sh does).
@@ -751,8 +808,10 @@ remove_shared_units() {
 # only while the unit still has the content this script wrote (another install, such as the P6
 # setup-microvm.sh, may have replaced it and its worker depends on it). The env file is the operator's
 # allowlist: it goes only if it still hashes to what was seeded (a manifest without a digest falls back
-# to comparing with the seed). A moca-egress.service the manifest does not list was never ours.
-# An `egress <kind>` this script does not know (a later version's) is left alone, line and file.
+# to comparing with the seed -- or with the legacy GitHub-only seed, which an older script's fresh
+# install wrote and which is not an operator's edit). A moca-egress.service the manifest does not list
+# was never ours. An `egress <kind>` this script does not know (a later version's) is left alone, line
+# and file.
 remove_egress() {
   local kind path sha
   [[ -f "$SBX_ENV_DIR/manifest" ]] || return 0
@@ -772,7 +831,8 @@ remove_egress() {
       if [[ ! -f "$path" ]]; then
         :
       elif [[ -n "$sha" && "$(sha256_of "$path")" != "$sha" ]] ||
-        [[ -z "$sha" && "$(cat "$path")" != "$(egress_seed)" ]]; then
+        [[ -z "$sha" && "$(cat "$path")" != "$(egress_seed)" &&
+          "$(cat "$path")" != "MOCA_EGRESS_ALLOW=$LEGACY_EGRESS_ALLOW" ]]; then
         log "kept $path (edited)"
       else
         rm -f "$path"
@@ -899,27 +959,14 @@ uninstall_worker() {
   log "left in place: $SBX_SRV/workspaces/$id and $(jail_dir "$id") (workspace data; remove by hand when no sandbox needs it)"
 }
 
-# uninstall_shared: what --keep-shared left once the last worker went (the host agent's removals
-# leave it so). Refused while the manifest names a worker, so it never takes units a worker runs on.
-uninstall_shared() {
-  local left
-  [[ -f "$SBX_ENV_DIR/manifest" ]] || { log "no manifest in $SBX_ENV_DIR: nothing installed here to remove"; return 0; }
-  left="$(sed -n 's/^worker sbx-worker@\([^ ]*\) .*/\1/p' "$SBX_ENV_DIR/manifest" | tr '\n' ' ')"
-  [[ -z "$left" ]] || die "workers are still installed (${left% }): --uninstall each, then --uninstall-shared"
-  remove_shared_units
-  systemctl daemon-reload
-  log "removed the shared units, read-ahead and moca-egress this script installed (no SBX0 worker left on this host)"
-}
-
 main() {
   parse_args "$@"
   [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root'
   local modes=0 m
-  for m in "$BUNDLE" "$UNINSTALL" "$UNINSTALL_SHARED" "$JANITOR" "$UNINSTALL_JANITOR" "$EGRESS_BUNDLE" "$UNINSTALL_EGRESS" "$EGRESS_CA_OUT"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
-  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --uninstall-shared, --janitor, --uninstall-janitor, --egress, --uninstall-egress or --egress-ca-out at a time'
+  for m in "$BUNDLE" "$UNINSTALL" "$JANITOR" "$UNINSTALL_JANITOR" "$EGRESS_BUNDLE" "$UNINSTALL_EGRESS" "$EGRESS_CA_OUT"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
+  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --janitor, --uninstall-janitor, --egress, --uninstall-egress or --egress-ca-out at a time'
   [[ -z "$KEEP_SHARED" || -n "$UNINSTALL" ]] || die '--keep-shared goes with --uninstall'
   if [[ -n "$UNINSTALL" ]]; then uninstall_worker "$UNINSTALL"; return; fi
-  if [[ -n "$UNINSTALL_SHARED" ]]; then uninstall_shared; return; fi
   if [[ -n "$UNINSTALL_JANITOR" ]]; then uninstall_janitor; return; fi
   if [[ -n "$JANITOR" ]]; then install_janitor; return; fi
   if [[ -n "$EGRESS_CA_OUT" ]]; then
@@ -940,7 +987,9 @@ main() {
   if [[ -n "$EGRESS_BUNDLE" ]]; then install_egress_credentials; return; fi
   valid_read_ahead "$SBX_READ_AHEAD_KB" ||
     die "SBX_READ_AHEAD_KB='$SBX_READ_AHEAD_KB' must be a whole number of KiB from 0 (leave the device alone) to 16384"
-  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID [--keep-shared] | --uninstall-shared | --janitor DIR | --uninstall-janitor | --egress DIR | --uninstall-egress | --egress-ca-out'
+  [[ "$SBX_WORKER_AT_BOOT" =~ ^[01]$ ]] ||
+    die "SBX_WORKER_AT_BOOT='$SBX_WORKER_AT_BOOT' must be 1 (start the worker at boot, the default) or 0 (do not; under a host agent)"
+  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID [--keep-shared] | --janitor DIR | --uninstall-janitor | --egress DIR | --uninstall-egress | --egress-ca-out'
   validate_worker
   [[ -n "$NO_EGRESS" ]] || install_egress
   install_units

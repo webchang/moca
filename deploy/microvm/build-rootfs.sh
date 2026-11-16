@@ -14,12 +14,12 @@
 # --source-name is the reference /etc/moca-rootfs-source records as `image=` (default: --image). A
 # guest's agent can read that file, so a caller pulling from a private registry (template-build.sh
 # with --registry) passes the spec's own host-free reference, never the pull reference: the
-# registry host never reaches the guest (register G49). The `digest=` line is the pulled image's.
+# registry host never reaches the guest. The `digest=` line is the pulled image's.
 #
-# --require replaces REQUIRED_TOOLS below with the caller's list, for an image that is not MOCA's
-# own sandbox image: a template's image needs the tools its spec lists plus the guest agent's
-# minimum (template-build.sh passes them; GATING-RULES.md M3), not MOCA's whole toolchain. Without
-# it, every image must carry MOCA's list, as before: `gh` there made every benchmark image fail.
+# --require replaces REQUIRED_TOOLS below with the caller's list, for an image that is not Moca's
+# own sandbox image: a sandbox template's image needs the tools its template lists plus the guest
+# agent's minimum, not Moca's whole toolchain. Without it, every image must carry Moca's list, as
+# before (`gh` there refuses every benchmark image, none of which ships it).
 #
 # Env:
 #   SH_SKIP_PULL  Non-empty: export the copy of IMAGE this host already has instead of pulling it

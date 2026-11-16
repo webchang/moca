@@ -43,7 +43,7 @@ func TemplateLabels(lookup func(string) (string, bool)) map[string]string {
 // Labels is a worker's whole Hello label set: its tier (TierLabels, with def) and its template
 // (TemplateLabels). Nil when it has neither.
 // BuildLabelKey is the presence label naming the build this worker serves: its snapshot's manifest
-// hash, `sha256:<hex>` (combined control plane spec §3.4, register G19). A session pinned to a build
+// hash, `sha256:<hex>` (combined control plane spec §3.4). A session pinned to a build
 // runs only on workers labelled with it. Only microvm-worker sets it, from the manifest it verified.
 const BuildLabelKey = "moca.dev/build"
 

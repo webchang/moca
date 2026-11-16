@@ -2,12 +2,14 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { HANDLERS } from '../src/handlers.js';
+import { HANDLERS, type CpConfig } from '../src/handlers.js';
+import { templateCatalogFromEnv } from '../src/main.js';
 import { ProvenanceStore, verifyExport } from '../src/provenance.js';
 import type { SandboxTemplate } from '../src/sandbox-config.js';
 import {
   FileTemplateCatalog,
   MemoryTemplateCatalog,
+  docFromDeclared,
   PRESENCE_KEY,
   importedBuildId,
   redisPresenceReader,
@@ -29,9 +31,20 @@ const DECLARED: SandboxTemplate[] = [
     worker: 'sbx_django_django_11133_3d3e705ff379',
     description: 'SWE-bench django__django-11133',
     tools: ['bash', 'git', 'python3', 'rg'],
-    seed: 'cp -a /opt/testbed-src/. /workspace/',
   },
 ];
+const SEED = 'cp -a /opt/testbed-src/. /workspace/';
+/** A catalog over fixed documents (the store's read side; tests build the documents). */
+const fixed = (docs: TemplateDoc[]) => ({
+  list: async () => docs,
+  get: async (id: string) => docs.find((x) => x.id === id) ?? null,
+});
+/** The env list's two templates, the second's build carrying a seed in its spec. */
+const seeded = (): TemplateDoc[] => {
+  const docs = DECLARED.map((t) => docFromDeclared(t, 0));
+  docs[1]!.builds[0]!.spec.seed = SEED;
+  return docs;
+};
 const freshDir = (): string => mkdtempSync(join(tmpdir(), 'cp-catalog-'));
 const presence = (recs: PresenceRecord[]) => ({ list: async () => recs });
 let seq = 0;
@@ -61,7 +74,7 @@ describe('the catalog', () => {
       profile: 'imported',
       createdAt: 100,
     });
-    expect(d.builds[0].spec.seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    expect(d.builds[0].spec).toEqual({ tools: ['bash', 'git', 'python3', 'rg'] });
     expect(d.tags.default).toBe(d.builds[0].buildId);
     expect(d.builds[0].buildId).toMatch(/^imported:[0-9a-f]{12}$/);
     expect(d.builds[0].buildId).not.toContain('sbx_');
@@ -183,6 +196,25 @@ describe('FileTemplateCatalog: the env list imported once (§3.1)', () => {
   });
 });
 
+describe('SH_PROVENANCE_DIR (templateCatalogFromEnv)', () => {
+  const config = { sandbox: { templates: DECLARED } } as unknown as CpConfig;
+
+  it('opens nothing unset, and refuses a relative path', () => {
+    expect(templateCatalogFromEnv({}, config)).toEqual({});
+    expect(() => templateCatalogFromEnv({ SH_PROVENANCE_DIR: 'rel/dir' }, config)).toThrow(
+      /absolute path/,
+    );
+  });
+
+  it('opens the provenance store and the catalog on one directory, the env list imported', async () => {
+    const dir = freshDir();
+    const { templates, provenance } = templateCatalogFromEnv({ SH_PROVENANCE_DIR: dir }, config);
+    expect((await templates!.list()).map((d) => d.id)).toEqual(['default', 'django-django-11133']);
+    expect((await provenance!.chain('template/default')).map((r) => r.kind)).toEqual(['create']);
+    expect(readdirSync(dir).sort()).toEqual(['blobs', 'catalog', 'heads', 'records']);
+  });
+});
+
 describe('the read API (§4)', () => {
   const attached = (worker: string, cap = 3): PresenceRecord => ({
     sandboxId: worker,
@@ -213,11 +245,11 @@ describe('the read API (§4)', () => {
   });
 
   it('omits specs from the list and includes them, seed and all, on one template and its builds', async () => {
-    const d = sbxDeps({ templates: new MemoryTemplateCatalog(DECLARED) });
+    const d = sbxDeps({ templates: fixed(seeded()) });
     const listed = (await call('listTemplates', d)).templates as Body[];
     expect(listed[1].builds[0].spec).toBeUndefined();
     const one = await call('getTemplate', d, { id: 'django-django-11133' });
-    expect(one.builds[0].spec.seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    expect(one.builds[0].spec.seed).toBe(SEED);
     const builds = (await call('listTemplateBuilds', d, { id: 'django-django-11133' }))
       .builds as Body[];
     const b = await call('getTemplateBuild', d, {
@@ -259,9 +291,7 @@ describe('the read API (§4)', () => {
       owner: alice.sub,
       visibility: 'private',
     };
-    const d = sbxDeps({
-      templates: { list: async () => [priv], get: async (id) => (id === 'mine' ? priv : null) },
-    });
+    const d = sbxDeps({ templates: fixed([priv]) });
     expect(
       ((await call('listTemplates', d, {}, alice)).templates as Body[]).map((t) => t.id),
     ).toEqual(['mine']);
@@ -312,16 +342,16 @@ describe('presence', () => {
   });
 });
 
-describe('increment 2: both profiles, lastUsedAt, tags', () => {
+describe('both profiles, lastUsedAt, tags (§4.1)', () => {
   const harnessDeps = (over: Parameters<typeof makeDeps>[0] = {}): TestDeps =>
     makeDeps({
       ...over,
       config: { routeProfile: 'harness', sandbox: undefined, ...(over.config ?? {}) },
     });
 
-  it('serves the harness profile its session templates, with no sandbox counts (null, not 0)', async () => {
+  it("serves the harness profile the store's templates, with no sandbox counts (null, not 0)", async () => {
     const d = harnessDeps({
-      config: { sessionTemplates: DECLARED },
+      templates: fixed(seeded()),
       presence: { list: async () => [{ sandboxId: 'sbx_default', labels: {}, capacityMax: 2 }] },
     });
     const ts = (
@@ -333,7 +363,7 @@ describe('increment 2: both profiles, lastUsedAt, tags', () => {
     expect(ts[0].builds[0].lastUsedAt).toBeNull();
     expect(ts[1].readiness).toBe('inactive');
     const one = await call('getTemplate', d, { id: 'django-django-11133' });
-    expect(one.builds[0].spec.seed).toBe('cp -a /opt/testbed-src/. /workspace/');
+    expect(one.builds[0].spec.seed).toBe(SEED);
   });
 
   it('lists nothing on a harness control plane that declares no templates', async () => {
@@ -370,4 +400,88 @@ describe('increment 2: both profiles, lastUsedAt, tags', () => {
 
 it('lists an empty hosts block until a host agent reports (§6.2)', async () => {
   expect((await call('listTemplates', sbxDeps())).hosts).toEqual([]);
+});
+
+describe('a sandbox names id, id:tag or id@build, resolved once at create (§3.2, §9)', () => {
+  const HASH = `sha256:${'a'.repeat(64)}`;
+  const OLD = 'imported:000000000000';
+  const tr = (over: Partial<TemplateDoc> = {}): TemplateDoc => ({
+    schema: 'moca-template/1',
+    id: 'tr',
+    owner: alice.sub,
+    visibility: 'deployment',
+    description: 't',
+    tags: { default: HASH, old: OLD },
+    builds: [
+      {
+        buildId: HASH,
+        status: 'registered',
+        profile: 'base',
+        worker: 'sbx_tr_new',
+        spec: { tools: [] },
+        createdAt: 0,
+      },
+      {
+        buildId: OLD,
+        status: 'registered',
+        profile: 'imported',
+        worker: 'sbx_tr_old',
+        spec: { tools: [] },
+        createdAt: 0,
+      },
+    ],
+    createdAt: 0,
+    ...over,
+  });
+  const mk = async (d: TestDeps, template: string, principal = bob) =>
+    (await HANDLERS.createSandbox!(ctx({ principal, body: { template } }), d)).body as Body;
+
+  it('records the build each reference resolves to, and the worker it routes to', async () => {
+    const d = sbxDeps({ templates: fixed([tr()]) });
+    expect(await mk(d, 'tr')).toMatchObject({
+      template: 'tr',
+      buildId: HASH,
+      templateManifestHash: HASH,
+    });
+    const old = await mk(d, 'tr:old');
+    expect(old).toMatchObject({ template: 'tr', buildId: OLD, templateManifestHash: null });
+    expect(await mk(d, `tr@${HASH}`)).toMatchObject({ buildId: HASH });
+    const rec = await d.sandboxes!.get(old.id as string, Math.floor(NOW_MS / 1000));
+    expect(rec).toMatchObject({ worker: 'sbx_tr_old', buildId: OLD });
+    const tok = (
+      await HANDLERS.mintSandboxToken!(ctx({ principal: bob, params: { id: old.id as string } }), d)
+    ).body as Body;
+    expect(tok.wrk).toBe('sbx_tr_old');
+  });
+
+  it('refuses an unknown tag or build, one not registered, or a private template as unknown_template', async () => {
+    const pending = tr();
+    pending.builds[1]!.status = 'built';
+    const d = sbxDeps({
+      templates: fixed([pending, { ...tr(), id: 'mine', visibility: 'private' }]),
+    });
+    for (const ref of ['tr:nope', `tr@sha256:${'0'.repeat(64)}`, 'tr:old', 'nope', 'nope:x'])
+      expect(await codeOf(() => mk(d, ref)), ref).toBe('unknown_template');
+    // Private: its owner and admins may use it; anyone else reads it as unknown.
+    expect(await codeOf(() => mk(d, 'mine', bob))).toBe('unknown_template');
+    expect(await mk(d, 'mine', alice)).toMatchObject({ template: 'mine', buildId: HASH });
+  });
+});
+
+describe('the build on the provenance chain (§7.1)', () => {
+  it("names the sandbox's build in its created and terminated records", async () => {
+    const dir = freshDir();
+    const provenance = new ProvenanceStore({ dir, now: () => NOW_MS });
+    const d = sbxDeps({ provenance });
+    const sb = (
+      await HANDLERS.createSandbox!(ctx({ principal: alice, body: { template: 'node22' } }), d)
+    ).body as Body;
+    await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id as string } }), d);
+    const chain = await provenance.chain('template/node22');
+    expect(chain.map((r) => (r.body as Body).buildId)).toEqual([
+      importedBuildId('sbx_node22'),
+      importedBuildId('sbx_node22'),
+    ]);
+    expect((chain[0]!.body as Body).templateManifestHash).toBeNull();
+  });
 });

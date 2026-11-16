@@ -237,8 +237,6 @@ describe('acquireTurnSandbox seeds a templated session (session-templates spec �
     const r = await acquire({ id: 'py312', seed: 'echo hi' });
     const got = await r.got;
     expect(got.placement?.sandboxId).toBe('py-1');
-    // The result's placement names the template (session-templates spec §6).
-    expect(got.placement?.template).toBe('py312');
     expect(r.commands).toHaveLength(1);
     expect(r.commands[0]).toContain('.moca-seeded');
     expect(r.commands[0]).toContain('echo hi');
@@ -320,7 +318,7 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
       stdio: 'pipe',
     });
 
-  /** A scratch repository at one commit, as image-factory's /opt/testbed-src is. */
+  /** A scratch repository at one commit, as an image builder's source checkout is. */
   function repo() {
     const src = scratch();
     git(src, 'init', '-q');
@@ -346,9 +344,15 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
   it('the seed records the baseline commit beside the marker', async () => {
     const src = repo();
     const ws = scratch();
-    await seedWorkspace(realBash, 'django', `cp -a ${src}/. .`, ws);
+    await seedWorkspace(realBash, 'example-repo', `cp -a ${src}/. .`, ws);
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ws }).toString().trim();
     expect(readFileSync(join(ws, SEED_BASELINE), 'utf8').trim()).toBe(head);
+    // The baseline is one of the seed's own files: a stock `git status` does not show it.
+    const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: ws,
+      encoding: 'utf8',
+    });
+    expect(status).toBe('');
   });
 
   it('a seed that leaves no repository still seeds, with no baseline', async () => {
@@ -358,10 +362,10 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
     expect(existsSync(join(ws, SEED_BASELINE))).toBe(false);
   });
 
-  it("captures the end state against the baseline: edits, new files, deletions; MOCA's files left out", async () => {
+  it("captures the end state against the baseline: edits, new files, deletions; Moca's files left out", async () => {
     const src = repo();
     const ws = scratch();
-    await seedWorkspace(realBash, 'django', `cp -a ${src}/. .`, ws);
+    await seedWorkspace(realBash, 'example-repo', `cp -a ${src}/. .`, ws);
     execFileSync('bash', ['-c', 'printf "a\\nB\\n" > f.txt; rm keep.txt; echo new > n.txt'], {
       cwd: ws,
     });
@@ -392,7 +396,7 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
   it('an unchanged workspace is an empty patch, not an error', async () => {
     const src = repo();
     const ws = scratch();
-    await seedWorkspace(realBash, 'django', `cp -a ${src}/. .`, ws);
+    await seedWorkspace(realBash, 'example-repo', `cp -a ${src}/. .`, ws);
     const w = await captureTurnPatch(bashOut, ws, 1 << 20);
     expect(w).toMatchObject({ patch: '', patchBytes: 0 });
   });
@@ -400,7 +404,7 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
   it('over the cap the patch is refused whole, never truncated', async () => {
     const src = repo();
     const ws = scratch();
-    await seedWorkspace(realBash, 'django', `cp -a ${src}/. .`, ws);
+    await seedWorkspace(realBash, 'example-repo', `cp -a ${src}/. .`, ws);
     execFileSync('bash', ['-c', 'head -c 4000 /dev/zero | tr "\\0" a > big.txt'], { cwd: ws });
     const w = await captureTurnPatch(bashOut, ws, 1000);
     expect(w.patchRefused).toBe('too_large');
@@ -412,7 +416,7 @@ describe('the seed baseline and the patch capture (session-templates spec §5.1)
   it('a binary change is carried whole, as base64 when it is not UTF-8', async () => {
     const src = repo();
     const ws = scratch();
-    await seedWorkspace(realBash, 'django', `cp -a ${src}/. .`, ws);
+    await seedWorkspace(realBash, 'example-repo', `cp -a ${src}/. .`, ws);
     execFileSync('bash', ['-c', "printf '\\377\\376\\000' > bin.dat"], { cwd: ws });
     const w = await captureTurnPatch(bashOut, ws, 1 << 20);
     expect(w.patch ?? Buffer.from(w.patchBase64!, 'base64').toString('latin1')).toContain(
@@ -539,7 +543,7 @@ describe('the seed origin on the placement', () => {
     const { acquireTurnSandbox } = await import('../src/run-turn.js');
     const rec = {
       sandboxId: 'py-1',
-      labels: { 'moca.dev/template': 'django', 'moca.dev/build': 'sha256:' + 'b'.repeat(64) },
+      labels: { 'moca.dev/template': 'example-repo', 'moca.dev/build': 'sha256:' + 'b'.repeat(64) },
       capabilities: [],
       capacityMax: 4,
       transport: 'grpc' as const,
@@ -573,20 +577,20 @@ describe('the seed origin on the placement', () => {
     } as NodeJS.ProcessEnv;
     const build = 'sha256:' + 'b'.repeat(64);
     const got = await acquireTurnSandbox(undefined, env, '/h', 's-1', deps, undefined, {
-      id: 'django',
+      id: 'example-repo',
       seed: 'true',
       seedSource: 'build',
       build,
     });
     expect(got.placement?.seed).toEqual({ source: 'build', buildId: build });
     const old = await acquireTurnSandbox(undefined, env, '/h', 's-2', deps, undefined, {
-      id: 'django',
+      id: 'example-repo',
       seed: 'true',
       build,
     });
     expect(old.placement?.seed).toEqual({ source: 'declared' });
     const none = await acquireTurnSandbox(undefined, env, '/h', 's-3', deps, undefined, {
-      id: 'django',
+      id: 'example-repo',
       build,
     });
     expect(none.placement?.seed).toBeUndefined();
@@ -607,7 +611,7 @@ describe('withWorkspacePatch: which turns carry a patch', () => {
   it('a leased turn on a templated session: captured in its workspace', async () => {
     commands.length = 0;
     const { withWorkspacePatch } = await import('../src/run-turn.js');
-    const r = await withWorkspacePatch(result, { leased: true, sandbox }, 'django', {});
+    const r = await withWorkspacePatch(result, { leased: true, sandbox }, 'example-repo', {});
     expect(r.workspace).toMatchObject({ baseline: 'abc', patch: 'diff\n', patchBytes: 5 });
     expect(commands[0].startsWith("cd '/workspace/s-1' ")).toBe(true);
   });
@@ -616,10 +620,12 @@ describe('withWorkspacePatch: which turns carry a patch', () => {
     commands.length = 0;
     const { withWorkspacePatch } = await import('../src/run-turn.js');
     expect(await withWorkspacePatch(result, { leased: true, sandbox }, undefined, {})).toBe(result);
-    expect(await withWorkspacePatch(result, { leased: false, sandbox }, 'django', {})).toBe(result);
-    expect(await withWorkspacePatch(result, { leased: true, sandbox: null }, 'django', {})).toBe(
+    expect(await withWorkspacePatch(result, { leased: false, sandbox }, 'example-repo', {})).toBe(
       result,
     );
+    expect(
+      await withWorkspacePatch(result, { leased: true, sandbox: null }, 'example-repo', {}),
+    ).toBe(result);
     expect(commands).toEqual([]);
   });
 });

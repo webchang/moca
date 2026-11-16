@@ -76,21 +76,23 @@ saturated the turn gets 503 `sandbox_unavailable` with `Retry-After`.
   (`SANDBOX_TEMPLATE` in its environment). The control plane declares the templates in
   `SH_SANDBOX_TEMPLATES`, a JSON list of `{id, worker, description, tools, seed?}`.
 - A user picks a template once, at session creation (`mocactl run --option sandboxTemplate=ID`), beside the
-  tier. With a template store, `ID` may also pin a build (`ID@sha256:…`) or a tag (`ID:TAG`); mocactl
-  passes such a value through and the control plane resolves it. Every turn then runs on a worker of that template. A session that names none runs only on workers
-  with no template, so it never gets a benchmark image by accident.
+  tier. A value that is not among the declared templates is passed through for the control plane to
+  judge. Every turn then runs on a worker of that template. A session that names none runs only on
+  workers with no template, so it never gets a benchmark image by accident.
 - Leaves (`/runs`) and unauthenticated turns name no template either: keep at least one untemplated
   worker for them. If every worker is templated they fail with `sandbox_unavailable`.
 - A session's template is fixed. If the operator drops it from `SH_SANDBOX_TEMPLATES`, its turns fail
   (no worker of it) rather than move to an untemplated worker on an empty workspace.
-- If the template has a `seed` (for SWE-bench, `cp -a /opt/testbed-src/. /workspace/`), the harness runs
-  it once, on the session's first turn, before the agent's first tool call. A marker in the workspace
+- If the template has a `seed` (say, `cp -a /opt/repo/. /workspace/` for an image that carries its
+  repository there), the harness runs it once, on the session's first turn, before the agent's first
+  tool call. A marker in the workspace
   (`.moca-seeded`) keeps it from running again; after a workspace reset it runs again. Its output is in
   the workspace's `.moca-seed.log`. A seed must be safe to re-run: a failed one leaves no marker.
 - An affine sandbox that now serves another template (or none) moves the session at once, with reason
   `retiered`. The design is
   [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../specs/2026-10-30-session-sandbox-templates-design.md);
-  turning an image into a template's snapshot is [`deploy/sbx/template-onboarding/ONBOARDING.md`](../../deploy/sbx/template-onboarding/README.md).
+  installing a templated P4 worker is in
+  [`deploy/microvm/P4-ON-P6.md`](../../deploy/microvm/P4-ON-P6.md#a-templated-p4-worker-session-templates).
 
 An affinity move never loses a workspace silently: the session either waits or is told it was reset. Idle
 reclaim (`SH_WORKSPACE_IDLE`) is still silent on both tiers (#338).

@@ -3,13 +3,13 @@ import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
 
 /**
  * Policy at create (template lifecycle spec §8.1): the checks a template create passes before any
- * build is queued, as machine rules instead of an approver (D12). Each rule carries its id from the
- * gating rules (governance/GATING-RULES.md: M for MOCA's own, X for image-factory's extensions), so
- * a refusal names the rule and a `check` record lists every rule with its result.
+ * build is queued, as machine rules instead of an approver. Each rule carries its id from the
+ * gating rules (governance/GATING-RULES.md: M for Moca's own, X for the image builder's extensions),
+ * so a refusal names the rule and a `check` record lists every rule with its result.
  *
- * These mirror template-build.sh's spec checks (step 1), which run again on the build host: the
- * control plane refuses early, so a refused create costs no host time, and the host still refuses
- * what slips past (a host is never trusted to have been asked only valid builds).
+ * These mirror the build tool's spec checks, which run again on the build host: the control plane
+ * refuses early, so a refused create costs no host time, and the host still refuses what slips
+ * past (a host is never trusted to have been asked only valid builds).
  */
 
 export const POLICY_SCHEMA = 'moca-template-policy/1';
@@ -21,16 +21,17 @@ export interface Profile {
   /** Rule ids beyond the base rules (from PROFILE_RULES); the benchmark profile's are the X rules. */
   requires: string[];
   /**
-   * Self-attestation (register G41 (c)): a gate record the policy does not trust still passes
-   * X1.trusted when the creating subject submitted it, for that subject's own templates only. The
-   * build is then self-attested: shown as such, private, never deployment-visible until an admin
-   * adds the record's sha256 to trustedGateRecords. Absent: false.
+   * Self-attestation: a gate record the policy does not trust still passes X1.trusted when the
+   * creating subject submitted it, for that subject's own templates only. The build is then
+   * self-attested: shown as such, private, never deployment-visible until an admin adds the
+   * record's sha256 to trustedGateRecords. Absent: false.
    */
   selfAttest?: boolean;
   /**
-   * On a self-attested record only: whether spec.egress may be true (the host's allowlisted egress,
-   * never unrestricted). Absent: false. `benchmark-self` keeps it false (benchmark integrity, X11);
-   * `general-self` sets it, for general users whose sandboxes need the host's allowlisted network.
+   * On a self-attested record only: whether spec.egress may be true (the KVM host's allowlisted
+   * egress, never unrestricted). Absent: false. `benchmark-self` keeps it false (benchmark
+   * integrity, X11); `general-self` sets it, for general users whose sandboxes need the host's
+   * allowlisted network.
    */
   selfAttestEgress?: boolean;
   /**
@@ -64,13 +65,12 @@ export interface Policy {
    * from there. A registry with no list allows every repository it serves (as before); one with a
    * list allows only those, each an exact repository path (`library/python`) or a prefix ending in
    * `/*` (`library/*`), matched on whole path segments. A registry named here must also be in
-   * `allowedRegistries` (register G41's document samples: Docker Hub opened to named repositories
-   * only, not to all of it).
+   * `allowedRegistries` (Docker Hub, say, opened to named repositories only, not to all of it).
    */
   allowedRepositories?: Record<string, string[]>;
   /**
-   * The sha256 of each gate record the benchmark profile trusts (spec §8.3, A23: an admin-loaded
-   * copy of the trusted source's records, until G13's fetch exists).
+   * The sha256 of each gate record the benchmark profile trusts (spec §8.3: an admin-loaded
+   * copy of the trusted source's records, until a fetch from the trusted source exists).
    */
   trustedGateRecords: string[];
   /** Per-subject quotas (§6.2), the deployment default; admins may set per-subject ones. */
@@ -82,9 +82,19 @@ export interface Policy {
   quotaBySubject?: Record<string, Quota>;
 }
 
-/** The quota that applies to a subject (§6.2): its override, else the default. */
-export const quotaFor = (pol: Policy, subject: string): Quota =>
-  pol.quotaBySubject?.[subject] ?? pol.quota;
+/**
+ * The quota that applies to a subject (§6.2), each counter its override's, else the default's.
+ * An override always holds templates, buildsQueued and active; its owned is optional, so owned is
+ * the override's, else the default's, else DEFAULT_OWNED. The answer always holds owned.
+ */
+export const quotaFor = (pol: Policy, subject: string): Quota & { owned: number } => {
+  const over = pol.quotaBySubject?.[subject];
+  return { ...(over ?? pol.quota), owned: over?.owned ?? ownedLimit(pol.quota) };
+};
+
+/** Where a subject's owned quota comes from: its override, else the deployment default. */
+export const ownedSource = (pol: Policy, subject: string): 'subject' | 'default' =>
+  pol.quotaBySubject?.[subject]?.owned !== undefined ? 'subject' : 'default';
 
 export interface Quota {
   /** Templates a subject owns with a build registered or on its way there. */
@@ -93,7 +103,23 @@ export interface Quota {
   buildsQueued: number;
   /** Templates a subject holds active at once. */
   active: number;
+  /**
+   * Template ids a subject owns, in any status (a failed or cancelled-only template too): bounds
+   * the catalog documents and provenance streams one subject opens, which `templates` alone does
+   * not, since a failed or cancelled-only template holds no `templates` slot. Checked for a new id
+   * only. Optional: a default without it gets DEFAULT_OWNED, an override without it the default's.
+   */
+  owned?: number;
 }
+
+/** The counters a quota holds; `owned` is optional. */
+export const QUOTA_KEYS = ['templates', 'buildsQueued', 'active', 'owned'] as const;
+
+/** The `owned` quota of a policy that does not set one. */
+export const DEFAULT_OWNED = 200;
+
+/** The `owned` quota in force: the policy's, else DEFAULT_OWNED. */
+export const ownedLimit = (q: Quota): number => q.owned ?? DEFAULT_OWNED;
 
 export const DEFAULT_POLICY: Policy = {
   schema: POLICY_SCHEMA,
@@ -108,7 +134,7 @@ export const DEFAULT_POLICY: Policy = {
         exact: { guestMb: 4096, vcpus: 2 },
       },
     },
-    // G41 (c): a subject's own gate record, for its own templates; offline for benchmark integrity.
+    // Self-attestation: a subject's own gate record, for its own templates; offline (benchmark integrity).
     'benchmark-self': {
       requires: ['X1', 'X10', 'X11', 'X12', 'X14', 'X15'],
       selfAttest: true,
@@ -120,7 +146,8 @@ export const DEFAULT_POLICY: Policy = {
         exact: { guestMb: 4096, vcpus: 2 },
       },
     },
-    // G41 (c): the same, for general users whose sandboxes need the host's allowlisted egress.
+    // Self-attestation: the same without X11, for general users whose sandboxes need the host's
+    // allowlisted egress.
     'general-self': {
       requires: ['X1', 'X10', 'X12', 'X14', 'X15'],
       selfAttest: true,
@@ -137,21 +164,29 @@ export const DEFAULT_POLICY: Policy = {
   defaultProfile: 'base',
   allowedRegistries: ['<default>'],
   trustedGateRecords: [],
-  quota: { templates: 100, buildsQueued: 10, active: 8 },
+  quota: { templates: 100, buildsQueued: 10, active: 8, owned: DEFAULT_OWNED },
 };
 
-/** image-factory's general-gate record schema (its docs/GENERAL_GATE.md). */
-export const GENERAL_GATE_SCHEMA = 'image-factory/gate/1';
+/**
+ * The default general-gate record schema (`SH_GATE_RECORD_SCHEMA`): the format an image builder
+ * writes for Moca. A deployment that consumes another builder's records sets the setting to that
+ * builder's schema string.
+ */
+export const DEFAULT_GATE_RECORD_SCHEMA = 'moca-gate-record/1';
 
 /**
- * Whether a gate record's test floor was checked offline (image-factory ec4b5a0): a general-gate
- * record (`image-factory/gate/1`) always carries `gate.floor_checked_offline`, false only from a
- * contract with `network_needed`; fail closed, so absent or false is not offline. Any other schema
- * (the curated family records) predates the field, and their gates ran offline: absent is offline.
+ * Whether a gate record's test floor was checked offline: a general-gate record (schema
+ * `gateRecordSchema`, `SH_GATE_RECORD_SCHEMA`) always carries `gate.floor_checked_offline`, false
+ * only from a contract with `network_needed`; fail closed, so absent or false is not offline. Any
+ * other schema (the curated family records) predates the field, and their gates ran offline: absent
+ * is offline.
  */
-export function gateFloorCheckedOffline(gate: Record<string, unknown>): boolean {
+export function gateFloorCheckedOffline(
+  gate: Record<string, unknown>,
+  gateRecordSchema: string = DEFAULT_GATE_RECORD_SCHEMA,
+): boolean {
   const v = (gate.gate as Record<string, unknown> | undefined)?.floor_checked_offline;
-  return gate.schema === GENERAL_GATE_SCHEMA ? v === true : v !== false;
+  return gate.schema === gateRecordSchema ? v === true : v !== false;
 }
 
 /** The template id rule (M7); refused past 31 characters, never truncated. */
@@ -199,14 +234,15 @@ export interface CreateInput {
   /** The gate record, as the exact bytes the client sent (its sha256 is what is trusted). */
   gateRecordBytes?: Buffer;
   /**
-   * The creating subject (G41 (c)): on a `selfAttest` profile, a gate record it submits is trusted
-   * for its own template. Who submits is the control plane's to know; nothing in the record counts.
+   * The creating subject (self-attestation): on a `selfAttest` profile, a gate record it submits is
+   * trusted for its own template. Who submits is the control plane's to know; nothing in the record
+   * counts.
    */
   subject?: string;
   /**
-   * The other subjects that already self-attested this gate record's sha256 (G41 (c), keyed by
-   * (subject, sha256)): a self-attested record belongs to its first submitter, so another subject's
-   * create on it is refused rather than riding on someone else's attestation.
+   * The other subjects that already self-attested this gate record's sha256 (keyed by subject and
+   * sha256): a self-attested record belongs to its first submitter, so another subject's create on
+   * it is refused rather than riding on someone else's attestation.
    */
   gateSelfSubmitters?: string[];
 }
@@ -225,8 +261,8 @@ export interface CheckResult {
   failed?: RuleResult;
   gateRecordSha256?: string;
   /**
-   * How the gate record is trusted (G41 (c)): `trusted`, its sha256 is in trustedGateRecords;
-   * `self`, only by its submitter on a `selfAttest` profile. Absent with no gate record.
+   * How the gate record is trusted: `trusted`, its sha256 is in trustedGateRecords; `self`, not
+   * listed (on a `selfAttest` profile, trusted only by its submitter). Absent with no gate record.
    */
   gateTrust?: 'trusted' | 'self';
   /** The gate record's offline facts (gate.floor_checked_offline, gate.floor_met_offline). */
@@ -255,10 +291,9 @@ function sortKeys(v: unknown): unknown {
  * The registry host an image reference names, or `<default>` for one with no host.
  *
  * `<default>` is NOT Docker Hub here: a reference with no host is pulled from the build host's
- * configured registry (template-build.sh's `--registry`, the host agent's SBX_REGISTRY), which on
- * this deployment is the curated image registry. Docker Hub is therefore always written with its host,
- * `docker.io/…`, and `index.docker.io` is read as `docker.io`, so one key covers Docker Hub without
- * ever merging it with the build host's default registry.
+ * configured registry, so Docker Hub is always written with its host, `docker.io/…`, and
+ * `index.docker.io` is read as `docker.io`, so one key covers Docker Hub without ever merging it
+ * with the build host's default registry.
  */
 export function registryOf(image: string): string {
   const [host] = splitHost(image.split('@')[0] ?? '');
@@ -278,8 +313,7 @@ function registryHostOf(image: string): string {
 /**
  * The repository path of an image reference: without its registry host, its digest and any tag.
  * On Docker Hub (`docker.io`) a one-segment name is an official image, `library/<name>`, as Docker
- * reads it. Paths compare as given otherwise (registries are case-sensitive for paths only in
- * lowercase form, which M1's reference grammar already requires).
+ * reads it. Other paths compare as given.
  */
 export function repositoryOf(image: string): string {
   const name = image.split('@')[0] ?? '';
@@ -318,20 +352,33 @@ const int = (v: unknown): v is number => typeof v === 'number' && Number.isSafeI
  * Every create-time rule, in order. Returns all results (for the `check` record) and the first
  * failure (for the 422). Never throws on bad input: a malformed field is a failed rule.
  */
-export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
+export interface CheckOptions {
+  /** The general-gate record schema (`SH_GATE_RECORD_SCHEMA`); absent: DEFAULT_GATE_RECORD_SCHEMA. */
+  gateRecordSchema?: string;
+}
+
+export function checkCreate(
+  input: CreateInput,
+  policy: Policy,
+  opts: CheckOptions = {},
+): CheckResult {
+  const gateSchema = opts.gateRecordSchema ?? DEFAULT_GATE_RECORD_SCHEMA;
   const results: RuleResult[] = [];
   const rule = (id: string, passed: boolean, message: string) =>
     results.push(passed ? { rule: id, passed } : { rule: id, passed, message });
   const s = input.spec ?? {};
   const profileName = input.profile ?? policy.defaultProfile;
-  const profile = policy.profiles[profileName];
+  // An own key only: a name like `constructor` or `__proto__` is not a profile.
+  const profile = Object.hasOwn(policy.profiles, profileName)
+    ? policy.profiles[profileName]
+    : undefined;
   rule(
     'profile',
     profile !== undefined,
     `no policy profile '${profileName}' (GET /v1/policy lists them)`,
   );
 
-  // M7: the id and the spec well formed (template-build.sh step 1).
+  // M7: the id and the spec well formed (the build tool's spec checks).
   rule(
     'M7.id',
     TEMPLATE_ID_RE.test(input.id ?? ''),
@@ -434,9 +481,9 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     );
   }
   // M7.spec_id, M7.spec_image: a spec that names the template's id or image names the create's own.
-  // The build job takes both from the create (host-handlers.ts buildJobSpec: the create's always
-  // win), so a different copy in the spec would be silently ignored: refused instead. The same copy
-  // is fine: a gate record's template block, sent as the spec unchanged, carries both.
+  // The build takes both from the create (the create's always win), so a different copy in the
+  // spec would be silently ignored: refused instead. The same copy is fine: a gate record's
+  // template block, sent as the spec unchanged, carries both.
   for (const k of ['id', 'image'] as const) {
     rule(
       `M7.spec_${k}`,
@@ -505,7 +552,8 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     );
   }
   const req = new Set(profile?.requires ?? []);
-  // G41 (c): a record the policy does not trust, accepted only because its submitter is creating.
+  // Self-attestation: a record the policy does not trust, accepted only because its submitter is
+  // the one creating.
   const selfAttest = profile?.selfAttest === true;
   const trusted = gateSha !== undefined && policy.trustedGateRecords.includes(gateSha);
   const selfAttested = selfAttest && gateSha !== undefined && !trusted;
@@ -522,8 +570,7 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
   if (req.has('X1')) {
     rule(
       'X1.trusted',
-      gateSha !== undefined &&
-        (policy.trustedGateRecords.includes(gateSha) || (selfAttest && !!input.subject)),
+      trusted || (selfAttested && !!input.subject),
       selfAttest
         ? 'a self-attested profile needs the gate record sent with the create, by the subject who owns the template'
         : 'the gate record is not one the policy trusts (spec §8.3: its sha256 must be listed in trustedGateRecords)',
@@ -538,7 +585,7 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     if (profile?.requireOfflineGate !== false)
       rule(
         'X1.offline',
-        gate === null || gateFloorCheckedOffline(gate),
+        gate === null || gateFloorCheckedOffline(gate, gateSchema),
         `the ${profileName} profile needs the gate's floor checked offline (the record's run needed the network)`,
       );
   }
@@ -556,7 +603,7 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     rule(
       'X1.self.scope',
       others.length === 0,
-      'this gate record is self-attested by another subject; a self-attested record counts only for its submitter (G41)',
+      'this gate record is self-attested by another subject; a self-attested record counts only for its submitter',
     );
     // A self-run gate is reviewed by no one but its submitter: commits refused always (X12 strict),
     // and egress only where the profile allows it (the host's allowlist, never the template's).
@@ -565,12 +612,12 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
       gate !== null &&
         gate.observed?.testbed?.agent_can_commit === 'no' &&
         gate.observed?.guest?.git_identity === 'none',
-      'a self-attested gate record must show commits refused (agent_can_commit no, git_identity none), whatever the spec (X12, G41)',
+      'a self-attested gate record must show commits refused (agent_can_commit no, git_identity none), whatever the spec (X12)',
     );
     rule(
       'X1.self.egress',
       profile?.selfAttestEgress === true || s.egress === false,
-      `the ${profileName} profile allows no egress for a self-attested template: spec.egress must be false (G41)`,
+      `the ${profileName} profile allows no egress for a self-attested template: spec.egress must be false`,
     );
   }
   // X12, whatever the profile: a skip of the git identity check is backed by a gate record
@@ -612,7 +659,7 @@ export function checkCreate(input: CreateInput, policy: Policy): CheckResult {
     ...(gate !== null
       ? {
           gateFloor: {
-            checkedOffline: gateFloorCheckedOffline(gate),
+            checkedOffline: gateFloorCheckedOffline(gate, gateSchema),
             ...(typeof gate.gate?.floor_met_offline === 'boolean'
               ? { metOffline: gate.gate.floor_met_offline as boolean }
               : {}),
@@ -712,6 +759,8 @@ export function policyProblems(p: unknown): string[] {
     );
   };
   if (!quotaOk(q)) out.push('quota must hold whole numbers templates, buildsQueued, active');
+  else if (q?.owned !== undefined && !(int(q.owned) && q.owned >= 0))
+    out.push('quota.owned, when set, must be a whole number');
   const by = (o as { quotaBySubject?: unknown }).quotaBySubject;
   if (by !== undefined) {
     if (typeof by !== 'object' || by === null || Array.isArray(by))
@@ -720,15 +769,16 @@ export function policyProblems(p: unknown): string[] {
       for (const [s, v] of Object.entries(by as Record<string, unknown>)) {
         if (!MEMBER_SUBJECT_RE.test(s))
           out.push(`quotaBySubject: ${s} is not a subject (${MEMBER_SUBJECT_FORMS})`);
-        // An override holds the three counters alone: nothing else is kept in the policy.
+        // An override holds the four counters alone (#748), owned optional: nothing else is kept
+        // in the policy.
+        const ov = v as Partial<Quota> | undefined;
         if (
           !quotaOk(v) ||
-          Object.keys(v as object).some(
-            (k) => k !== 'templates' && k !== 'buildsQueued' && k !== 'active',
-          )
+          (ov?.owned !== undefined && !(int(ov.owned) && ov.owned >= 0)) ||
+          Object.keys(v as object).some((k) => !(QUOTA_KEYS as readonly string[]).includes(k))
         )
           out.push(
-            `quotaBySubject.${s} must hold whole numbers templates, buildsQueued, active, and nothing else`,
+            `quotaBySubject.${s} must hold whole numbers templates, buildsQueued, active, optionally owned, and nothing else`,
           );
       }
   }
@@ -738,14 +788,14 @@ export function policyProblems(p: unknown): string[] {
 /**
  * The deployment's policy, kept beside the catalog (<SH_PROVENANCE_DIR>/policy.json) and recorded:
  * every change is a `policy` record in the provenance store, whose digest every `check` cites.
- * Until an admin sets one, DEFAULT_POLICY applies, and the first create records it, so a `check`
+ * Until an admin sets one, DEFAULT_POLICY applies, and the first read records it, so a `check`
  * always cites a policy record that exists.
  */
 export interface PolicyStore {
   current(): Promise<{ policy: Policy; record: string }>;
   /**
    * Store a new policy, and record it. `extra` is added to the `policy` record's body beside the
-   * policy (G41 (c): the builds a trust removal narrows), never into the policy itself.
+   * policy (self-attestation: the builds a trust removal narrows), never into the policy itself.
    */
   set(
     policy: Policy,

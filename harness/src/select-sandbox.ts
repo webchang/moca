@@ -617,9 +617,9 @@ export async function selectPoolSandbox(
      */
     template?: string;
     /**
-     * The build the session's template resolved to (combined control plane spec §3.4, register
-     * G19). Set: only records labelled `moca.dev/build=<it>` are candidates, so a session pinned to a
-     * build never runs on another. Absent: any build of the template, as before.
+     * The build the session's template resolved to (combined control plane spec §3.4). Set: only
+     * records labelled `moca.dev/build=<it>` are candidates, so a session pinned to a build never
+     * runs on another. Absent: any build of the template, as before.
      */
     build?: string;
     /**
@@ -735,7 +735,7 @@ async function select(
   const template = opts.template || '';
   const ofTemplate = (r: SandboxRecord): boolean => (r.labels?.[TEMPLATE_LABEL] || '') === template;
   grpcRecs = grpcRecs.filter(ofTemplate);
-  // The build filter (register G19): only with a template and a pinned build; a worker reporting no
+  // The build filter: only with a template and a pinned build; a worker reporting no
   // build label never serves a pinned session.
   const build = template && opts.build ? opts.build : '';
   const ofBuild = (r: SandboxRecord): boolean => !build || r.labels?.[BUILD_LABEL] === build;

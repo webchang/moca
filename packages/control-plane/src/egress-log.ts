@@ -3,7 +3,7 @@ import { CpError } from './errors.js';
 import { canonicalJson } from './provenance.js';
 
 /**
- * Per-sandbox egress records (register G42, docs/specs/2026-11-08-sandbox-egress-records-design.md).
+ * Per-sandbox egress records (docs/specs/2026-11-08-sandbox-egress-records-design.md).
  * A KVM host's agent posts the egress proxy's audit events (`moca-egress`, remote-worker
  * internal/egress/audit.go `Event`) as they are; each event whose `sid` is a sandbox's workspace
  * key is appended, in arrival order, to that sandbox's log.

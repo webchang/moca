@@ -194,7 +194,6 @@ describe('terminalFrame carries where the turn ran and its patch (session-templa
   const sandbox = {
     id: 'w-1',
     tier: 'microvm',
-    template: 'django',
     seed: { source: 'build' as const, buildId: 'sha256:' + 'b'.repeat(64) },
   };
   const workspace = { baseline: 'abc', patch: 'diff\n', patchSha256: 'sha256:x', patchBytes: 5 };

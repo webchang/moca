@@ -8,6 +8,7 @@ import { CP_ERROR_CODES } from '../src/errors.js';
 import { MINTED_TURN_ID_RE, TURN_STATES } from '../src/turn-record.js';
 import { CREDENTIAL_NAME_RE } from '../src/credential-store.js';
 import { LABEL_KEY_RE, SANDBOX_ID_RE } from '../src/sandbox-handlers.js';
+import { SANDBOX_MODE_NAMES } from '../src/sandbox-store.js';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const doc = () => parse(readFileSync(resolve(REPO_ROOT, 'docs/api/openapi.yaml'), 'utf8'));
@@ -112,6 +113,9 @@ describe('§9.3 test 3 — contract drift', () => {
       'expiresAt',
       'terminatedAt',
       'labels',
+      'mode',
+      'idleTimeoutS',
+      'modeEpoch',
     ];
     expect([...s.required].sort()).toEqual([...fields].sort());
     expect(Object.keys(s.properties).sort()).toEqual([...fields].sort());
@@ -119,6 +123,39 @@ describe('§9.3 test 3 — contract drift', () => {
     expect(s.properties.state.enum).toEqual(['ready', 'terminated']);
     expect(s.properties.reason.enum).toEqual(['deleted', 'expired', null]);
     expect(s.properties.id.pattern).toBe(SANDBOX_ID_RE.source);
+    expect(s.properties.mode.enum).toEqual([...SANDBOX_MODE_NAMES]);
+    expect(s.properties.idleTimeoutS.type).toBe('integer');
+    expect(s.properties.modeEpoch.type).toBe('integer');
+  });
+
+  it('documents mode and idleTimeoutS on create and on PUT /mode, with the same bounds', () => {
+    const create = doc().paths['/v1/sandboxes'].post.requestBody.content['application/json'].schema;
+    const put = doc().paths['/v1/sandboxes/{id}/mode'].put;
+    const body = put.requestBody.content['application/json'].schema;
+    expect(body.required).toEqual(['mode']);
+    for (const s of [create, body]) {
+      expect(s.properties.mode.enum).toEqual([...SANDBOX_MODE_NAMES]);
+      expect(s.properties.idleTimeoutS).toMatchObject({ type: 'integer', minimum: 30 });
+    }
+    expect(Object.keys(put.responses).sort()).toEqual(
+      ['200', '400', '401', '403', '404', '409', '503'].sort(),
+    );
+    const ok = put.responses['200'].content['application/json'].schema;
+    expect([...ok.required].sort()).toEqual(['sandbox', 'setModeToken']);
+    expect(ok.properties.sandbox.$ref).toBe('#/components/schemas/Sandbox');
+    expect(doc().paths['/v1/sandboxes'].post.responses['403'].description).toContain(
+      'mode_not_allowed',
+    );
+    expect(put.responses['403'].description).toContain('mode_not_allowed');
+  });
+
+  it('documents the set-mode token response', () => {
+    const post = doc().paths['/v1/sandboxes/{id}/mode-token'].post;
+    expect(post.requestBody).toBeUndefined();
+    const schema = post.responses['200'].content['application/json'].schema;
+    expect(schema.required).toEqual(['setModeToken']);
+    expect(Object.keys(schema.properties)).toEqual(['setModeToken']);
+    expect(post.responses['409']).toBeDefined();
   });
 
   it('states the label rules the code enforces: key pattern, and no character-count limit', () => {
@@ -175,6 +212,14 @@ describe('§9.3 test 3 — contract drift', () => {
     expect(post.responses['400'].description).toContain('ack');
   });
 
+  it('documents the envelope as a required field of the turn exchange response', () => {
+    const schema =
+      doc().paths['/internal/turn-credentials'].post.responses['200'].content['application/json']
+        .schema;
+    expect(schema.required).toContain('envelope');
+    expect(schema.properties.envelope.required).toEqual(['sessionId']);
+  });
+
   it('never describes a RESPONSE that returns a credential value', () => {
     // GET /v1/credentials is metadata only and there is no read-back path anywhere in /v1 (spec §4.2).
     // Scoped to responses on purpose: `PUT /v1/credentials/{name}` legitimately documents `secret` in
@@ -197,13 +242,14 @@ describe('§9.3 test 3 — contract drift', () => {
         r.operationId === 'completeDeviceAuth' ||
         r.operationId === 'refreshAuth' ||
         (r.profiles.includes('sandbox') && r.profiles.length === 1 && r.auth === 'api') ||
-        // The template routes are on both profiles; on the sandbox one they check enrollment.
+        // The template, policy and quota routes are on both profiles; on the sandbox one they
+        // check enrollment.
         ((r.path.startsWith('/v1/templates') ||
           r.path === '/v1/policy' ||
           r.path.startsWith('/v1/quota')) &&
           r.auth === 'api'),
     ).map((r) => `${r.method} ${r.path}`);
-    expect(enrollable.length).toBe(29);
+    expect(enrollable.length).toBe(31);
     const missing = operations()
       .filter(({ path, method }) => enrollable.includes(`${method} ${path}`))
       .filter(({ op }) => !(op as { responses?: Record<string, unknown> }).responses?.['403'])
@@ -231,5 +277,17 @@ describe('§9.3 test 3 — contract drift', () => {
     // document is the only mechanical link between the two nine-state lists.
     const enumerated = doc().components.schemas.TurnStatus.properties.state.enum as string[];
     expect([...enumerated].sort()).toEqual([...TURN_STATES].sort());
+  });
+});
+
+describe('the contract version', () => {
+  it("info.version is the changelog's newest section, and change-policy names it", () => {
+    const changelog = readFileSync(resolve(REPO_ROOT, 'docs/api/CHANGELOG.md'), 'utf8');
+    const top = /^## (\d+\.\d+\.\d+)$/m.exec(changelog)?.[1];
+    expect(top).toBeDefined();
+    expect(doc().info.version).toBe(top);
+    const policy = readFileSync(resolve(REPO_ROOT, 'docs/reference/change-policy.md'), 'utf8');
+    expect(policy).toContain(`says \`version: ${top}\``);
+    expect(policy).toContain(`(control plane ${top},`);
   });
 });

@@ -77,18 +77,17 @@ export interface SessionDeps {
   /**
    * The most a turn waits, in total, on the harness's "no capacity, retry after N s" before it fails
    * with that refusal (default: no bound, as the TUI, where a person can press Esc). Headless sets
-   * one: a script cannot, and a tier with no worker never gains capacity by waiting (bm1,
-   * 2026-10-31: a session retried an empty tier for 10 minutes).
+   * one: a script cannot, and a tier with no worker never gains capacity by waiting.
    */
   maxCapacityWaitMs?: number;
   /**
-   * Told each time a session create waits for its template to become active (template lifecycle
-   * spec §6.4): the control plane started the activation and answered 409 template_not_active.
+   * Told each time a session create waits for its template to become active: a control plane that
+   * activates templates on first use started the activation and answered 409 template_not_active.
    */
   onActivationWait?: (seconds: number) => void;
 }
 
-/** How long a session create waits for its template to become active (§6.4) before giving up. */
+/** How long a session create waits for its template to become active before giving up. */
 export const SESSION_ACTIVATION_WAIT_MS = 10 * 60_000;
 
 type PromptJob = { kind: 'prompt'; prompt: string; resend: boolean; conflicts: number };
@@ -842,8 +841,8 @@ export class SessionManager {
   }
 
   /**
-   * The create, retried while its template activates (§6.4): a 409 template_not_active means the
-   * control plane started the activation, so wait its Retry-After, up to SESSION_ACTIVATION_WAIT_MS.
+   * The create, retried while its template activates: a 409 template_not_active means the control
+   * plane started the activation, so wait its Retry-After, up to SESSION_ACTIVATION_WAIT_MS.
    */
   private async createWaitingForActivation(req: CreateSessionRequest) {
     const start = this.deps.now();

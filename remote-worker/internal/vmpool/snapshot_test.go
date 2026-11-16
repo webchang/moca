@@ -133,6 +133,37 @@ func TestManifestHasLeaseFeature(t *testing.T) {
 	}
 }
 
+// balloon-fpr-v1 is the name build-snapshot.sh writes when the golden snapshot carries the
+// reporting-only balloon; the worker's start-up warning keys on this exact string.
+func TestBalloonFeatureConstant(t *testing.T) {
+	if FeatureBalloonFPRV1 != "balloon-fpr-v1" {
+		t.Fatalf("FeatureBalloonFPRV1 = %q, want balloon-fpr-v1", FeatureBalloonFPRV1)
+	}
+	var m Manifest
+	if err := json.Unmarshal([]byte(`{"features":["lease-v1","balloon-fpr-v1"]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if !m.HasFeature(FeatureBalloonFPRV1) {
+		t.Fatalf("Features = %v, HasFeature(balloon-fpr-v1) = false", m.Features)
+	}
+}
+
+// lease-processes-v1 is the name build-snapshot.sh writes, beside lease-v1, on a Firecracker
+// snapshot whose image carries the tracked-process identities; the worker refuses a process
+// kind without it.
+func TestLeaseProcessesFeatureConstant(t *testing.T) {
+	if FeatureLeaseProcessesV1 != "lease-processes-v1" {
+		t.Fatalf("FeatureLeaseProcessesV1 = %q, want lease-processes-v1", FeatureLeaseProcessesV1)
+	}
+	var m Manifest
+	if err := json.Unmarshal([]byte(`{"features":["lease-v1","lease-processes-v1","balloon-fpr-v1"]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if !m.HasFeature(FeatureLeaseProcessesV1) {
+		t.Fatalf("Features = %v, HasFeature(lease-processes-v1) = false", m.Features)
+	}
+}
+
 // Features is outside the hash in both hash versions: a snapshot that predates the
 // field still verifies.
 func TestManifestHashIgnoresFeatures(t *testing.T) {
@@ -221,7 +252,7 @@ func TestManifestV1StillVerifies(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.VerifyWith(img, VerifyOptions{Memfile: true}); err != nil {
-		t.Fatalf("a version-1 snapshot (built before PV2) must keep verifying: %v", err)
+		t.Fatalf("a version-1 snapshot (built before hash version 2) must keep verifying: %v", err)
 	}
 }
 
@@ -232,7 +263,7 @@ func TestManifestV2HashCoversEveryField(t *testing.T) {
 	}{
 		{"image", func(m *Manifest) { m.Image = "other" }},
 		{"vmm", func(m *Manifest) { m.VMM = "cloud-hypervisor" }},
-		{"instance_type", func(m *Manifest) { m.InstanceType = "c5.metal" }},
+		{"instance_type", func(m *Manifest) { m.InstanceType = "example.metal" }},
 		{"kernel_release", func(m *Manifest) { m.Kernel = "6.1.0" }},
 		{"guest_ram_mb", func(m *Manifest) { m.GuestRAMMB = 4096 }},
 		{"vcpus", func(m *Manifest) { m.VCPUs = 2 }},
@@ -259,6 +290,41 @@ func TestManifestV2HashCoversEveryField(t *testing.T) {
 				if err := m.Verify(img); !strings.Contains(err.Error(), "does not match") {
 					t.Fatalf("an edited %s: err = %v, want the hash mismatch", tc.field, err)
 				}
+			}
+		})
+	}
+}
+
+// TestProbeTearsDownItsVMOnEveryFailurePath pins the probe's teardown (#797): a probe that
+// fails is followed at once by the worker's exit, so a VM it restored and did not destroy is
+// left running beside the next start's sweep. Every way Probe can fail AFTER a VM exists must
+// destroy it before returning. (The restore failure itself creates no VM here; the
+// Firecracker launcher's own teardown on that path is pinned in
+// TestRestoreKillsTheJailerItStartedWhenTheAPISocketNeverAppears.)
+func TestProbeTearsDownItsVMOnEveryFailurePath(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage func(*fakeLauncher)
+	}{
+		{"resume fails", func(lc *fakeLauncher) {
+			lc.setResumeFn(func(*fakeVM, context.Context) error { return errNoKVM })
+		}},
+		{"guest does not answer", func(lc *fakeLauncher) {
+			lc.setRunFn(func(*fakeVM, Command, Sink) (Result, error) { return Result{}, errNoKVM })
+		}},
+		{"true exits non-zero", func(lc *fakeLauncher) {
+			lc.setRunFn(func(*fakeVM, Command, Sink) (Result, error) { return Result{ExitCode: 1}, nil })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, lc, _ := testPool(t)
+			tc.stage(lc)
+			if err := p.Probe(context.Background()); err == nil {
+				t.Fatal("Probe succeeded despite the staged failure")
+			}
+			if lc.createdCount() != 1 || lc.liveCount() != 0 {
+				t.Fatalf("created=%d live=%d after a failed Probe, want 1 and 0 — the probe left its VM behind",
+					lc.createdCount(), lc.liveCount())
 			}
 		})
 	}

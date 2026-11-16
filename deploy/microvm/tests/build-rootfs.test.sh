@@ -85,7 +85,7 @@ for d in dev proc sys; do
 done
 check "the temporary container is removed" "$(grep -c '^podman rm -f cid-42$' "$MOCK_LOG")" "1"
 
-echo "== --source-name: the recorded image is the caller's host-free name, never the pull reference (G49)"
+echo "== --source-name: the recorded image is the caller's host-free name, never the pull reference"
 make_fixture "${ALL_TOOLS[@]}"
 : >"$MOCK_LOG"
 bash "$SCRIPT" --out "$TMP/out-src" --image registry.example.com/team/img@sha256:0123abcd \
@@ -144,8 +144,8 @@ check "names rg" "$(grep -c "missing required tool.*rg" "$TMP/run2.log")" "1"
 check "the temporary container is removed on failure too" "$(grep -c '^podman rm -f cid-42$' "$MOCK_LOG")" "1"
 
 echo "== --require replaces the list: a benchmark image without gh builds; a listed tool is still required"
-# A template's image carries its spec's tools plus the guest agent's minimum, not MOCA's toolchain
-# (GATING-RULES.md M3): gh in the default list refused every benchmark image (494353b7).
+# A template's image carries its own tools plus the guest agent's minimum, not Moca's toolchain:
+# gh in the default list refused every benchmark image.
 make_fixture bash git python3 rg base64 file ls cat # no gh
 bash "$SCRIPT" --out "$TMP/out-req" --image example/img:1 \
   --require "bash git python3 rg ls cat base64 file" >"$TMP/run-req.log" 2>&1

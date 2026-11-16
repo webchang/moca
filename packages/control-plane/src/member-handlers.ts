@@ -6,12 +6,11 @@ import { ADMIN, MAX_GRANT_SECONDS, type MembersStore } from './members.js';
 import type { TokenClaims } from './token.js';
 
 /**
- * Enrollment and roles through the API (enrollment and roles spec §4, register G38): admins only.
- * The deployment's settings stay the bootstrap and are never edited here: a subject on
- * SH_ALLOWED_SUBJECTS cannot be unenrolled, and one on SH_ADMIN_SUBJECTS cannot lose the role
- * (`409 bootstrap_subject`), so the deployment can always recover. Any admin, bootstrap or
- * API-granted, may list the subjects; only an admin named in SH_ADMIN_SUBJECTS (settingsAdmin)
- * enrolls, unenrolls, grants or revokes admin. A grant may carry an expiry (decision 4).
+ * Enrollment and roles through the API (enrollment and roles spec §4): any admin reads the list,
+ * only an admin named in SH_ADMIN_SUBJECTS changes it. The deployment's settings stay the bootstrap
+ * and are never edited here: a subject on SH_ALLOWED_SUBJECTS cannot be unenrolled, and one on
+ * SH_ADMIN_SUBJECTS cannot lose the role (`409 bootstrap_subject`), so the deployment can always
+ * recover. A grant may carry an expiry (`until`, epoch seconds).
  */
 
 function admin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: MembersStore } {
@@ -26,8 +25,8 @@ function admin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: Member
 }
 
 /**
- * Who may CHANGE enrollment or roles (the user, 2026-11-08): only an admin named in the settings
- * (SH_ADMIN_SUBJECTS). An admin by an API grant holds the role for templates, policy and quota, but
+ * Who may CHANGE enrollment or roles: only an admin named in the settings
+ * (SH_ADMIN_SUBJECTS). An admin by an API grant holds the role on every other admin route, but
  * cannot change who has access, so the API never widens access beyond what the settings' admins do.
  */
 function settingsAdmin(ctx: RequestCtx, deps: CpDeps): { p: TokenClaims; members: MembersStore } {

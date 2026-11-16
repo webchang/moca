@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import type { ProvenanceStore } from './provenance.js';
 
 /**
- * Enrollment and roles through the API (enrollment and roles spec, register G38). The deployment's
+ * Enrollment and roles through the API (enrollment and roles spec). The deployment's
  * settings stay the bootstrap: SH_ALLOWED_SUBJECTS are always enrolled and SH_ADMIN_SUBJECTS always
- * admins, and the API never edits either. This store holds what the API adds on top of them, on the
- * control plane's template store directory beside policy.json, and each change is a record on the
- * `members` provenance stream.
+ * admins, and the API never edits either. This store holds what the API adds on top of them, in the
+ * control plane's template store directory (SH_PROVENANCE_DIR) beside the catalog, and each change is
+ * a record on the `members` provenance stream.
  *
  * Roles are evaluated PER REQUEST from the bootstrap lists and this store (`membershipNow`), not
  * taken from a token's claims, so a grant, a revoke or a lapsed `until` takes effect at the subject's
@@ -82,6 +82,38 @@ export interface Bootstrap {
 const statKey = (st: { ino: number; size: number; mtimeMs: number }): string =>
   `${st.ino}:${st.size}:${st.mtimeMs}`;
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const isRoleGrant = (v: unknown): v is RoleGrant =>
+  isPlainObject(v) &&
+  v.role === ADMIN &&
+  (v.until === undefined || Number.isFinite(v.until)) &&
+  typeof v.by === 'string' &&
+  Number.isFinite(v.since) &&
+  (v.expiredRecorded === undefined || typeof v.expiredRecorded === 'boolean');
+
+const isMember = (subject: string, v: unknown): v is Member =>
+  isPlainObject(v) &&
+  v.subject === subject &&
+  typeof v.enrolled === 'boolean' &&
+  Array.isArray(v.roles) &&
+  v.roles.every(isRoleGrant) &&
+  Number.isFinite(v.since) &&
+  typeof v.by === 'string';
+
+/**
+ * Whether a parsed members.json has the shape every reader relies on: `members` a plain object,
+ * each entry a Member under its own subject, its `roles` an array of admin grants.
+ */
+export function isMembersDoc(v: unknown): v is MembersDoc {
+  return (
+    isPlainObject(v) &&
+    isPlainObject(v.members) &&
+    Object.entries(v.members).every(([subject, m]) => isMember(subject, m))
+  );
+}
+
 export class MembersStore {
   private readonly path: string;
   private readonly provenance: ProvenanceStore;
@@ -138,8 +170,10 @@ export class MembersStore {
       const key = statKey(await fh.stat());
       // The cache and its key are set together, synchronously, so a matching key means this cache.
       if (key === this.cacheKey) return this.cache;
-      const parsed = JSON.parse(await fh.readFile('utf8')) as MembersDoc;
-      if (!parsed || typeof parsed.members !== 'object') throw new Error('members.json is invalid');
+      const parsed: unknown = JSON.parse(await fh.readFile('utf8'));
+      // A document of the wrong shape is refused as a corrupt one is: the read fails, so
+      // membershipNow answers the settings' subjects from the settings and everyone else fails closed.
+      if (!isMembersDoc(parsed)) throw new Error('members.json is invalid');
       if (gen === this.writes) {
         this.cache = parsed;
         this.cacheKey = key;
@@ -176,8 +210,7 @@ export class MembersStore {
 
   /**
    * One change, serialized: `fn` edits a copy of the doc and returns the record to write (or null
-   * for no change). The record is appended before the file is replaced, as the policy store does:
-   * a crash between the two leaves a record for a change the store does not hold, never the reverse.
+   * for no change). The record is appended before the file is replaced: a crash between the two leaves a record for a change the store does not hold, never the reverse.
    */
   change(
     fn: (
