@@ -34,7 +34,7 @@ import {
   type StartQueue,
 } from './activation.js';
 import { activationLock } from './activation-lock.js';
-import { busyWorkers, freshHosts, hostViewsOf, liveSnapshots } from './host-handlers.js';
+import { busyWorkers, freshHosts, heldFresh, hostViewsOf, liveSnapshots } from './host-handlers.js';
 import { SubjectQueue } from './subject-document.js';
 import {
   checkCreate,
@@ -53,6 +53,8 @@ import {
 import {
   TEMPLATE_DOC_SCHEMA,
   MemoryTemplateCatalog,
+  buildById,
+  buildByRef,
   resolveBuild,
   type TemplateBuild,
   type TemplateCatalog,
@@ -683,8 +685,10 @@ function buildBody(d: TemplateDoc, b: TemplateBuild, f: ReadinessFacts, full: bo
             .filter((h) => h.holds[b.buildId] !== undefined)
             .map((h) => h.id)
             .sort(),
+    // A tag names a build id; a superseded build keeps its id, retired, and its tags are the
+    // build's that took it over (buildById).
     tags: Object.entries(d.tags)
-      .filter(([, id]) => id === b.buildId)
+      .filter(([, id]) => id === b.buildId && buildById(d.builds, id) === b)
       .map(([t]) => t)
       .sort(),
     createdAt: b.createdAt,
@@ -1060,9 +1064,18 @@ async function admitBuild(
             );
           // §3.2: the same inputs are the same build. One registered, or still on its way there,
           // is answered instead of a second build (two creates would otherwise queue two builds
-          // that register under one manifest hash).
-          reused = cur?.builds.find((x) => REUSABLE.has(x.status) && buildReuseKey(x) === want);
+          // that register under one manifest hash). A registered one counts only while a host
+          // holds its snapshot (stillHeld).
+          reused = cur?.builds.find(
+            (x) => REUSABLE.has(x.status) && buildReuseKey(x) === want && stillHeld(deps, x),
+          );
           if (reused) return cur!;
+          // The registered build of the same inputs that was skipped because no fresh host holds
+          // its snapshot: this build rebuilds it, and only such a rebuild may supersede it at
+          // registration (host-handlers.ts, rule T.unique).
+          const rebuilds = cur?.builds.find(
+            (x) => x.status === 'registered' && buildReuseKey(x) === want && !stillHeld(deps, x),
+          );
           const u = await usage(cat, charged);
           // A template takes a slot when it holds none yet: a new id, or one whose builds all
           // failed, were cancelled or were retired (usage does not count it). Checking only new
@@ -1155,6 +1168,7 @@ async function admitBuild(
               ? { selfAttestProfile: true }
               : {}),
             ...(result.gateFloor ? { gateFloor: result.gateFloor } : {}),
+            ...(rebuilds ? { rebuildOf: rebuilds.handle ?? rebuilds.buildId } : {}),
           };
           const base: TemplateDoc = cur ?? {
             schema: TEMPLATE_DOC_SCHEMA,
@@ -1237,6 +1251,25 @@ function reuseKey(
   });
 }
 
+/**
+ * Whether a registered build's snapshot still exists somewhere (lifecycle spec §4, Reuse): on a
+ * deployment with host agents, when fresh hosts report (freshHosts: the hosts placement and a
+ * sandbox create read, so a host silent past HOST_STALE_S does not count), one of them must hold
+ * it, or a create would be answered with a build no sandbox can be created on (its snapshot removed
+ * from every host). When no fresh host reports at all (right after a restart, or the only host
+ * silent), holding is unknown and the build is reused as before. A build on its way has no snapshot
+ * yet and is reused as before. A create admitted because fresh hosts hold nothing of it is its
+ * rebuild (rebuildOf), which may supersede it at registration (host-handlers.ts, rule T.unique).
+ */
+function stillHeld(deps: CpDeps, x: TemplateBuild): boolean {
+  if (x.status !== 'registered' || !deps.hosts) return true;
+  // No fresh host reports at all (a control-plane restart, the only host silent): whether the
+  // snapshot is held is unknown, so the build is reused as before. Only hosts that report and
+  // hold nothing of it say it is gone.
+  if (freshHosts(deps).length === 0) return true;
+  return heldFresh(deps, x.buildId);
+}
+
 /** A stored build's reuse key; none for an imported build (it has no request). */
 function buildReuseKey(x: TemplateBuild): string | undefined {
   if (!x.request) return undefined;
@@ -1284,7 +1317,7 @@ async function cancelBuild(ctx: RequestCtx, deps: CpDeps) {
   let cancelled: TemplateBuild | undefined;
   await cat.update(d0.id, async (c) => {
     const cur = own(c);
-    const x = cur.builds.find((y) => y.handle === ref || y.buildId === ref);
+    const x = buildByRef(cur.builds, ref);
     if (!x) throw new CpError('template_not_found', 'no such build of this template');
     if (!CANCELLABLE.has(x.status))
       throw new CpError(
@@ -1503,7 +1536,8 @@ async function takeLeaseLocked(
   // lock too, so this read is current. A build retired or rejected since is refused here (retired:
   // template_retired; rejected, as any build no longer registered: template_unavailable), so no
   // lease (none counting against the quota) is written onto it.
-  const fresh = docs.find((d) => d.id === d0.id)?.builds.find((x) => x.buildId === target.buildId);
+  const mineNow = docs.find((d) => d.id === d0.id);
+  const fresh = mineNow ? buildById(mineNow.builds, target.buildId) : undefined;
   if (fresh?.status === 'retired')
     throw new CpError('template_retired', `template '${d0.id}' build ${target.buildId} is retired`);
   if (fresh?.status !== 'registered')
@@ -1539,9 +1573,7 @@ async function takeLeaseLocked(
   };
   // Would it be placed? Judge with this lease added, before keeping it.
   const trial = docs.map((d) =>
-    d.id !== d0.id
-      ? d
-      : { ...d, builds: d.builds.map((x) => (x.buildId === target.buildId ? withLease(x) : x)) },
+    d.id !== d0.id ? d : { ...d, builds: d.builds.map((x) => (x === fresh ? withLease(x) : x)) },
   );
   // A graced worker gives its slot up to this lease (it is not `placed`, so never "displaced"
   // below); the workers with a live sandbox drain, keep their slot, and are never graced.
@@ -1614,10 +1646,14 @@ async function takeLeaseLocked(
       ...(reason === 'first_use' ? { reason } : {}),
     },
   });
-  await cat.update(d0.id, async (cur) => ({
-    ...cur!,
-    builds: cur!.builds.map((x) => (x.buildId === target.buildId ? withLease(x, rec.digest) : x)),
-  }));
+  // Onto the one build the id names now (buildById), never a superseded twin that keeps it.
+  await cat.update(d0.id, async (cur) => {
+    const into = buildById(cur!.builds, target.buildId);
+    return {
+      ...cur!,
+      builds: cur!.builds.map((x) => (x === into ? withLease(x, rec.digest) : x)),
+    };
+  });
   return { until: nowS + want, host };
 }
 
@@ -1676,12 +1712,14 @@ async function deactivate(ctx: RequestCtx, deps: CpDeps) {
 }
 
 /**
- * Why each build is in use now (§5.1): a live sandbox runs on it. A retire is refused while any
+ * Why each build is in use now (§5.1): a live sandbox runs on it, or an active Moca Pi session is
+ * pinned to it (its next turn needs the build's worker). A retire is refused while any
  * build it names is in use, so it never cuts off running work. A sandbox names the build it
  * resolved to (`buildId`), so it counts for that build only: two builds of one template from one
  * image can share a worker id, and a sandbox on one must not block retiring the other. A record
- * from before builds were traced (no `buildId`) counts for every build on its worker. Sessions
- * pinned to a build, once sessions are, are live use too, and are to be checked here.
+ * from before builds were traced (no `buildId`) counts for every build on its worker. A session
+ * counts through the index of the sessions pinned to each build (hasActiveSessionOnBuild); a
+ * deployment whose index has no such check counts sandboxes only.
  */
 async function buildsInUse(
   deps: CpDeps,
@@ -1689,17 +1727,25 @@ async function buildsInUse(
   nowS: number,
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  if (!deps.sandboxes) return out;
-  const busyBuilds = new Set<string>();
-  const legacyWorkers = new Set<string>();
-  for (const r of await deps.sandboxes.listAll(nowS)) {
-    if (!isLive(r, nowS)) continue;
-    if (r.buildId) busyBuilds.add(r.buildId);
-    else legacyWorkers.add(r.worker);
+  if (deps.sandboxes) {
+    const busyBuilds = new Set<string>();
+    const legacyWorkers = new Set<string>();
+    for (const r of await deps.sandboxes.listAll(nowS)) {
+      if (!isLive(r, nowS)) continue;
+      if (r.buildId) busyBuilds.add(r.buildId);
+      else legacyWorkers.add(r.worker);
+    }
+    for (const x of builds) {
+      if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
+        out.set(x.buildId, 'still serves a live sandbox');
+    }
   }
-  for (const x of builds) {
-    if (busyBuilds.has(x.buildId) || (x.worker !== '' && legacyWorkers.has(x.worker)))
-      out.set(x.buildId, 'still serves a live sandbox');
+  if (typeof deps.index?.hasActiveSessionOnBuild === 'function') {
+    for (const x of builds) {
+      if (out.has(x.buildId) || !x.buildId) continue;
+      if (await deps.index.hasActiveSessionOnBuild(x.buildId))
+        out.set(x.buildId, 'is pinned by an active session');
+    }
   }
   return out;
 }
@@ -1747,7 +1793,7 @@ async function adminTemplate(ctx: RequestCtx, deps: CpDeps) {
 async function retireBuilds(
   ctx: RequestCtx,
   deps: CpDeps,
-  which: (b: TemplateBuild) => boolean,
+  which: (b: TemplateBuild, builds: readonly TemplateBuild[]) => boolean,
   mode: 'retire' | 'reject' = 'retire',
 ): Promise<{ templateId: string; subject: string; builds: RetiredBuild[] }> {
   // Retire: the owner, or an admin; the owner's check is made on the template as read and again
@@ -1780,12 +1826,16 @@ async function retireBuilds(
       // build that registers after this read has no sandbox, and gets none while the lock is held.
       const now = await cat.get(d0.id);
       if (!now) throw new CpError('template_not_found', 'no such template');
-      const inUse = await buildsInUse(deps, now.builds.filter(which), seconds(deps));
+      const inUse = await buildsInUse(
+        deps,
+        now.builds.filter((x) => which(x, now.builds)),
+        seconds(deps),
+      );
       await cat.update(d0.id, async (c) => {
         const cur = own(c);
         done.length = 0;
         records.clear();
-        const targets = cur.builds.filter(which);
+        const targets = cur.builds.filter((x) => which(x, cur.builds));
         if (targets.length === 0)
           throw new CpError('template_not_found', 'no such build of this template');
         if (mode === 'reject' && targets.some((x) => x.status !== 'registered' && !ended(x)))
@@ -1845,7 +1895,11 @@ async function retireBuilds(
     templateId: d0.id,
     subject: p.sub,
     builds: after.builds
-      .filter((x) => (mode === 'reject' ? rejectedByAdmin(x) : x.status === 'retired') && which(x))
+      .filter(
+        (x) =>
+          (mode === 'reject' ? rejectedByAdmin(x) : x.status === 'retired') &&
+          which(x, after.builds),
+      )
       .map((x) => ({
         build: x.handle ?? x.buildId,
         // A build retired before it registered has only its handle.
@@ -1900,7 +1954,8 @@ async function retireTemplate(ctx: RequestCtx, deps: CpDeps) {
 /** DELETE /v1/templates/{id}/builds/{build} (§5.1): one build, by its build id or handle. */
 async function retireTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
   const ref = ctx.params.build ?? '';
-  const r = await retireBuilds(ctx, deps, (x) => x.handle === ref || x.buildId === ref);
+  // One build: the one its handle or build id names (buildByRef), never a superseded twin beside it.
+  const r = await retireBuilds(ctx, deps, (x, all) => x === buildByRef(all, ref));
   return {
     status: 200,
     body: { templateId: r.templateId, subject: r.subject, ...r.builds[0], status: 'retired' },
@@ -1914,7 +1969,7 @@ async function retireTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
  */
 async function rejectTemplateBuild(ctx: RequestCtx, deps: CpDeps) {
   const ref = ctx.params.build ?? '';
-  const r = await retireBuilds(ctx, deps, (x) => x.handle === ref || x.buildId === ref, 'reject');
+  const r = await retireBuilds(ctx, deps, (x, all) => x === buildByRef(all, ref), 'reject');
   const b = r.builds[0];
   return {
     status: 200,
@@ -2039,7 +2094,8 @@ async function createUnlessEnded<T>(
   const cat = deps.templates;
   if (!cat?.update) return create();
   return templateUseLock(cat).run(t.id, async () => {
-    const b = (await cat.get(t.id))?.builds.find((x) => x.buildId === t.buildId);
+    const d = await cat.get(t.id);
+    const b = d ? buildById(d.builds, t.buildId) : undefined;
     if (b?.status === 'retired')
       throw new CpError('template_retired', `template '${t.id}' build ${t.buildId} is retired`);
     if (b?.status !== 'registered')
@@ -2109,7 +2165,7 @@ async function moveTemplateTags(ctx: RequestCtx, deps: CpDeps) {
   await cat.update(d0.id, async (c) => {
     const cur = own(c);
     moved = [];
-    const target = cur.builds.find((x) => x.buildId === ref || x.handle === ref);
+    const target = buildByRef(cur.builds, ref);
     if (!target) throw new CpError('template_not_found', 'no such build of this template');
     if (target.status !== 'registered')
       throw new CpError(
@@ -2465,7 +2521,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const ref = ctx.params.build ?? '';
-    const b = d.builds.find((x) => x.buildId === ref || x.handle === ref);
+    const b = buildByRef(d.builds, ref);
     if (!b) throw new CpError('template_not_found', 'no such build of this template');
     return { status: 200, body: buildBody(d, b, await readinessFacts(deps), true) };
   },
