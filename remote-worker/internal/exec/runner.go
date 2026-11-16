@@ -105,6 +105,84 @@ type Spec struct {
 	// Dir is the directory the child starts in; empty means the worker's own. Never on the
 	// wire: WorkspaceRunner derives it from a validated WorkspaceKey (#408).
 	Dir string
+	// The lease fields, from Exec.mode, mode_epoch, idle_timeout_s and keepalive. The relay
+	// sets the first three from the caller's verified token. Mode is "" for per-exec (proto
+	// UNSPECIFIED or PER_EXEC), else "lease" or "lease+processes" (vmpool's Mode.String());
+	// a proto value the session does not know arrives as "unknown(<n>)", so a runner refuses
+	// it rather than reading it as per-exec. BashRunner ignores all four; vmpool.Runner
+	// forwards them to the pool.
+	Mode         string
+	ModeEpoch    uint64
+	IdleTimeoutS uint32
+	Keepalive    bool
+	// Kind is Exec.kind (plan 5): KindCommand ("") for a command, else one of the process
+	// kinds below, in the guest protocol's spelling. A proto value the session does not know
+	// arrives as "unknown(<n>)", so a runner refuses it (UnknownKind) rather than running it
+	// as a command. Process is Exec.process, the zero value when it is unset. BashRunner
+	// refuses every kind but a command; vmpool.Runner forwards both to the pool.
+	Kind    string
+	Process ProcessArgs
+}
+
+// The Exec kinds as Spec.Kind spells them: the guest protocol's names
+// (guestagent.RequestKind*), with "" for a command so a Spec that names no kind is today's.
+const (
+	KindCommand      = ""
+	KindProcessStart = "process_start"
+	KindProcessList  = "process_list"
+	KindProcessLogs  = "process_logs"
+	KindProcessStop  = "process_stop"
+)
+
+// ProcessArgs mirrors pb.ProcessArgs: Name and Cwd for process_start, ID or Name for logs
+// and stop, Tail for logs (0 = the default), Signal for stop ("" = TERM).
+type ProcessArgs struct {
+	Name   string
+	ID     string
+	Cwd    string
+	Tail   uint32
+	Signal string
+}
+
+// UnknownKind is the refusal detail for a Spec.Kind that names no kind above (ruling
+// P5-R22): "unknown exec kind <n>" for the session's "unknown(<n>)", "unknown exec kind
+// "<kind>"" for any other name (a host-only guest kind such as process_stop_all included).
+// ok is false for a known kind. Both tiers answer it lease_unsupported, before any work.
+func UnknownKind(kind string) (detail string, ok bool) {
+	switch kind {
+	case KindCommand, KindProcessStart, KindProcessList, KindProcessLogs, KindProcessStop:
+		return "", false
+	}
+	var n int32
+	if _, err := fmt.Sscanf(kind, "unknown(%d)", &n); err == nil && kind == fmt.Sprintf("unknown(%d)", n) {
+		return fmt.Sprintf("unknown exec kind %d", n), true
+	}
+	return fmt.Sprintf("unknown exec kind %q", kind), true
+}
+
+// noLeaseModeDetail is the container tier's refusal of a process kind: it has no lease mode.
+const noLeaseModeDetail = "this worker has no lease mode"
+
+// refuseKind is the container tier's answer to a Spec that is not a command (Review Focus
+// 5): lease_unsupported, so the command never runs as a one-shot bash. nil for a command.
+func refuseKind(s Spec) error {
+	if detail, unknown := UnknownKind(s.Kind); unknown {
+		return fmt.Errorf("lease_unsupported: %s", detail)
+	}
+	if s.Kind != KindCommand {
+		return fmt.Errorf("lease_unsupported: %s", noLeaseModeDetail)
+	}
+	return nil
+}
+
+// LeaseSink is the optional extension of Sink a lease-mode runner uses to report a lease
+// state change on the Exec's response. The session's per-Exec sink implements it, stamping
+// the Exec's req_id on the event; a runner type-asserts for it. Lease returns nil only once
+// the event is queued on the connection, so a runner acknowledges an event (vmpool's
+// AckLeaseEvent) only when it returned nil. Called from inside Run, never after it returns,
+// and never concurrently with Chunk.
+type LeaseSink interface {
+	Lease(ev *pb.LeaseEvent) error
 }
 
 // Sink receives output as it is produced. data is owned by the callee. Chunk is
@@ -180,6 +258,11 @@ type BashRunner struct {
 }
 
 func (b BashRunner) Run(ctx context.Context, s Spec, sink Sink) (code int32, err error) {
+	// The container tier runs commands only: every other kind is refused before anything
+	// starts, and the command it carries never runs (refuseKind).
+	if err := refuseKind(s); err != nil {
+		return -1, err
+	}
 	// Refuse before spawning anything on a platform that cannot isolate the child
 	// in its own process group: abort and timeout would then leave grandchildren
 	// running, which is not a degraded mode worth offering (#173 item 8). Always

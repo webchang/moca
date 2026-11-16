@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { main } from '../src/cli.js';
 import {
   authLockPath,
@@ -16,8 +16,21 @@ import { cmdLogin, devicePrompt } from '../src/headless.js';
 import { buildRuntime } from '../src/runtime.js';
 import { SandboxApiClient } from '../src/sbx/api.js';
 import { openSbxRuntime, sbxMain, sbxPaths } from '../src/sbx/cli.js';
+import { createWaitingForActivation } from '../src/sbx/commands.js';
 import { readBoundSandbox } from '../src/sbx/state.js';
-import { fakeCp, LOGIN, sandbox, SBX, setup, TOKEN, URL_, type Handler } from './helpers/sbx.js';
+import { LeaseControlError } from '@moca/sandbox-client';
+import type { ExecFactory } from '../src/sbx/exec.js';
+import {
+  fakeCp,
+  fakeLease,
+  LOGIN,
+  sandbox,
+  SBX,
+  setup,
+  TOKEN,
+  URL_,
+  type Handler,
+} from './helpers/sbx.js';
 
 const MOCA_URL = 'https://moca-api.example.invalid';
 
@@ -61,9 +74,18 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
   });
 
   it('needs a control plane URL, and says how to give one', async () => {
-    const { home, io } = setup();
+    // No login either: a login's own controlPlaneUrl is the last fallback (a login file alone).
+    const { home, io } = setup({ loggedIn: false });
     expect(await sbxMain(['ls'], { HOME: home }, io, { home })).toBe(2);
     expect(io.errs.join('\n')).toMatch(/--control-plane-url|MOCACTL_SBX_URL/);
+  });
+
+  it("falls back to the login's own control plane when nothing else names one", async () => {
+    // sbx-auth.json alone, no MOCACTL_SBX_URL, no config (a login file copied without config.json).
+    const { home, io } = setup();
+    const cp = fakeCp({ 'GET /v1/sandboxes': () => ({ status: 200, body: { sandboxes: [] } }) });
+    expect(await sbxMain(['ls'], { HOME: home }, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(cp.calls.map((c) => `${c.method} ${c.path}`)).toContain('GET /v1/sandboxes');
   });
 
   it('asks for a login first (exit 3)', async () => {
@@ -189,6 +211,20 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(existsSync(sbxPaths(paths).authFile)).toBe(false);
   });
 
+  it('logs in to a combined control plane, which serves sandboxes too (combined spec §3.1)', async () => {
+    const { home, env, paths, io } = setup({ loggedIn: false });
+    const cp = fakeCp({
+      'GET /v1/discovery': () => ({
+        status: 200,
+        body: { ...SBX_DISCOVERY, profile: 'combined', harnessUrl: 'https://h' },
+      }),
+      'POST /v1/auth/device': () => ({ status: 200, body: { ...DEVICE, userCode: 'X' } }),
+      'POST /v1/auth/device/token': () => ({ status: 200, body: loginBody('api-c', 'github:1') }),
+    });
+    expect(await sbxMain(['login'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(loadAuth(sbxPaths(paths), URL_)?.apiToken).toBe('api-c');
+  });
+
   it('explains a not-enrolled login', async () => {
     const { home, env, io } = setup({ loggedIn: false });
     const cp = fakeCp({
@@ -256,6 +292,151 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     ]);
   });
 
+  it('moves tags onto a build and removes one, saying what changed (lifecycle §5.1)', async () => {
+    const { home, env, io } = setup();
+    const b2 = `sha256:${'2'.repeat(64)}`;
+    const b1 = `sha256:${'1'.repeat(64)}`;
+    const cp = fakeCp({
+      'POST /v1/templates/node22/tags': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          buildId: b2,
+          tags: [
+            { tag: 'default', buildId: b2, before: b1, record: `sha256:${'a'.repeat(64)}` },
+            { tag: 'stable', buildId: b2, before: null, record: `sha256:${'b'.repeat(64)}` },
+            { tag: 'v2', buildId: b2, before: b2, record: null },
+          ],
+        },
+      }),
+      'DELETE /v1/templates/node22/tags/stable': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          tag: 'stable',
+          buildId: null,
+          before: b2,
+          record: `sha256:${'c'.repeat(64)}`,
+        },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(
+        ['templates', 'tag', 'node22', 'default', 'stable', 'v2', '--build', b2],
+        env,
+        io,
+        opts,
+      ),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({
+      method: 'POST',
+      body: { tags: ['default', 'stable', 'v2'], build: b2 },
+    });
+    const out = io.outs.join('');
+    expect(out).toContain(`node22:default -> ${b2} (was ${b1})`);
+    expect(out).toContain(`node22:stable -> ${b2} (new)`);
+    expect(out).toContain(`node22:v2 -> ${b2} (unchanged)`);
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'untag', 'node22', 'stable'], env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)!.method).toBe('DELETE');
+    expect(io.outs.join('')).toContain(`removed node22:stable (was ${b2})`);
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'untag', 'node22', 'stable', '--json'], env, io, opts)).toBe(
+      0,
+    );
+    expect(JSON.parse(io.outs.join(''))).toMatchObject({ tag: 'stable', before: b2 });
+    // Usage errors, before any request.
+    const n = cp.calls.length;
+    expect(await sbxMain(['templates', 'tag', 'node22', 'x'], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/templates tag needs --build BUILD/);
+    expect(await sbxMain(['templates', 'tag', 'node22', '--build', b2], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'untag', 'node22'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'untag', 'node22', 'a', 'b'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'untag', 'node22', 'a', '--build', b2], env, io, opts)).toBe(
+      2,
+    );
+    expect(io.errs.join('\n')).toMatch(
+      /--build only applies to templates show, follow, cancel, tag/,
+    );
+    expect(cp.calls.length).toBe(n);
+  });
+
+  it('edits a template and transfers it, saying what changed (lifecycle §5.1, §5.2)', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'PATCH /v1/templates/node22': (req) => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          visibility: 'private',
+          description: 'Node',
+          changes: (req.body as { visibility?: string } | undefined)?.visibility
+            ? [
+                {
+                  field: 'visibility',
+                  value: 'private',
+                  before: 'deployment',
+                  record: `sha256:${'a'.repeat(64)}`,
+                },
+              ]
+            : [],
+        },
+      }),
+      'PUT /v1/templates/node22/owner': () => ({
+        status: 200,
+        body: {
+          templateId: 'node22',
+          subject: 'github:1',
+          owner: 'github:9',
+          before: 'github:1',
+          record: `sha256:${'b'.repeat(64)}`,
+        },
+      }),
+      'PUT /v1/templates/other/owner': () => ({
+        status: 403,
+        body: { error: 'forbidden', message: 'transferring a template requires the admin role' },
+      }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(
+      await sbxMain(['templates', 'edit', 'node22', '--visibility', 'private'], env, io, opts),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({ method: 'PATCH', body: { visibility: 'private' } });
+    expect(io.outs.join('')).toContain('node22: visibility changed');
+    io.outs.length = 0;
+    expect(
+      await sbxMain(['templates', 'edit', 'node22', '--description', 'Node'], env, io, opts),
+    ).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({ body: { description: 'Node' } });
+    expect(io.outs.join('')).toContain('node22: unchanged');
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'transfer', 'node22', 'github:9'], env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({ method: 'PUT', body: { owner: 'github:9' } });
+    expect(io.outs.join('')).toContain('node22: owner github:9 (was github:1)');
+    // A refusal is reported with its code (exit 1).
+    expect(await sbxMain(['templates', 'transfer', 'other', 'github:9'], env, io, opts)).toBe(1);
+    expect(io.errs.join('\n')).toMatch(/forbidden|admin role/);
+    // Usage errors, before any request.
+    const n = cp.calls.length;
+    expect(await sbxMain(['templates', 'edit', 'node22'], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/templates edit needs --visibility or --description/);
+    expect(
+      await sbxMain(['templates', 'edit', 'node22', '--visibility', 'public'], env, io, opts),
+    ).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/--visibility must be private or deployment/);
+    expect(await sbxMain(['ls', '--visibility', 'private'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'show', 'x', '--description', 'd'], env, io, opts)).toBe(2);
+    expect(await sbxMain(['templates', 'transfer', 'node22'], env, io, opts)).toBe(2);
+    expect(
+      await sbxMain(['templates', 'edit', 'a', 'b', '--description', 'd'], env, io, opts),
+    ).toBe(2);
+    expect(cp.calls.length).toBe(n);
+  });
+
   it('creates a sandbox with a template, a name and labels, and prints its id and expiry', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({ 'POST /v1/sandboxes': () => ({ status: 201, body: sandbox() }) });
@@ -284,6 +465,85 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     });
     expect(io.outs.join('')).toContain(SBX);
     expect(io.errs.join('')).toContain(new Date(1_800_604_800 * 1000).toISOString());
+  });
+
+  it('waits while the template activates (§6.4): retries a 409 template_not_active after its Retry-After', async () => {
+    const { home, env, io } = setup();
+    let n = 0;
+    const cp = fakeCp({
+      'POST /v1/sandboxes': () =>
+        ++n < 3
+          ? {
+              status: 409,
+              body: {
+                error: 'template_not_active',
+                message: "template 'node22' is activating; its activation has started",
+                readiness: 'activating',
+              },
+              headers: { 'retry-after': '30' },
+            }
+          : { status: 201, body: sandbox() },
+    });
+    const { rt, api } = openSbxRuntime(URL_, env, { home, fetchImpl: cp.fetchImpl });
+    const slept: number[] = [];
+    let t = 0;
+    rt.sleep = async (ms: number) => {
+      slept.push(ms);
+      t += ms;
+    };
+    rt.now = () => t;
+    const s = await createWaitingForActivation(
+      { rt, api, url: URL_, io, json: false },
+      { template: 'node22' },
+    );
+    expect(s.id).toBe(SBX);
+    expect(n).toBe(3);
+    expect(slept).toEqual([30_000, 30_000]);
+    expect(io.errs.join('')).toContain(
+      "sbx: template 'node22' is activating; its activation has started; retrying in 30 s",
+    );
+  });
+
+  it('gives up waiting for an activation after 10 minutes, with the refusal', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'POST /v1/sandboxes': () => ({
+        status: 409,
+        body: { error: 'template_not_active', message: 'activating', readiness: 'activating' },
+        headers: { 'retry-after': '30' },
+      }),
+    });
+    const { rt, api } = openSbxRuntime(URL_, env, { home, fetchImpl: cp.fetchImpl });
+    let t = 0;
+    rt.sleep = async (ms: number) => {
+      t += ms;
+    };
+    rt.now = () => t;
+    const err = await createWaitingForActivation(
+      { rt, api, url: URL_, io, json: false },
+      { template: 'node22' },
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 409, code: 'template_not_active' });
+    // 10 minutes of 30 s waits: the first try and 20 retries.
+    expect(cp.calls.length).toBe(21);
+  });
+
+  it('does not wait on any other refusal of a create', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'POST /v1/sandboxes': () => ({
+        status: 409,
+        body: { error: 'no_active_slot', message: 'full', readiness: 'unavailable' },
+        headers: { 'retry-after': '60' },
+      }),
+    });
+    const { rt, api } = openSbxRuntime(URL_, env, { home, fetchImpl: cp.fetchImpl });
+    const err = await createWaitingForActivation(
+      { rt, api, url: URL_, io, json: false },
+      { template: 'node22' },
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 409, code: 'no_active_slot' });
+    expect(cp.calls.length).toBe(1);
   });
 
   it('creates from the default template without --template (spec §6.1), and refuses a malformed --label', async () => {
@@ -335,8 +595,8 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     });
     expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
     const out = io.outs.join('');
-    expect(out).toMatch(new RegExp(`${SBX}\\s+web\\s+node22\\s+ready`));
-    expect(out).toMatch(/sbx-dead\s+-\s+node22\s+terminated \(deleted\)/);
+    expect(out).toMatch(new RegExp(`${SBX}\\s+web\\s+node22\\s+per-exec\\s+ready`));
+    expect(out).toMatch(/sbx-dead\s+-\s+node22\s+per-exec\s+terminated \(deleted\)/);
     expect(out).toContain(new Date(1_800_604_800 * 1000).toISOString());
     await sbxMain(['ls', '--all'], env, io, { home, fetchImpl: cp.fetchImpl });
     expect(cp.calls.at(-1)!.path).toBe('/v1/sandboxes?all=1');
@@ -361,6 +621,263 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     );
   });
 
+  it('rm sends sandbox_deleted before DELETE for a lease sandbox, and not for per-exec', async () => {
+    for (const mode of ['lease', 'lease+processes', 'per-exec']) {
+      const { home, env, io } = setup();
+      const order: string[] = [];
+      const cp = fakeCp({
+        [`GET /v1/sandboxes/${SBX}`]: () => ({ status: 200, body: sandbox({ mode }) }),
+        [`POST /v1/sandboxes/${SBX}/token`]: () => ({ status: 200, body: TOKEN }),
+        [`DELETE /v1/sandboxes/${SBX}`]: () => {
+          order.push('DELETE');
+          return { status: 200, body: { id: SBX, state: 'terminated', reason: 'deleted' } };
+        },
+      });
+      const lease = fakeLease((op) => {
+        order.push(op);
+        return { mode: 'lease', epochKnown: true, state: 'none', ageMs: 0, idleTimeoutS: 0 };
+      });
+      let closed = 0;
+      const execFactory: ExecFactory = () => ({
+        exec: async () => {
+          throw new Error('no command runs in this test');
+        },
+        close: () => void closed++,
+        leaseControl: lease.leaseControl,
+        leaseKeepalive: lease.leaseKeepalive,
+      });
+      expect(
+        await sbxMain(['rm', '--force', SBX], env, io, {
+          home,
+          fetchImpl: cp.fetchImpl,
+          execFactory,
+        }),
+      ).toBe(0);
+      expect(order).toEqual(mode === 'per-exec' ? ['DELETE'] : ['sandbox_deleted', 'DELETE']);
+      expect(closed).toBe(mode === 'per-exec' ? 0 : 1);
+    }
+    // Best effort: a lease call that fails, or a record that cannot be read, still deletes.
+    for (const broken of ['lease', 'get'] as const) {
+      const { home, env, io } = setup();
+      const cp = fakeCp({
+        [`GET /v1/sandboxes/${SBX}`]: () =>
+          broken === 'get'
+            ? { status: 500, body: { error: 'internal', message: 'boom' } }
+            : { status: 200, body: sandbox({ mode: 'lease' }) },
+        [`POST /v1/sandboxes/${SBX}/token`]: () => ({ status: 200, body: TOKEN }),
+        [`DELETE /v1/sandboxes/${SBX}`]: () => ({
+          status: 200,
+          body: { id: SBX, state: 'terminated', reason: 'deleted' },
+        }),
+      });
+      const lease = fakeLease(() => new LeaseControlError('unavailable', 'no worker'));
+      const execFactory: ExecFactory = () => ({
+        exec: async () => {
+          throw new Error('no command runs in this test');
+        },
+        close: () => {},
+        ...lease,
+      });
+      expect(
+        await sbxMain(['rm', '--force', SBX], env, io, {
+          home,
+          fetchImpl: cp.fetchImpl,
+          execFactory,
+        }),
+      ).toBe(0);
+      expect(cp.calls.at(-1)).toMatchObject({ method: 'DELETE' });
+      expect(io.errs.join('\n')).toMatch(/^deleted /);
+    }
+  });
+
+  it("rm bounds sandbox_deleted's wait at 15 s, then deletes; Ctrl-C during it deletes nothing", async () => {
+    const world = () => {
+      const s = setup();
+      const cp = fakeCp({
+        [`GET /v1/sandboxes/${SBX}`]: () => ({ status: 200, body: sandbox({ mode: 'lease' }) }),
+        [`POST /v1/sandboxes/${SBX}/token`]: () => ({ status: 200, body: TOKEN }),
+        [`DELETE /v1/sandboxes/${SBX}`]: () => ({
+          status: 200,
+          body: { id: SBX, state: 'terminated', reason: 'deleted' },
+        }),
+      });
+      const leaseCalls: string[] = [];
+      const execFactory: ExecFactory = () => ({
+        exec: async () => {
+          throw new Error('no command runs in this test');
+        },
+        close: () => {},
+        // The worker blocks sandbox_deleted (up to grace_limit): only an abort ends this call.
+        leaseControl: (op, _t, o) =>
+          new Promise((_res, rej) => {
+            leaseCalls.push(op);
+            o?.signal?.addEventListener('abort', () =>
+              rej(new LeaseControlError('cancelled', 'cancelled on client')),
+            );
+          }),
+        leaseKeepalive: async () => {},
+      });
+      return { ...s, cp, leaseCalls, execFactory };
+    };
+    // The bound passes (the sleep seam answers once the call is waiting): the DELETE goes ahead.
+    const w = world();
+    const slept: number[] = [];
+    expect(
+      await sbxMain(['rm', '--force', SBX], w.env, w.io, {
+        home: w.home,
+        fetchImpl: w.cp.fetchImpl,
+        execFactory: w.execFactory,
+        sleep: async (ms) => {
+          slept.push(ms);
+          await vi.waitFor(() => expect(w.leaseCalls).toHaveLength(1));
+        },
+      }),
+    ).toBe(0);
+    expect(slept).toEqual([15_000]);
+    expect(w.leaseCalls).toEqual(['sandbox_deleted']);
+    expect(w.cp.calls.at(-1)).toMatchObject({ method: 'DELETE' });
+    // Ctrl-C while it waits: no DELETE, said so, exit 130.
+    const x = world();
+    const ac = new AbortController();
+    const p = sbxMain(['rm', '--force', SBX], x.env, x.io, {
+      home: x.home,
+      fetchImpl: x.cp.fetchImpl,
+      execFactory: x.execFactory,
+      signal: ac.signal,
+    });
+    await vi.waitFor(() => expect(x.leaseCalls).toHaveLength(1));
+    ac.abort();
+    expect(await p).toBe(130);
+    expect(x.cp.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    expect(x.io.errs.join('\n')).toContain('nothing was deleted');
+  });
+
+  it("rm's 15 s bound covers the record read and the token mint too; Ctrl-C there deletes nothing (review #4569829061)", async () => {
+    const world = (hang: 'get' | 'token') => {
+      const s = setup();
+      const cp = fakeCp({
+        [`GET /v1/sandboxes/${SBX}`]: () => ({ status: 200, body: sandbox({ mode: 'lease' }) }),
+        [`POST /v1/sandboxes/${SBX}/token`]: () => ({ status: 200, body: TOKEN }),
+        [`DELETE /v1/sandboxes/${SBX}`]: () => ({
+          status: 200,
+          body: { id: SBX, state: 'terminated', reason: 'deleted' },
+        }),
+      });
+      const hung: string[] = [];
+      // A control plane that never answers the record read (or the mint): only an abort ends it.
+      const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
+        const u = new URL(String(input));
+        const method = init?.method ?? 'GET';
+        const slow =
+          hang === 'get'
+            ? method === 'GET' && u.pathname === `/v1/sandboxes/${SBX}`
+            : method === 'POST' && u.pathname === `/v1/sandboxes/${SBX}/token`;
+        if (!slow) return cp.fetchImpl(input, init);
+        hung.push(`${method} ${u.pathname}`);
+        return new Promise<Response>((_res, rej) => {
+          const stop = () => rej(new DOMException('aborted', 'AbortError'));
+          if (init?.signal?.aborted) stop();
+          init?.signal?.addEventListener('abort', stop, { once: true });
+        });
+      }) as typeof fetch;
+      const execFactory: ExecFactory = () => ({
+        exec: async () => {
+          throw new Error('no command runs in this test');
+        },
+        close: () => {},
+        ...fakeLease(() => ({
+          mode: 'lease',
+          epochKnown: true,
+          state: 'none',
+          ageMs: 0,
+          idleTimeoutS: 0,
+        })),
+      });
+      return { ...s, cp, fetchImpl, hung, execFactory };
+    };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      for (const hang of ['get', 'token'] as const) {
+        const w = world(hang);
+        const p = sbxMain(['rm', '--force', SBX], w.env, w.io, {
+          home: w.home,
+          fetchImpl: w.fetchImpl,
+          execFactory: w.execFactory,
+        });
+        await vi.waitFor(() => expect(w.hung).toHaveLength(1));
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(await p, hang).toBe(0);
+        expect(w.cp.calls.at(-1), hang).toMatchObject({ method: 'DELETE' });
+        expect(w.io.errs.join('\n')).toMatch(/^deleted /);
+      }
+      // Ctrl-C while the record read hangs: no DELETE, said so, exit 130.
+      const x = world('get');
+      const ac = new AbortController();
+      const p = sbxMain(['rm', '--force', SBX], x.env, x.io, {
+        home: x.home,
+        fetchImpl: x.fetchImpl,
+        execFactory: x.execFactory,
+        signal: ac.signal,
+      });
+      await vi.waitFor(() => expect(x.hung).toHaveLength(1));
+      ac.abort();
+      expect(await p).toBe(130);
+      expect(x.cp.calls.some((c) => c.method === 'DELETE')).toBe(false);
+      expect(x.io.errs.join('\n')).toContain('nothing was deleted');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rm forgets the sandbox\'s seen notices, the "already gone" path too', async () => {
+    for (const gone of [false, true]) {
+      const s = setup();
+      const file = join(s.paths.stateDir, 'sbx', 'notices.json');
+      mkdirSync(join(s.paths.stateDir, 'sbx'), { recursive: true });
+      writeFileSync(file, JSON.stringify({ [SBX]: 1, 'sbx-other': 2 }));
+      const cp = fakeCp({
+        [`DELETE /v1/sandboxes/${SBX}`]: () =>
+          gone
+            ? { status: 404, body: { error: 'sandbox_not_found', message: 'no such sandbox' } }
+            : { status: 200, body: { id: SBX, state: 'terminated', reason: 'deleted' } },
+      });
+      // Bound here, from this control plane: its 404 is "already gone".
+      const r = mkdtempSync(join(tmpdir(), 'sbx-rm-'));
+      mkdirSync(join(r, '.sbx'));
+      writeFileSync(
+        join(r, '.sbx/sandbox.json'),
+        JSON.stringify({ id: SBX, controlPlaneUrl: URL_ }),
+      );
+      expect(
+        await sbxMain(['rm', '--force', '--keep-config', SBX], s.env, s.io, {
+          home: s.home,
+          fetchImpl: cp.fetchImpl,
+          cwd: r,
+        }),
+      ).toBe(0);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'sbx-other': 2 });
+    }
+  });
+
+  it('ls shows MODE', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/sandboxes': () => ({
+        status: 200,
+        body: {
+          sandboxes: [
+            sandbox(),
+            sandbox({ id: 'sbx-lease', name: 'l', mode: 'lease+processes', modeEpoch: 2 }),
+          ],
+        },
+      }),
+    });
+    expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    const lines = io.outs.join('').split('\n');
+    expect(lines[0]).toMatch(new RegExp(`^${SBX}\\s+web\\s+node22\\s+per-exec\\s+ready\\s`));
+    expect(lines[1]).toMatch(/^sbx-lease\s+l\s+node22\s+lease\+processes\s+ready\s/);
+  });
+
   it('refuses a malformed sandbox id before any request', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({});
@@ -375,6 +892,35 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     });
     expect(await sbxMain(['token', SBX], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
     expect(io.outs.join('')).toBe(`${TOKEN.token}\n`);
+  });
+
+  it('token --renew-every: a fresh token per period, one line each, until stopped', async () => {
+    const { home, env, io } = setup();
+    let n = 0;
+    const cp = fakeCp({
+      [`POST /v1/sandboxes/${SBX}/token`]: () => ({
+        status: 200,
+        body: { ...TOKEN, token: `${TOKEN.token}${n++}` },
+      }),
+    });
+    const ac = new AbortController();
+    const slept: number[] = [];
+    const sleep = async (ms: number) => {
+      slept.push(ms);
+      if (slept.length === 2) ac.abort();
+    };
+    const deps = { home, fetchImpl: cp.fetchImpl, sleep, signal: ac.signal };
+    expect(await sbxMain(['token', SBX, '--renew-every', '600'], env, io, deps)).toBe(0);
+    expect(io.outs.join('')).toBe(`${TOKEN.token}0\n${TOKEN.token}1\n`);
+    expect(slept).toEqual([600_000, 600_000]);
+    // Only on token, and only a whole number of seconds, at least 1: refused before any request.
+    const calls = cp.calls.length;
+    const d = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain(['ls', '--renew-every', '5'], env, io, d)).toBe(2);
+    expect(await sbxMain(['token', SBX, '--renew-every', '0'], env, io, d)).toBe(2);
+    expect(await sbxMain(['token', SBX, '--renew-every', '1.5'], env, io, d)).toBe(2);
+    expect(io.errs.join('\n')).toContain('--renew-every must be a whole number of seconds');
+    expect(cp.calls.length).toBe(calls);
   });
 
   it('says why a terminated sandbox gives no token', async () => {
@@ -678,7 +1224,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     });
     expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
     const out = io.outs.join('');
-    expect(out).toMatch(/node22\s+terminated\s+\d{4}-/);
+    expect(out).toMatch(/node22\s+per-exec\s+terminated\s+\d{4}-/);
     expect(out).not.toMatch(/expired|\(/);
   });
 
@@ -696,5 +1242,215 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     const [a, b] = io.outs.join('').trimEnd().split('\n');
     expect(a).not.toContain('\u001b');
     expect(a!.indexOf('node22')).toBe(b!.indexOf('node22'));
+  });
+});
+
+describe('mocactl sbx templates quota (template lifecycle §5.2; admins)', () => {
+  const policyView = (over: Record<string, unknown> = {}) => ({
+    policy: { quota: { templates: 100, buildsQueued: 10, active: 8 }, ...over },
+    digest: `sha256:${'1'.repeat(64)}`,
+    record: `sha256:${'2'.repeat(64)}`,
+  });
+  const answer = (target: string, quota: unknown, before: unknown) => ({
+    status: 200,
+    body: {
+      target,
+      subject: 'github:1',
+      quota,
+      before,
+      policy: `sha256:${'5'.repeat(64)}`,
+      record: `sha256:${'6'.repeat(64)}`,
+    },
+  });
+  const ARGS = [
+    'templates',
+    'quota',
+    'github:9',
+    '--templates',
+    '5',
+    '--builds-queued',
+    '2',
+    '--active',
+    '1',
+  ];
+  const Q = { templates: 5, buildsQueued: 2, active: 1 };
+  const OLD = { templates: 3, buildsQueued: 1, active: 1 };
+  // The compare-and-set's query: the value the command read.
+  const ifRead = (v: unknown) => `?${new URLSearchParams({ expect: JSON.stringify(v) })}`;
+
+  it('reads, writes and prints old -> new with the policy digest; names the control plane', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({ quotaBySubject: { 'github:9': OLD } }),
+      }),
+      'PUT /v1/quota/github%3A9': (req) => answer('github:9', req.body, OLD),
+    });
+    expect(await sbxMain(ARGS, env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(cp.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /v1/policy',
+      `PUT /v1/quota/github%3A9${ifRead(OLD)}`,
+    ]);
+    expect(cp.calls.at(-1)!.body).toEqual(Q);
+    expect(io.outs.join('')).toBe(
+      'github:9: templates 3, builds queued 1, active 1 -> templates 5, builds queued 2, active 1 ' +
+        `(policy sha256:${'5'.repeat(64)}, record sha256:${'6'.repeat(64)})\n`,
+    );
+    expect(io.errs.join('\n')).toContain(`admin write to ${URL_}`);
+  });
+
+  it('--clear sends null and prints the return to the default; the default is set the same way', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({ quotaBySubject: { 'github:9': OLD } }),
+      }),
+      'PUT /v1/quota/github%3A9': () => answer('github:9', null, OLD),
+      'PUT /v1/quota/default': (req) =>
+        answer('default', req.body, { templates: 100, buildsQueued: 10, active: 8 }),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain(['templates', 'quota', 'github:9', '--clear'], env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)).toMatchObject({
+      method: 'PUT',
+      path: `/v1/quota/github%3A9${ifRead(OLD)}`,
+    });
+    expect(cp.calls.at(-1)!.body).toBeNull();
+    expect(io.outs.join('')).toContain(
+      'github:9: templates 3, builds queued 1, active 1 -> the default',
+    );
+    io.outs.length = 0;
+    expect(await sbxMain(['templates', 'quota', 'default', ...ARGS.slice(3)], env, io, opts)).toBe(
+      0,
+    );
+    expect(io.outs.join('')).toContain(
+      'default: templates 100, builds queued 10, active 8 -> templates 5, builds queued 2, active 1',
+    );
+  });
+
+  it('writes nothing when the quota changed after its read, and reports the value now (exit 1)', async () => {
+    const { home, env, io } = setup();
+    let reads = 0;
+    const cp = fakeCp({
+      // The first read sees OLD; another admin then writes, so the second read sees theirs.
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({
+          quotaBySubject: { 'github:9': reads++ === 0 ? OLD : { ...OLD, templates: 4 } },
+        }),
+      }),
+      'PUT /v1/quota/github%3A9': () => ({
+        status: 409,
+        body: { error: 'quota_changed', message: "github:9's quota changed since it was read" },
+      }),
+    });
+    expect(await sbxMain(ARGS, env, io, { home, fetchImpl: cp.fetchImpl })).toBe(1);
+    expect(cp.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /v1/policy',
+      `PUT /v1/quota/github%3A9${ifRead(OLD)}`,
+      'GET /v1/policy',
+    ]);
+    expect(io.errs.join('\n')).toContain(
+      "nothing written: github:9's quota was changed by someone else after this command read it (read templates 3, builds queued 1, active 1, now templates 4, builds queued 1, active 1)",
+    );
+    expect(io.outs.join('')).toBe('');
+  });
+
+  it('--owned sets the fourth counter; without it, the target keeps its own and new shows it', async () => {
+    const { home, env, io } = setup();
+    const OLD4 = { ...OLD, owned: 7 };
+    const cp = fakeCp({
+      'GET /v1/policy': () => ({
+        status: 200,
+        body: policyView({ quotaBySubject: { 'github:9': OLD4 } }),
+      }),
+      // As the control plane stores it: a body without owned keeps the target's.
+      'PUT /v1/quota/github%3A9': (req) =>
+        answer('github:9', { owned: 7, ...(req.body as object) }, OLD4),
+    });
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain([...ARGS, '--owned', '3'], env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)!.path).toBe(`/v1/quota/github%3A9${ifRead(OLD4)}`);
+    expect(cp.calls.at(-1)!.body).toEqual({ ...Q, owned: 3 });
+    expect(io.outs.join('')).toContain(
+      'github:9: templates 3, builds queued 1, active 1, owned 7 -> templates 5, builds queued 2, active 1, owned 3 ',
+    );
+    io.outs.length = 0;
+    expect(await sbxMain(ARGS, env, io, opts)).toBe(0);
+    expect(cp.calls.at(-1)!.body).toEqual(Q);
+    expect(io.outs.join('')).toContain('-> templates 5, builds queued 2, active 1, owned 7 ');
+    for (const bad of ['-1', '1.5', 'x'])
+      expect(await sbxMain([...ARGS, '--owned', bad], env, io, opts)).toBe(2);
+    expect(io.errs.join('\n')).toMatch(/--owned must be a whole number/);
+    expect(
+      await sbxMain(['templates', 'quota', 'github:9', '--clear', '--owned', '1'], env, io, opts),
+    ).toBe(2);
+    expect(await sbxMain(['ls', '--owned', '1'], env, io, opts)).toBe(2);
+  });
+
+  it('expects no override when the subject has none', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/policy': () => ({ status: 200, body: policyView() }),
+      'PUT /v1/quota/github%3A9': (req) => answer('github:9', req.body, null),
+    });
+    expect(await sbxMain(ARGS, env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(cp.calls.at(-1)!.path).toBe(`/v1/quota/github%3A9${ifRead(null)}`);
+    expect(io.outs.join('')).toContain('github:9: the default -> templates 5');
+  });
+
+  it('expects only the counters read, when the stored quota carries another key', async () => {
+    const { home, env, io } = setup();
+    // A deployment-wide quota stored through PUT /v1/policy may hold a key the control plane's
+    // expect refuses; the command sends the counters alone.
+    const STORED = { ...OLD, owned: 7, note: 'set by hand' };
+    const cp = fakeCp({
+      'GET /v1/policy': () => ({ status: 200, body: policyView({ quota: STORED }) }),
+      'PUT /v1/quota/default': (req) => answer('default', req.body, STORED),
+    });
+    expect(
+      await sbxMain(['templates', 'quota', 'default', ...ARGS.slice(3)], env, io, {
+        home,
+        fetchImpl: cp.fetchImpl,
+      }),
+    ).toBe(0);
+    expect(cp.calls.at(-1)!.path).toBe(`/v1/quota/default${ifRead({ ...OLD, owned: 7 })}`);
+  });
+
+  it("refuses a login another deployment's control plane issued, before any read or write", async () => {
+    const { home, env, io, paths } = setup();
+    const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const other = `${b64({ alg: 'EdDSA' })}.${b64({ iss: 'sh-control-plane', sub: 'github:1' })}.sig`;
+    saveAuth(sbxPaths(paths), { ...LOGIN, apiToken: other });
+    const cp = fakeCp({
+      'GET /v1/discovery': () => ({ status: 200, body: SBX_DISCOVERY }),
+    });
+    expect(await sbxMain(ARGS, env, io, { home, fetchImpl: cp.fetchImpl })).toBe(1);
+    expect(io.errs.join('\n')).toContain(
+      `refused: the login was issued by 'sh-control-plane', but ${URL_} (profile sandbox) issues 'sbx-control-plane-api'`,
+    );
+    expect(cp.calls.map((c) => c.path)).toEqual(['/v1/discovery']);
+  });
+
+  it('refuses bad flags before any request (exit 2)', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({});
+    const opts = { home, fetchImpl: cp.fetchImpl };
+    expect(await sbxMain(['templates', 'quota', 'github:9', '--active', '1'], env, io, opts)).toBe(
+      2,
+    );
+    expect(io.errs.join('\n')).toMatch(/needs --templates, --builds-queued and --active/);
+    expect(
+      await sbxMain(['templates', 'quota', 'github:9', '--clear', '--active', '1'], env, io, opts),
+    ).toBe(2);
+    expect(await sbxMain(['templates', 'quota', 'default', '--clear'], env, io, opts)).toBe(2);
+    expect(await sbxMain([...ARGS.slice(0, 2), ...ARGS.slice(3)], env, io, opts)).toBe(2);
+    expect(await sbxMain(['ls', '--active', '1'], env, io, opts)).toBe(2);
+    expect(
+      await sbxMain([...ARGS.slice(0, 3), '--templates', '-1', ...ARGS.slice(5)], env, io, opts),
+    ).toBe(2);
+    expect(cp.calls).toEqual([]);
   });
 });

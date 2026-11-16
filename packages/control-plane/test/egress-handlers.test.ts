@@ -38,6 +38,9 @@ const rec = (id: string, worker: string, over: Partial<SandboxRecord> = {}): San
   labels: {},
   createdAt: NOW_S - 10,
   expiresAt: NOW_S + 1000,
+  mode: 'per-exec',
+  idleTimeoutS: 0,
+  modeEpoch: 0,
   ...over,
 });
 
@@ -155,6 +158,15 @@ describe('lookupEgressCredential', () => {
         egressHost: 'kvm',
       }),
     );
+    d.config.sandbox!.allowedSubjects = [];
+    expect(await codeOf(() => call(d, KVM, { sandbox: sbxA, host: 'github.com' }))).toBe(
+      'no_credential',
+    );
+  });
+
+  it('on combined, answers no_credential for an owner not enrolled, though login is open there', async () => {
+    d.config.routeProfile = 'combined';
+    expect((await call(d, KVM, { sandbox: sbxA, host: 'github.com' })).status).toBe(200);
     d.config.sandbox!.allowedSubjects = [];
     expect(await codeOf(() => call(d, KVM, { sandbox: sbxA, host: 'github.com' }))).toBe(
       'no_credential',

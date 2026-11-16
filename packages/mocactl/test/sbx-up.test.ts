@@ -10,7 +10,13 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ExecMachineryError } from '@moca/sandbox-client';
+import {
+  ExecMachineryError,
+  leaseNotice,
+  sandboxRules,
+  WORKSPACE,
+  type LeaseEvent,
+} from '@moca/sandbox-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { saveAuth } from '../src/config.js';
 import { SBX_USAGE, sbxMain, sbxPaths } from '../src/sbx/cli.js';
@@ -19,14 +25,17 @@ import { hasUnpulled, MAX_FILE, repoId } from '../src/sbx/push.js';
 import {
   LOGIN,
   NEW,
+  NO_LEASE,
   OTHER,
   SBX,
   URL_,
   cleanupTmp,
   git,
   harness,
+  leaseEnd,
   repo,
   sandbox,
+  withLeaseEvents,
 } from './helpers/sbx.js';
 
 afterEach(cleanupTmp);
@@ -138,6 +147,24 @@ describe('mocactl sbx up (SBX0 §6.1)', () => {
     expect(binding(h.r).id).toBe(SBX);
   });
 
+  it('writes the lease rules into CLAUDE.md and AGENTS.md for a lease sandbox (P4-R11)', async () => {
+    const h = harness();
+    const rid = await repoId(h.r);
+    h.cp.boxes.set(
+      SBX,
+      sandbox({ id: SBX, labels: { project: rid }, mode: 'lease', modeEpoch: 1 }),
+    );
+    expect(await h.run(['up'])).toBe(0);
+    expect(binding(h.r).id).toBe(SBX);
+    for (const f of ['CLAUDE.md', 'AGENTS.md']) {
+      const md = readFileSync(join(h.r, f), 'utf8');
+      expect(md).toContain(sandboxRules(WORKSPACE, 'lease'));
+      expect(md).not.toContain('Every tool call runs in a fresh VM');
+    }
+    // doctor takes the block written for the sandbox's mode.
+    expect(checkAgentConfig(h.r)).toEqual([]);
+  }, 30_000);
+
   it('warns and pushes nothing when the reused sandbox holds changes not yet pulled', async () => {
     const h = harness();
     expect(await h.run(['up'])).toBe(0);
@@ -235,6 +262,29 @@ describe('mocactl sbx up (SBX0 §6.1)', () => {
 });
 
 describe('mocactl sbx push and pull (SBX0 §6.2, §10.3)', () => {
+  it('push, pull and up say the lease events their Execs carried (plan-4 M2)', async () => {
+    const h = harness();
+    expect(await h.run(['up'])).toBe(0);
+    const queue: LeaseEvent[][] = [];
+    const run = (argv: string[]) => {
+      h.io.errs.length = 0;
+      h.io.outB.length = 0;
+      return sbxMain(argv, h.env, h.io, {
+        home: h.home,
+        fetchImpl: h.cp.fetchImpl,
+        cwd: h.r,
+        execFactory: withLeaseEvents(h.ws.factory, queue),
+      });
+    };
+    let at = 1_800_000_100_000;
+    for (const argv of [['push'], ['pull'], ['up']]) {
+      const end = leaseEnd({ reason: 'idle', atUnixMs: (at += 60_000) });
+      queue.push([end]);
+      expect(await run(argv), argv.join(' ')).toBe(0);
+      expect(h.io.errs, argv.join(' ')).toContain(leaseNotice(end, Date.now()));
+    }
+  });
+
   it('push is refused while changes are not yet pulled; --force pushes', async () => {
     const h = harness();
     expect(await h.run(['up'])).toBe(0);
@@ -583,6 +633,7 @@ describe('mocactl sbx up and rm: the agent configuration (SBX0 §6.3, plan Revie
         );
       },
       close: () => {},
+      ...NO_LEASE,
     });
     const run = (argv: string[]) =>
       sbxMain(argv, h.env, h.io, {

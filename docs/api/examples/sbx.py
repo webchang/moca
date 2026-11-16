@@ -51,7 +51,7 @@ def sandbox() -> Sandbox:
 
 
 def log(op: str, started: float, code: int, **extra) -> None:
-    """sbx.py's SBX_LOG record, {t, op, ms, exit}, plus the keys G36 added, as the Go sbx writes them: "attempt"
+    """sbx.py's SBX_LOG record, {t, op, ms, exit}, plus the keys the busy retry added, as the Go sbx writes them: "attempt"
     (every record, from 1); "refused" and "reason" (a refused attempt's record, and the final one when the retries
     ran out: the class, and the refusal's text sanitized and cut to 300 characters); "busy_wait_ms" (the final
     record of a call only: the total slept between retries, 0 when none)."""
@@ -87,7 +87,7 @@ def jitter(d: float) -> float:
 
 def run(command: str, stdin: bytes = b"", op: str = "run", sleep=time.sleep) -> int:
     """Run one command. A command the sandbox refused at capacity before anything of it ran (RefusedAtCapacity) is
-    sent again, with backoff, until SBX_BUSY_RETRY_S of waiting is spent (G36); nothing else is ever retried, so a
+    sent again, with backoff, until SBX_BUSY_RETRY_S of waiting is spent; nothing else is ever retried, so a
     command that may have started never runs twice. Each retry is a new Exec with a new req_id (Sandbox.exec draws
     one per call): the refused one never ran, and the worker dedups by req_id, so a fresh id is admitted afresh."""
     started = time.time()
@@ -97,9 +97,12 @@ def run(command: str, stdin: bytes = b"", op: str = "run", sleep=time.sleep) -> 
         print(f"sbx: {e}", file=sys.stderr)
         return 2
     waited, attempt, attempt_start = 0.0, 1, started
+    sb = None  # one Sandbox (one channel, one TokenSource) for every attempt: a retry needs only a new req_id
     while True:
         try:
-            r = sandbox().exec(command, stdin=stdin, timeout_s=int(os.environ.get("SBX_TIMEOUT", "600")))
+            if sb is None:
+                sb = sandbox()  # inside the try, so a failed token command is reported as before
+            r = sb.exec(command, stdin=stdin, timeout_s=int(os.environ.get("SBX_TIMEOUT", "600")))
             break
         except RefusedAtCapacity as e:
             nxt = min(jitter(backoff(attempt)), budget - waited)

@@ -3,10 +3,14 @@ package vmpool
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +143,33 @@ func TestRunOverConnSurfacesAGuestError(t *testing.T) {
 	}
 }
 
+// PR #763 review (F2): the agent's report that a command's own timeout fired is a guest
+// error like any other on the wire, and guestTimedOut tells it apart; the error text is
+// unchanged.
+func TestRunOverConnMarksTheGuestsOwnTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		payload string
+		timeout bool
+	}{
+		{ga.TimeoutMessage(7), true},
+		{"guest-agent: this agent is dead", false},
+	} {
+		conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+			_ = ga.WriteFrame(rw, ga.KindError, []byte(tc.payload))
+		})
+		_, err := runOverConn(context.Background(), conn, Command{Command: "true", CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+		if !errors.Is(err, ErrGuest) || err.Error() != "vmpool: guest error: "+tc.payload {
+			t.Fatalf("%q: err = %v, want ErrGuest with the message unchanged", tc.payload, err)
+		}
+		if got := guestTimedOut(err); got != tc.timeout {
+			t.Errorf("%q: guestTimedOut = %v, want %v", tc.payload, got, tc.timeout)
+		}
+	}
+	if guestTimedOut(ErrAborted) || guestTimedOut(nil) {
+		t.Error("guestTimedOut is true for an error the guest did not send")
+	}
+}
+
 func TestRunOverConnReportsDroppedBytes(t *testing.T) {
 	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
 		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{ExitCode: 0, DroppedStdout: 4096, DroppedStderr: 12})
@@ -176,6 +207,113 @@ func TestRunOverConnUnblocksOnContextCancel(t *testing.T) {
 	}
 }
 
+// The whole command is one request frame, bounded by ga.MaxFrame. A larger
+// one used to be refused by WriteFrame on the write goroutine while the read loop waited
+// for an answer the guest could never send, so the Exec hung to the caller's deadline.
+// It is refused at once now, before anything reaches the guest.
+func TestRunOverConnRefusesACommandLargerThanOneFrameAtOnce(t *testing.T) {
+	got := make(chan struct{}, 1)
+	host, guest := net.Pipe()
+	go func() {
+		defer guest.Close()
+		if _, _, err := ga.ReadFrame(guest); err == nil {
+			got <- struct{}{}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	_, err := runOverConn(ctx, host, Command{Command: strings.Repeat("x", ga.MaxFrame), CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if !errors.Is(err, ErrCommandTooLarge) {
+		t.Fatalf("err = %v, want ErrCommandTooLarge", err)
+	}
+	if !strings.Contains(err.Error(), "stdin") {
+		t.Fatalf("err = %v, want it to name stdin as the way to send large content", err)
+	}
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("refused after %v, want at once", d)
+	}
+	select {
+	case <-got:
+		t.Fatal("the guest received a frame for a command it cannot take")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// closeRecorder is an io.ReadWriteCloser that records Close, wrapping one side of a pipe.
+type closeRecorder struct {
+	io.ReadWriteCloser
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeRecorder) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.ReadWriteCloser.Close()
+}
+
+// runOverConn owns the connection it is given, so a command it refuses as too large
+// still closes it: left open, each refusal kept a vsock descriptor on the worker and
+// left the guest agent blocked reading a request that never came.
+func TestRunOverConnClosesTheConnOnACommandTooLarge(t *testing.T) {
+	host, guest := net.Pipe()
+	guestDone := make(chan error, 1)
+	go func() {
+		defer guest.Close()
+		_, _, err := ga.ReadFrame(guest)
+		guestDone <- err
+	}()
+	rw := &closeRecorder{ReadWriteCloser: host, closed: make(chan struct{})}
+	_, err := runOverConn(context.Background(), rw, Command{Command: strings.Repeat("x", ga.MaxFrame), CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if !errors.Is(err, ErrCommandTooLarge) {
+		t.Fatalf("err = %v, want ErrCommandTooLarge", err)
+	}
+	select {
+	case <-rw.closed:
+	default:
+		t.Fatal("runOverConn returned ErrCommandTooLarge without closing the connection")
+	}
+	select {
+	case err := <-guestDone:
+		if err == nil {
+			t.Fatal("the guest read a frame for a command it cannot take")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the guest's read is still blocked after the refusal")
+	}
+}
+
+// The same bound against the REAL guest agent, and its way around: a command just
+// under one frame runs, and content far larger than a frame goes through stdin.
+func TestRunOverConnAgainstTheAgentTakesLargeStdinButNotALargeCommand(t *testing.T) {
+	run := func(c Command) (string, error) {
+		a, err := ga.NewAgent(ga.AgentOptions{WorkDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("NewAgent: %v", err)
+		}
+		defer a.Close()
+		host, guest := net.Pipe()
+		go func() { _ = a.ServeConn(guest) }()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var out capturingSink
+		c.TimeoutS, c.CapBytes = 5, OutputCapBytes
+		_, err = runOverConn(ctx, host, c, &out, time.Now())
+		return out.out(), err
+	}
+	// Just under the frame once encoded: the JSON envelope is well under 1 KiB.
+	if out, err := run(Command{Command: ": " + strings.Repeat("x", ga.MaxFrame-1024) + "; echo ok"}); err != nil || out != "ok\n" {
+		t.Fatalf("command under one frame: out=%q err=%v", out, err)
+	}
+	if _, err := run(Command{Command: ": " + strings.Repeat("x", 40*1024)}); !errors.Is(err, ErrCommandTooLarge) {
+		t.Fatalf("40 KiB command: err = %v, want ErrCommandTooLarge", err)
+	}
+	big := strings.Repeat("y", 175*1024)
+	if out, err := run(Command{Command: "wc -c", Stdin: []byte(big)}); err != nil || strings.TrimSpace(out) != "179200" {
+		t.Fatalf("175 KiB stdin: out=%q err=%v", out, err)
+	}
+}
+
 func TestRunOverConnSurfacesTeardownFailed(t *testing.T) {
 	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
 		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{ExitCode: 0, TeardownFailed: true})
@@ -191,7 +329,11 @@ func TestRunOverConnSurfacesTeardownFailed(t *testing.T) {
 
 func TestSendRequestCarriesTheLeaseFlags(t *testing.T) {
 	var buf bytes.Buffer
-	if err := sendRequest(&buf, Command{Command: "true", Lease: true, NormaliseWorkspace: true}, OutputCapBytes, time.Now()); err != nil {
+	enc, err := json.Marshal(guestRequest(Command{Command: "true", Lease: true, NormaliseWorkspace: true}, OutputCapBytes, time.Now()))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := sendRequest(&buf, enc, nil); err != nil {
 		t.Fatalf("sendRequest: %v", err)
 	}
 	_, p, err := ga.ReadFrame(&buf)
@@ -204,5 +346,150 @@ func TestSendRequestCarriesTheLeaseFlags(t *testing.T) {
 	}
 	if !req.Lease || !req.NormaliseWorkspace {
 		t.Fatalf("req = %+v, want both lease flags forwarded", req)
+	}
+}
+
+// TestLeaseRunCarriesHostClock pins spec §8.4's clock correction for lease mode (ruling R5):
+// a lease VM idles for minutes between Execs, so every lease request frame must carry the
+// host clock, not only the first after Resume. The stamp is added here, in runOverConn,
+// which every Run of a real launcher goes through; the fake VM cannot observe it.
+func TestLeaseRunCarriesHostClock(t *testing.T) {
+	now := time.Unix(1762940000, 0)
+	for i, c := range []Command{
+		{Command: "first", Lease: true, NormaliseWorkspace: true, CapBytes: OutputCapBytes},
+		{Command: "later", Lease: true, CapBytes: OutputCapBytes},
+	} {
+		var gotReq ga.Request
+		conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+			gotReq = req
+			_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{})
+		})
+		if _, err := runOverConn(context.Background(), conn, c, &capturingSink{}, now); err != nil {
+			t.Fatalf("Exec %d: runOverConn: %v", i, err)
+		}
+		if !gotReq.Lease || gotReq.NormaliseWorkspace != c.NormaliseWorkspace {
+			t.Fatalf("Exec %d: request flags = lease %v, normalise %v; want %v, %v",
+				i, gotReq.Lease, gotReq.NormaliseWorkspace, true, c.NormaliseWorkspace)
+		}
+		if gotReq.HostUnixNanos <= 0 || gotReq.HostUnixNanos != now.UnixNano() {
+			t.Fatalf("Exec %d: HostUnixNanos = %d, want the host clock %d", i, gotReq.HostUnixNanos, now.UnixNano())
+		}
+	}
+}
+
+// A process kind reaches the guest's Request with its arguments and the host's process cap;
+// a command's request carries no kind, process or max_processes key, byte-identical to an
+// older host's.
+func TestGuestRequestCarriesTheProcessKind(t *testing.T) {
+	req := guestRequest(Command{
+		Command: "npm run dev", Lease: true, Kind: ExecKindProcessStart,
+		Process: ProcessArgs{Name: "web", Cwd: "app", Tail: 5, Signal: "INT", ID: "7"}, MaxProcesses: 4,
+	}, OutputCapBytes, time.Now())
+	want := ga.ProcessArgs{Name: "web", Cwd: "app", Tail: 5, Signal: "INT", ID: "7"}
+	if req.Kind != ga.RequestKindProcessStart || req.Process == nil || *req.Process != want || req.MaxProcesses != 4 {
+		t.Fatalf("req = %+v (process %+v), want process_start with its args and max 4", req, req.Process)
+	}
+	b, err := json.Marshal(guestRequest(Command{Command: "true", Lease: true}, OutputCapBytes, time.Now()))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	for _, k := range []string{`"kind"`, `"process"`, `"max_processes"`} {
+		if bytes.Contains(b, []byte(k)) {
+			t.Fatalf("a command's request %s carries %s", b, k)
+		}
+	}
+}
+
+// End.Tracked becomes Result.Tracked, started_unix_ms as a time.
+func TestRunOverConnReturnsTheTrackedTable(t *testing.T) {
+	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{Tracked: []ga.TrackedProcess{
+			{ID: "1", Name: "web", PID: 412, State: ga.TrackedRunning, StartedUnixMs: 1762940000123, MemoryBytes: 1 << 20},
+			{ID: "2", Name: "p2", PID: 413, State: ga.TrackedKilled, Code: 9, StartedUnixMs: 1762940000000},
+		}})
+	})
+	res, err := runOverConn(context.Background(), conn, Command{Command: "true", Lease: true, CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if err != nil {
+		t.Fatalf("runOverConn: %v", err)
+	}
+	want := []TrackedProcess{
+		{ID: "1", Name: "web", PID: 412, State: "running", Started: time.UnixMilli(1762940000123), MemoryBytes: 1 << 20},
+		{ID: "2", Name: "p2", PID: 413, State: "killed", Code: 9, Started: time.UnixMilli(1762940000000)},
+	}
+	if len(res.Tracked) != 2 || !res.Tracked[0].Started.Equal(want[0].Started) {
+		t.Fatalf("tracked = %+v, want %+v", res.Tracked, want)
+	}
+	for i := range want {
+		g, w := res.Tracked[i], want[i]
+		g.Started, w.Started = time.Time{}, time.Time{}
+		if g != w || !res.Tracked[i].Started.Equal(want[i].Started) {
+			t.Fatalf("tracked[%d] = %+v, want %+v", i, res.Tracked[i], want[i])
+		}
+	}
+}
+
+// PR #814 review: the host takes ids, names and states from the guest's End, and logs them in
+// its audit lines. A row breaking the guest's own rules (id: decimal digits; name: 1-64 of
+// [A-Za-z0-9._-], or none; state: running, exited or killed) is dropped and flagged, quoted,
+// so a compromised agent cannot write a line of its own into the host's audit.
+func TestTrackedFromGuestDropsRowsBreakingTheGuestRules(t *testing.T) {
+	logs := captureLog(t)
+	ok := []ga.TrackedProcess{
+		{ID: "1", Name: "web", PID: 412, State: ga.TrackedRunning},
+		{ID: "2", Name: "p2", PID: 413, State: ga.TrackedKilled, Code: 9},
+		{ID: "3", PID: 414, State: ga.TrackedExited, Code: 1},
+		{ID: "4", Name: strings.Repeat("a", 64), PID: 415, State: ga.TrackedRunning},
+	}
+	bad := []ga.TrackedProcess{
+		{ID: "5", Name: "web\nvmpool: lease end workspace_key=\"other\" reason=reset", PID: 1, State: ga.TrackedRunning},
+		{ID: "6\nx", Name: "web", PID: 1, State: ga.TrackedRunning},
+		{ID: "", Name: "web", PID: 1, State: ga.TrackedRunning},
+		{ID: "p7", Name: "web", PID: 1, State: ga.TrackedRunning},
+		{ID: "8", Name: strings.Repeat("a", 65), PID: 1, State: ga.TrackedRunning},
+		{ID: "9", Name: "a b", PID: 1, State: ga.TrackedRunning},
+		{ID: "10", Name: "web", PID: 1, State: "running\nforged"},
+		{ID: "11", Name: "web", PID: 1, State: "zombie"},
+	}
+	got := trackedFromGuest(append(slices.Clone(ok[:2]), append(slices.Clone(bad), ok[2:]...)...))
+	var ids []string
+	for _, tp := range got {
+		ids = append(ids, tp.ID)
+	}
+	if !slices.Equal(ids, []string{"1", "2", "3", "4"}) {
+		t.Fatalf("kept ids %q, want only the rows within the guest's rules", ids)
+	}
+	out := logs.String()
+	if n := strings.Count(out, "vmpool: guest tracked row refused"); n != len(bad) {
+		t.Fatalf("%d refused-row lines, want %d:\n%s", n, len(bad), out)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if !strings.Contains(line, "vmpool: ") {
+			t.Fatalf("a log line the host did not write: %q", line)
+		}
+	}
+}
+
+// End to end: a row with a newline in its name, from the guest's End, never reaches the
+// lease_process audit or a lease end's processes field; the ids those lines carry are quoted.
+func TestGuestTrackedRowWithANewlineNeverReachesAnAuditLine(t *testing.T) {
+	logs := captureLog(t)
+	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{Tracked: []ga.TrackedProcess{
+			{ID: "1", Name: "web", PID: 412, State: ga.TrackedRunning},
+			{ID: "2", Name: "x\nvmpool: lease end forged", PID: 413, State: ga.TrackedRunning},
+		}})
+	})
+	res, err := runOverConn(context.Background(), conn, Command{Command: "true", Lease: true, CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if err != nil {
+		t.Fatalf("runOverConn: %v", err)
+	}
+	auditTracked("k", ModeLeaseProcesses, nil, nil, res.Tracked)
+	log.Printf("vmpool: lease end test%s", trackedAuditField(res.Tracked))
+	out := logs.String()
+	if strings.Contains(out, "\nvmpool: lease end forged") || strings.Contains(out, "\nforged") {
+		t.Fatalf("the forged line reached the log:\n%s", out)
+	}
+	if !strings.Contains(out, `event=start workspace_key="k" mode=lease+processes id="1" name="web"`) {
+		t.Fatalf("want web's start record with its id quoted:\n%s", out)
 	}
 }

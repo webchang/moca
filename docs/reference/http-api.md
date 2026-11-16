@@ -82,19 +82,19 @@ A model-level failure still returns 200 with `stopReason` `error` or `aborted` a
 
 **Errors before any output:**
 
-| Status | Body `error`                                                                            | Meaning                                                                                          |
-| ------ | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 400    | `read_error`, `invalid_json`, `prompt_required`, `session_mismatch`, `subject_conflict` | Bad request                                                                                      |
-| 401    | `token_required`, `token_invalid`, `token_expired`                                      | Auth                                                                                             |
-| 404    | `session_not_found`                                                                     | A session that does not exist (anonymous calls), or passed through from the credential exchange  |
-| 409    | `turn_in_progress`                                                                      | `SH_TURN_DETACH=1` and a detachable turn is live (authenticated callers also get `turnId`)       |
-| 410    | `config_bundle_not_found`                                                               | The session's config bundle is missing or expired; the turn never runs without its skills        |
-| 503    | `sandbox_unavailable`                                                                   | Sandbox pool saturated, empty, or the session's sandbox is pending (affinity). Has `Retry-After` |
-| 503    | `credential_unavailable`, `redis_unavailable`                                           | Control plane or Redis fault. Has `Retry-After` for 503s                                         |
-| 500    | `internal_error`                                                                        | Never carries error text                                                                         |
+| Status | Body `error`                                                                            | Meaning                                                                                                                                                                                                                                             |
+| ------ | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `read_error`, `invalid_json`, `prompt_required`, `session_mismatch`, `subject_conflict` | Bad request                                                                                                                                                                                                                                         |
+| 401    | `token_required`, `token_invalid`, `token_expired`                                      | Auth                                                                                                                                                                                                                                                |
+| 404    | `session_not_found`                                                                     | A session that does not exist (anonymous calls), or passed through from the credential exchange                                                                                                                                                     |
+| 409    | `turn_in_progress`                                                                      | `SH_TURN_DETACH=1` and a detachable turn is live (authenticated callers also get `turnId`)                                                                                                                                                          |
+| 410    | `config_bundle_not_found`                                                               | The session's config bundle is missing or expired; the turn never runs without its skills                                                                                                                                                           |
+| 503    | `sandbox_unavailable`                                                                   | Sandbox pool saturated, empty, or the session's sandbox is pending (affinity). Has `Retry-After`, and a `message` naming the cause (a pool, tier, template or sandbox id; for a host's mid-turn refusal a fixed sentence, never the host's figures) |
+| 503    | `credential_unavailable`, `redis_unavailable`                                           | Control plane or Redis fault. Has `Retry-After` for 503s                                                                                                                                                                                            |
+| 500    | `internal_error`                                                                        | Never carries error text                                                                                                                                                                                                                            |
 
-Error bodies are `{error, sessionId?}`, plus a `message` on auth errors and on the `/runs` 501, and
-`turnId` on `turn_in_progress`. The 503 `Retry-After` is `KAGENTI_SYNC_SATURATION_RETRY_AFTER_S`
+Error bodies are `{error, sessionId?}`, plus a `message` on auth errors, on the `/turn` 503
+`sandbox_unavailable` and on the `/runs` 501, and `turnId` on `turn_in_progress`. The 503 `Retry-After` is `KAGENTI_SYNC_SATURATION_RETRY_AFTER_S`
 (default 5), or, for a pending affinity, the wait clamped to 1 to 10 seconds. The credential exchange also
 passes through `credential_required`, `credential_ambiguous`, `credential_not_found`,
 `endpoint_unresolved`, `session_not_found`, `token_invalid` and `token_expired`, so authenticated callers
@@ -128,6 +128,10 @@ terminal `error` frame, not an HTTP status.
 
 `done` is used when `stopReason` is `stop`, `length`, `end_turn` or `max_tokens`; anything else ends in
 `error`. On a non-detachable stream a client disconnect aborts the turn.
+
+A terminal `error` frame for a host's mid-turn capacity refusal has the 503 `message`'s fixed sentence as its
+`errorMessage`, never the host's figures. The refused command's `tool_result` is a tool result like any other:
+its `preview` is the clipped text the tool returned, which for a refusal is the transport's error text.
 
 ### Detachable turns: attach and cancel
 
@@ -185,22 +189,112 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                                                                                        |
 | Config bundles | `POST` and `GET /v1/config-bundles` (your own, newest first), `DELETE /v1/config-bundles/{digest}`                                                                                                      |
 | Internal       | `POST /internal/credentials` (session token → credential) and `POST /internal/turn-credentials` (queued turn id → credential, at dequeue): data plane only, both authenticated with `SH_EXCHANGE_TOKEN` |
+| Templates      | `GET /v1/templates`, `GET /v1/templates/{id}`, `GET /v1/templates/{id}/builds[/{build}]`, `GET /v1/templates/{id}/tags`: both route profiles (API 1.4.0)                                                |
+| Self-serve     | `POST /v1/templates`, `POST /v1/templates/{id}/builds`, `POST /v1/templates/{id}/builds/{build}/cancel`, `GET` and `PUT /v1/policy`, `GET /v1/quota`: both route profiles (API 1.5.0)                   |
+| Template admin | `POST /v1/templates/{id}/tags`, `DELETE /v1/templates/{id}/tags/{tag}`, `PATCH /v1/templates/{id}` (the owner, or an admin), `PUT /v1/templates/{id}/owner` (an admin): both route profiles (API 1.8.0) |
+| Host agents    | `POST /v1/hosts/{host}/inventory`, `/builds/claim`, `/builds/{build}/log` and `/report`, `GET /v1/hosts/{host}/blobs/{digest}`: a host's own bearer, both route profiles (API 1.10.0)                   |
+| Activation     | `POST /v1/templates/{id}/activate` and `/deactivate` (both route profiles); `GET /v1/hosts/{host}/wanted`, `POST /v1/hosts/{host}/workers/report` (a host's own bearer) (API 1.11.0)                    |
+| Egress records | `GET /v1/sandboxes/{id}/egress` (the owner or an admin; sandbox profile); `POST /v1/hosts/{host}/egress` (a host's own bearer) (API 1.14.0)                                                             |
+| Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.18.0)                                                                                          |
+| Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}[/roles/admin]` (enroll, unenroll; grant with an optional `until`, revoke): both route profiles (API 1.20.0)                                   |
+| Admin          | `PUT /v1/quota/{subject\|default}`, `POST /v1/templates/{id}/builds/{build}/reject`: admins, both route profiles (API 1.21.0)                                                                           |
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
-An async turn that is still **queued** is a next turn, not a running one: it picks up the new model when a worker claims
-it, however long ago it was submitted, because `/internal/turn-credentials` reads `model` from the session as it is at
-dequeue. Pinning the model a queued turn was submitted with is M2 ([#388](https://github.com/rossoctl/moca/issues/388)).
+An async turn is the exception, and it is not a next turn either: a turn already **queued** keeps the model it was
+submitted with, however long it waits, because the turn record pins `model` and `sandboxTier` at submission and
+`/internal/turn-credentials` reads them from the record ([#388](https://github.com/rossoctl/moca/issues/388)). The
+switch applies to turns submitted after it.
 The id is checked against the credential's catalog (400 `model_unavailable` when it is not listed); when the endpoint
 cannot list its models, the id is accepted unverified and the answer has `modelVerified: false`. Only the two list routes
 answer 503 `model_catalog_unavailable`. These routes came with API 1.1.0; see the [changelog](../api/CHANGELOG.md).
+
+The template read routes came with API 1.4.0 and mount on both route profiles, so a session's brain and a sandbox client
+read the same templates. With `SH_PROVENANCE_DIR` set, templates live in the control plane's template store
+(`SH_SANDBOX_TEMPLATES` is imported into it once); unset, they come from the env list at every start. Each template is a
+name over its builds, with tags naming builds (`default` is what a bare id names), and each registered build reports its
+readiness from the relay's presence: `active`, `inactive`, or `unknown` when presence cannot be read. A sandbox create
+names `id`, `id:tag` or `id@<build id>`, resolved to one build at creation and kept for the sandbox's life (the Sandbox
+shows `buildId`). A `private` template, like an unknown id or build, answers 404 `template_not_found` to anyone but its
+owner and admins. See the [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md).
+
+The self-serve routes came with API 1.5.0 and need `SH_PROVENANCE_DIR`. An enrolled client creates a template from an
+image pinned by digest; the deployment's policy (`GET /v1/policy`, set by an admin with `PUT`) checks it before anything
+is queued, and a refusal is 422 `policy_refused` naming the gating rule
+([GATING-RULES.md](../../deploy/sbx/template-onboarding/governance/GATING-RULES.md)). Ids are unique per deployment
+(409 `template_exists`); quotas are per subject (429 `quota_exceeded` naming which; `GET /v1/quota` shows them). A create
+with the same inputs as a build of the caller's own template answers that build, `reused: true`.
+
+The template admin routes came with API 1.8.0 and need `SH_PROVENANCE_DIR`. A template's owner, or an admin, moves tags
+onto a registered build (`id:tag`, and the bare `id` for `default`, then name it for new sandboxes and sessions; those
+already created keep their build), removes a tag (never `default`; the build stays), and changes the description or the
+visibility (`private` hides it from other subjects, as a 404). An admin transfers a template to another enrolled subject
+(`github:<id>` or `oidc:<sub>`), including one the deployment declared, which has no owner until then. Each change is a
+provenance record (`tag`, `visibility` or `owner`) naming the new value and the one before.
+The host routes came with API 1.10.0. A KVM host's agent (`deploy/sbx/host-agent.sh`) claims queued builds, builds them
+with `template-build.sh` and reports them, with its own bearer (`SH_TEMPLATE_HOSTS`, `SH_HOST_TOKEN_<ID>`); the control
+plane registers a built build or rejects it, by policy, naming the rule. A client follows its build by the create's handle
+through `queued`, `building`, `probing` and `registered` (or `failed` with `reason.step`, `rejected` with `reason.rule`).
+
+Activation came with API 1.11.0. A client takes or renews a lease on a registered build (`activate`, 60 s to a day a
+grant, renewals unlimited); a build is wanted running only while a lease stands, and the host agents start and stop the
+installed workers by each host's wanted state. A build no host holds is 409 `template_unavailable`; one whose holders are
+all at their active limit with leased builds is 409 `no_active_slot` with `Retry-After`; over the subject's `active` quota
+is 429 `quota_exceeded`. With template hosts configured, a sandbox create on a build that is not active takes the
+caller's lease and answers 409 `template_not_active` with `Retry-After` (`activate: false` starts nothing). A template
+imported from `SH_SANDBOX_TEMPLATES` is never gated (the deployment runs its worker) and takes no lease.
+
+Egress records came with API 1.14.0. A sandbox's egress log (`GET /v1/sandboxes/{id}/egress`) holds the KVM host's
+egress proxy events for it, shipped by the host agent; the sandbox's end record names the log's sha256. Paths are logged
+without query, fragment or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL
+path segment is logged as sent. See the [egress records spec](../specs/2026-11-08-sandbox-egress-records-design.md).
+
+Retire came with API 1.18.0. The template's owner, or an admin, retires a whole template (`POST
+/v1/templates/{id}/retire`, with an optional `reason`) or one build (`DELETE /v1/templates/{id}/builds/{build}`). A
+retired build's leases go and its holding hosts are told to stop its worker; it is never served again: a sandbox create
+or an activation naming it, a tag of it or a template whose every build is retired is 410 `template_retired`. A retire
+is refused 409 `build_in_use` while a live sandbox runs on the build, and is idempotent. Each build retired writes a
+`retire` record naming the caller, the status before and the build's `build` record. A retire cannot be undone: a new
+build of the template is the way back. Each build lists `heldBy`, the hosts still holding its snapshot, and a retired
+build reports `capacity` while its worker still runs (null once its host has stopped it). Since API 1.19.0
+([#743](https://github.com/rossoctl/moca/issues/743)) each holding host's agent then removes the build's worker and
+snapshot (the wanted state's `remove`) and reports it, a `retire` record by `host:<id>` with `event: removed`, and
+`heldBy` drops the host. `mocactl sbx templates retire --wait` waits for the stop and for `heldBy` to empty, and
+returns at once for a build no host holds (`heldBy` null or empty: no host agent stops its worker) and for a `shared`
+one (its snapshot or worker serves a build neither retired nor rejected, so its worker is kept running for that build).
+
+Who is enrolled and who is an admin (API 1.20.0, with a template store): the deployment's settings
+(`SH_ALLOWED_SUBJECTS`, `SH_ADMIN_SUBJECTS`) are the bootstrap, and admins add to them through `/v1/subjects`: any admin
+reads the list, only an admin named in `SH_ADMIN_SUBJECTS` changes it. Roles and enrollment are evaluated per request, so
+a grant, a revoke or a lapsed `until` takes effect at the subject's next request; a token's `roles` claim reports what
+held when it was minted. A subject is `github:<numeric id>` or `oidc:<provider sub>`, never `test:<n>`. See the
+[enrollment and roles spec](../specs/2026-11-08-enrollment-and-roles-api-design.md).
+
+The admin routes came with API 1.21.0. An admin sets the deployment default quota (`PUT /v1/quota/default`) or one
+subject's override (`PUT /v1/quota/{subject}`, `github:<numeric id>` or `oidc:<provider sub>`; a body of `null` removes
+it). A quota holds `templates`, `buildsQueued`, `active` and, optionally, `owned` (a write without `owned` keeps the
+target's; a subject whose override has none has the default's). Overrides live in the policy (`quotaBySubject`), so each
+change is a `policy` record naming the admin, enforced at once; `?expect=` (the value read, as JSON percent-encoded into the query, e.g.
+`?expect=%7B%22templates%22%3A3%2C%22buildsQueued%22%3A1%2C%22active%22%3A1%7D`, or `?expect=null` for no override)
+makes it a compare-and-set on the four counters, 409 `quota_changed` with nothing written when the quota is no longer
+that value. A `PUT /v1/policy` stores the whole policy, overrides included: with `?expect=` (the `digest` that
+`GET /v1/policy` answered) it is refused 409 `policy_changed`, nothing written and the body's `digest` the policy's now,
+if anything changed since that read; without it, it replaces the policy as sent. `GET /v1/quota` shows the limits that apply to the caller, `quotaSource` (`subject` or `default`) and
+`ownedSource`, the same for `owned` alone. An admin also
+rejects a registered build after the fact (`POST /v1/templates/{id}/builds/{build}/reject {reason}`): it becomes
+`rejected` (`reason.rule: admin`), its leases go and its holding hosts are told to stop its worker, as for a retire (but not to remove it), and a
+sandbox create naming it is 400 `unknown_template`. A `reject` record names the admin, the reason and the build's `build`
+record; a reject is refused 409 `build_in_use` under a live sandbox, is idempotent, and cannot be undone.
+`mocactl sbx templates quota TARGET` sets a quota from the terminal (`--owned N` for `owned`). A quota write without
+`owned` keeps the target's current `owned`, so to return one subject's `owned` to the default, remove its override
+(`--clear`, or a body of `null`) and then set its quota again.
 
 Another user's session returns 404, not 403. Control-plane error codes and statuses: 400
 (`invalid_json`, `invalid_request`, `invalid_grant`, `subject_conflict`, `session_mismatch`,
 `digest_mismatch`, `configRef_invalid`, `credential_required`, `credential_ambiguous`, `endpoint_unresolved`, `model_unavailable`), 401 (`token_required`,
 `token_invalid`, `token_expired`, `unauthorized`), 403 `forbidden`, 404 (`session_not_found`, `config_bundle_not_found`,
-`credential_not_found`, `turn_not_found`), 409 (`turn_not_cancellable`, `turn_not_claimable`), 410 `device_code_expired`, 428 `authorization_pending`, 429
-(`bundle_quota_exceeded`, `async_quota_exhausted`), 500 `internal_error`, 501
+`credential_not_found`, `template_not_found`, `turn_not_found`), 409 (`template_exists`, `turn_not_cancellable`, `turn_not_claimable`, `no_active_slot`, `template_unavailable`, `template_not_active`, `build_in_use`, `bootstrap_subject`, `self_revoke`, `admin_granted`, `quota_changed`, `policy_changed`), 410 (`device_code_expired`, `template_retired`), 422 `policy_refused`, 428 `authorization_pending`, 429
+(`quota_exceeded`, `bundle_quota_exceeded`, `async_quota_exhausted`), 500 `internal_error`, 501
 (`async_tenancy_unsupported`, `workload_runs_unavailable`), 502 `identity_provider_misconfigured`, 503
 (`credential_unavailable`, `redis_unavailable`, `model_catalog_unavailable`). The list may not be complete; the mapping is in
 `packages/control-plane/src/errors.ts`.

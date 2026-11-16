@@ -5,14 +5,17 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	mrand "math/rand/v2"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,15 +41,20 @@ microVM over the workspace, and nothing runs on the local machine. See docs/api/
     sbx pull                  print every change since the baseline commit as a git patch
 
 Environment: SBX_ADDR, SBX_SANDBOX_ID, SBX_WORKSPACE_KEY, and SBX_TOKEN or SBX_TOKEN_FILE.
-Optional: SBX_TIMEOUT (seconds per command, default 600), SBX_LOG (append one JSON line per call),
+Optional: SBX_TIMEOUT (seconds per command, default 600; as in sbx.py, cut to what a JWT token has left before its
+exp, less 60 s, so the command times out before the relay cancels it at exp), SBX_LOG (append one JSON line per call),
 SBX_DIAL_ADDR (ip:port to connect to instead of looking up SBX_ADDR's host: the caller resolved it once; TLS still
 verifies, and requests still name, SBX_ADDR's host),
 SBX_TLS=1 (dial the exec endpoint over TLS, as SBX0's exec Route), SBX_CA_FILE (with SBX_TLS: an extra CA, PEM,
 added to the system roots, e.g. a sandbox token grant's execCa),
 SBX_BUSY_RETRY_S (seconds, default 30: how long in all to wait and retry a command refused before it started,
 because the worker or the relay was at capacity; 0 never retries).
-` + "`sbx run`" + ` exits with the command's own exit code; 124 means it timed out, 125 that the sandbox failed, 75 that
-the sandbox refused the command at capacity until SBX_BUSY_RETRY_S ran out (nothing ran).
+` + "`sbx run`" + ` prints the sandbox's lease notices (a guest restart, a new guest, a lease about to end) to stderr,
+one line each. It exits with the command's own exit code; 124 means it timed out, 125 that the sandbox failed
+(or that the command outlived its token, or that it refused a lease command: stale_mode, lease_unsupported), 75 that the sandbox refused the command at capacity until
+SBX_BUSY_RETRY_S ran out (nothing ran), 128 + n that signal n killed it.
+Unlike sbx.py, this client dials plaintext unless SBX_TLS=1, and reads no SBX_TOKEN_CMD (so the exports of
+` + "`mocactl sbx env`" + ` are not enough: give SBX_TOKEN or SBX_TOKEN_FILE).
 There is no ` + "`sbx push`" + `: this client is for a workspace seeded on the server side.
 `
 
@@ -64,15 +72,15 @@ type config struct {
 	tls   bool
 	caPEM []byte
 	// dialAddr (SBX_DIAL_ADDR), when set, is an ip:port the caller resolved SBX_ADDR's host to once, so a run of
-	// many calls does not look the name up per call (validation window 3, G30: every ~20 s stall was that lookup)
+	// many calls does not look the name up per call (behind a slow resolver, a lookup per call cost about 20 s)
 	dialAddr string
 	// busyRetry (SBX_BUSY_RETRY_S) is the most a call sleeps, in all, between retries of a command refused before it
-	// started (refusalClass); 0 never retries, as before G36.
+	// started (refusalClass); 0 never retries, as before.
 	busyRetry time.Duration
 }
 
 // defaultBusyRetry is SBX_BUSY_RETRY_S's default: long enough for a template worker's running VM to finish a
-// command and give its memory back (G36), short enough that an agent's tool call is not held for minutes.
+// command and give its memory back, short enough that an agent's tool call is not held for minutes.
 const defaultBusyRetry = 30 * time.Second
 
 func configFrom(getenv func(string) string, readFile func(string) ([]byte, error)) (config, error) {
@@ -129,11 +137,12 @@ func configFrom(getenv func(string) string, readFile func(string) ([]byte, error
 		c.dialAddr = a
 	}
 	if s := getenv("SBX_TIMEOUT"); s != "" {
-		var n uint32
-		if _, err := fmt.Sscanf(s, "%d", &n); err != nil || n == 0 {
-			return c, fmt.Errorf("SBX_TIMEOUT must be a positive integer, got %q", s)
+		// ParseUint takes the whole string: Sscanf's %d would read "1e3" as 1 and "10s" as 10.
+		n, err := strconv.ParseUint(s, 10, 32)
+		if err != nil || n == 0 {
+			return c, fmt.Errorf("SBX_TIMEOUT must be a whole number of seconds from 1 to %d, got %q", uint32(1<<32-1), s)
 		}
-		c.timeoutS = n
+		c.timeoutS = uint32(n)
 	}
 	if s := getenv("SBX_BUSY_RETRY_S"); s != "" {
 		n, err := strconv.Atoi(s)
@@ -160,7 +169,13 @@ type result struct {
 	stdout, stderr []byte
 	exitCode       int32
 	truncated      bool
+	timedOut       bool             // the command ran out of SBX_TIMEOUT: the worker's in-stream ExecError "timeout:<n>"
+	leases         []*pb.LeaseEvent // the lease events of the stream, in order, printed by call (notice.go)
 }
+
+// timeoutMessage is the worker's whole ExecError text for a command that ran out of its timeout,
+// as sbx.py's TIMEOUT_MESSAGE.fullmatch checks it; any other ExecError is a sandbox failure.
+var timeoutMessage = regexp.MustCompile(`^timeout:\d+$`)
 
 // execFailure is execOnce's error: the machinery failing, never the command's own exit status.
 // refused is the refusal's class (refusalClass) when the sandbox declined the command at capacity
@@ -193,7 +208,8 @@ func refusalClass(code codes.Code, msg string) string {
 }
 
 // execOnce runs one command. An error (an *execFailure) is the machinery failing (VM boot, worker gone, a timeout,
-// a refused token, a refusal at capacity), never the command's own exit status, which comes back in result.
+// a refused token, a refusal at capacity), never the command's own exit status, which comes back in result. The
+// lease events seen before an error come back with it, so call can print them.
 func execOnce(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64, command string, stdin []byte) (result, error) {
 	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+cfg.token)
 	stream, err := c.Exec(ctx, &pb.ExecRequest{
@@ -216,12 +232,14 @@ func execOnce(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			return result{}, &execFailure{msg: "exec failed: the stream ended without an End event"}
+			return r, &execFailure{msg: "exec failed: the stream ended without an End event"}
 		}
 		if err != nil {
-			return result{}, rpcErr(err, started)
+			return r, rpcErr(err, started)
 		}
 		switch {
+		case ev.GetLease() != nil:
+			r.leases = append(r.leases, ev.GetLease())
 		case ev.GetChunk() != nil:
 			started = true
 			ch := ev.GetChunk()
@@ -235,13 +253,17 @@ func execOnce(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64
 			return r, nil
 		case ev.GetError() != nil:
 			m := ev.GetError().GetMessage()
+			if timeoutMessage.MatchString(m) {
+				r.timedOut = true // the output so far is kept and written, as sbx.py does
+				return r, nil
+			}
 			f := &execFailure{msg: fmt.Sprintf("exec failed: %s", m)}
 			if !started {
 				if f.refused = refusalClass(codes.OK, m); f.refused != "" {
 					f.reason = m
 				}
 			}
-			return result{}, f
+			return r, f
 		}
 	}
 }
@@ -249,6 +271,14 @@ func execOnce(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64
 // rpcErr turns a non-OK status into an *execFailure; started says a Chunk had arrived first.
 func rpcErr(err error, started bool) error {
 	if s, ok := status.FromError(err); ok {
+		if s.Code() == codes.DeadlineExceeded && tokenExpiry(s.Message()) {
+			// The relay cancels an Exec at its token's exp: name that case, in sbx.py's words.
+			msg := s.Message()
+			if msg == "" {
+				msg = "sandbox token expired during the Exec"
+			}
+			return &execFailure{msg: msg + ": the command outlived its token and was cancelled; give it a shorter timeout"}
+		}
 		f := &execFailure{msg: fmt.Sprintf("exec failed: %s: %s", upperSnake(s.Code().String()), s.Message())}
 		if !started {
 			if f.refused = refusalClass(s.Code(), s.Message()); f.refused != "" {
@@ -258,6 +288,64 @@ func rpcErr(err error, started bool) error {
 		return f
 	}
 	return &execFailure{msg: fmt.Sprintf("exec failed: %v", err)}
+}
+
+// tokenExpiry says a DEADLINE_EXCEEDED is the relay cancelling the Exec at its token's exp ("sandbox token expired
+// during the Exec"); the client sets no deadline of its own, so an empty message is taken as that case too, as sbx.py does.
+func tokenExpiry(msg string) bool {
+	m := strings.ToLower(msg)
+	return m == "" || (strings.Contains(m, "token") && strings.Contains(m, "expir"))
+}
+
+// marginS is sbx.py's MARGIN_S: an Exec's timeout leaves this much of the token's life spare, so the worker's
+// own timeout fires before the relay cancels the Exec at the token's exp.
+const marginS = 60
+
+// tokenTimes is the token's (iat, exp), read without verifying, as sandbox_v1_client.py's _times_of: the relay
+// verifies, the client only schedules. (0, 0) when the token is not a JWT or has no exp.
+func tokenTimes(token string) (iat, exp int64) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return 0, 0
+	}
+	var claims struct {
+		Iat *float64 `json:"iat"`
+		Exp *float64 `json:"exp"`
+	}
+	if json.Unmarshal(b, &claims) != nil || claims.Exp == nil {
+		return 0, 0
+	}
+	if claims.Iat != nil {
+		iat = int64(*claims.Iat)
+	}
+	return iat, int64(*claims.Exp)
+}
+
+// capTimeout is sbx.py's rule for a static token (Sandbox._prepare): the requested timeout is cut to the token's
+// lifetime (exp - iat) less 60 s, and then to what it has left at now (exp - now, rounded up) less 60 s, never
+// below 1 s; capped says it was cut. A token whose exp cannot be read is not capped.
+func capTimeout(token string, requested uint32, now time.Time) (timeout uint32, capped bool) {
+	iat, exp := tokenTimes(token)
+	t := int64(requested)
+	if iat > 0 && exp > iat {
+		if limit := max(1, exp-iat-marginS); t > limit {
+			t, capped = limit, true
+		}
+	}
+	if exp != 0 {
+		left := float64(exp) - float64(now.UnixNano())/1e9
+		if float64(t+marginS) > left {
+			// ceil: a token minted this instant keeps its full cap
+			if cut := max(1, int64(math.Ceil(left))-marginS); cut < t {
+				t, capped = cut, true
+			}
+		}
+	}
+	return uint32(t), capped
 }
 
 // upperSnake spells a gRPC code the way grpcio's Python enum names it (PermissionDenied ->
@@ -317,16 +405,12 @@ const (
 	exitInterrupted = 130
 )
 
-// callID runs one command and turns its outcome into the process's exit code, writing output and
-// the SBX_LOG line the way sbx.py does: 124 for a timeout, 125 for any other sandbox failure,
-// 137 for a command killed by a signal (a negative exit code), else the command's own code.
-func callID(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64, op, command string, stdin []byte, stdout, stderr io.Writer, now func() time.Time) int {
-	var cur atomic.Uint64
-	return call(ctx, c, cfg, id, op, command, stdin, stdout, stderr, callEnv{now: now, sleep: sleepCtx, newID: reqID, jitter: jitterOf, cur: &cur})
-}
-
-// call is callID with its environment. A command the sandbox refused at capacity before anything of it ran
-// (refusalClass) is retried, with backoff, until SBX_BUSY_RETRY_S of waiting is spent (G36: a template worker at its
+// call runs one command and turns its outcome into the process's exit code, writing output and the SBX_LOG
+// records the way sbx.py does: the command's own code, 128 + n for a command killed by signal n (outcome), 124 for
+// a timeout, 125 for any other sandbox failure, 75 for a command refused at capacity until SBX_BUSY_RETRY_S ran out
+// (nothing ran), and 130 when interrupted while waiting to retry. Each attempt's timeout is capped to the token
+// (capTimeout). A command the sandbox refused at capacity before anything of it ran
+// (refusalClass) is retried, with backoff, until SBX_BUSY_RETRY_S of waiting is spent (a template worker at its
 // memory budget refuses a warm acquire while two reps' VMs run). Nothing else is ever retried: a command that may
 // have started is never run twice.
 //
@@ -339,10 +423,19 @@ func call(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64, op
 	started := env.now()
 	var waited time.Duration
 	attempt := 1
-	attemptStart := started // each attempt's own start, for its refused record; the clock is read once per event
+	attemptStart := started   // each attempt's own start, for its refused record; the clock is read once per event
+	notices := noticeDedupe{} // each lease event is printed once in this run, even when a retry repeats it
 	env.cur.Store(id)
 	for {
-		r, err := execOnce(ctx, c, cfg, id, command, stdin)
+		// Each attempt caps its own timeout to what the token has left at its start (capTimeout): a retry after a
+		// wait has less of the token left than the first attempt had.
+		acfg := cfg
+		var capped bool
+		acfg.timeoutS, capped = capTimeout(cfg.token, cfg.timeoutS, attemptStart)
+		r, err := execOnce(ctx, c, acfg, id, command, stdin)
+		if len(r.leases) > 0 {
+			printNotices(stderr, notices, r.leases, env.now())
+		}
 		var f *execFailure
 		if err != nil && errors.As(err, &f) && f.refused != "" && cfg.busyRetry > 0 && ctx.Err() == nil {
 			next := env.jitter(busyBackoff(attempt))
@@ -368,36 +461,40 @@ func call(ctx context.Context, c pb.SandboxExecClient, cfg config, id uint64, op
 			env.cur.Store(id)
 			continue
 		}
-		code := outcome(r, err, stdout, stderr)
+		code := outcome(r, err, acfg.timeoutS, capped, stdout, stderr)
 		logCall(cfg.logPath, op, started, env.now(), code, logExtra{attempt: attempt, busyWait: &waited})
 		return code
 	}
 }
 
-// outcome writes a finished (or failed) Exec's output and returns its exit code.
-func outcome(r result, err error, stdout, stderr io.Writer) int {
+// outcome writes a finished (or failed) Exec's output and returns its exit code: 125 (exitFailed) for a failure,
+// whose message goes to stderr; else the output, then the timeout-capped line when capped, and 124 (exitTimedOut)
+// for a command that ran out of timeoutS (the output so far is written), 128 + n for one killed by signal n (an
+// exit code of -n), or the command's own code.
+func outcome(r result, err error, timeoutS uint32, capped bool, stdout, stderr io.Writer) int {
 	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "timeout:") {
-			fmt.Fprintln(stderr, "sbx: command timed out")
-			return exitTimedOut
-		}
-		fmt.Fprintf(stderr, "sbx: %s\n", msg)
+		fmt.Fprintf(stderr, "sbx: %s\n", err.Error())
 		return exitFailed
 	}
 	_, _ = stdout.Write(r.stdout)
 	_, _ = stderr.Write(r.stderr)
+	if capped {
+		fmt.Fprintf(stderr, "sbx: timeout capped at %d s, the sandbox token's lifetime minus 60 s\n", timeoutS)
+	}
 	if r.truncated {
 		fmt.Fprintln(stderr, "sbx: stdout exceeded 8 MiB and was cut")
 	}
-	code := int(r.exitCode)
-	if code < 0 {
-		code = 128 + 9
+	switch {
+	case r.timedOut:
+		fmt.Fprintf(stderr, "sbx: command timed out after %d s\n", timeoutS)
+		return exitTimedOut
+	case r.exitCode < 0:
+		return 128 - int(r.exitCode) // killed by signal n: 128 + n, as sbx.py
 	}
-	return code
+	return int(r.exitCode)
 }
 
-// logExtra is what a record carries besides sbx.py's {t, op, ms, exit}. Added for G36, with these keys:
+// logExtra is what a record carries besides sbx.py's {t, op, ms, exit}. Added for the busy retry, with these keys:
 //   - "attempt": the Exec's attempt number, from 1 (every record);
 //   - "refused", "reason": a capacity refusal's class (refusalClass) and its text, sanitized and cut to 300
 //     characters (a refused attempt's record; also the final one when the retries ran out);

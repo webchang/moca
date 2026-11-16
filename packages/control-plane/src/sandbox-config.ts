@@ -3,6 +3,7 @@ import type { CpConfig } from './handlers.js';
 import type { RouteProfile } from './routes.js';
 import { SUBJECT_RE } from './identity.js';
 import { DEFAULT_SANDBOX_ISSUER } from './sandbox-token.js';
+import { SANDBOX_MODE_NAMES, isSandboxModeName, type SandboxModeName } from './sandbox-store.js';
 import { egressConfigFromEnv, type EgressConfig } from './egress-config.js';
 
 /**
@@ -17,6 +18,11 @@ export interface SandboxTemplate {
   worker: string;
   description: string;
   tools: string[];
+  /**
+   * A bash command that fills a new workspace (session-templates spec §5). Optional, and read only
+   * by the harness profile, whose harness runs it once per workspace; SBX0 clients run it themselves.
+   */
+  seed?: string;
 }
 
 export interface SandboxConfig {
@@ -41,9 +47,21 @@ export interface SandboxConfig {
   execCa?: string;
   /** `SH_JANITOR_TOKEN` (a credential), at least 32 characters; absent refuses the janitor's route. */
   janitorToken?: string;
+  /** `SH_SANDBOX_MODES_ALLOWED`: the modes a user may pick (lease-mode spec §8.1). */
+  modesAllowed: ReadonlySet<SandboxModeName>;
+  /** `SH_SANDBOX_IDLE_CEILING_S`: the most an owner's idleTimeoutS may be. */
+  idleCeilingS: number;
   /** `SH_EGRESS_HOSTS` + `SH_CREDENTIAL_KEK`: user-scoped egress credentials (SBX0.2b); absent = off. */
   egress?: EgressConfig;
+  /**
+   * `SH_GATE_RECORD_SCHEMA`: the schema of the general-gate records this deployment reads (the
+   * records that must carry `gate.floor_checked_offline`); absent: DEFAULT_GATE_RECORD_SCHEMA.
+   */
+  gateRecordSchema?: string;
 }
+
+/** A schema string: path segments of letters, digits, `.`, `_`, `-`, joined by `/`. */
+const SCHEMA_RE = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
 const TEMPLATE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 /** The relay looks a worker up by this name (sandbox-relay main.ts SANDBOX_ID_RE). */
@@ -51,14 +69,14 @@ const WORKER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENDPOINT_RE = /^[A-Za-z0-9.-]+:[0-9]{1,5}$/;
 
 /**
- * `SH_ROUTE_PROFILE`: exactly `harness` or `sandbox`; absent or empty means `harness`. A near-miss
- * (`Sandbox`, ` sandbox`) refuses to boot rather than mounting nothing, `/healthz` included. The
- * value is not echoed, as no boot refusal here echoes one.
+ * `SH_ROUTE_PROFILE`: exactly `harness`, `sandbox` or `combined`; absent or empty means `harness`.
+ * A near-miss (`Sandbox`, ` sandbox`) refuses to boot rather than mounting nothing, `/healthz`
+ * included. The value is not echoed, as no boot refusal here echoes one.
  */
 export function routeProfileFromEnv(env: NodeJS.ProcessEnv): RouteProfile {
   const v = env.SH_ROUTE_PROFILE || 'harness';
-  if (v !== 'harness' && v !== 'sandbox') {
-    throw new Error(`SH_ROUTE_PROFILE must be exactly 'harness' or 'sandbox'`);
+  if (v !== 'harness' && v !== 'sandbox' && v !== 'combined') {
+    throw new Error(`SH_ROUTE_PROFILE must be exactly 'harness', 'sandbox' or 'combined'`);
   }
   return v;
 }
@@ -69,11 +87,33 @@ export function routeProfileFromEnv(env: NodeJS.ProcessEnv): RouteProfile {
  */
 export const MAX_SANDBOX_TOKEN_TTL_S = 3600;
 
+/** The shortest lease idle timeout an owner may set (`idleTimeoutS`); 0 means the worker's default. */
+export const MIN_IDLE_TIMEOUT_S = 30;
+
 function positive(env: NodeJS.ProcessEnv, name: string, def: number): number {
   const v = env[name];
   if (v === undefined || v === '') return def;
   if (!/^[1-9][0-9]*$/.test(v)) throw new Error(`${name} must be a positive integer`);
   return Number(v);
+}
+
+/**
+ * `SH_SANDBOX_MODES_ALLOWED`: a comma list of mode names; absent or empty means `per-exec`, so
+ * every lease mode stays off until an operator lists it (`per-exec,lease` opts in to level 1). The
+ * default stays `per-exec` until plan 4's live smoke and the lease section (§11) of the SBX
+ * security review (lease-mode spec §8.1). An unknown name, or a list of none, refuses boot.
+ */
+function modesAllowedFromEnv(env: NodeJS.ProcessEnv): ReadonlySet<SandboxModeName> {
+  const names = (env.SH_SANDBOX_MODES_ALLOWED || 'per-exec')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (names.length === 0 || !names.every(isSandboxModeName)) {
+    throw new Error(
+      `SH_SANDBOX_MODES_ALLOWED must be a comma list of ${SANDBOX_MODE_NAMES.join(', ')}`,
+    );
+  }
+  return new Set(names);
 }
 
 export function parseTemplates(raw: string | undefined): SandboxTemplate[] {
@@ -110,13 +150,35 @@ export function parseTemplates(raw: string | undefined): SandboxTemplate[] {
     if (new Set(o.tools).size !== o.tools.length) {
       throw new Error(`${where}: tools must not list a tool twice`);
     }
+    if (o.seed !== undefined && typeof o.seed !== 'string') {
+      throw new Error(`${where}: seed must be a string`);
+    }
     if (seen.has(o.id)) throw new Error(`${where}: template id '${o.id}' is listed twice`);
     seen.add(o.id);
-    return { id: o.id, worker: o.worker, description: o.description, tools: o.tools as string[] };
+    return {
+      id: o.id,
+      worker: o.worker,
+      description: o.description,
+      tools: o.tools as string[],
+      ...(typeof o.seed === 'string' && o.seed.trim() !== '' ? { seed: o.seed } : {}),
+    };
   });
 }
 
-export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
+/**
+ * The harness profile's session templates (session-templates spec §3.3): `SH_SANDBOX_TEMPLATES`,
+ * the same list the sandbox profile reads, or null when it is unset or blank (no templates, and
+ * nothing about sessions changes). Malformed refuses to boot, as on the sandbox profile.
+ */
+export function sessionTemplatesFromEnv(env: NodeJS.ProcessEnv): SandboxTemplate[] | null {
+  const raw = env.SH_SANDBOX_TEMPLATES?.trim();
+  return raw ? parseTemplates(raw) : null;
+}
+
+export function sandboxConfigFromEnv(
+  env: NodeJS.ProcessEnv,
+  opts: { kekIsShared?: boolean } = {},
+): SandboxConfig {
   const allowedSubjects = (env.SH_ALLOWED_SUBJECTS ?? '')
     .split(',')
     .map((s) => s.trim())
@@ -150,8 +212,20 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
       `SH_SANDBOX_TOKEN_TTL_SECONDS must be at most ${MAX_SANDBOX_TOKEN_TTL_S}: a delete takes effect only within one token lifetime`,
     );
   }
+  const idleCeilingS = positive(env, 'SH_SANDBOX_IDLE_CEILING_S', 1800);
+  if (idleCeilingS < MIN_IDLE_TIMEOUT_S) {
+    throw new Error(
+      `SH_SANDBOX_IDLE_CEILING_S must be at least ${MIN_IDLE_TIMEOUT_S}: the smallest idle timeout an owner may set`,
+    );
+  }
+  const gateRecordSchema = env.SH_GATE_RECORD_SCHEMA || undefined;
+  if (gateRecordSchema !== undefined && !SCHEMA_RE.test(gateRecordSchema)) {
+    throw new Error(
+      'SH_GATE_RECORD_SCHEMA must be a schema string such as moca-gate-record/1 (no spaces)',
+    );
+  }
   const templates = parseTemplates(env.SH_SANDBOX_TEMPLATES);
-  const egress = egressConfigFromEnv(env, templates);
+  const egress = egressConfigFromEnv(env, templates, opts);
   return {
     templates,
     allowedSubjects,
@@ -162,19 +236,58 @@ export function sandboxConfigFromEnv(env: NodeJS.ProcessEnv): SandboxConfig {
     maxTotal: positive(env, 'SH_SANDBOX_MAX_TOTAL', 40),
     issuer: env.SH_SANDBOX_TOKEN_ISSUER || DEFAULT_SANDBOX_ISSUER,
     execEndpoint,
+    modesAllowed: modesAllowedFromEnv(env),
+    idleCeilingS,
     ...(execCa ? { execCa } : {}),
     ...(janitorToken ? { janitorToken } : {}),
     ...(egress ? { egress } : {}),
+    ...(gateRecordSchema ? { gateRecordSchema } : {}),
   };
 }
 
 /**
- * Who may use the sandbox profile (spec §4.2): the allow list, plus admins. The harness profile has
- * no allow list (MU1 admits any GitHub account), so this is always true there.
+ * Who may LOG IN (spec §4.2): on the sandbox profile the allow list, plus admins, plus a subject
+ * the members store enrolls (`storeEnrolled`). The harness profile has no allow list (MU1 admits
+ * any GitHub account), and neither does `combined` at login (combined control plane spec §3.2:
+ * login stays open, enrollment moves to the routes).
  */
-export function isEnrolled(subject: string, roles: string[], config: CpConfig): boolean {
+export function isEnrolled(
+  subject: string,
+  roles: string[],
+  config: CpConfig,
+  storeEnrolled = false,
+): boolean {
   if (config.routeProfile !== 'sandbox') return true;
-  return roles.includes('admin') || (config.sandbox?.allowedSubjects ?? []).includes(subject);
+  return onAllowList(subject, roles, config, storeEnrolled);
+}
+
+/**
+ * Who may use the sandbox routes and the template writes: the allow list, plus admins, plus a
+ * subject the members store enrolls (`storeEnrolled`), on `sandbox` and on `combined` (combined
+ * spec §3.2). A test user (`test:<n>`) is never on it: SH_ALLOWED_SUBJECTS admits only `github:`
+ * subjects. Always true on `harness`, which mounts none of those routes.
+ */
+export function isEnrolledForSandbox(
+  subject: string,
+  roles: string[],
+  config: CpConfig,
+  storeEnrolled = false,
+): boolean {
+  if (config.routeProfile === 'harness' || config.routeProfile === undefined) return true;
+  return onAllowList(subject, roles, config, storeEnrolled);
+}
+
+function onAllowList(
+  subject: string,
+  roles: string[],
+  config: CpConfig,
+  storeEnrolled: boolean,
+): boolean {
+  return (
+    roles.includes('admin') ||
+    storeEnrolled ||
+    (config.sandbox?.allowedSubjects ?? []).includes(subject)
+  );
 }
 
 /**

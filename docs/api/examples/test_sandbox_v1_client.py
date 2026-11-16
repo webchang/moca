@@ -441,7 +441,7 @@ class SbxCliTest(unittest.TestCase):
         self.assertIn("timed out", err)
 
     def test_a_busy_sandbox_with_retries_off_exits_125_saying_so(self):
-        # SBX_BUSY_RETRY_S=0: the behaviour before G36.
+        # SBX_BUSY_RETRY_S=0: the behaviour without the retry.
         with mock.patch.dict("os.environ", {"SBX_BUSY_RETRY_S": "0"}):
             code, err = self.run_sbx([FakeRpcError(grpc.StatusCode.RESOURCE_EXHAUSTED, "sandbox busy: 2 Execs already in flight")])
         self.assertEqual(code, 125)

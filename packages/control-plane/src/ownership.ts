@@ -86,6 +86,18 @@ export interface SessionRecord {
    */
   sandboxTier?: string;
   /**
+   * The session's sandbox template, chosen once at creation (session-templates spec §3.3). Absent
+   * (or '') when the session named none: it then runs only on untemplated workers.
+   */
+  sandboxTemplate?: string;
+  /**
+   * The build `sandboxTemplate` resolved to at creation through the template store (combined
+   * control plane spec §3.4): `id` by its default tag, `id:tag`, or `id@<build id>`. Kept for the
+   * session's life; when it is a manifest hash, a turn runs only on a worker labelled with it.
+   * Absent without a template store.
+   */
+  sandboxBuildId?: string;
+  /**
    * The model this session's turns run on (per-session model spec §4.4). '' or absent means the
    * deployment default. Changed by PATCH /v1/sessions/{id}, unlike the fields above.
    */
@@ -201,6 +213,8 @@ export class OwnershipIndex {
         configRef: rec.configRef ?? '',
         tombstone: rec.tombstone ? '1' : '0',
         sandboxTier: rec.sandboxTier ?? '',
+        sandboxTemplate: rec.sandboxTemplate ?? '',
+        sandboxBuildId: rec.sandboxBuildId ?? '',
         model: rec.model ?? '',
         modelLimits: rec.modelLimits ? JSON.stringify(rec.modelLimits) : '',
       }),
@@ -226,6 +240,8 @@ export class OwnershipIndex {
       configRef: h.configRef ? h.configRef : null,
       tombstone: h.tombstone === '1',
       sandboxTier: h.sandboxTier,
+      ...(h.sandboxTemplate ? { sandboxTemplate: h.sandboxTemplate } : {}),
+      ...(h.sandboxBuildId ? { sandboxBuildId: h.sandboxBuildId } : {}),
       ...(h.model ? { model: h.model } : {}),
       ...(readLimits(h.modelLimits) ? { modelLimits: readLimits(h.modelLimits) } : {}),
     };
@@ -345,11 +361,22 @@ export class OwnershipIndex {
     egressHost?: string;
     configRef?: string;
     bytes?: number;
+    /** The template a decision is about (template lifecycle spec §4). */
+    templateId?: string;
+    /** The gating rule ids a policy refusal failed, comma-separated (spec §8.1). */
+    rules?: string;
     decision: string;
-    /** The error code of a refusal. */
+    /**
+     * The error code of a refusal; on a `sandbox_mode_changed` the policy made (a mode no longer
+     * allowed, downgraded at a token mint), `mode_not_allowed`.
+     */
     reason?: string;
     model?: string;
     fromModel?: string;
+    /** A sandbox mode change (lease-mode spec §8.1): the old and new mode, and the new epoch. */
+    fromMode?: string;
+    toMode?: string;
+    modeEpoch?: number;
   }): Promise<void> {
     await this.guard(() =>
       this.redis.xAdd(
@@ -368,9 +395,14 @@ export class OwnershipIndex {
           ...(entry.egressHost ? { egressHost: entry.egressHost } : {}),
           ...(entry.configRef ? { configRef: entry.configRef } : {}),
           ...(entry.bytes !== undefined ? { bytes: String(entry.bytes) } : {}),
+          ...(entry.templateId ? { templateId: entry.templateId } : {}),
+          ...(entry.rules ? { rules: entry.rules } : {}),
           ...(entry.reason ? { reason: entry.reason } : {}),
           ...(entry.model ? { model: entry.model } : {}),
           ...(entry.fromModel ? { fromModel: entry.fromModel } : {}),
+          ...(entry.fromMode ? { fromMode: entry.fromMode } : {}),
+          ...(entry.toMode ? { toMode: entry.toMode } : {}),
+          ...(entry.modeEpoch !== undefined ? { modeEpoch: String(entry.modeEpoch) } : {}),
         },
         { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: AUDIT_MAXLEN } },
       ),

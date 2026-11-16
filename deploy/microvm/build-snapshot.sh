@@ -39,10 +39,14 @@
 #                      device state to vmstate/memfile.
 #   5. write_manifest -- record image, vmm, instance type, the GUEST's kernel release
 #                      (uname -r inside the booted VM, not the build host's), guest RAM,
-#                      the capabilities probed INSIDE the guest before snapshotting,
-#                      and the three component digests + their combined hash, in the
-#                      exact kernel/rootfs/agent order vmpool.Manifest.ComputeHash
-#                      hashes them in. kernel_sha256 is expected to legitimately
+#                      vcpus, the capabilities probed INSIDE the guest before
+#                      snapshotting, the features the image supports (lease-v1,
+#                      lease-processes-v1 and balloon-fpr-v1 on the Firecracker arm;
+#                      outside the hash), the digests of kernel, rootfs,
+#                      agent, vmstate, memfile (and ch-config.json, the egress CA), the
+#                      image digest build-rootfs.sh recorded, and hash version 2: one
+#                      hash over every other field and digest, in the exact line format
+#                      vmpool.Manifest.ComputeHash hashes. kernel_sha256 is expected to legitimately
 #                      DIFFER between a firecracker-arm and a cloud-hypervisor-arm
 #                      manifest for the same --image: the two arms need different
 #                      kernels (see preflight's virtio-fs check, item 1 above, and
@@ -107,6 +111,10 @@
 #                      left the host WORSE off than before it ran. Publishing by rename
 #                      after verification means a failed build leaves the previous
 #                      good snapshot exactly where it was.
+#   9. seed_verify_cache -- after publishing, best-effort and never failing the build:
+#                      the worker binary's own -verify-snapshot does the first full
+#                      check of $OUT and records it in the worker's verify cache,
+#                      so the first worker start does not re-hash the snapshot.
 #
 # Needs a KVM host with the chosen VMM installed; it cannot run in CI. What CAN run
 # everywhere is deploy/microvm/tests/build-snapshot.test.sh, which pins this script's
@@ -125,25 +133,37 @@ INSTANCE_TYPE=""
 VMM="firecracker"
 GUEST_RAM_MB=256
 OUT=""
+EGRESS_CA=""
 # Both opt-in, both off by default (the defaults keep the build exactly as before):
 # SKIP_GIT_IDENTITY_CHECK for images that deliberately refuse agent commits (no git identity,
 # e.g. benchmark testbeds whose patch must stay a diff against an untouched baseline);
 # GUEST_HOME for a writable HOME, since init otherwise leaves the kernel's HOME=/ on a
 # read-only rootfs. See check_git_identity and assemble_rootfs.
 SKIP_GIT_IDENTITY_CHECK=0
+# GUEST_HOME_GITCONFIG: opt-in, with --guest-home: copy the image's root git config into the new HOME.
+GUEST_HOME_GITCONFIG=0
 GUEST_HOME=""
 # VCPUS: the guest's vCPU count, recorded in the manifest. Default 1, exactly as before; a
 # benchmark comparing this tier with containers of N CPUs builds with --vcpus N so the comparison
 # measures the tier, not the CPU count. Restore takes the count from the snapshot itself.
 VCPUS=1
-EGRESS_CA=""
+# VERIFY_COMMAND: opt-in, what verify_restore runs in the restored VM instead of `true` (a template's
+# seed and probe, so a snapshot whose image cannot do its job is never published). See
+# verify_guest_command. VERIFY_TIMEOUT_S bounds it in the guest.
+VERIFY_COMMAND=""
+VERIFY_TIMEOUT_S=600
+# The microvm-worker binary that seeds the worker's verify cache after publishing
+# (seed_verify_cache). Best-effort: a missing or older binary only skips the seed.
+WORKER_BIN="/usr/local/bin/microvm-worker"
 
 usage() {
   cat >&2 <<'USAGE'
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR] [--egress-ca PATH]
-                  [--skip-git-identity-check] [--guest-home /tmp/DIR] [--vcpus 1]
+                  [--skip-git-identity-check] [--guest-home /tmp/DIR [--guest-home-gitconfig]] [--vcpus 1]
+                  [--verify-command CMD [--verify-timeout-s 600]]
+                  [--worker-bin /usr/local/bin/microvm-worker]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
 restore requires identical hardware and software). --instance-type is an OVERRIDE:
@@ -156,7 +176,7 @@ name something other than what this host reports.
 
 --egress-ca PATH bakes the KVM host's TLS-interception CA (the PUBLIC certificate
 only; a file holding any PRIVATE KEY block is refused) into the rootfs trust store,
-and records "egress_ca_sha256" (sha256 of the DER) in manifest.json, outside "hash". Writes vmstate, memfile and a
+and records "egress_ca_sha256" (sha256 of the DER) in manifest.json, inside "hash" (version 2). Writes vmstate, memfile and a
 manifest.json the worker verifies at start, then restores one VM to prove the
 artifact works.
 
@@ -165,8 +185,23 @@ artifact works.
 --guest-home /tmp/DIR      export HOME=DIR to guest commands, created by init on the /tmp
                            tmpfs (default: unset, so commands see the kernel's HOME=/ on a
                            read-only rootfs). Must be a path under /tmp.
+--guest-home-gitconfig     with --guest-home: copy the image's /root/.gitconfig and
+                           /root/.config/git into that HOME, so an identity the image set with
+                           `git config --global` applies (default: off, so an image whose root
+                           identity must NOT reach the agent, e.g. a benchmark testbed whose
+                           commits are refused on purpose, keeps refusing).
 --vcpus N                  the guest's vCPU count, 1-32 (default 1, as before), recorded in the
                            manifest; every VM restored from the snapshot has it.
+--verify-command CMD       what the verify step runs in the restored VM, in place of `true`: a
+                           bash command, run in /workspace once it is mounted as a worker mounts
+                           it (an empty workspace), so it can seed and probe a template. Nonzero
+                           exit fails the build and publishes nothing. The last 16 KiB of its
+                           output are logged. Default: unset, so the check is `true` as before.
+--verify-timeout-s N       the guest-side timeout for --verify-command, 1-86400 s (default 600).
+--worker-bin PATH          the microvm-worker that seeds its verify cache for the published
+                           snapshot (`microvm-worker -verify-snapshot OUT`), so the first worker
+                           start skips re-hashing it (default /usr/local/bin/microvm-worker;
+                           SBX0 hosts: SBX_WORKER_BIN). Best-effort: never fails the build.
 USAGE
   exit 2
 }
@@ -205,6 +240,10 @@ while [ $# -gt 0 ]; do
       OUT="${2:-}"
       shift 2
       ;;
+    --egress-ca)
+      EGRESS_CA="${2:-}"
+      shift 2
+      ;;
     --skip-git-identity-check)
       SKIP_GIT_IDENTITY_CHECK=1
       shift
@@ -213,12 +252,26 @@ while [ $# -gt 0 ]; do
       GUEST_HOME="${2:-}"
       shift 2
       ;;
+    --guest-home-gitconfig)
+      GUEST_HOME_GITCONFIG=1
+      shift
+      ;;
     --vcpus)
       VCPUS="${2:-}"
       shift 2
       ;;
-    --egress-ca)
-      EGRESS_CA="${2:-}"
+    --verify-command)
+      VERIFY_COMMAND="${2:-}"
+      [ -n "$VERIFY_COMMAND" ] || usage
+      shift 2
+      ;;
+    --verify-timeout-s)
+      VERIFY_TIMEOUT_S="${2:-}"
+      shift 2
+      ;;
+    --worker-bin)
+      WORKER_BIN="${2:-}"
+      [ -n "$WORKER_BIN" ] || usage
       shift 2
       ;;
     -h | --help)
@@ -269,15 +322,27 @@ case "$VMM" in
     ;;
 esac
 
+# The three option checks match the WHOLE value with bash's [[ =~ ]], never grep: grep matches line
+# by line, so a value with an embedded newline passed when any one line did, and these values are
+# written into init (GUEST_HOME, through a sed script), the VMM's config and the manifest. The
+# patterns live in variables so bash 3.2 and 5 read them alike.
 # /tmp is the only writable tmpfs init mounts for every run (see assemble_rootfs), so a HOME
 # anywhere else would be read-only or vanish; the pattern keeps it one plain directory path.
-if [ -n "$GUEST_HOME" ] && ! printf '%s' "$GUEST_HOME" | grep -Eq '^/tmp(/[A-Za-z0-9._-]+)+$'; then
+guest_home_re='^/tmp(/[A-Za-z0-9._-]+)+$'
+vcpus_re='^([1-9]|[12][0-9]|3[0-2])$'
+verify_timeout_re='^[1-9][0-9]{0,4}$'
+if [ -n "$GUEST_HOME" ] && ! [[ "$GUEST_HOME" =~ $guest_home_re ]]; then
   echo "build-snapshot.sh: --guest-home must be a path under /tmp (e.g. /tmp/home), got '$GUEST_HOME'" >&2
   exit 2
 fi
 
-if ! printf '%s' "$VCPUS" | grep -Eq '^([1-9]|[12][0-9]|3[0-2])$'; then
+if ! [[ "$VCPUS" =~ $vcpus_re ]]; then
   echo "build-snapshot.sh: --vcpus must be an integer from 1 to 32, got '$VCPUS'" >&2
+  exit 2
+fi
+
+if ! [[ "$VERIFY_TIMEOUT_S" =~ $verify_timeout_re ]] || [ "$VERIFY_TIMEOUT_S" -gt 86400 ]; then
+  echo "build-snapshot.sh: --verify-timeout-s must be an integer from 1 to 86400, got '$VERIFY_TIMEOUT_S'" >&2
   exit 2
 fi
 
@@ -587,6 +652,45 @@ build_agent() {
 # ---------------------------------------------------------------------------
 # 3. assemble_rootfs
 # ---------------------------------------------------------------------------
+# tree_dir_target DIR: DIR is a directory under the staged tree that the build creates or writes
+# into on THIS host. The tree is an image's filesystem, so a path in it can be a symlink out of it
+# (an absolute one resolves on the build host). It exits 1 unless DIR resolves inside the tree,
+# checking the deepest part of it that exists BEFORE `mkdir -p` makes the rest (mkdir -p follows
+# symlinks, so making first would create directories on the build host and only then refuse), and
+# DIR itself once made.
+tree_dir_target() {
+  local dir="$1" tree probe real d
+  tree="$(cd -P "$STAGE/rootfs-tree" && pwd)"
+  probe="$dir"
+  while [ "$probe" != . ] && [ ! -e "$STAGE/rootfs-tree/$probe" ] && [ ! -L "$STAGE/rootfs-tree/$probe" ]; do
+    probe="$(dirname "$probe")"
+  done
+  for d in "$probe" "$dir"; do
+    if [ "$d" = "$dir" ]; then mkdir -p "$STAGE/rootfs-tree/$dir"; fi
+    real="$(cd -P "$STAGE/rootfs-tree/$d" 2>/dev/null && pwd)" || real="unresolvable"
+    case "$real/" in
+      "$tree"/*) ;;
+      *)
+        echo "build-snapshot.sh: the rootfs's /$d resolves outside the tree ($real); refusing to write /$dir through it" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# tree_write_target REL: REL is a file under the staged tree that the build writes or appends to on
+# THIS host (etc/passwd, etc/gitconfig, the egress CA). It exits 1 unless REL's directory passes
+# tree_dir_target and REL itself is not a symlink: its target is unknown, and appending through it
+# would write the build host's file.
+tree_write_target() {
+  local rel="$1"
+  tree_dir_target "$(dirname "$rel")"
+  if [ -L "$STAGE/rootfs-tree/$rel" ]; then
+    echo "build-snapshot.sh: the rootfs's /$rel is a symlink ($(readlink "$STAGE/rootfs-tree/$rel")); refusing to write through it" >&2
+    exit 1
+  fi
+}
+
 # Bakes the host's interception CA (public cert) into the STAGED tree using the tree's own
 # trust-store tool, then points the runtimes that ignore the system store at it via init.
 install_egress_ca() {
@@ -594,13 +698,13 @@ install_egress_ca() {
   if [ -x "$STAGE/rootfs-tree/usr/sbin/update-ca-certificates" ]; then
     ca_guest=/usr/local/share/ca-certificates/moca-egress.crt
     bundle=/etc/ssl/certs/ca-certificates.crt
-    mkdir -p "$STAGE/rootfs-tree/usr/local/share/ca-certificates"
+    tree_write_target "${ca_guest#/}"
     cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
     chroot "$STAGE/rootfs-tree" /usr/sbin/update-ca-certificates
   elif [ -x "$STAGE/rootfs-tree/usr/bin/update-ca-trust" ]; then
     ca_guest=/etc/pki/ca-trust/source/anchors/moca-egress.crt
     bundle=/etc/pki/tls/certs/ca-bundle.crt
-    mkdir -p "$STAGE/rootfs-tree/etc/pki/ca-trust/source/anchors"
+    tree_write_target "${ca_guest#/}"
     cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
     chroot "$STAGE/rootfs-tree" /usr/bin/update-ca-trust extract
   else
@@ -630,36 +734,71 @@ install_egress_ca() {
   done
 }
 
-# add_sbx_identity gives lease mode its exec identity: user sbx (uid 7000) in group
-# sbx-ws (gid 7000), HOME /tmp/sbx-home. The agent's leasePrepare creates that HOME at
-# boot (it is on the /tmp tmpfs), so only the passwd/group lines are baked here. The
-# entries are appended directly rather than via useradd: the build host may not have
-# it, and running the tree's own useradd under chroot would need more of the tree than
-# a base rootfs promises. It refuses, before writing anything, when the tree already
-# uses uid/gid 7000 or the names sbx/sbx-ws for something else, since a lease Exec would
+# sbx_tracked_passwd prints the passwd lines of the tracked-process identities (lease
+# level 2, lease-processes-v1): sbxp<n>, uid 20000+n, in sbx-ws (gid 7000), HOME
+# /tmp/sbx-proc/<uid>, one per uid of the range the init hands the agent
+# (--lease-tracked-uid-base 20000 --lease-tracked-uids 4; the agent's defaults too). The
+# agent makes each HOME at process_start under a root-owned 0711 /tmp/sbx-proc it creates
+# at lease prepare (ruling P5-R12), so, as for sbx, only the passwd lines are baked. The
+# one source of the range for add_sbx_identity and check_lease_support.
+sbx_tracked_passwd() {
+  local base=20000 count=4 n=0
+  while [ "$n" -lt "$count" ]; do
+    echo "sbxp$n:x:$((base + n)):7000::/tmp/sbx-proc/$((base + n)):/bin/bash"
+    n=$((n + 1))
+  done
+}
+
+# add_sbx_identity gives lease mode its exec identities: user sbx (uid 7000) in group
+# sbx-ws (gid 7000), HOME /tmp/sbx-home, and, on a Firecracker build only (level 2,
+# lease-processes-v1, is Firecracker-only; ruling P5-R15), the tracked-process users
+# sbxp0..sbxp3 (uids 20000..20003, sbx_tracked_passwd) in the same group. A Cloud
+# Hypervisor build neither adds nor checks the tracked range. The agent's leasePrepare
+# creates those HOMEs (they are on the /tmp tmpfs), so only the passwd/group lines are
+# baked here. The entries are appended directly rather than via useradd: the build host
+# may not have it, and running the tree's own useradd under chroot would need more of the
+# tree than a base rootfs promises. It refuses, before writing anything, when the tree
+# already uses one of those uids or gid 7000 (compared as numbers), or one of the names
+# sbx/sbxp<n>/sbx-ws for something else, since a lease Exec or a tracked process would
 # then run as that other identity. The exact entries already present is a no-op, so a
 # rerun over the same tree is idempotent.
 add_sbx_identity() {
   local etc="$STAGE/rootfs-tree/etc"
-  local pw_line='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' gr_line='sbx-ws:x:7000:'
-  local f clash
-  mkdir -p "$etc"
-  for f in passwd group; do [ -e "$etc/$f" ] || : >"$etc/$f"; done
-  clash="$(awk -F: -v want="$pw_line" '($1 == "sbx" || $3 == "7000") && $0 != want' "$etc/passwd")"
+  local gr_line='sbx-ws:x:7000:' pw_lines f clash line
+  pw_lines='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash'
+  if [ "$VMM" = firecracker ]; then
+    pw_lines="$pw_lines
+$(sbx_tracked_passwd)"
+  fi
+  for f in passwd group; do
+    tree_write_target "etc/$f"
+    [ -e "$etc/$f" ] || : >"$etc/$f"
+  done
+  # want is |-joined (a newline in -v is not portable); no wanted line holds a |.
+  clash="$(awk -F: -v want="$(printf '%s\n' "$pw_lines" | paste -sd'|' -)" '
+    BEGIN {
+      n = split(want, w, "|")
+      for (i = 1; i <= n; i++) { ok[w[i]] = 1; split(w[i], fld, ":"); name[fld[1]] = 1; uid[fld[3] + 0] = 1 }
+    }
+    (($1 in name) || ($3 ~ /^[0-9]+$/ && (($3 + 0) in uid))) && !($0 in ok)' "$etc/passwd")"
   if [ -n "$clash" ]; then
-    echo "build-snapshot.sh: the rootfs /etc/passwd already uses the name sbx or uid 7000 for another account; lease mode needs it as '$pw_line': $clash" >&2
+    echo "build-snapshot.sh: the rootfs /etc/passwd already uses a lease identity's name or uid for another account; lease mode needs them as '$(printf '%s\n' "$pw_lines" | paste -sd' ' -)': $clash" >&2
     exit 1
   fi
-  clash="$(awk -F: -v want="$gr_line" '($1 == "sbx-ws" || $3 == "7000") && $0 != want' "$etc/group")"
+  clash="$(awk -F: -v want="$gr_line" '($1 == "sbx-ws" || ($3 ~ /^[0-9]+$/ && $3 + 0 == 7000)) && $0 != want' "$etc/group")"
   if [ -n "$clash" ]; then
     echo "build-snapshot.sh: the rootfs /etc/group already uses the name sbx-ws or gid 7000 for another group; lease mode needs it as '$gr_line': $clash" >&2
     exit 1
   fi
   # The leading newline guards a file that lacks a trailing one.
-  if ! grep -qxF "$pw_line" "$etc/passwd"; then
-    if [ -s "$etc/passwd" ] && [ -n "$(tail -c1 "$etc/passwd")" ]; then echo >>"$etc/passwd"; fi
-    echo "$pw_line" >>"$etc/passwd"
-  fi
+  while IFS= read -r line; do
+    if ! grep -qxF "$line" "$etc/passwd"; then
+      if [ -s "$etc/passwd" ] && [ -n "$(tail -c1 "$etc/passwd")" ]; then echo >>"$etc/passwd"; fi
+      echo "$line" >>"$etc/passwd"
+    fi
+  done <<EOF
+$pw_lines
+EOF
   if ! grep -qxF "$gr_line" "$etc/group"; then
     if [ -s "$etc/group" ] && [ -n "$(tail -c1 "$etc/group")" ]; then echo >>"$etc/group"; fi
     echo "$gr_line" >>"$etc/group"
@@ -674,34 +813,30 @@ assemble_rootfs() {
   # this build layers the agent and init onto. It is copied, never mutated in place,
   # so a failed build never corrupts the caller's base image.
   cp -a "$ROOTFS/." "$STAGE/rootfs-tree/"
-  mkdir -p "$STAGE/rootfs-tree/usr/local/bin" "$STAGE/rootfs-tree/sbin" \
-    "$STAGE/rootfs-tree/tmp" "$STAGE/rootfs-tree/var" "$STAGE/rootfs-tree/workspace"
   # NEVER WRITE THROUGH THE IMAGE'S SYMLINKS. The tree is an image's filesystem, and paths in it
   # resolve on THIS host: Ubuntu-based images ship /sbin/init -> /lib/systemd/systemd (absolute), so
-  # writing "$tree/sbin/init" opened the BUILD HOST's systemd (found 2026-10-14 on a moca-microvm
-  # image: "Text file busy" stopped it only because that file was running; a host file that was not
-  # running would have been overwritten as root). So: the directories we write into must resolve
-  # inside the tree, and the files we write are unlinked first, which replaces a symlink rather than
-  # following it.
-  local tree_real d
-  tree_real="$(realpath -e "$STAGE/rootfs-tree")"
-  for d in sbin usr/local/bin; do
-    case "$(realpath -e "$STAGE/rootfs-tree/$d")/" in
-      "$tree_real"/*) ;;
-      *)
-        echo "build-snapshot.sh: the rootfs's /$d resolves outside the tree ($(realpath -e "$STAGE/rootfs-tree/$d")); refusing to write through it" >&2
-        exit 1
-        ;;
-    esac
+  # writing "$tree/sbin/init" opened the BUILD HOST's systemd (seen on an Ubuntu-based image:
+  # "Text file busy" stopped it only because that file was running; a host file that was not
+  # running would have been overwritten as root). So: every directory the build makes or writes
+  # into must resolve inside the tree, checked before it is made (tree_dir_target), and the files we
+  # write are unlinked first, which replaces a symlink rather than following it.
+  local d
+  for d in usr/local/bin sbin tmp var workspace .moca-var; do
+    tree_dir_target "$d"
   done
+  # check_var's probe: one regular file the image has under /var, a plain name (quoted into a
+  # guest command), smallest path first so it is stable between builds. None: the check only writes.
+  VAR_PROBE="$(cd "$STAGE/rootfs-tree/var" && find . -xdev -type f 2>/dev/null |
+    sed 's|^\./||' | grep -E '^[A-Za-z0-9._/+-]+$' | LC_ALL=C sort | head -1 || true)"
   rm -f "$STAGE/rootfs-tree/sbin/init" "$STAGE/rootfs-tree/usr/local/bin/agent"
   install -m 0555 "$STAGE/agent" "$STAGE/rootfs-tree/usr/local/bin/agent"
   add_sbx_identity
 
   # A minimal init: mount the ephemeral filesystems every run needs writable, then
   # EXEC (not fork) the agent as PID 1 so the agent's own exit tears the VM down
-  # instead of leaving an orphaned init for the next restore. /tmp and /var are
-  # tmpfs so nothing a run writes there survives past this VM's destruction.
+  # instead of leaving an orphaned init for the next restore. /tmp is a tmpfs, and /var
+  # an overlay with a tmpfs on top, so nothing a run writes there survives past this
+  # VM's destruction.
   cat >"$STAGE/rootfs-tree/sbin/init" <<'INIT'
 #!/bin/sh
 set -e
@@ -711,7 +846,30 @@ mount -t sysfs sysfs /sys
 # the whole cgroup when the Exec ends; the agent creates that directory itself.
 mount -t cgroup2 cgroup2 /sys/fs/cgroup || { echo "init: cgroup2 mount failed (guest kernel lacks cgroup v2?)" >&2; exit 1; }
 mount -t tmpfs -o mode=1777 tmpfs /tmp
-mount -t tmpfs tmpfs /var
+# /var is writable and fresh in every VM, but keeps what the image put there: an overlay with the
+# image's own /var (on the read-only rootfs) underneath and a tmpfs on top. A plain tmpfs here hid
+# it all (for example a prebuilt TeX format under /var/lib/texmf). The tmpfs for the
+# overlay's upper and work dirs is /.moca-var, a mount point the build makes, outside /var. If the
+# kernel has no overlayfs, the image's /var is copied into that tmpfs and bound over /var; if even
+# that fails, an empty tmpfs as before. Never fatal: check_var fails the build instead.
+mount -t tmpfs -o mode=0700 tmpfs /.moca-var || true
+mkdir -p /.moca-var/upper /.moca-var/work || true
+if mount -t overlay overlay -o lowerdir=/var,upperdir=/.moca-var/upper,workdir=/.moca-var/work /var; then
+  :
+elif mkdir -p /.moca-var/copy && cp -a /var/. /.moca-var/copy/ && mount --bind /.moca-var/copy /var; then
+  :
+else
+  mount -t tmpfs tmpfs /var
+fi
+# The links a userspace /dev normally has and the kernel's devtmpfs does not: without /dev/fd,
+# bash's process substitution (<(...), >(...)) expands to /dev/fd/63 and fails "No such file or
+# directory", and tools reading /dev/stdin fail the same way.
+# Never fatal: a /dev that cannot take them must not stop the guest booting;
+# check_dev_fd fails the build instead.
+[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd || true
+[ -e /dev/stdin ] || ln -s /proc/self/fd/0 /dev/stdin || true
+[ -e /dev/stdout ] || ln -s /proc/self/fd/1 /dev/stdout || true
+[ -e /dev/stderr ] || ln -s /proc/self/fd/2 /dev/stderr || true
 
 # Fix-round-4 item 1: the kernel hands init an essentially empty environment --
 # no PATH at all. This script never needed one (every command above is called
@@ -759,13 +917,28 @@ if [ ! -x /usr/local/bin/agent ]; then
   exit 1
 fi
 
-exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 --lease-cgroup-root /sys/fs/cgroup/moca-execs
+exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 --lease-cgroup-root /sys/fs/cgroup/moca-execs --lease-tracked-uid-base 20000 --lease-tracked-uids 4
 INIT
   # --guest-home: give guest commands a writable HOME. Inserted right after the PATH line, so
   # /tmp is already mounted; the agent inherits init's environment, and so does every command.
-  if [ -n "$GUEST_HOME" ]; then
+  # --guest-home-gitconfig: the image's own HOME (root's, /root) may carry the user-level git
+  # config (its identity): the new HOME starts empty, so without the copy a `git commit` that works
+  # in the image fails in the guest with no identity. OPT-IN, because an image can carry a root
+  # identity that must not reach the agent: a benchmark base image can have one while its testbed
+  # refuses commits by design.
+  # Only git's files, and only if present.
+  if [ -n "$GUEST_HOME" ] && [ "$GUEST_HOME_GITCONFIG" = 1 ]; then
+    sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
+[ ! -f /root/.gitconfig ] || cp /root/.gitconfig $GUEST_HOME/.gitconfig || true\\
+[ ! -d /root/.config/git ] || { mkdir -p $GUEST_HOME/.config \\&\\& cp -R /root/.config/git $GUEST_HOME/.config/git; } || true\\
+export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
+  elif [ -n "$GUEST_HOME" ]; then
     sed -i "/^export PATH=/a mkdir -p $GUEST_HOME\\
 export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
+  fi
+  # Either way, the insertion must have landed (GUEST_HOME is one plain path, checked above, so it
+  # needs no quoting in init).
+  if [ -n "$GUEST_HOME" ]; then
     grep -qx "export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init" || {
       echo "build-snapshot.sh: could not add HOME=$GUEST_HOME to init" >&2
       exit 1
@@ -779,7 +952,7 @@ export HOME=$GUEST_HOME" "$STAGE/rootfs-tree/sbin/init"
   # (not the host's /etc) before mkfs. Appended, because the image may already carry an
   # /etc/gitconfig (the identity, see check_git_identity); the leading newline guards a
   # file that lacks a trailing one.
-  mkdir -p "$STAGE/rootfs-tree/etc"
+  tree_write_target etc/gitconfig
   cat >>"$STAGE/rootfs-tree/etc/gitconfig" <<'GITCONFIG'
 
 [credential]
@@ -1072,23 +1245,43 @@ probe_guest_kernel() {
   printf '%s\n' "$out"
 }
 
-# check_lease_support (lease-v1): the image advertises lease-v1, so prove in the booted
-# guest what lease mode relies on -- cgroup2 mounted at /sys/fs/cgroup, a user-namespace
-# sysctl the agent can write (it disables user namespaces at the first lease request;
-# per-Exec VMs keep them), the sbx identity in /etc/passwd, no setuid/setgid file on the
-# rootfs -- rather than trusting that init and assemble_rootfs did it. ONE ordinary
-# per-Exec request, never `lease: true`: the first lease request sets the agent's lease
-# latch, and anything set before the snapshot is baked into every VM restored from it
-# (the old clockOK latch failure). It creates nothing in the guest, so nothing reaches
-# the snapshot either. grep, not getent: the guest image need not have getent.
+# check_lease_support (lease-v1, and lease-processes-v1 on Firecracker): prove in the
+# booted guest what lease mode relies on -- cgroup2 mounted at /sys/fs/cgroup, a
+# user-namespace sysctl the agent can write (it disables user namespaces at the first
+# lease request; per-Exec VMs keep them), the sbx identity in /etc/passwd, no
+# setuid/setgid file on the rootfs -- rather than trusting that init and assemble_rootfs
+# did it. On a Firecracker build, whose manifest also advertises lease-processes-v1, it
+# proves what tracked processes rely on too: cgroup.kill (process_stop and every lease
+# teardown kill a cgroup through it; guest kernel 5.14 or later), the tracked uid range
+# held by exactly the sbxp<n> lines (sbx_tracked_passwd, in any order), and gid 7000
+# held by sbx-ws alone (uids and gids compared as numbers). A Cloud Hypervisor build
+# asks only what it asked before (ruling P5-R15). ONE ordinary per-Exec request, never
+# `lease: true`: the first lease request sets the agent's lease latch, and anything set
+# before the snapshot is baked into every VM restored from it (the old clockOK latch
+# failure). It leaves nothing in the guest, so nothing reaches the snapshot either:
+# cgroup.kill exists only in a child cgroup, never in the root, so the probe makes one
+# and removes it, and answers probe-left if it could not. grep, not getent: the guest
+# image need not have getent.
 check_lease_support() {
   local uds="$1"
-  local out rc cg userns sbx suid err="$STAGE/lease-check.err"
+  local out rc cg userns sbx kill tracked grp suid suid_line=4 err="$STAGE/lease-check.err"
+  local cmd uids want_tracked
+  want_tracked="$(sbx_tracked_passwd | LC_ALL=C sort | paste -sd' ' -)"
+  uids="$(sbx_tracked_passwd | cut -d: -f3 | paste -sd'|' -)"
   # stdout only is parsed, line by line; stderr goes aside so a stray diagnostic cannot
-  # shift the four answers, and is shown when the check could not run at all. Each probe
-  # prints exactly one line, so a missing answer cannot shift the next into its place.
-  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 60 \
-    -command 'cat /sys/fs/cgroup/cgroup.controllers >/dev/null 2>&1 && echo cg2 || echo no-cg2; test -w /proc/sys/user/max_user_namespaces && echo userns-ok || echo no-userns; grep "^sbx:" /etc/passwd || echo no-sbx; find / -xdev -type f -perm /6000 2>/dev/null | head -1' \
+  # shift the answers, and is shown when the check could not run at all. Each probe
+  # prints exactly one line, so a missing answer cannot shift the next into its place;
+  # the setuid probe, which may print none, comes last.
+  cmd='cat /sys/fs/cgroup/cgroup.controllers >/dev/null 2>&1 && echo cg2 || echo no-cg2; test -w /proc/sys/user/max_user_namespaces && echo userns-ok || echo no-userns; grep "^sbx:" /etc/passwd || echo no-sbx; '
+  if [ "$VMM" = firecracker ]; then
+    # shellcheck disable=SC2016 # the guest expands $d and $k
+    cmd="$cmd"'d=/sys/fs/cgroup/moca-kill-probe; if mkdir "$d" 2>/dev/null; then k=no-kill; test -e "$d/cgroup.kill" && k=kill-ok; rmdir "$d" 2>/dev/null || k=probe-left; echo "$k"; else echo no-mkdir; fi; '
+    cmd="$cmd""grep -E '^sbxp|^[^:]*:[^:]*:0*($uids):' /etc/passwd | LC_ALL=C sort | tr '\n' ' '; echo; "
+    cmd="$cmd""grep -E '^sbx-ws:|^[^:]*:[^:]*:0*7000:' /etc/group | tr '\n' ' '; echo; "
+    suid_line=7
+  fi
+  cmd="$cmd"'find / -xdev -type f -perm /6000 2>/dev/null | head -1'
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 60 -command "$cmd" \
     2>"$err")" && rc=0 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "build-snapshot.sh: the lease-v1 check could not run in the guest (exit $rc); guest_client diagnostics: $(cat "$err")" >&2
@@ -1097,7 +1290,7 @@ check_lease_support() {
   cg="$(printf '%s\n' "$out" | sed -n 1p)"
   userns="$(printf '%s\n' "$out" | sed -n 2p)"
   sbx="$(printf '%s\n' "$out" | sed -n 3p)"
-  suid="$(printf '%s\n' "$out" | sed -n 4p)"
+  suid="$(printf '%s\n' "$out" | sed -n "${suid_line}p")"
   if [ "$cg" != cg2 ]; then
     echo "build-snapshot.sh: lease-v1: cgroup2 is not mounted at /sys/fs/cgroup in the guest (the init must mount it, and the guest kernel needs cgroup v2)" >&2
     exit 1
@@ -1109,6 +1302,23 @@ check_lease_support() {
   if [ "$sbx" != 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' ]; then
     echo "build-snapshot.sh: lease-v1: the guest /etc/passwd has no 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' line (got '$sbx')" >&2
     exit 1
+  fi
+  if [ "$VMM" = firecracker ]; then
+    kill="$(printf '%s\n' "$out" | sed -n 4p)"
+    tracked="$(printf '%s\n' "$out" | sed -n 5p | sed 's/ *$//')"
+    grp="$(printf '%s\n' "$out" | sed -n 6p | sed 's/ *$//')"
+    if [ "$kill" != kill-ok ]; then
+      echo "build-snapshot.sh: lease-processes-v1: a child cgroup of /sys/fs/cgroup in the guest has no cgroup.kill (got '$kill'; no-mkdir: the probe cgroup could not be made, probe-left: it could not be removed; process_stop and every lease teardown kill a cgroup through it, and the guest kernel needs 5.14 or later)" >&2
+      exit 1
+    fi
+    if [ "$tracked" != "$want_tracked" ]; then
+      echo "build-snapshot.sh: lease-processes-v1: the guest /etc/passwd's tracked-process entries (names sbxp*, uids $uids) are not exactly '$want_tracked' (got '$tracked')" >&2
+      exit 1
+    fi
+    if [ "$grp" != 'sbx-ws:x:7000:' ]; then
+      echo "build-snapshot.sh: lease-processes-v1: the guest /etc/group's sbx-ws and gid-7000 entries are not exactly 'sbx-ws:x:7000:' (got '$grp')" >&2
+      exit 1
+    fi
   fi
   if [ -n "$suid" ]; then
     echo "build-snapshot.sh: lease-v1: the guest rootfs still has a setuid/setgid file: $suid" >&2
@@ -1152,9 +1362,16 @@ check_git_identity() {
     log "skipping the git identity check (--skip-git-identity-check): this image refuses agent commits on purpose"
     return 0
   fi
+  # An image with no git at all has no commit to fail, so the check passes: the guest
+  # prints `no-git` and exits 0. An image whose template needs git is refused earlier, by
+  # build-rootfs.sh's required tools (--require names them for a template image).
   out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
-    -command 'git init -q /tmp/id-check && cd /tmp/id-check && git -c user.useConfigOnly=true commit --allow-empty -m x 2>&1; rc=$?; cd / && rm -rf /tmp/id-check; exit $rc' \
+    -command 'command -v git >/dev/null 2>&1 || { echo no-git; exit 0; }; git init -q /tmp/id-check && cd /tmp/id-check && git -c user.useConfigOnly=true commit --allow-empty -m x 2>&1; rc=$?; cd / && rm -rf /tmp/id-check; exit $rc' \
     2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$out" | tr -d '[:space:]')" = "no-git" ]; then
+    log "the guest has no git: no commit to fail, so no identity is needed"
+    return 0
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "build-snapshot.sh: the guest git has no usable identity (exit $rc). An agent's" >&2
     echo "  first \`git commit\` in this sandbox will fail with exit 128 until it configures" >&2
@@ -1184,6 +1401,45 @@ check_egress_listener() {
     echo "  pointing at nothing (P4.1). The init must exec the agent with" >&2
     echo "  --egress-listen 127.0.0.1:3128 --egress-vsock-port 1025 -- or guest_client could" >&2
     echo "  not reach the guest at all, in which case its diagnostics follow. Output: $out" >&2
+    exit 1
+  fi
+}
+
+# check_dev_fd: the guest must have /dev/fd and /dev/std* (init links them), or every agent
+# command using bash process substitution fails in the sandbox. Same failure style as
+# check_egress_listener: loud, at build time.
+check_dev_fd() {
+  local uds="$1"
+  local out rc
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 \
+    -command 'cat <(echo fd-ok) && echo stdin-ok | cat /dev/stdin' \
+    2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "fd-okstdin-ok" ]; then
+    echo "build-snapshot.sh: the guest has no working /dev/fd or /dev/stdin (exit $rc)." >&2
+    echo "  bash's <(...) and >(...) would fail in every sandbox restored from this snapshot." >&2
+    echo "  The init links /dev/fd -> /proc/self/fd; its /dev must be writable (devtmpfs) --" >&2
+    echo "  or guest_client could not reach the guest at all. Output: $out" >&2
+    exit 1
+  fi
+}
+
+# check_var: the restored guest's /var shows the image's own files and takes writes (init's overlay).
+# VAR_PROBE is a file the image has under /var (found by assemble_rootfs's caller), or empty for an
+# image with an empty /var. The written file is removed in the same command: the snapshot captures
+# guest RAM, the tmpfs under /var included.
+VAR_PROBE=""
+check_var() {
+  local uds="$1"
+  local out rc cmd
+  cmd='echo x >/var/.moca-var-check && rm -f /var/.moca-var-check && echo var-writable'
+  [ -z "$VAR_PROBE" ] || cmd="test -r '/var/$VAR_PROBE' && echo var-kept && $cmd"
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 30 -command "$cmd" 2>&1)" && rc=0 || rc=$?
+  local want=var-writable
+  [ -z "$VAR_PROBE" ] || want=var-keptvar-writable
+  if [ "$rc" -ne 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "$want" ]; then
+    echo "build-snapshot.sh: the guest's /var is not the image's /var made writable (exit $rc)." >&2
+    echo "  init mounts an overlay (the image's /var under a tmpfs) on /var; probed /var/$VAR_PROBE" >&2
+    echo "  and a write. Output: $out" >&2
     exit 1
   fi
 }
@@ -1725,8 +1981,8 @@ boot_quiesce_snapshot_firecracker() {
   # which is how this was found, and vmpoolctl (which had no such check until this change)
   # went on measuring against a mutating image.
   #
-  # Nothing legitimate is lost. sbin/init mounts tmpfs on /tmp and /var (see assemble_
-  # rootfs) so everything a run writes there is ephemeral by design, and /workspace is a
+  # Nothing legitimate is lost. sbin/init mounts a tmpfs on /tmp and a tmpfs-backed overlay on
+  # /var (see assemble_rootfs), so everything a run writes there is ephemeral by design, and /workspace is a
   # SEPARATE rw drive. The Cloud Hypervisor path in this same script already passed
   # `readonly=on` for its rootfs -- this makes the Firecracker arm agree with it.
   api_put "$api_sock" /drives/rootfs \
@@ -1737,6 +1993,14 @@ boot_quiesce_snapshot_firecracker() {
     "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
   api_put "$api_sock" /machine-config \
     "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":$VCPUS}"
+  # balloon-fpr-v1 (spec §6 "Free-page reporting", §16 item 5): a virtio-balloon in free-page
+  # reporting mode only. amount_mib 0 and nothing ever inflates it; the guest reports the
+  # pages it frees and the host drops them, so an idle lease is charged its working set, not
+  # its peak. Pre-boot like every device here, and so in the snapshot: one golden snapshot
+  # for every mode (per-Exec latency measured unchanged with it on the E15 rig), and a
+  # restored VM keeps reporting, so verify_restore_firecracker never sends it. Validated
+  # against the real Firecracker v1.17.0 binary.
+  api_put "$api_sock" /balloon '{"amount_mib":0,"deflate_on_oom":false,"free_page_reporting":true}'
   api_put "$api_sock" /actions '{"action_type":"InstanceStart"}'
 
   wait_for_agent "$vsock_uds" "$console_log"
@@ -1744,6 +2008,8 @@ boot_quiesce_snapshot_firecracker() {
   MANIFEST_GUEST_KERNEL="$(probe_guest_kernel "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
+  check_dev_fd "$vsock_uds"
+  check_var "$vsock_uds"
   check_lease_support "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
@@ -1898,7 +2164,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --vsock "cid=3,socket=/vsock.sock" \
     --fs "tag=workspace,socket=/fs.sock" \
     --memory "size=${GUEST_RAM_MB}M,shared=on" \
-    --cpus boot=$VCPUS \
+    --cpus "boot=$VCPUS" \
     --console "file=/console.log" \
     --serial off \
     </dev/null >/dev/null 2>&1 &
@@ -1920,6 +2186,8 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   MANIFEST_GUEST_KERNEL="$(probe_guest_kernel "$vsock_uds")"
   check_git_identity "$vsock_uds"
   check_egress_listener "$vsock_uds"
+  check_dev_fd "$vsock_uds"
+  check_var "$vsock_uds"
   check_lease_support "$vsock_uds"
   quiesce_guest "$vsock_uds"
 
@@ -1966,37 +2234,74 @@ write_manifest() {
   # boots -- both now need it in place at the jail-relative name "/kernel"
   # pre-boot, not just afterwards for hashing.
 
-  local khash rhash ahash hash caps_json built_at egress_json features_json
+  local khash rhash ahash vhash mhash chhash cahash srcdig hash caps_json caps_csv built_at krel egress_json features_json f
   khash="sha256:$(sha256sum "$STAGE/kernel" | cut -d' ' -f1)"
   rhash="sha256:$(sha256sum "$STAGE/rootfs" | cut -d' ' -f1)"
   ahash="sha256:$(sha256sum "$STAGE/agent" | cut -d' ' -f1)"
-  # Hashed in this exact order -- kernel, then rootfs, then agent -- to match
-  # vmpool.Manifest.ComputeHash byte for byte; a different order here would make
-  # every worker's startup verification fail against a perfectly good snapshot.
-  hash="sha256:$(printf 'kernel:%s\nrootfs:%s\nagent:%s\n' "$khash" "$rhash" "$ahash" | sha256sum | cut -d' ' -f1)"
-
-  caps_json="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | awk '{printf "%s\"%s\"", sep, $0; sep=","}')"
-  built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-  # Only with --egress-ca, and AFTER "hash": the fingerprint is outside the hash (it is not one
-  # of vmpool.Manifest.ComputeHash's inputs) so a worker that predates it still verifies.
+  # Hash version 2: vmstate and memfile are hashed once here, and the hash covers every
+  # field below, so it names this build and nothing else.
+  vhash="sha256:$(sha256sum "$STAGE/vmstate" | cut -d' ' -f1)"
+  mhash="sha256:$(sha256sum "$STAGE/memfile" | cut -d' ' -f1)"
+  chhash=""
+  [ -f "$STAGE/ch-config.json" ] && chhash="sha256:$(sha256sum "$STAGE/ch-config.json" | cut -d' ' -f1)"
   # DER, not PEM, so it is independent of the file's encoding and line wrapping.
-  egress_json=""
-  if [ -n "$EGRESS_CA" ]; then
-    egress_json=",
-  \"egress_ca_sha256\": \"sha256:$(openssl x509 -in "$EGRESS_CA" -outform DER | sha256sum | cut -d' ' -f1)\""
+  cahash=""
+  [ -n "$EGRESS_CA" ] && cahash="sha256:$(openssl x509 -in "$EGRESS_CA" -outform DER | sha256sum | cut -d' ' -f1)"
+
+  # The image digest build-rootfs.sh recorded in the rootfs (/etc/moca-rootfs-source),
+  # copied here so a worker can compare it with its template record without mounting the
+  # rootfs; empty for a rootfs from elsewhere.
+  srcdig=""
+  if [ -n "$ROOTFS" ] && [ -f "$ROOTFS/etc/moca-rootfs-source" ]; then
+    srcdig="$(sed -n 's/^digest=\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$ROOTFS/etc/moca-rootfs-source" | head -1)"
   fi
 
-  # lease-v1 on the Firecracker arm only: Cloud Hypervisor's Run mounts the virtiofs
-  # workspace inside every command (chvWrapCommand), which a lease Exec, uid 7000 with
-  # no capabilities, cannot do.
+  # Byte order (LC_ALL=C), as Go's sort.Strings in ComputeHash: the build host's locale must not
+  # change the capabilities line the hash covers.
+  caps_json="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | LC_ALL=C sort | awk '{printf "%s\"%s\"", sep, $0; sep=","}')"
+  caps_csv="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | LC_ALL=C sort | paste -sd, -)"
+  built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # The GUEST's kernel release, probed in the booted VM (probe_guest_kernel), not the build host's.
+  krel="${MANIFEST_GUEST_KERNEL:-}"
+
+  # These lines, in this order, are what vmpool.Manifest.ComputeHash hashes for version 2;
+  # a difference here makes every worker refuse a perfectly good snapshot at start. A value
+  # holding a line break could forge a line: the Go side refuses one, so refuse it here too.
+  for f in "$IMAGE" "$VMM" "$INSTANCE_TYPE" "$krel" "$caps_csv"; do
+    case "$f" in *$'\n'* | *$'\r'*)
+      echo "build-snapshot.sh: a manifest field holds a line break: '$f'" >&2
+      exit 1
+      ;;
+    esac
+  done
+  hash="sha256:$(
+    printf 'moca-snapshot-manifest/2\nimage:%s\nvmm:%s\ninstance_type:%s\nkernel_release:%s\nguest_ram_mb:%s\nvcpus:%s\ncapabilities:%s\nbuilt_at:%s\nkernel:%s\nrootfs:%s\nagent:%s\nvmstate:%s\nmemfile:%s\nch_config:%s\negress_ca:%s\nsource_image_digest:%s\n' \
+      "$IMAGE" "$VMM" "$INSTANCE_TYPE" "$krel" "$GUEST_RAM_MB" "$VCPUS" "$caps_csv" "$built_at" \
+      "$khash" "$rhash" "$ahash" "$vhash" "$mhash" "$chhash" "$cahash" "$srcdig" | sha256sum | cut -d' ' -f1
+  )"
+
+  egress_json=""
+  [ -n "$cahash" ] && egress_json=",
+  \"egress_ca_sha256\": \"$cahash\""
+  local src_json=""
+  [ -n "$srcdig" ] && src_json=",
+  \"source_image_digest\": \"$srcdig\""
+  local ch_json=""
+  [ -n "$chhash" ] && ch_json=",
+  \"ch_config_sha256\": \"$chhash\""
+  # lease-v1 and lease-processes-v1 on the Firecracker arm only: Cloud Hypervisor's Run
+  # mounts the virtiofs workspace inside every command (chvWrapCommand), which a lease
+  # Exec, uid 7000 with no capabilities, cannot do, and a tracked process needs a lease.
+  # check_lease_support has proved both in the guest (it exits otherwise). balloon-fpr-v1
+  # likewise: only boot_quiesce_snapshot_firecracker configures the reporting balloon.
   features_json=""
   if [ "$VMM" = firecracker ]; then
-    features_json='"lease-v1"'
+    features_json='"lease-v1", "lease-processes-v1", "balloon-fpr-v1"'
   fi
 
   cat >"$STAGE/manifest.json" <<MANIFEST
 {
+  "hash_version": 2,
   "image": "$IMAGE",
   "vmm": "$VMM",
   "instance_type": "$INSTANCE_TYPE",
@@ -2009,7 +2314,9 @@ write_manifest() {
   "kernel_sha256": "$khash",
   "rootfs_sha256": "$rhash",
   "agent_sha256": "$ahash",
-  "hash": "$hash"$egress_json
+  "vmstate_sha256": "$vhash",
+  "memfile_sha256": "$mhash"$ch_json$egress_json$src_json,
+  "hash": "$hash"
 }
 MANIFEST
 }
@@ -2054,8 +2361,53 @@ lock_down() {
 # ---------------------------------------------------------------------------
 # 7. verify_restore
 # ---------------------------------------------------------------------------
+# verify_guest_command VMM: the command verify_restore runs in the restored VM. Without
+# --verify-command it is `true`, exactly as before. With it, the workspace is mounted first the way
+# the worker's launcher mounts it (launcher_firecracker.go's Resume: the ext4 drive /dev/vdb;
+# launcher_chv.go's chvWrapCommand: virtio-fs tag `workspace`), then the command runs in /workspace
+# with its output in /tmp (the guest agent caps each stream at 32 KiB), and only the log's tail is
+# returned, with the command's exit code.
+verify_guest_command() {
+  if [ -z "$VERIFY_COMMAND" ]; then
+    printf 'true'
+    return
+  fi
+  case "$1" in
+    firecracker) printf '%s\n' 'mountpoint -q /workspace || mount -o rw,noatime /dev/vdb /workspace || exit 97' ;;
+    cloud-hypervisor) printf '%s\n' 'mountpoint -q /workspace || mount -t virtiofs workspace /workspace || exit 97' ;;
+  esac
+  printf 'cd /workspace || exit 97\n(\n%s\n) >/tmp/.verify-command.log 2>&1\n' "$VERIFY_COMMAND"
+  # Literal: the guest's shell expands these, not this one.
+  # shellcheck disable=SC2016
+  printf '%s\n' 'rc=$?; tail -c 16384 /tmp/.verify-command.log; exit $rc'
+}
+
+# run_verify_command VSOCK_UDS: run verify_guest_command in the restored VM; its exit code is the
+# command's. The output goes to the log, so a failed probe shows why.
+run_verify_command() {
+  local uds="$1" out rc timeout_s=30
+  [ -z "$VERIFY_COMMAND" ] || timeout_s="$VERIFY_TIMEOUT_S"
+  out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s "$timeout_s" \
+    -command "$(verify_guest_command "$VMM")" 2>&1)" && rc=0 || rc=$?
+  if [ -n "$VERIFY_COMMAND" ]; then
+    log "verify command exited $rc; the last of its output:"
+    printf '%s\n' "$out" >&2
+  fi
+  return "$rc"
+}
+
+verify_what() {
+  # Backticks as text: the log names the default command.
+  # shellcheck disable=SC2016
+  if [ -n "$VERIFY_COMMAND" ]; then printf 'the --verify-command'; else printf '`true`'; fi
+}
+
 verify_restore() {
-  log "verifying: restoring one VM from $PENDING and running \`true\` in it"
+  if [ -n "$VERIFY_COMMAND" ]; then
+    log "verifying: restoring one VM from $PENDING and running the --verify-command in it"
+  else
+    log "verifying: restoring one VM from $PENDING and running \`true\` in it"
+  fi
   case "$VMM" in
     firecracker) verify_restore_firecracker ;;
     cloud-hypervisor) verify_restore_cloud_hypervisor ;;
@@ -2170,12 +2522,12 @@ verify_restore_firecracker() {
     "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
 
   local exit_code=0
-  "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
+  run_verify_command "$vsock_uds" || exit_code=$?
   teardown_jail "$jail"
   rm_rf_jail "$verify_root"
   CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
-    echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
+    echo "build-snapshot.sh: the fresh snapshot restored but $(verify_what) exited $exit_code" >&2
     exit 1
   fi
 }
@@ -2261,7 +2613,7 @@ verify_restore_cloud_hypervisor() {
     '{"source_url":"file:///ch-snapshot","resume":true}'
 
   local exit_code=0
-  "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
+  run_verify_command "$vsock_uds" || exit_code=$?
   teardown_jail "$jail"
   # Fix-round-12: VMM first (teardown_jail above), then virtiofsd -- see
   # teardown_virtiofsd's own comment. Must run before rm_rf_jail: virtiofsd
@@ -2270,7 +2622,7 @@ verify_restore_cloud_hypervisor() {
   rm_rf_jail "$verify_root"
   CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
-    echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
+    echo "build-snapshot.sh: the fresh snapshot restored but $(verify_what) exited $exit_code" >&2
     exit 1
   fi
 }
@@ -2309,6 +2661,44 @@ publish_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
+# 9. seed_verify_cache
+# ---------------------------------------------------------------------------
+# A worker verifies its snapshot at every start: kernel, rootfs, agent and vmstate hashed in
+# full, several GiB. With its verify cache (remote-worker/internal/vmpool/verifycache.go) a
+# file whose identity is unchanged since a full hash on this host matched the manifest is not
+# hashed again -- but without this step the first start after a build is still a full read,
+# and a snapshot is often rebuilt and then cold-started only a few times. So the worker's
+# OWN code does that first full check here, right after publishing, while the files are still
+# in the page cache: `microvm-worker -verify-snapshot $OUT` verifies $OUT against its
+# manifest (memfile included) and records the matches in the cache file the worker for $OUT
+# reads (one implementation of the cache, not a shell copy of its format).
+#
+# Best-effort, after publish: it can never fail or undo a build. A missing binary is skipped
+# with a log line; a failure (an older binary without -verify-snapshot, an unwritable cache)
+# is logged and the build still succeeds, its first start hashing in full as before. The
+# environment is cleared (env -i) so an older binary, which takes no arguments and would
+# start as a worker, stops at once on its missing SH_SNAPSHOT_DIR instead of registering;
+# only the three cache settings pass through.
+seed_verify_cache() {
+  if [ ! -x "$WORKER_BIN" ]; then
+    log "verify cache not seeded: no executable microvm-worker at $WORKER_BIN (--worker-bin); its first start hashes the snapshot in full"
+    return 0
+  fi
+  local rc=0
+  local -a envs=(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
+  [ -z "${SH_VERIFY_CACHE+x}" ] || envs+=("SH_VERIFY_CACHE=$SH_VERIFY_CACHE")
+  [ -z "${SH_VERIFY_CACHE_PATH+x}" ] || envs+=("SH_VERIFY_CACHE_PATH=$SH_VERIFY_CACHE_PATH")
+  [ -z "${SH_VERIFY_CACHE_DIR+x}" ] || envs+=("SH_VERIFY_CACHE_DIR=$SH_VERIFY_CACHE_DIR")
+  env -i "${envs[@]}" "$WORKER_BIN" -verify-snapshot "$OUT" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "verify cache seeded for $OUT"
+  else
+    log "verify cache not seeded ($WORKER_BIN -verify-snapshot exited $rc; a binary older than the verify cache has no such mode); the snapshot is published and fine, its first start hashes it in full"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 main() {
   require_root
   preflight
@@ -2324,6 +2714,7 @@ main() {
   lock_down
   verify_restore
   publish_snapshot
+  seed_verify_cache
   log "done: $OUT"
 }
 

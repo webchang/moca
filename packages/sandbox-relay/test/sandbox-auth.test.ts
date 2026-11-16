@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Exec } from '@moca/k8s-sandbox';
 import { armDeadline, makeExecAuth } from '../src/main.js';
 import {
   DEFAULT_SANDBOX_MAX_INFLIGHT,
@@ -261,6 +262,9 @@ describe('the sandbox Exec handler after its token expires', () => {
       wrk: 'sbx_default',
       wsk: 'sbx-aaaa',
       scope: ['exec'],
+      mode: 'per-exec' as const,
+      mode_epoch: 0,
+      idle_timeout_s: 0,
       iat: 0,
       exp: 0,
       jti: 'j',
@@ -297,7 +301,7 @@ describe('the sandbox Exec handler after its token expires', () => {
       const call = Object.assign(new EventEmitter(), {
         request: {
           sandboxId: 'sbx_default',
-          exec: { reqId, command: 'true', workspaceKey: 'sbx-aaaa' },
+          exec: Exec.fromPartial({ reqId, command: 'true', workspaceKey: 'sbx-aaaa' }),
         },
         metadata: { get: () => ['Bearer x'] },
         cancelled,

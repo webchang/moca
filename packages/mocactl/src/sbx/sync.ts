@@ -19,7 +19,7 @@ import {
   type AgentopExec,
 } from './agentop.js';
 import type { SbxSandbox } from './api.js';
-import { failed, SBX_EXIT, type SbxCtx } from './commands.js';
+import { createWaitingForActivation, failed, SBX_EXIT, type SbxCtx } from './commands.js';
 import {
   execFailed,
   openExec,
@@ -27,6 +27,7 @@ import {
   type ExecFactory,
   type OpenedExec,
 } from './exec.js';
+import { noticingExec } from './notices.js';
 import {
   PushError,
   advanceBaseline,
@@ -76,7 +77,8 @@ async function withExec(
     return execFailed(c, err);
   }
   try {
-    return await fn(x);
+    // Each Exec's lease events are said as they come (plan-4 M2).
+    return await fn({ ...x, exec: noticingExec(c, id, x.exec) });
   } catch (err) {
     if (err instanceof PushError) {
       say(c, err.message);
@@ -284,7 +286,7 @@ async function findOrCreate(
       c.io.err(`reusing ${sanitizeRemote(mine[0].id)}, this repository's sandbox`);
       return { sandbox: mine[0], reused: true };
     }
-    const s = await c.api.createSandbox({
+    const s = await createWaitingForActivation(c, {
       template: f.template ?? DEFAULT_TEMPLATE,
       ...(f.name ? { name: f.name } : {}),
       labels: { project: rid },
@@ -377,7 +379,7 @@ export async function cmdUp(
   if (code !== SBX_EXIT.ok) return code;
   if (!f.noAgentConfig) {
     try {
-      const { changed } = writeAgentConfig(root, { cortex });
+      const { changed } = writeAgentConfig(root, { cortex, mode: s.mode });
       if (cortex) c.io.err(CORTEX_NOTE);
       if (changed.length) {
         c.io.err(`configured Claude Code, OpenCode and IBM Bob: ${changed.join(', ')}`);

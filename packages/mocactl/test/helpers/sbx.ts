@@ -10,10 +10,18 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Exec, ExecConnOptions } from '@moca/sandbox-client';
+import {
+  LeaseControlError,
+  type Exec,
+  type ExecConnOptions,
+  type LeaseEvent,
+  type LeaseOpName,
+  type LeaseStatusView,
+} from '@moca/sandbox-client';
 import { resolvePaths, saveAuth } from '../../src/config.js';
 import { sbxMain, sbxPaths } from '../../src/sbx/cli.js';
 import type { AgentopExec } from '../../src/sbx/agentop.js';
+import type { ExecFactory } from '../../src/sbx/exec.js';
 
 /** The fakes `mocactl sbx`'s tests share: a scripted control plane, a login, a sandbox, a token. */
 
@@ -21,7 +29,9 @@ export const URL_ = 'https://sbx-api.example.invalid';
 export const SBX = 'sbx-0123456789abcdef0123456789';
 
 export type Req = { method: string; path: string; body: unknown; auth?: string };
-export type Handler = (req: Req) => { status: number; body?: unknown } | Error;
+export type Handler = (
+  req: Req,
+) => { status: number; body?: unknown; headers?: Record<string, string> } | Error;
 
 /** A scripted control plane: one handler per "METHOD /path", recording every call. */
 export function fakeCp(routes: Record<string, Handler>) {
@@ -41,7 +51,7 @@ export function fakeCp(routes: Record<string, Handler>) {
     if (r instanceof Error) throw r;
     return new Response(r.body === undefined ? null : JSON.stringify(r.body), {
       status: r.status,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...r.headers },
     });
   }) as typeof fetch;
   return { fetchImpl, calls };
@@ -87,6 +97,32 @@ export function setup(opts: { loggedIn?: boolean; expired?: boolean } = { logged
   return { home, env, paths, io };
 }
 
+/** `GET /v1/policy`'s answer: the default policy (template-policy.ts DEFAULT_POLICY), its two profiles. */
+export const policyView = (over: Record<string, unknown> = {}) => ({
+  policy: {
+    schema: 'moca-template-policy/1',
+    profiles: {
+      base: { requires: [], envelope: { maxGuestMb: 16_384, maxVcpus: 8, maxWorkspaceMb: 16_384 } },
+      benchmark: {
+        requires: ['X1', 'X10', 'X11', 'X12', 'X14', 'X15'],
+        envelope: {
+          maxGuestMb: 4096,
+          maxVcpus: 2,
+          maxWorkspaceMb: 8192,
+          exact: { guestMb: 4096, vcpus: 2 },
+        },
+      },
+    },
+    defaultProfile: 'base',
+    allowedRegistries: ['<default>'],
+    trustedGateRecords: [],
+    quota: { templates: 100, buildsQueued: 10, active: 8 },
+    ...over,
+  },
+  digest: `sha256:${'d'.repeat(64)}`,
+  record: `sha256:${'e'.repeat(64)}`,
+});
+
 /** A sandbox as the control plane returns it (`SbxSandbox`, loosely typed for scripted bodies). */
 export type FakeSandbox = {
   id: string;
@@ -99,6 +135,9 @@ export type FakeSandbox = {
   expiresAt: number;
   terminatedAt: number | null;
   labels: Record<string, string>;
+  mode: string;
+  idleTimeoutS: number;
+  modeEpoch: number;
 };
 export const sandbox = (over: Record<string, unknown> = {}): FakeSandbox => ({
   id: SBX,
@@ -111,12 +150,42 @@ export const sandbox = (over: Record<string, unknown> = {}): FakeSandbox => ({
   expiresAt: 1_800_604_800,
   terminatedAt: null,
   labels: {},
+  mode: 'per-exec',
+  idleTimeoutS: 0,
+  modeEpoch: 0,
   ...over,
 });
 
+/**
+ * A fake connection's lease calls: every call recorded (`calls`), answered by `answer`. The default
+ * answers each one `unavailable`, as a relay without lease calls would (the shared `NO_LEASE`).
+ */
+export function fakeLease(
+  answer: (op: LeaseOpName, setModeToken?: string) => LeaseStatusView | Error = () =>
+    new LeaseControlError('unavailable', 'this fake has no lease calls'),
+) {
+  const calls: { op: LeaseOpName; token?: string }[] = [];
+  return {
+    calls,
+    leaseControl: async (op: LeaseOpName, setModeToken?: string): Promise<LeaseStatusView> => {
+      calls.push({ op, ...(setModeToken !== undefined ? { token: setModeToken } : {}) });
+      const a = answer(op, setModeToken);
+      if (a instanceof Error) throw a;
+      return a;
+    },
+    leaseKeepalive: async (): Promise<void> => {
+      throw new LeaseControlError('unavailable', 'this fake has no lease calls');
+    },
+  };
+}
+/** The lease calls of a fake connection that does not use them: each answers `unavailable`. */
+export const NO_LEASE = (({ leaseControl, leaseKeepalive }) => ({ leaseControl, leaseKeepalive }))(
+  fakeLease(),
+);
+
 const b64url = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
-/** An unsigned JWT with the claims mocactl reads (unverified): `iat` and `exp`. */
-export const jwt = (claims: { iat: number; exp: number }) =>
+/** An unsigned JWT with the claims mocactl reads (unverified): `iat`, `exp` and `mode`. */
+export const jwt = (claims: { iat: number; exp: number; mode?: string }) =>
   `${b64url({ alg: 'EdDSA', typ: 'JWT' })}.${b64url({ sbx: SBX, ...claims })}.sig`;
 
 /** The token's lifetime is 900 s (`exp − iat`): the default timeout is 840 s. */
@@ -194,6 +263,7 @@ export function localWorkspace(o: { capBytes?: number; without?: string[] } = {}
             stderr,
             exitCode: typeof code === 'number' ? code : -1,
             truncated: cut,
+            lease: [],
           });
         },
       );
@@ -318,7 +388,7 @@ export function workspaces(o: Parameters<typeof localWorkspace>[0] = {}) {
   let closed = 0;
   const factory = (c: ExecConnOptions) => {
     opened++;
-    return { exec: get(c.workspaceKey).exec, close: () => void closed++ };
+    return { exec: get(c.workspaceKey).exec, close: () => void closed++, ...NO_LEASE };
   };
   return { get, factory, counts: () => ({ opened, closed }) };
 }
@@ -351,4 +421,35 @@ export function harness(
   };
   const err = () => s.io.errs.join('\n');
   return { ...s, cp, ws, r, run, err };
+}
+
+/** A lease end as the worker sends it on an Exec's response (spec §5). */
+export const leaseEnd = (over: Partial<LeaseEvent> = {}): LeaseEvent => ({
+  reqId: 0,
+  state: 'end',
+  reason: 'idle',
+  atUnixMs: 1_800_000_100_000,
+  mode: 2, // SANDBOX_MODE_LEASE
+  ageMs: 60_000,
+  processes: [],
+  endsByUnixMs: 0,
+  tracked: [],
+  ...over,
+});
+
+/**
+ * `factory`'s connections, each Exec's result carrying the next entry of `queue` as its lease
+ * events (none once it is empty), as a lease worker's responses do (spec §5).
+ */
+export function withLeaseEvents(factory: ExecFactory, queue: LeaseEvent[][]): ExecFactory {
+  return (o) => {
+    const c = factory(o);
+    return {
+      ...c,
+      exec: async (command, opts) => {
+        const r = await c.exec(command, opts);
+        return { ...r, lease: queue.shift() ?? r.lease };
+      },
+    };
+  };
 }

@@ -733,3 +733,56 @@ func TestAgentCorrectsClockOnEveryRequestWhileStillWrong(t *testing.T) {
 			"a latch would have suppressed the second, restore-shaped correction", got)
 	}
 }
+
+// The agent's own stderr notice (the lease OOM hint, G3) is one stderr frame written past
+// the stream's cap, and never after the terminal frame.
+func TestFrameWriterNoticeIsNotCappedAndNotAfterTheSeal(t *testing.T) {
+	var buf bytes.Buffer
+	w := &frameWriter{rw: &buf, cap: 4}
+	w.stderr([]byte("123456"))
+	w.notice("hint\n")
+	if err := w.sealAndWriteEnd(End{}); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	sealedAt := buf.Len()
+	w.notice("late\n")
+	if buf.Len() != sealedAt {
+		t.Fatalf("%d bytes were written after the terminal frame", buf.Len()-sealedAt)
+	}
+	var got []string
+	for buf.Len() > 0 {
+		k, p, err := ReadFrame(&buf)
+		if err != nil {
+			t.Fatalf("ReadFrame: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%#x:%s", byte(k), p))
+	}
+	if len(got) != 3 || got[0] != fmt.Sprintf("%#x:1234", byte(KindStderr)) || got[1] != fmt.Sprintf("%#x:hint\n", byte(KindStderr)) {
+		t.Fatalf("frames = %q, want the capped stderr, the notice in full, then End", got)
+	}
+	if w.droppedStderr != 2 {
+		t.Fatalf("droppedStderr = %d, want 2: the notice is not counted against the cap", w.droppedStderr)
+	}
+}
+
+// Ruling P5-R6: a kind this agent does not know, or a process kind outside a lease, is
+// refused and never runs as a command, here on the parked shell.
+func TestAgentRefusesAnUnknownKindWithoutRunningIt(t *testing.T) {
+	a := newTestAgent(t)
+	marker := filepath.Join(t.TempDir(), "ran")
+	for _, tc := range []struct{ kind, want string }{
+		{"bogus", "lease_unsupported: unknown kind bogus"},
+		{RequestKindProcessStart, "lease_unsupported: process_start needs a lease request"},
+	} {
+		_, _, _, errMsg := drive(t, a, Request{Command: "touch " + marker, Kind: tc.kind, CapBytes: 1 << 20}, nil)
+		if errMsg != tc.want {
+			t.Errorf("kind %s: error %q, want %q", tc.kind, errMsg, tc.want)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("kind %s ran as a command", tc.kind)
+		}
+	}
+	if out, _, end, errMsg := drive(t, a, Request{Command: "echo ok", Kind: RequestKindCommand, CapBytes: 1 << 20}, nil); errMsg != "" || end.ExitCode != 0 || out != "ok\n" {
+		t.Fatalf("kind command: stdout %q, end %+v, err %q", out, end, errMsg)
+	}
+}

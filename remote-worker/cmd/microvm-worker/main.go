@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -238,7 +239,129 @@ func poolConfig(get func(string) string) (vmpool.Config, error) {
 			cfg.WorkspaceIdle = d
 		}
 	}
+	if e := leaseConfig(get, &cfg); e != nil && err == nil {
+		err = e
+	}
 	return cfg, err
+}
+
+// maxLeaseGraceS is the largest SH_LEASE_GRACE_S a worker boots with (plan 4, M6): the
+// relay's LeaseControl timeout for reset and set_mode is 31 min, the default grace plus
+// 60 s, and a reset or a set_mode downgrade blocks for up to the grace limit plus the cut
+// Exec's unwind. A longer grace would let the relay fail a call the worker is still
+// running, and the client would then report an op that later lands.
+//
+// Linked to LEASE_MUTATE_TIMEOUT_MS in packages/sandbox-relay/src/sandbox-caller.ts: raise one
+// only with the other (TestMaxLeaseGraceFitsTheRelayMutateTimeout and the relay's twin read
+// the other side's literal).
+const maxLeaseGraceS = 1800
+
+// leaseConfig reads the SH_LEASE_* knobs (spec §4, §6). Unset leaves a field zero for
+// vmpool's Normalize to default; a malformed value is refused, never defaulted -- the
+// WORKER_MAX_CONCURRENT posture, since a lease's lifetime or reclaim target that came
+// from a typo must not look like one that was chosen. Read on every worker, lease-capable
+// or not, so a bad value fails at start rather than when the snapshot gains lease-v1.
+//
+// A value whose conversion would overflow is refused too: a wrapped Duration is negative,
+// and Normalize would then put the default back in its place. SH_LEASE_GRACE_S has a
+// tighter bound, maxLeaseGraceS.
+func leaseConfig(get func(string) string, cfg *vmpool.Config) error {
+	var err error
+	// read is envInt64 bounded above by limit, recording the first refusal in err.
+	read := func(k string, limit int64) (int64, bool) {
+		v, e := envInt64(get, k, 0)
+		if e == nil && v > limit {
+			e = fmt.Errorf("%s=%q is too large (at most %d)", k, get(k), limit)
+		}
+		if e != nil {
+			if err == nil {
+				err = e
+			}
+			return 0, false
+		}
+		return v, true
+	}
+	seconds := func(k string, dst *time.Duration) {
+		if get(k) == "" {
+			return
+		}
+		if v, ok := read(k, math.MaxInt64/int64(time.Second)); ok {
+			*dst = time.Duration(v) * time.Second
+		}
+	}
+	mib := func(k string, dst *int64) {
+		if get(k) == "" {
+			return
+		}
+		if v, ok := read(k, math.MaxInt64>>20); ok {
+			*dst = v << 20
+		}
+	}
+	seconds("SH_LEASE_IDLE_DEFAULT_S", &cfg.LeaseIdleDefault)
+	seconds("SH_LEASE_IDLE_CEILING_S", &cfg.LeaseIdleCeiling)
+	seconds("SH_LEASE_MAX_DURATION_S", &cfg.LeaseMaxDuration)
+	seconds("SH_LEASE_MAX_DURATION_L2_S", &cfg.LeaseMaxDurationProcesses)
+	seconds("SH_LEASE_GRACE_S", &cfg.LeaseGraceLimit)
+	if v := get("SH_LEASE_GRACE_S"); v != "" && cfg.LeaseGraceLimit > maxLeaseGraceS*time.Second && err == nil {
+		err = fmt.Errorf("SH_LEASE_GRACE_S=%q is above %d: the relay times reset and set_mode out at 31 min, "+
+			"and both wait up to the grace limit, so a longer grace fails them while the worker still runs them",
+			v, maxLeaseGraceS)
+	}
+	seconds("SH_LEASE_KEEPALIVE_LOSS_S", &cfg.LeaseKeepaliveLoss)
+	mib("SH_LEASE_START_MB", &cfg.LeaseStartBytes)
+	mib("SH_LEASE_PAGECACHE_MB", &cfg.LeasePageCacheBytes)
+	mib("SH_LEASE_RECLAIM_FREE_MB", &cfg.LeaseReclaimFreeBytes)
+	if get("SH_LEASE_MAX_PROCESSES") != "" {
+		// Level 2's cap on running tracked processes (spec §7), at most the tracked uids
+		// a level-2 image has.
+		if v, ok := read("SH_LEASE_MAX_PROCESSES", vmpool.MaxLeaseProcesses); ok {
+			cfg.LeaseMaxProcesses = int(v)
+		}
+	}
+	if v := get("SH_LEASE_HEADROOM"); v != "" {
+		h, e := strconv.ParseFloat(v, 64)
+		// !(h >= 1) rather than h < 1: it also refuses NaN, which compares false to everything.
+		if e != nil || !(h >= 1) || math.IsInf(h, 0) {
+			if err == nil {
+				err = fmt.Errorf("SH_LEASE_HEADROOM=%q must be a finite number >= 1", v)
+			}
+		} else {
+			cfg.LeaseHeadroom = h
+		}
+	}
+	return err
+}
+
+// leaseBanner is the banner's lease fields: whether this worker serves lease mode, and
+// the resolved values it would serve it with. It normalizes a COPY, as slotBudgetWarning
+// does, because vmpool.New normalizes its own.
+func leaseBanner(cfg vmpool.Config) string {
+	if !vmpool.LeaseSupported(cfg) {
+		return "lease=off"
+	}
+	c := cfg
+	if err := c.Normalize(); err != nil {
+		return "lease=on"
+	}
+	return fmt.Sprintf("lease=on lease_idle=%s/%s lease_max=%s/%s lease_grace=%s lease_start=%dMiB "+
+		"lease_headroom=%s lease_pagecache=%dMiB lease_reclaim_free=%dMiB",
+		c.LeaseIdleDefault, c.LeaseIdleCeiling, c.LeaseMaxDuration, c.LeaseMaxDurationProcesses,
+		c.LeaseGraceLimit, c.LeaseStartBytes>>20, strconv.FormatFloat(c.LeaseHeadroom, 'g', -1, 64),
+		c.LeasePageCacheBytes>>20, c.LeaseReclaimFreeBytes>>20)
+}
+
+// balloonWarning is the start-up warning for a lease-v1 snapshot built without the
+// reporting balloon (balloon-fpr-v1): lease mode still works, but the guest never returns
+// the pages it frees, so a lease's measured charge follows its peak, not its working set
+// (spec §6). Rebuilding the snapshot with the current build-snapshot.sh adds the balloon.
+func balloonWarning(features []string) string {
+	if !slices.Contains(features, vmpool.FeatureLeaseV1) || slices.Contains(features, vmpool.FeatureBalloonFPRV1) {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: the snapshot advertises %s without %s: lease mode works, but "+
+		"guests never report freed pages, so measured lease charge follows each lease's peak, not "+
+		"its working set (spec §6). Rebuild the snapshot with build-snapshot.sh to add the balloon.",
+		vmpool.FeatureLeaseV1, vmpool.FeatureBalloonFPRV1)
 }
 
 // effectiveWorkspaceIdle is what the pool will use: poolConfig leaves the field zero when unset,
@@ -308,6 +431,36 @@ func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string, p
 		return nil, fmt.Errorf("SH_VMM=%q must be %q or %q; there is no host-execution fallback (spec §3.5)",
 			kind, vmpool.Firecracker, vmpool.CloudHypervisor)
 	}
+}
+
+// sweptJailWait bounds settleSweep's wait for VMMs the orphan sweep killed to stop answering
+// on their API sockets. The same few seconds as the sweep's own wait for them to exit
+// (vmpool's sweepExitWait), for the same teardown.
+const sweptJailWait = 5 * time.Second
+
+// settleSweep decides whether the worker may go on to Probe after an orphan sweep (#797).
+//
+// A cgroup the sweep reports as stuck still holds a process SIGKILL has not ended, so the
+// start fails naming it: going on would place the probe's VM in a pooled cgroup name the
+// stuck one still holds. Otherwise, when the sweep removed anything, it waits (bounded) for
+// every jail's API socket to have no listener — heldJails is vmpool.WaitForHeldJails in
+// production — because a killed VMM can still be answering there while the kernel tears it
+// down, and Probe's first Restore would then be refused by the launcher's collision guard,
+// failing a start that a short wait would have let through. A socket still held when
+// the wait ends fails the start too, naming the VM ids.
+func settleSweep(res vmpool.SweepResult, heldJails func(time.Duration) []string) error {
+	if len(res.Stuck) > 0 {
+		return fmt.Errorf("orphan sweep: VM cgroup(s) %v still hold a process that has not exited after SIGKILL; "+
+			"refusing to start beside it", res.Stuck)
+	}
+	if res.Swept == 0 {
+		return nil
+	}
+	if held := heldJails(sweptJailWait); len(held) > 0 {
+		return fmt.Errorf("orphan sweep: a live VMM still answers on the API socket of VM id(s) %v %s after the sweep; "+
+			"refusing to probe into a collision", held, sweptJailWait)
+	}
+	return nil
 }
 
 // --- Item 5 (fix round): verify the manifest's recorded InstanceType against the
@@ -521,6 +674,12 @@ type diagStats struct {
 	// and the budget is genuinely too small" (#452). Stats.BudgetEvictions has the
 	// reading instructions.
 	BudgetEvictions uint64 `json:"budgetEvictions"`
+	// Lease mode (vmpool.Stats' lease fields). omitempty, so a worker that never served a
+	// lease -- every per-Exec worker -- serves exactly the /stats it served before.
+	LeaseVMs            int               `json:"leaseVMs,omitempty"`
+	LeaseExecuting      int               `json:"leaseExecuting,omitempty"`
+	LeaseCommittedBytes int64             `json:"leaseCommittedBytes,omitempty"`
+	LeaseEnds           map[string]uint64 `json:"leaseEnds,omitempty"`
 }
 
 func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
@@ -543,6 +702,15 @@ func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
 		BarrierUnobserved:     st.BarrierUnobserved,
 		TimeoutsClamped:       st.TimeoutsClamped,
 		BudgetEvictions:       st.BudgetEvictions,
+		LeaseVMs:              st.LeaseVMs,
+		LeaseExecuting:        st.LeaseExecuting,
+		LeaseCommittedBytes:   st.LeaseCommittedBytes,
+	}
+	if len(st.LeaseEnds) > 0 {
+		out.LeaseEnds = make(map[string]uint64, len(st.LeaseEnds))
+		for k, v := range st.LeaseEnds {
+			out.LeaseEnds[string(k)] = v
+		}
 	}
 	for k, v := range st.ColdAcquires {
 		out.ColdAcquires[string(k)] = v
@@ -578,6 +746,11 @@ func diagStatsMux(statsFn func() vmpool.Stats, maxConcurrent int) *http.ServeMux
 }
 
 func main() {
+	// Arguments select a one-shot mode (runCLI: -verify-snapshot DIR); the worker itself
+	// takes none, it is configured by its environment.
+	if len(os.Args) > 1 {
+		os.Exit(runCLI(os.Args[1:], os.Getenv, os.Stderr))
+	}
 	// Opt-in profiling. OFF unless SH_DIAG_PPROF names a bind address, because pprof
 	// serves goroutine dumps, heap contents and command lines to anyone who can reach
 	// it -- bind loopback (127.0.0.1:6060) and reach it over ssh, never 0.0.0.0.
@@ -607,6 +780,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
+	// Loaded before New, which decides LeaseEnabled from the manifest's features; it is
+	// still verified below, before anything is served.
+	man, err := vmpool.LoadManifest(snapDir)
+	if err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	cfg.ManifestFeatures = man.Features
 	pool, err := vmpool.New(cfg, lc, vmpool.RealClock())
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
@@ -617,15 +797,29 @@ func main() {
 	// the live stream (remote-worker/DESIGN.md:29-30): a worker that registers and then
 	// discovers it cannot restore has already been given work. Spec §6: fail at start,
 	// not on a user's first request.
-	man, err := vmpool.LoadManifest(snapDir)
+	// SH_VERIFY_MEMFILE=1 re-hashes the memory file too (a version-2 manifest): a full read
+	// of the guest's RAM image, so off by default; the build hashes it.
+	// The verify cache (verifyCachePath; SH_VERIFY_CACHE=0 turns it off) spares the
+	// re-hash of a file whose identity is unchanged since a full hash on this host matched
+	// the manifest; the comparison with the manifest is made either way.
+	verifyCache, err := verifyCachePath(get, snapDir)
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
-	if err := man.Verify(snapDir); err != nil {
+	if err := man.VerifyWith(snapDir, vmpool.VerifyOptions{Memfile: get("SH_VERIFY_MEMFILE") == "1", Cache: verifyCache}); err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
 	if err := verifyInstanceType(get, man.InstanceType, detectHostInstanceType); err != nil {
 		log.Fatalf("microvm-worker: %v", err)
+	}
+	// SH_TEMPLATE_RECORD: the template record this worker serves (template-build.sh's),
+	// checked against the snapshot and the worker's own identity. Unset: no check, as before.
+	if rec := get("SH_TEMPLATE_RECORD"); rec != "" {
+		if err := verifyTemplateRecord(rec, man, env(get, "SH_SNAPSHOT_IMAGE", "default"),
+			get("SANDBOX_ID"), strings.TrimSpace(get("SANDBOX_TEMPLATE"))); err != nil {
+			log.Fatalf("microvm-worker: %v", err)
+		}
+		log.Printf("microvm-worker: template record %s matches the snapshot (manifest %s, image %s)", rec, man.Hash, man.SourceImageDigest)
 	}
 	unpin, err := vmpool.PinMemoryFile(filepath.Join(snapDir, "memfile"))
 	if err != nil {
@@ -690,6 +884,9 @@ func main() {
 	} else {
 		log.Printf("microvm-worker: orphan sweep: swept %d VM cgroup(s) from a previous incarnation; left alone %d non-VM cgroup(s) %v",
 			res.Swept, len(res.Skipped), res.Skipped)
+		if err := settleSweep(res, func(d time.Duration) []string { return vmpool.WaitForHeldJails(lc, d) }); err != nil {
+			log.Fatalf("microvm-worker: %v", err)
+		}
 	}
 
 	if err := pool.Probe(context.Background()); err != nil {
@@ -753,13 +950,17 @@ func main() {
 	// a guest, so the worker's PATH says nothing about what an Exec can use. They come
 	// from the golden snapshot's manifest loaded above instead, which the build script
 	// fills by probing INSIDE the guest before snapshotting; an empty manifest field
-	// advertises nothing rather than lying.
-	labels := session.TierLabels(os.LookupEnv, "microvm")
+	// advertises nothing rather than lying. HelloCapabilities adds the reserved
+	// sbx:lease-processes-v1 when this worker serves the process kinds (ruling P5-R37), so
+	// the relay never forwards one to a worker that cannot.
+	// moca.dev/build: the manifest hash verified above, so a session pinned to a build runs only here
+	// (combined control plane spec §3.4).
+	labels := session.WithBuild(session.Labels(os.LookupEnv, "microvm"), man.Hash)
 	sess := session.New(session.Config{
 		SandboxID:     env(get, "SANDBOX_ID", "sbx-microvm-1"),
 		Image:         env(get, "SANDBOX_IMAGE", ""),
 		Trust:         env(get, "SANDBOX_TRUST", "untrusted"),
-		Capabilities:  man.Capabilities,
+		Capabilities:  vmpool.HelloCapabilities(cfg, man.Capabilities),
 		MaxConcurrent: maxConcurrent,
 		Labels:        labels,
 	}, vmpool.Runner{Pool: pool,
@@ -772,12 +973,15 @@ func main() {
 	// nothing in journalctl naming the number, and /stats is gated behind the opt-in
 	// SH_DIAG_STATS_ADDR. cmd/worker logs the same thing as capacity=%d. #305's own thesis
 	// is that a run whose slots came from a typo must not look like a run that chose them.
-	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d standby_headroom=%s mem_floor=%dMiB workspace_idle=%s labels=%v",
+	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d standby_headroom=%s mem_floor=%dMiB workspace_idle=%s %s labels=%v",
 		relayAddr, env(get, "SANDBOX_ID", "sbx-microvm-1"), useTLS, cfg.VMM,
 		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20, maxConcurrent,
 		standbyHeadroomLabel(cfg), cfg.HostMemFloorBytes>>20,
-		effectiveWorkspaceIdle(cfg), labels)
+		effectiveWorkspaceIdle(cfg), leaseBanner(cfg), labels)
 	if w := slotBudgetWarning(cfg, maxConcurrent); w != "" {
+		log.Printf("microvm-worker: %s", w)
+	}
+	if w := balloonWarning(cfg.ManifestFeatures); w != "" {
 		log.Printf("microvm-worker: %s", w)
 	}
 

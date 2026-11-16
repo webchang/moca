@@ -20,6 +20,42 @@ const SHARED = [
   'POST /v1/auth/revoke',
   'POST /v1/auth/revoke-all',
   'GET /v1/me',
+  // Template lifecycle spec §4.1: one catalog for sessions and sandboxes.
+  'GET /v1/templates',
+  'GET /v1/templates/{id}',
+  'GET /v1/templates/{id}/builds',
+  'GET /v1/templates/{id}/builds/{build}',
+  'GET /v1/templates/{id}/tags',
+  'POST /v1/templates',
+  'POST /v1/templates/{id}/builds',
+  'POST /v1/templates/{id}/builds/{build}/cancel',
+  'POST /v1/templates/{id}/tags',
+  'DELETE /v1/templates/{id}/tags/{tag}',
+  'PATCH /v1/templates/{id}',
+  'PUT /v1/templates/{id}/owner',
+  'POST /v1/templates/{id}/retire',
+  'DELETE /v1/templates/{id}/builds/{build}',
+  'POST /v1/templates/{id}/builds/{build}/reject',
+  'POST /v1/templates/{id}/activate',
+  'POST /v1/templates/{id}/deactivate',
+  'GET /v1/policy',
+  'PUT /v1/policy',
+  'GET /v1/quota',
+  'PUT /v1/quota/{subject}',
+  'POST /v1/hosts/{host}/inventory',
+  'POST /v1/hosts/{host}/builds/claim',
+  'GET /v1/hosts/{host}/blobs/{digest}',
+  'POST /v1/hosts/{host}/builds/{build}/log',
+  'POST /v1/hosts/{host}/builds/{build}/report',
+  'GET /v1/hosts/{host}/wanted',
+  'POST /v1/hosts/{host}/workers/report',
+  'GET /v1/subjects',
+  'PUT /v1/subjects/{subject}',
+  'DELETE /v1/subjects/{subject}',
+  'PUT /v1/subjects/{subject}/roles/admin',
+  'DELETE /v1/subjects/{subject}/roles/admin',
+  // The egress proxy's events into sandboxes' logs.
+  'POST /v1/hosts/{host}/egress',
 ];
 
 const servers: Server[] = [];
@@ -39,11 +75,13 @@ const SANDBOX_ONLY = [
   'createSandbox',
   'deleteSandbox',
   'getSandbox',
+  'getSandboxEgress',
   'janitorSandboxes',
   'listSandboxes',
-  'listTemplates',
   'lookupEgressCredential',
+  'mintSandboxModeToken',
   'mintSandboxToken',
+  'setSandboxMode',
 ];
 
 // SBX0.2b: mounted on `sandbox` only when egress is configured (RouteSpec.requiresEgress).
@@ -116,6 +154,25 @@ describe('route profiles (SBX0 §4.1)', () => {
     expect(matchRoute('POST', '/v1/sessions', 'sandbox')).toBeNull();
     expect(matchRoute('GET', '/v1/me', 'sandbox')?.route.operationId).toBe('getMe');
     expect(matchRoute('POST', '/v1/sessions')?.route.operationId).toBe('createSession'); // default: harness
+  });
+
+  it('mounts on combined exactly the union of the two profiles, and lists combined on no route', () => {
+    // Combined control plane spec §3.1: one process, both route sets; no route names `combined`.
+    expect(ROUTES.filter((r) => r.profiles.includes('combined')).map(key)).toEqual([]);
+    const on = (p: 'harness' | 'sandbox' | 'combined', egress: boolean) =>
+      ROUTES.filter((r) => matchRoute(r.method, concrete(r.path), p, { egress, testUsers: true }))
+        .map(key)
+        .sort();
+    for (const egress of [false, true]) {
+      const union = [...new Set([...on('harness', egress), ...on('sandbox', egress)])].sort();
+      expect(on('combined', egress)).toEqual(union);
+    }
+    expect(matchRoute('POST', '/v1/sessions', 'combined')?.route.operationId).toBe('createSession');
+    expect(matchRoute('POST', '/v1/sandboxes', 'combined')?.route.operationId).toBe(
+      'createSandbox',
+    );
+    // As on sandbox, the egress-only route needs egress configured.
+    expect(matchRoute('POST', '/v1/egress/credential', 'combined')).toBeNull();
   });
 
   it('answers every harness-only route with the unknown-path 404 under the sandbox profile', async () => {
@@ -216,6 +273,50 @@ describe('route profiles (SBX0 §4.1)', () => {
       headers: { authorization: `Bearer ${JANITOR_TOKEN}` },
     });
     expect(res.status).toBe(401);
+  });
+
+  it('takes only a user API token on the mode routes: a sandbox or set-mode token is a 401', async () => {
+    const d = { ...sandboxDeps(), newId: () => 'b'.repeat(26) };
+    const base = await serveWith(d);
+    const user = d.signer.mint({
+      sub: 'github:1234',
+      tenant: 'github:1234',
+      roles: [],
+      scope: ['api'],
+      ttlSeconds: 3600,
+      iss: apiIssuer(d.config),
+      now: Math.floor(NOW_MS / 1000),
+    });
+    const call = (method: string, path: string, token: string, body?: object) =>
+      fetch(base + path, {
+        method,
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    const created = await call('POST', '/v1/sandboxes', user, { template: 'default' });
+    expect(created.status).toBe(201);
+    const { id } = (await created.json()) as { id: string };
+    const sbxToken = (
+      (await (await call('POST', `/v1/sandboxes/${id}/token`, user)).json()) as {
+        token: string;
+      }
+    ).token;
+    const put = await call('PUT', `/v1/sandboxes/${id}/mode`, user, { mode: 'lease' });
+    expect(put.status).toBe(200);
+    const { setModeToken } = (await put.json()) as { setModeToken: string };
+    const minted = await call('POST', `/v1/sandboxes/${id}/mode-token`, user);
+    expect(minted.status).toBe(200);
+    for (const [what, token] of [
+      ['a sandbox token', sbxToken],
+      ['a set-mode token', setModeToken],
+    ] as const) {
+      const p = await call('PUT', `/v1/sandboxes/${id}/mode`, token, { mode: 'per-exec' });
+      expect(p.status, `PUT mode with ${what}`).toBe(401);
+      const m = await call('POST', `/v1/sandboxes/${id}/mode-token`, token);
+      expect(m.status, `mode-token with ${what}`).toBe(401);
+    }
+    // Neither refusal changed anything: the one accepted PUT is epoch 1.
+    expect((await d.sandboxes!.get(id, Math.floor(NOW_MS / 1000)))!.modeEpoch).toBe(1);
   });
 
   it('still serves the harness routes under the default profile', async () => {

@@ -4,6 +4,7 @@ import { touchBundle } from './bundle-budget.js';
 import { firstBinding, inferenceAuthHeader, type InferenceAuthHeader } from './credential-store.js';
 import { CpError } from './errors.js';
 import type { CpConfig, CpDeps } from './handlers.js';
+import { holdPinnedWorker } from './host-handlers.js';
 import type { InferenceTarget } from './model-catalog.js';
 import type { SessionModel } from './models.js';
 import type { SessionRecord } from './ownership.js';
@@ -45,6 +46,25 @@ export interface ExchangeResponse {
    */
   sandboxTier?: string;
   /**
+   * The session's sandbox template and its seed (session-templates spec §3.3), which the data plane
+   * filters sandboxes on and seeds a new workspace with. Both absent when the session names no
+   * template or the deployment declares none, so that response is unchanged.
+   */
+  sandboxTemplate?: string;
+  sandboxSeed?: string;
+  /**
+   * Where `sandboxSeed` came from, sent with it: `build` when it is the pinned build's own
+   * `spec.seed` in the template store (combined control plane spec §3.4), `declared` when it is
+   * SH_SANDBOX_TEMPLATES's. A client checks the turn's `sandbox.seed` against its pin with it.
+   */
+  sandboxSeedSource?: 'build' | 'declared';
+  /**
+   * The build the session resolved its template to (`sha256:<manifest hash>`, combined control plane
+   * spec §3.4): the data plane keeps the session on workers labelled `moca.dev/build`
+   * with it. Absent for a session without a resolved build, so that response is unchanged.
+   */
+  sandboxBuildId?: string;
+  /**
    * The session's model and the limits snapshotted when it was chosen (per-session model spec
    * §4.5). Absent when the session names none, so that response is unchanged.
    */
@@ -72,8 +92,14 @@ export function placeholderFor(subject: string): string {
  * response stays byte-identical. That holds even for a record that stored a tier while tiers were
  * declared: the data plane runs untiered then and filters nothing, so naming the stored tier would
  * claim a placement that no longer happens (spec §3.3).
+ *
+ * Takes the FIELD rather than a SessionRecord, so a TurnRecord -- which pins its own
+ * `sandboxTier` (#388) -- gets the identical reading with no second copy of this rule.
  */
-export function sessionTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers']): string {
+export function sessionTier(
+  rec: Pick<SessionRecord, 'sandboxTier'>,
+  tiers: CpConfig['sandboxTiers'],
+): string {
   return tiers ? rec.sandboxTier || tiers.default : '';
 }
 
@@ -84,6 +110,59 @@ export function sessionTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers'])
  */
 export function viewTier(rec: SessionRecord, tiers: CpConfig['sandboxTiers']): string | null {
   return sessionTier(rec, tiers) || null;
+}
+
+/**
+ * The template a session runs on (session-templates spec §3.3): its stored one, always, with the
+ * seed while the deployment still declares it. FAIL CLOSED: unlike a tier, there is no default
+ * template to fall back to, so a template dropped from SH_SANDBOX_TEMPLATES (or the variable unset)
+ * is still named. The data plane then finds no worker of it and refuses the turn
+ * (SandboxPoolEmptyError naming the template) rather than quietly moving a benchmark session to an
+ * untemplated worker on an empty workspace.
+ */
+export function sessionTemplate(
+  rec: SessionRecord,
+  templates: CpConfig['sessionTemplates'],
+): { id: string; seed?: string } | undefined {
+  if (!rec.sandboxTemplate) return undefined;
+  const t = templates?.find((x) => x.id === rec.sandboxTemplate);
+  return { id: rec.sandboxTemplate, ...(t?.seed ? { seed: t.seed } : {}) };
+}
+
+/**
+ * The seed a session's workspace is filled with: the PINNED build's own `spec.seed` when the
+ * session resolved a `sha256:` build through the template store (combined control plane spec §3.4:
+ * a self-serve template is in no env list, and each build carries its own seed, lifecycle spec
+ * §3.2), else the declared one (sessionTemplate). The build is the session's, never the newest. A
+ * build with no seed (or an empty one) sends none, even if the env list declares one: the build is
+ * what the session runs. A store that cannot answer FAILS CLOSED, as sessionTemplate does: the
+ * exchange refuses (a CpError the data plane reads as retryable: credential_unavailable, and a
+ * dequeue leaves the turn pending), never a turn on a workspace without its build's seed. Only a
+ * template or build the store does not hold falls back to the declared seed.
+ */
+export async function sessionSeed(
+  rec: SessionRecord,
+  deps: Pick<CpDeps, 'templates' | 'config'>,
+): Promise<{ seed: string; source: 'build' | 'declared' } | undefined> {
+  if (!rec.sandboxTemplate) return undefined;
+  const build = rec.sandboxBuildId;
+  if (build?.startsWith('sha256:') && deps.templates) {
+    let doc: Awaited<ReturnType<NonNullable<CpDeps['templates']>['get']>>;
+    try {
+      doc = await deps.templates.get(rec.sandboxTemplate);
+    } catch (err) {
+      if (err instanceof CpError) throw err;
+      console.error(
+        `[control-plane] template store read failed for session ${rec.sessionId}: ` +
+          `${(err as Error)?.message ?? String(err)}`,
+      );
+      throw new CpError('internal_error', "the template store could not read the session's build");
+    }
+    const b = doc?.builds.find((x) => x.buildId === build);
+    if (b) return b.spec.seed?.trim() ? { seed: b.spec.seed, source: 'build' } : undefined;
+  }
+  const declared = sessionTemplate(rec, deps.config.sessionTemplates)?.seed;
+  return declared ? { seed: declared, source: 'declared' } : undefined;
 }
 
 /**
@@ -325,10 +404,20 @@ export const targetOf = (r: ResolvedInference): InferenceTarget => ({
   header: r.authHeader,
 });
 
-export async function exchangeCredential(
+/**
+ * The IDENTITY half of a session-token exchange: verify the token, find the session it names, and
+ * refuse one that is not the presenter's or is tombstoned. Everything the caller does with the
+ * session afterwards -- resolving a credential, or minting MI1 §6.1's grants -- is its own.
+ *
+ * Shared rather than duplicated so the 404-shaped answer lives in ONE place: `exchangeCredential`
+ * below and `grant-exchange.ts` must refuse an unknown session, another subject's session and a
+ * deleted session identically, or the pair of them becomes an existence oracle that the session
+ * route alone is not.
+ */
+export async function sessionFromToken(
   presentedToken: string,
   deps: CpDeps,
-): Promise<ExchangeResponse> {
+): Promise<SessionRecord> {
   // Only a SESSION token may drive a turn; an api token is rejected here (plan gap #7).
   const claims = verifyToken(presentedToken, deps.verifyKeys, {
     now: Math.floor(deps.now() / 1000),
@@ -344,6 +433,14 @@ export async function exchangeCredential(
   }
   // The tombstone check is what stops a DELETED session starting a new turn (spec §5.3, §7.3).
   if (rec.tombstone) throw new CpError('session_not_found', undefined, claims.sid);
+  return rec;
+}
+
+export async function exchangeCredential(
+  presentedToken: string,
+  deps: CpDeps,
+): Promise<ExchangeResponse> {
+  const rec = await sessionFromToken(presentedToken, deps);
 
   const resolved = await resolveInference(rec, deps);
   const { secretValue, credentialName, baseUrl, authHeader, usedOperatorFallback } = resolved;
@@ -360,6 +457,11 @@ export async function exchangeCredential(
   if (mode === 'direct') {
     refuseMisdirectedSecret(resolved, rec.sessionId);
   }
+
+  // Before the audit, as everything that can refuse is: a store that cannot answer for the seed
+  // refuses the exchange (sessionSeed), so no credential is recorded as issued and then withheld.
+  const template = sessionTemplate(rec, deps.config.sessionTemplates);
+  const seed = template ? await sessionSeed(rec, deps) : undefined;
 
   const exchangeEntry = {
     subject: rec.owner,
@@ -385,6 +487,10 @@ export async function exchangeCredential(
   }
 
   const tier = sessionTier(rec, deps.config.sandboxTiers);
+  // A turn of a session pinned to a build keeps that build's worker running between turns. After
+  // the audit and every refusal (the template and seed are resolved above), so a refused exchange
+  // holds nothing; best effort, it never refuses one itself.
+  if (template) await holdPinnedWorker(rec, deps);
   return {
     mode,
     anthropicAuthToken: mode === 'placeholder' ? placeholderFor(rec.owner) : secretValue,
@@ -396,6 +502,12 @@ export async function exchangeCredential(
     ...(mode === 'direct' && authHeader === 'x-api-key' ? { authHeader } : {}),
     ...(rec.configRef ? { configRef: rec.configRef } : {}),
     ...(tier ? { sandboxTier: tier } : {}),
+    ...(template ? { sandboxTemplate: template.id } : {}),
+    ...(seed ? { sandboxSeed: seed.seed, sandboxSeedSource: seed.source } : {}),
+    // Only a manifest-hash build pins workers; an `imported:` build names no snapshot.
+    ...(template && rec.sandboxBuildId?.startsWith('sha256:')
+      ? { sandboxBuildId: rec.sandboxBuildId }
+      : {}),
     ...(rec.model ? { model: { id: rec.model, ...rec.modelLimits } } : {}),
   };
 }

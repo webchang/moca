@@ -41,6 +41,50 @@ const messageOf = (fn: () => unknown): string => {
   throw new Error('expected a throw');
 };
 
+describe('the combined profile config (combined control plane spec §3.5)', () => {
+  const KEK = Buffer.alloc(32, 7).toString('base64'); // notsecret
+  const harness = { SH_CREDENTIAL_KEK: KEK, SH_EXCHANGE_TOKEN: 'x'.repeat(32) }; // notsecret
+  const cenv = (over: Record<string, string | undefined> = {}) =>
+    env({ SH_ROUTE_PROFILE: 'combined', ...harness, ...over });
+
+  it("boots with both profiles' settings: the sandbox block and the harness fields", () => {
+    const c = configFromEnv(cenv({ SH_PUBLIC_HARNESS_URL: 'https://h.example.invalid' }));
+    expect(c.routeProfile).toBe('combined');
+    expect(c.sandbox?.allowedSubjects).toEqual(['github:1', 'github:2']);
+    expect(c.sandbox?.execEndpoint).toBe('sbx-exec.apps.example.invalid:443');
+    expect(c.exchangeToken).toBe('x'.repeat(32));
+    expect(c.publicHarnessUrl).toBe('https://h.example.invalid');
+    // One template list for sessions and sandboxes.
+    expect(c.sessionTemplates?.map((t) => t.id)).toEqual(['default', 'node22']);
+    expect(c.sandbox?.templates.map((t) => t.id)).toEqual(['default', 'node22']);
+  });
+
+  it("refuses to boot without either profile's required settings, naming the missing one", () => {
+    for (const name of [
+      'SH_CREDENTIAL_KEK',
+      'SH_EXCHANGE_TOKEN',
+      'SH_ALLOWED_SUBJECTS',
+      'SH_SANDBOX_EXEC_ENDPOINT',
+      'SH_SANDBOX_TEMPLATES',
+    ]) {
+      expect(messageOf(() => configFromEnv(cenv({ [name]: undefined })))).toContain(name);
+    }
+  });
+
+  it('builds the sandbox store and keeps the harness credential store', () => {
+    const d = depsFromEnv(
+      cenv({
+        REDIS_URL: 'redis://127.0.0.1:1',
+        SH_CREDENTIAL_STORE: 'file',
+        SH_CREDENTIAL_DIR: mkdtempSync(join(tmpdir(), 'cp-comb-')),
+      }),
+    );
+    expect(d.sandboxes).toBeInstanceOf(RedisSandboxStore);
+    expect(d.credentials).not.toBeInstanceOf(UnavailableCredentialStore);
+    void d.close?.();
+  });
+});
+
 describe('the sandbox profile config (SBX0 §4.1, §5)', () => {
   it('boots with no credential store, KEK, exchange token or inference settings', () => {
     const c = configFromEnv(env());
@@ -56,6 +100,52 @@ describe('the sandbox profile config (SBX0 §4.1, §5)', () => {
       execEndpoint: 'sbx-exec.apps.example.invalid:443',
     });
     expect(c.sandbox!.templates.map((t) => t.worker)).toEqual(['sbx_default', 'sbx_node22']);
+    // Lease-mode policy (lease-mode spec §8.1, ruling R20): every lease mode stays off unless an
+    // operator lists it, until the §11 lease section of the security review.
+    expect([...c.sandbox!.modesAllowed].sort()).toEqual(['per-exec']);
+    expect(c.sandbox!.idleCeilingS).toBe(1800);
+  });
+
+  it('reads SH_SANDBOX_MODES_ALLOWED as a comma list, and an empty value as the default', () => {
+    const modes = (v: string | undefined) =>
+      [...configFromEnv(env({ SH_SANDBOX_MODES_ALLOWED: v })).sandbox!.modesAllowed].sort();
+    expect(modes(' per-exec , lease , lease+processes ')).toEqual([
+      'lease',
+      'lease+processes',
+      'per-exec',
+    ]);
+    expect(modes('per-exec')).toEqual(['per-exec']);
+    expect(modes('lease,lease')).toEqual(['lease']);
+    expect(modes('')).toEqual(['per-exec']);
+    expect(modes(undefined)).toEqual(['per-exec']);
+  });
+
+  it('refuses an unknown or empty mode list at boot, without echoing it', () => {
+    for (const v of ['per-exec,resident', 'Lease', 'lease processes', ' , ']) {
+      const msg = messageOf(() => configFromEnv(env({ SH_SANDBOX_MODES_ALLOWED: v })));
+      expect(msg, v).toMatch(/^SH_SANDBOX_MODES_ALLOWED/);
+      if (v.trim().replace(/,/g, '') !== '') expect(msg, v).not.toContain(v);
+    }
+  });
+
+  it('reads SH_SANDBOX_IDLE_CEILING_S as a positive integer', () => {
+    expect(configFromEnv(env({ SH_SANDBOX_IDLE_CEILING_S: '3600' })).sandbox!.idleCeilingS).toBe(
+      3600,
+    );
+    for (const v of ['0', '-5', '30s', '1.5']) {
+      expect(() => configFromEnv(env({ SH_SANDBOX_IDLE_CEILING_S: v })), v).toThrow(
+        /^SH_SANDBOX_IDLE_CEILING_S must be a positive integer/,
+      );
+    }
+  });
+
+  it('refuses an idle ceiling below the 30 s floor of an owner idle timeout (ruling R6)', () => {
+    expect(configFromEnv(env({ SH_SANDBOX_IDLE_CEILING_S: '30' })).sandbox!.idleCeilingS).toBe(30);
+    for (const v of ['1', '29']) {
+      expect(() => configFromEnv(env({ SH_SANDBOX_IDLE_CEILING_S: v })), v).toThrow(
+        /^SH_SANDBOX_IDLE_CEILING_S must be at least 30/,
+      );
+    }
   });
 
   it('refuses to boot without an allow list, templates or an exec endpoint', () => {
@@ -84,6 +174,17 @@ describe('the sandbox profile config (SBX0 §4.1, §5)', () => {
     );
   });
 
+  it('reads SH_GATE_RECORD_SCHEMA: absent by default, set when given, refused when malformed', () => {
+    expect(configFromEnv(env({})).sandbox).not.toHaveProperty('gateRecordSchema');
+    expect(
+      configFromEnv(env({ SH_GATE_RECORD_SCHEMA: 'builder.example/gate/1' })).sandbox
+        ?.gateRecordSchema,
+    ).toBe('builder.example/gate/1');
+    expect(() => configFromEnv(env({ SH_GATE_RECORD_SCHEMA: 'a gate/1' }))).toThrow(
+      /^SH_GATE_RECORD_SCHEMA must be a schema string/,
+    );
+  });
+
   it('names the variable in a refusal, never its value', () => {
     // A refusal lands in a pod log; a mistyped secret must not ride along with it.
     const short = 'janitor-secret-too-short'; // notsecret
@@ -91,6 +192,10 @@ describe('the sandbox profile config (SBX0 §4.1, §5)', () => {
     expect(messageOf(() => configFromEnv(env({ SH_SANDBOX_MAX_TOTAL: '4x0' })))).not.toContain(
       '4x0',
     );
+  });
+
+  it('reads the combined profile (combined control plane spec §3.5)', () => {
+    expect(routeProfileFromEnv({ SH_ROUTE_PROFILE: 'combined' })).toBe('combined');
   });
 
   it('keeps the harness profile the default, and refuses an unknown one', () => {

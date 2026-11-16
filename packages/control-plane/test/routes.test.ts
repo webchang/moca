@@ -37,6 +37,10 @@ describe('the route table', () => {
         'POST /internal/credentials',
         // The dequeue-time credential exchange (async fan-out spec §5.4).
         'POST /internal/turn-credentials',
+        // MI1 §6.2's grant lifecycle. Unmounted unless MOCA_GRANT_SIGNING_KEY is set, so these two
+        // are declared here but 404 on a deployment with no grant ring.
+        'POST /internal/turn-grants',
+        'POST /internal/grants/refresh',
         'GET /healthz',
         'GET /readyz',
         // §7's async_quota_refusals: the control plane's own /metrics (async fan-out spec §7).
@@ -45,11 +49,48 @@ describe('the route table', () => {
         'POST /v1/egress/credential',
         // SBX0 §5.1: the sandbox profile's own.
         'GET /v1/templates',
+        'GET /v1/templates/{id}',
+        'GET /v1/templates/{id}/builds',
+        'GET /v1/templates/{id}/builds/{build}',
+        'GET /v1/templates/{id}/tags',
+        'POST /v1/templates',
+        'POST /v1/templates/{id}/builds',
+        'POST /v1/templates/{id}/builds/{build}/cancel',
+        'POST /v1/templates/{id}/tags',
+        'DELETE /v1/templates/{id}/tags/{tag}',
+        'PATCH /v1/templates/{id}',
+        'PUT /v1/templates/{id}/owner',
+        'POST /v1/templates/{id}/retire',
+        'DELETE /v1/templates/{id}/builds/{build}',
+        'POST /v1/templates/{id}/builds/{build}/reject',
+        'POST /v1/templates/{id}/activate',
+        'POST /v1/templates/{id}/deactivate',
+        'GET /v1/policy',
+        'PUT /v1/policy',
+        'GET /v1/quota',
+        'PUT /v1/quota/{subject}',
+        'POST /v1/hosts/{host}/inventory',
+        'POST /v1/hosts/{host}/builds/claim',
+        'GET /v1/hosts/{host}/blobs/{digest}',
+        'POST /v1/hosts/{host}/builds/{build}/log',
+        'POST /v1/hosts/{host}/builds/{build}/report',
+        'GET /v1/hosts/{host}/wanted',
+        'POST /v1/hosts/{host}/workers/report',
+        'GET /v1/subjects',
+        'PUT /v1/subjects/{subject}',
+        'DELETE /v1/subjects/{subject}',
+        'PUT /v1/subjects/{subject}/roles/admin',
+        'DELETE /v1/subjects/{subject}/roles/admin',
+        'POST /v1/hosts/{host}/egress',
         'POST /v1/sandboxes',
         'GET /v1/sandboxes',
         'GET /v1/sandboxes/{id}',
         'DELETE /v1/sandboxes/{id}',
         'POST /v1/sandboxes/{id}/token',
+        'GET /v1/sandboxes/{id}/egress',
+        // Lease-mode spec §8.1-§8.2.
+        'PUT /v1/sandboxes/{id}/mode',
+        'POST /v1/sandboxes/{id}/mode-token',
         'GET /v1/janitor/sandboxes',
       ].sort(),
     );
@@ -75,14 +116,24 @@ describe('the route table', () => {
     expect(auth('POST', '/v1/auth/revoke-all')).toBe('api');
     expect(auth('POST', '/internal/credentials')).toBe('exchange');
     expect(auth('POST', '/internal/turn-credentials')).toBe('exchange');
-    // Both internal routes, and ONLY those two, take the shared bearer. The list is pinned rather
-    // than counted: a third route that quietly joined this auth kind would be reachable by anything
+    // The grant lifecycle rides the same bearer because it is the same control-plane-to-worker hop
+    // (MI1 §6.2); what makes it safer than the exchanges is that a grant is a capability spent at an
+    // enforcement point, not a secret.
+    expect(auth('POST', '/internal/turn-grants')).toBe('exchange');
+    expect(auth('POST', '/internal/grants/refresh')).toBe('exchange');
+    // These internal routes, and ONLY these, take the shared bearer. The list is pinned rather
+    // than counted: a route that quietly joined this auth kind would be reachable by anything
     // in the harness pod, which is the one property the exchange bearer cannot defend on its own.
     expect(
       ROUTES.filter((r) => r.auth === 'exchange')
         .map((r) => r.operationId)
         .sort(),
-    ).toEqual(['exchangeCredential', 'exchangeTurnCredential']);
+    ).toEqual([
+      'exchangeCredential',
+      'exchangeTurnCredential',
+      'issueTurnGrants',
+      'refreshTurnGrants',
+    ]);
     // A client reads it before it has logged in; it carries no per-subject data.
     expect(auth('GET', '/v1/discovery')).toBe('none');
     // The host janitor's read takes its own bearer and never a user's token (SBX0 §8.3).
@@ -107,6 +158,8 @@ describe('the route table', () => {
       (r) =>
         r.path.startsWith('/v1/') &&
         !r.path.startsWith('/v1/auth/') &&
+        // A template host agent's routes take its host token (template lifecycle spec §6.1).
+        !(r.path.startsWith('/v1/hosts/{host}/') && r.auth === 'host') &&
         r.auth !== (EXEMPT.get(`${r.method} ${r.path}`) ?? 'api'),
     );
     expect(wrong.map((r) => r.path)).toEqual([]);

@@ -81,6 +81,7 @@ mocactl run "prompt" [--session ID | --new] [--option inferenceCredential=NAME] 
 mocactl promote DIR [--dry-run] [--json]    # upload DIR's .claude/skills and .claude/commands
 mocactl run "prompt" --config DIGEST        # start the new session with that config bundle
 mocactl run "prompt" --show-tools           # print each tool call between the turn's text
+mocactl run "prompt" --record F             # one redacted NDJSON line per HTTP attempt to F (no token, host or text)
 mocactl bundles list [--json]               # your own live bundles, newest first; prints the full digest
 mocactl bundles delete DIGEST [--json]      # delete a bundle you promoted; frees your budget
 ```
@@ -154,6 +155,10 @@ verdict. A session that has not finished yet exits `1` with a hint; a `failed` b
 with the status, reason, and detail on stderr.
 
 `mocactl run` continues the session `--session` names, or starts a new one (`--new`, the default).
+An empty `--session ""` is refused (exit `2`), not taken as `--new`. When the harness has no
+capacity (`503` with `Retry-After`), it waits and retries, printing the harness's reason (for
+example `no attached sandbox in sandbox tier 'container'`), for at most 15 minutes in all; then it
+exits `1` with that refusal. A tier or template with no worker never gains one by waiting.
 
 By default it prints the assistant's text only. `--show-tools` adds each tool call the turn makes,
 on its own line between the text, formatted as the TUI formats it (`$ ls /tmp`, `read src/a.ts`),
@@ -308,6 +313,15 @@ their own shapes. These shapes are stable: fields may be added, but none is rena
 is `null` before the first turn); `endpoint` is `null` when the deployment default applies.
 `title` is this machine's: the first prompt, or a TUI rename, and `null` for a session with no
 local history (the control plane stores no titles).
+
+## Sandboxes and templates
+
+`mocactl sbx` is the sandbox service's client: log in with `mocactl sbx login`, list templates with
+`mocactl sbx templates`, and create a sandbox of one with `mocactl sbx create --template ID` (or
+`sbx up --template ID` in a repository). On a deployment with the template store,
+`mocactl sbx templates` also creates, follows, activates and retires your own templates. The
+[SBX0 user guide](../../docs/sbx/user-guide.md) has every command; turning a container image into a
+template is the template onboarding guide, `deploy/sbx/template-onboarding/GUIDE.md`.
 
 ## Files
 
