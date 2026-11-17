@@ -1360,6 +1360,8 @@ async function executeTurnCore(
     ...(sandbox ? [k8sSandboxExtension({ ...sandbox, capacity })] : []),
     checkpointExtension(store, sessionManager),
     toolChoiceExtension(),
+    // SH_PROMPT_CACHE / SH_GATEWAY_CACHE (#754). Built here, not inside pi's loader, so a refused
+    // value throws out of the turn; with both unset it registers nothing.
     promptCacheExtension(),
   ];
   if (Number.isFinite(budgetLimit) && budgetLimit > 0) {

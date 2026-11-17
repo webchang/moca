@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   bypassGatewayCache,
   promptCacheExtension,
+  readCacheSwitches,
   stripCacheControl,
 } from '../src/prompt-cache-extension';
 
@@ -24,7 +25,7 @@ const EPHEMERAL = { type: 'ephemeral' };
 // and a marked last block of the final user message (here a tool_result with nested content).
 function anthropicPayload() {
   return {
-    model: 'aws/claude-sonnet-5',
+    model: 'claude-test',
     system: [{ type: 'text', text: 'You are…', cache_control: EPHEMERAL }],
     tools: [
       {
@@ -51,39 +52,90 @@ function anthropicPayload() {
   };
 }
 
-describe('promptCacheExtension', () => {
-  const saved = process.env.SH_PROMPT_CACHE;
-  const savedGw = process.env.SH_GATEWAY_CACHE;
-  beforeEach(() => {
-    delete process.env.SH_PROMPT_CACHE;
-    delete process.env.SH_GATEWAY_CACHE;
-  });
-  afterEach(() => {
-    saved === undefined
-      ? delete process.env.SH_PROMPT_CACHE
-      : (process.env.SH_PROMPT_CACHE = saved);
-    savedGw === undefined
-      ? delete process.env.SH_GATEWAY_CACHE
-      : (process.env.SH_GATEWAY_CACHE = savedGw);
+// The OpenAI-compatible provider's shape when its compat flags ask for Anthropic-style markers:
+// a marked last tool and a marked text part.
+function openaiPayload() {
+  return {
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: EPHEMERAL }] },
+    ],
+    tools: [{ type: 'function', function: { name: 'bash' }, cache_control: EPHEMERAL }],
+  };
+}
+
+const NAMES = ['SH_PROMPT_CACHE', 'SH_GATEWAY_CACHE'] as const;
+const saved = Object.fromEntries(NAMES.map((n) => [n, process.env[n]]));
+beforeEach(() => {
+  for (const n of NAMES) delete process.env[n];
+});
+afterEach(() => {
+  for (const n of NAMES)
+    saved[n] === undefined ? delete process.env[n] : (process.env[n] = saved[n]);
+  vi.restoreAllMocks();
+});
+
+describe('readCacheSwitches', () => {
+  it('reads unset, blank and "on" as today (caching on), and "off" as off', () => {
+    expect(readCacheSwitches({})).toEqual({ promptOff: false, gatewayOff: false });
+    expect(readCacheSwitches({ SH_PROMPT_CACHE: '', SH_GATEWAY_CACHE: 'on' })).toEqual({
+      promptOff: false,
+      gatewayOff: false,
+    });
+    expect(readCacheSwitches({ SH_PROMPT_CACHE: 'off' })).toEqual({
+      promptOff: true,
+      gatewayOff: false,
+    });
+    expect(readCacheSwitches({ SH_GATEWAY_CACHE: 'off' })).toEqual({
+      promptOff: false,
+      gatewayOff: true,
+    });
   });
 
-  it('is inert (registers no handler) unless SH_PROMPT_CACHE=off', () => {
-    for (const v of [undefined, '', 'on', 'OFF', 'none']) {
-      if (v === undefined) delete process.env.SH_PROMPT_CACHE;
-      else process.env.SH_PROMPT_CACHE = v;
+  it('refuses any other value, naming the switch', () => {
+    for (const v of ['OFF', 'Off', ' off', 'false', '0', 'none', 'disabled']) {
+      expect(() => readCacheSwitches({ SH_PROMPT_CACHE: v }), v).toThrow(
+        /^SH_PROMPT_CACHE must be "off", "on" or unset/,
+      );
+      expect(() => readCacheSwitches({ SH_GATEWAY_CACHE: v }), v).toThrow(
+        /^SH_GATEWAY_CACHE must be "off", "on" or unset/,
+      );
+    }
+  });
+});
+
+describe('promptCacheExtension', () => {
+  it('is inert (registers no handler) with both switches unset, blank or "on"', () => {
+    for (const v of [undefined, '', 'on']) {
+      for (const n of NAMES) v === undefined ? delete process.env[n] : (process.env[n] = v);
       const { pi, getHandler } = makePi();
       promptCacheExtension()(pi as never);
-      expect(getHandler(), `SH_PROMPT_CACHE=${v}`).toBeUndefined();
+      expect(getHandler(), `both=${v}`).toBeUndefined();
     }
+  });
+
+  it('throws when it is built, not when pi runs it, on a refused value', () => {
+    // pi records a factory's throw as a load error and carries on; building it must be what fails.
+    process.env.SH_PROMPT_CACHE = 'OFF';
+    expect(() => promptCacheExtension()).toThrow(/SH_PROMPT_CACHE/);
   });
 
   it('removes every cache_control marker from an Anthropic payload', () => {
     process.env.SH_PROMPT_CACHE = 'off';
     const { pi, getHandler } = makePi();
     promptCacheExtension()(pi as never);
-    const out = getHandler()!({ payload: anthropicPayload() });
-    // The marker's own shape; the schema property `cache_control: {type: "string"}` is kept on purpose.
+    const out = getHandler()!({ payload: anthropicPayload() }) as Record<string, unknown>;
+    // The marker's own shape: the schema property `cache_control: {type: "string"}` is kept on
+    // purpose.
     expect(JSON.stringify(out)).not.toMatch(/"cache_control":\{"type":"ephemeral"/);
+    expect(out).not.toHaveProperty('cache');
+  });
+
+  it('removes the markers from an OpenAI-compatible payload too', () => {
+    const p = openaiPayload();
+    expect(stripCacheControl(p)).toBe(2);
+    expect(JSON.stringify(p)).not.toContain('cache_control');
   });
 
   it('keeps a tool schema property named cache_control', () => {
@@ -108,13 +160,25 @@ describe('promptCacheExtension', () => {
     expect(getHandler()!({})).toBeUndefined();
   });
 
+  it('logs once, on the first request', () => {
+    process.env.SH_PROMPT_CACHE = 'off';
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { pi, getHandler } = makePi();
+    promptCacheExtension()(pi as never);
+    getHandler()!({ payload: anthropicPayload() });
+    getHandler()!({ payload: anthropicPayload() });
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(err.mock.calls[0][0]).toMatch(/removed 4 cache_control marker/);
+  });
+
   it('SH_GATEWAY_CACHE=off adds cache.no-cache and leaves the prompt-cache markers alone', () => {
     process.env.SH_GATEWAY_CACHE = 'off';
     const { pi, getHandler } = makePi();
     promptCacheExtension()(pi as never);
     const out = getHandler()!({ payload: anthropicPayload() }) as Record<string, unknown>;
     expect(out.cache).toEqual({ 'no-cache': true });
-    expect(JSON.stringify(out)).toContain('"cache_control":{"type":"ephemeral"}');
+    const { cache: _cache, ...rest } = out;
+    expect(rest).toEqual(anthropicPayload());
   });
 
   it('both switches together strip the markers and add no-cache', () => {
@@ -127,13 +191,11 @@ describe('promptCacheExtension', () => {
     expect(JSON.stringify(out)).not.toContain('"cache_control":{"type":"ephemeral"}');
   });
 
-  it('SH_GATEWAY_CACHE other than "off" registers nothing', () => {
-    for (const v of ['', 'on', 'OFF']) {
-      process.env.SH_GATEWAY_CACHE = v;
-      const { pi, getHandler } = makePi();
-      promptCacheExtension()(pi as never);
-      expect(getHandler(), `SH_GATEWAY_CACHE=${v}`).toBeUndefined();
-    }
+  it('reads an explicit env when one is given, not process.env', () => {
+    process.env.SH_PROMPT_CACHE = 'off';
+    const { pi, getHandler } = makePi();
+    promptCacheExtension({})(pi as never);
+    expect(getHandler()).toBeUndefined();
   });
 });
 
@@ -143,9 +205,16 @@ describe('bypassGatewayCache', () => {
     bypassGatewayCache(p);
     expect(p.cache).toEqual({ ttl: 60, 'no-cache': true });
   });
-  it('replaces a non-object cache value', () => {
-    const p: Record<string, unknown> = { cache: 'x' };
+  it('overrides an existing no-cache: false', () => {
+    const p: Record<string, unknown> = { cache: { 'no-cache': false, ttl: 60 } };
     bypassGatewayCache(p);
-    expect(p.cache).toEqual({ 'no-cache': true });
+    expect(p.cache).toEqual({ ttl: 60, 'no-cache': true });
+  });
+  it('replaces a non-object cache value', () => {
+    for (const v of ['x', 1, null, ['a']]) {
+      const p: Record<string, unknown> = { cache: v };
+      bypassGatewayCache(p);
+      expect(p.cache, JSON.stringify(v)).toEqual({ 'no-cache': true });
+    }
   });
 });
