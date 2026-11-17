@@ -115,19 +115,20 @@ def s_demo_users(d):
                 "As the demo runs it: the admin on one laptop, the user on another (demo runbook §1, §5)",
                 notes="Commands as the demo runs them, with the subject as github:<id>. Grant's "
                       "--until takes a duration (30m) or epoch seconds. Each admin write prints "
-                      "old -> new and is refused if the login names another control plane.")
+                      "old -> new and is refused if the login names another control plane. The demo user is "
+                      "enrolled by the settings, so enroll and unenroll are not shown on them "
+                      "(409 bootstrap_subject).")
     table(s, 0.6, 1.45, 12.1, [
         ["Who", "Command", "What the room sees"],
-        ["user", "`mocactl sbx login`", "GitHub's device code; `403 not_enrolled` until step 2"],
-        ["admin", "`sbx admin subjects enroll github:<id>`", "a `member` record; the user's next "
-         "request works"],
+        ["user", "`mocactl sbx login`", "GitHub's device code; enrolled by the settings"],
         ["admin", "`sbx admin subjects`", "each subject, its roles, and `env` or `api` as source"],
         ["admin", "`sbx admin subjects grant github:<id> --until 30m`", "the user's next request "
          "is admin"],
+        ["user", "`sbx admin subjects`", "works now; `403` before the grant"],
         ["admin", "`sbx templates quota github:<id> --templates 10 …`", "old → new; the user's "
          "`sbx quota` shows it"],
         ["admin", "`sbx admin subjects revoke github:<id>`", "admin gone at the next request"],
-        ["admin", "`sbx admin subjects unenroll github:<id>`", "the user's next request: `403`"],
+        ["admin", "`sbx templates quota github:<id> --clear`", "old → the default"],
     ], [1.3, 5.6, 5.2], right_from=-1, size=12, row_h=0.47, bold_first_col=False)
     note(s, 0.6, 5.55, 12.1, 0.7, "No settings edit, no setup.sh, no redeploy",
          ["every step is an API call that takes effect at the next request and leaves a record"],
@@ -138,7 +139,8 @@ def s_demo_templates(d):
     s = d.slide("Demo: a template's lifecycle, image to retire",
                 "As the demo runs it, as one enrolled user, profile `base` (demo runbook §1-§4)",
                 notes="The spec is flat: its own id and image, guest_ram_mb, vcpus, egress, tools, "
-                      "a probe (cmd, expect_rc, expect). Refusal 1 changes --image so it differs "
+                      "a probe (cmd, timeout_s, expect_rc, expect), a description. Refusal 1 changes "
+                      "--image so it differs "
                       "from the spec's own (--image exists for a spec that names no image, and "
                       "must equal the spec's own when it does); refusal 2 asks for the benchmark "
                       "profile, which needs "
@@ -151,24 +153,24 @@ def s_demo_templates(d):
          "local checks pass; a build queued"],
         ["3  follow the build", "`sbx templates follow ID`",
          "queued → building → probing → registered"],
-        ["4  versions", "`templates build`, `tag`, `edit`", "a second build; a tag names one"],
+        ["4  versions", "`templates build`, `tag`, `edit`", "same spec: reused; a tag names a build"],
         ["5  use", "`templates activate --wait`; `sbx create --template ID`; `sbx run`",
-         "a lease; a sandbox on that build"],
+         "a lease; a sandbox, 7 d without use"],
         ["6  release, retire", "`templates deactivate`; `templates retire --wait`",
-         "the worker stops; a later create: `410`"],
+         "the worker stops; then `sbx create`: `410`"],
     ], [2.6, 5.6, 3.9], right_from=-1, size=12, row_h=0.44, bold_first_col=False)
     label(s, 0.6, 4.6, 6.0, 0.3, "Two refusals, shown between steps 2 and 3; nothing is built",
           size=12, color=INK, align=PP_ALIGN.LEFT)
     note(s, 0.6, 4.95, 5.95, 1.25, "1. Refused by mocactl, before sending",
          ["`create --spec F --image <another digest>`", "rule `M7.spec_image`: `--image` "
           "supplies an image a spec lacks, never a different one; refused locally, nothing "
-          "sent"], size=12)
+          "sent"], size=12, anchor=MSO_ANCHOR.TOP)
     note(s, 6.75, 4.95, 5.95, 1.25, "2. Refused by the control plane's policy",
          ["`create --spec F --profile benchmark`", "`422 policy_refused`: no trusted gate "
-          "record; a `check` record"], size=12)
+          "record; a `check` record"], size=12, anchor=MSO_ANCHOR.TOP)
     text(s, 0.6, 6.3, 12.1, 0.35, [
-        "Every step leaves a record on the template's chain: create, gate, build, check, "
-        "activate, retire."], size=11, color=MUTED)
+        "Every step leaves a record on the template's chain: create, check, build, activate, "
+        "deactivate, retire (a gate record when one is sent)."], size=11, color=MUTED)
 
 def s_users_api(d):
     s = d.slide("Five routes, one mocactl command; each change is a record",
