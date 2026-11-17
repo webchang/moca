@@ -1,8 +1,9 @@
 # mocactl for templates and users: the client's whole path
 
 - **Status:** implemented and merged (e2ba2aa4; `activate --wait`'s sized default 5b0c4696), as accepted (the user, 2026-11-10: all seven
-  recommendations in §7), after reviews by autobench-moca and autobench. As built: §4a. Not yet run
-  against a live control plane or in a KVM-host window (§5's side-by-side run).
+  recommendations in §7), after reviews by autobench-moca and autobench. As built: §4a. Upstream's client (below) has since run live
+  in a KVM-host window (2026-11-17: `templates create`, `activate --wait`, `deactivate`, `retire --wait` and `sbx create
+--seed`); §5's side-by-side run was not done.
   **Since the sync with upstream main 0dc3d01e (2026-11-16):** upstream's reviewed client (#767,
   #768) is the code on this branch. It leaves out, and so this branch no longer has: `sbx create
 --seed`'s check of the seeded HEAD against the spec's `baseline_commit`; `activate --wait` stopping
