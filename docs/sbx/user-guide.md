@@ -19,7 +19,9 @@ is untouched** until you take the agent's work back as a patch and apply it
 Why this is safer than letting the agent run on your laptop:
 
 - no process survives a call, so nothing the agent starts keeps running;
-- the VM has no network, so nothing can be downloaded or sent out;
+- the VM has no network device: a template without egress reaches nothing, and one with egress
+  reaches only the hosts your operator allowlisted, through a proxy on the host
+  ([Credentials](#6-credentials)), so nothing can be downloaded from or sent to anywhere else;
 - the VM holds no secrets: no credentials, no tokens, none of your laptop's files except the ones
   you pushed.
 
@@ -78,12 +80,17 @@ created sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default)
 pushed 214 files (3.2 MiB) to sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a
 configured Claude Code, OpenCode and IBM Bob: .mcp.json, .claude/settings.json, opencode.json, .bob/settings.json, .bob/mcp.json, CLAUDE.md, AGENTS.md
 sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a
-sandbox sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default), expires 2026-10-26T09:00:00.000Z; bound in .sbx/sandbox.json
+sandbox sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default), expires 2026-10-26T09:00:00.000Z, after 7 d without use; bound in .sbx/sandbox.json
 ```
 
 Without `--template`, `up` uses the `default` template; `mocactl sbx templates` lists the others,
 and `mocactl sbx up --template <id>` picks one. Run `up` again at any time: it reuses this
 repository's sandbox while it is live.
+
+A new sandbox ends after 7 days without use by default; `--lifetime DURATION` (`36h`, `14d`,
+`90m`, or whole seconds) picks another: at least 1 h, at most the deployment's maximum (30 days
+by default). It applies only to a new sandbox: `up` on an existing one warns that the sandbox
+keeps its own lifetime, and goes on.
 
 **Each worktree gets its own sandbox.** A sandbox belongs to one working tree: another clone, or
 another `git worktree` of the same repository, gets a sandbox of its own at its first `up`, so
@@ -368,9 +375,9 @@ interactively and choose a trust level.`). Prefer choosing the level in `bob cha
 `--trust` blind.
 
 **Toolchains.** The sandbox templates carry the Pi toolchain — `bash`, `git`, Python 3, `ripgrep`,
-`curl` — and the VM has no network, so nothing more can be fetched into it. Reading, grepping and
-editing work; compiling does not, for a language the template does not carry. Check
-`mocactl sbx templates` before asking Bob for a build or a test run, and expect it to report a
+`curl` — and the VM reaches only the hosts on the egress allowlist, and none on a template without
+egress, so a toolchain the template lacks can be fetched only from an allowlisted host. Reading,
+grepping and editing work; compiling does not, for a language the template does not carry. Check `mocactl sbx templates` before asking Bob for a build or a test run, and expect it to report a
 missing compiler rather than produce one. (If it silently succeeds instead, check the tool names: it
 may have used your laptop's.)
 
@@ -533,8 +540,12 @@ that is not bound here.
 - **Each call is a fresh VM.** Files under `/workspace` persist from one call to the next; nothing
   else does. No process survives a call: a server, a watcher or a background job started in one
   call is gone in the next. Chain the steps into one command instead (`make build && make test`).
-- **No network.** Packages cannot be installed from the internet. The templates carry the
-  toolchains: `mocactl sbx templates` lists them, with their tools.
+- **No network of its own.** A template with egress reaches only the hosts your operator
+  allowlisted, through a proxy (anything else answers `403 destination_denied`); one without
+  egress reaches nothing. A package installs only from a registry on the allowlist: the default
+  one carries the common registries (PyPI, npm, crates.io, the Go module proxy), but your operator
+  may have changed it. The templates carry the toolchains: `mocactl sbx templates` lists them, with
+  their tools, and `mocactl sbx policy` lists each profile's egress.
 - **One command at a time per sandbox.** The sandbox runs one call at a time, so batch the work:
   read several files in one call, run the whole test suite in one call. The agent's tools refuse a
   call that would wait more than 30 s behind another one with `sandbox busy: … retry later`, and
@@ -647,11 +658,14 @@ supported. Two of your credentials cannot hold the identical destination (`409 d
 
 ## 7. Limits
 
-- **Sandboxes expire after 7 days** by default (your operator may set another lifetime). Then the
-  sandbox and its files are gone: pull before. `mocactl sbx ls` shows each sandbox's expiry, and
-  `mocactl sbx doctor` fails its sandbox check in the last 24 hours. A sandbox's lifetime cannot be
-  extended; for a fresh one, pull, `mocactl sbx rm`, then `mocactl sbx up` (an expired one is
-  removed with `mocactl sbx rm --force`, as its files can no longer be checked).
+- **A sandbox ends after 7 days without use** by default. Any command extends it from that
+  moment: `exec`, `run`, `push`, `pull`, `shell`, or an agent's tool call. `mocactl sbx ls`,
+  `mocactl sbx get` and an idle `mocactl sbx mcp` do not. Pick another lifetime with `--lifetime`
+  on `mocactl sbx create` or `up`, up to the deployment's maximum (30 days by default); it is set
+  at create only. When it ends, the sandbox and its files are gone: pull before. `mocactl sbx ls`
+  shows each sandbox's expiry and lifetime, and `mocactl sbx doctor` fails its sandbox check in the
+  last 24 hours. For a fresh sandbox, pull, `mocactl sbx rm`, then `mocactl sbx up` (an expired one
+  is removed with `mocactl sbx rm --force`, as its files can no longer be checked).
 - **3 sandboxes per person** by default, and a total for the whole service. Each worktree or clone
   you run `up` in uses one.
 - **Delete and de-enrollment take effect within one token lifetime plus 30 s** (15 minutes by
@@ -681,6 +695,13 @@ supported. Two of your credentials cannot hold the identical destination (`409 d
 - **One shared KVM host, best effort.** Every sandbox runs on one shared machine, supported in
   business hours. If it is lost, every sandbox on it ends and its files are gone. Your laptop
   keeps the original tree, so pull often.
+- **Commands that keep failing for days.** If commands keep failing while the sandbox is still
+  used (the relay unreachable for days), the host may reclaim the workspace before the sandbox
+  reads expired: about 25 days at the default lifetime, 2 days at 30 days.
+- **Older `mocactl sbx mcp` with a long lifetime.** An older `mocactl sbx mcp` counts its lease
+  keepalive as use, so a sandbox it drives never ends from disuse. At a 30-day `--lifetime`
+  that leaves only about 2 days of the margin above. Upgrade `mocactl` everywhere before using
+  `--lifetime` above the default.
 
 ## 8. Your own templates
 
@@ -785,7 +806,8 @@ prints, for the bound sandbox, `export` lines for a client: `SBX_ADDR`, `SBX_TLS
 `SBX_SANDBOX_ID`, `SBX_WORKSPACE_KEY`, `SBX_TOKEN_CMD` and, when the endpoint's certificate is
 self-issued, `SBX_CA_FILE`. `mocactl sbx token` prints a fresh token; `mocactl sbx token
 --renew-every 600` prints a new one every 600 seconds, one line each, until stopped, for a
-long-lived client that reads its next token from a pipe. See
+long-lived client that reads its next token from a pipe. Each token printed counts as use of the
+sandbox, so a `--renew-every` pump keeps it alive whether or not its client runs commands. See
 [the direct-client guide](../api/sandbox-v1-direct-client.md) for what a client sends.
 
 ## 10. Troubleshooting
@@ -798,7 +820,7 @@ mocactl sbx doctor
 
 ```
 ok - login: logged in to https://<api host> as <your GitHub login>
-ok - sandbox: sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default) is ready; expires 2026-10-26T09:00:00.000Z, in 6 d 23 h
+ok - sandbox: sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default) is ready; expires 2026-10-26T09:00:00.000Z, in 6 d 23 h, after 7 d without use
 ok - agent config: Claude Code, OpenCode and IBM Bob use the sandbox MCP server, with every local tool denied in this repository's project config except Bob's, which has no deny list, so its own tools stay available; user-level and managed settings are not checked
 ok - exec: one `true` in a fresh VM: 412 ms
 ok - changes: nothing to pull
@@ -868,8 +890,8 @@ Other messages:
 - **Bob says a folder `is not a trusted folder`**: choose a trust level in `bob chat`, or pass
   `--trust`. Prefer the former: `--trust` takes the default grant without showing you what it is.
 - **Bob reports a missing compiler** (`go: command not found` and the like): the templates carry
-  only the Pi toolchain and the VM has no network, so nothing more can be installed. See
-  `mocactl sbx templates`, and [IBM Bob](#ibm-bob) above.
+  only the Pi toolchain, and anything more installs only on a template with egress, from a host on
+  the allowlist. See `mocactl sbx templates`, and [IBM Bob](#ibm-bob) above.
 - **Codex edits files on your laptop instead of in the sandbox**: check you started it with
   `mocactl sbx codex` (or the `-c mcp_servers.sandbox=…` line), and that `/mcp` in the TUI lists
   the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code,

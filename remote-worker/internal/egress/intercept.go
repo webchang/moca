@@ -139,6 +139,10 @@ func (ic *tlsInterceptor) serve(pc *proxyConn, t target, addrs []netip.Addr, br 
 		},
 	})
 	defer func() {
+		// The slot first (#783): tls.Conn.Close writes close_notify before it closes pc.c, and a
+		// guest may reconnect the moment it reads that orderly EOF, before boundConn.Close would
+		// release it.
+		pc.release()
 		_ = c.gtls.Close()
 		_ = utls.Close()
 	}()
@@ -163,8 +167,12 @@ func (c *icConn) sniMatches(sni string) bool {
 }
 
 // refuse writes a named refusal over the guest TLS, emits its event and ends
-// the conn. It reports false so callers can `return c.refuse(...)`.
+// the conn. It reports false so callers can `return c.refuse(...)`. Like
+// proxyConn.refuse, it writes nothing on a conn Unregister aborted (#825).
 func (c *icConn) refuse(e Event, base Event) bool {
+	if c.pc.wasAborted() {
+		return false
+	}
 	base.Status, base.Decision = e.Status, e.Decision
 	if e.Credential != "" {
 		base.Credential = e.Credential

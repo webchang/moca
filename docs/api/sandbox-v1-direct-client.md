@@ -40,7 +40,8 @@ ExecRequest { sandbox_id, exec: Exec { req_id, command, stdin, timeout_s, stream
   Execs ([Lease mode](#lease-mode)).
 - **Files under `/workspace` persist** between calls, for the sandbox's lifetime. Nothing else does:
   no process, and no file outside `/workspace`, survives the call.
-- **There is no network** in the VM.
+- **There is no network device** in the VM. A template with egress reaches only the hosts the
+  operator allowlisted, through a proxy on the host; any other host answers `403 destination_denied`.
 - **There is no file RPC.** Files are commands: write with `cat > path` and the bytes on `stdin`,
   read with `cat -- path`.
 
@@ -128,6 +129,15 @@ left (480 s by default), and cuts that call's timeout to what the token has left
 that names a timeout the held token cannot cover still gets a fresh token.
 
 The longest single command is therefore one token lifetime. Split longer work into several calls.
+
+A mint also moves the sandbox's deadline: to at least now plus the sandbox's idle lifetime
+(`idleLifetimeS`), never backwards. Send `{"activity": false}` as the body for a mint that runs no
+command, such as a keepalive, so that it does not count. A client that mints without running
+commands should always send it. Each `mocactl sbx token` and each `--renew-every` mint counts as
+use: a token pump keeps the sandbox alive whether or not its client runs commands, and at a
+30-day lifetime the margin before the host reclaims an unreachable workspace is 2 days (spec §7).
+The token response's `sandboxExpiresAt` is
+the deadline after the mint; track it, since it moves.
 
 **Delete and de-enrollment are not immediate.** A token already issued keeps working until its
 `exp`, plus the relay's 30 s leeway: up to one token lifetime plus 30 s (15.5 minutes by default)

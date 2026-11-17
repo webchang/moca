@@ -18,7 +18,12 @@ import {
   type ProvenanceStore,
 } from './provenance.js';
 import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
-import { isEnrolledForSandbox, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
+import {
+  isEnrolledForSandbox,
+  MIN_IDLE_TIMEOUT_S,
+  MIN_SANDBOX_LIFETIME_S,
+  type SandboxConfig,
+} from './sandbox-config.js';
 import {
   hostManaged,
   lastLeaseEnd,
@@ -147,7 +152,7 @@ async function assertSandboxOwner(
 }
 
 /** The wire `Sandbox` (spec §5.1): nulls, never absent fields, and no worker or tenant. */
-function sandboxBody(v: SandboxView) {
+function sandboxBody(v: SandboxView, cfg: SandboxConfig) {
   return {
     id: v.id,
     owner: v.owner,
@@ -166,6 +171,7 @@ function sandboxBody(v: SandboxView) {
     mode: v.mode,
     idleTimeoutS: v.idleTimeoutS,
     modeEpoch: v.modeEpoch,
+    idleLifetimeS: lifetimeOf(cfg, v),
   };
 }
 
@@ -182,6 +188,33 @@ function parseMode(raw: unknown, cfg: SandboxConfig): SandboxModeName {
     throw new CpError('mode_not_allowed', `mode '${raw}' is not allowed on this deployment`);
   }
   return raw;
+}
+
+/**
+ * The idle lifetime a sandbox slides its deadline by: its own, else the default, never more than
+ * the maximum as it is now. The clamp keeps every NEW extension within the current maximum;
+ * deadlines set under an older, higher maximum stand until they pass, which is why lowering the
+ * maximum needs the hosts reinstalled only after the old maximum has passed (deploy/sbx README,
+ * idle-lifetime spec §6.3).
+ */
+function lifetimeOf(cfg: SandboxConfig, rec: SandboxRecord): number {
+  return Math.min(rec.idleLifetimeS ?? cfg.lifetimeS, cfg.maxLifetimeS);
+}
+
+/** The owner's idle lifetime: omitted is the default; given, an hour..the maximum. */
+function parseLifetime(raw: unknown, cfg: SandboxConfig): number {
+  if (raw === undefined) return cfg.lifetimeS;
+  if (
+    !Number.isSafeInteger(raw) ||
+    (raw as number) < MIN_SANDBOX_LIFETIME_S ||
+    (raw as number) > cfg.maxLifetimeS
+  ) {
+    throw new CpError(
+      'invalid_request',
+      `idleLifetimeS must be an integer from ${MIN_SANDBOX_LIFETIME_S} to ${cfg.maxLifetimeS}`,
+    );
+  }
+  return raw as number;
 }
 
 /** The owner's lease idle timeout: omitted is 0 (the worker's default); given, 30..the ceiling. */
@@ -258,6 +291,33 @@ async function underPolicy(
     modeEpoch: next.modeEpoch,
   });
   return next;
+}
+
+/**
+ * Whether a mint counts as activity (idle-lifetime spec §4.2): omitted is true, so today's clients,
+ * which send no body, keep a sandbox alive. `false` is for a mint that runs no command, such as a
+ * lease keepalive. Parsed before any write, so a refused body changes nothing.
+ */
+function parseActivity(raw: unknown): boolean {
+  if (raw === undefined) return true;
+  if (typeof raw !== 'boolean')
+    throw new CpError('invalid_request', 'activity must be true or false');
+  return raw;
+}
+
+/**
+ * Slide the sandbox's deadline to at least now plus its idle lifetime (idle-lifetime spec §3.1),
+ * atomically in the store, so a mint racing a delete or the deadline refuses rather than reviving
+ * the record. Returns the record as moved; the token is signed from it, so it is capped at the NEW
+ * deadline.
+ */
+async function extend(deps: CpDeps, rec: SandboxRecord, now: number): Promise<SandboxRecord> {
+  const { cfg, store } = service(deps);
+  // Sliding is off until the maximum is configured: only then are the workers sized for it (spec §6.1).
+  if (!cfg.slideOnActivity) return rec;
+  const moved = await store.touch(rec.id, now, lifetimeOf(cfg, rec), cfg.retentionS);
+  if (!moved) return refuseGone(store, rec.id, now);
+  return moved;
 }
 
 /**
@@ -338,6 +398,37 @@ async function sandboxCreated(
       expiresAt: rec.expiresAt,
     },
   });
+}
+
+/**
+ * Undoes a create whose start record could not be appended (createSandbox, #806): the record is
+ * marked deleted with no retention, which frees its quota slot and its name at once (the store's
+ * delete, atomic as create is) and drops the record itself (Redis: EXPIRE 0; memory: the next
+ * purge), so GET /v1/sandboxes no longer lists it. Nothing else of a create needs undoing: create
+ * does no worker I/O and mints no token, and its egress log is empty. A lease the create's first
+ * use took (requireActive) is kept: it has its own `activate` record, a retry uses it, and it ends
+ * by its own expiry. The `sandbox_created` audit line already written is answered by
+ * `sandbox_create_rolled_back`, so the audit stream shows the record's whole life.
+ *
+ * Best effort: a delete that fails too (the store down) is logged with the id, and the sandbox
+ * stays, as before this rollback, until its owner deletes it or it expires.
+ */
+async function rollBackCreate(
+  deps: CpDeps,
+  store: SandboxStore,
+  rec: SandboxRecord,
+  subject: string,
+): Promise<void> {
+  try {
+    // 'already' (it expired, or its owner deleted it after listing it) leaves nothing to undo.
+    if ((await store.markDeleted(rec.id, seconds(deps), 0)) === 'deleted')
+      await audit(deps, subject, rec.id, 'sandbox_create_rolled_back');
+  } catch (err) {
+    console.error(
+      `[control-plane] rolling back sandbox ${rec.id} after its start record failed: ` +
+        `${(err as Error).message} -- it stays until deleted or expired`,
+    );
+  }
 }
 
 /**
@@ -2771,6 +2862,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const labels = parseLabels(b.labels);
     const mode = b.mode === undefined ? 'per-exec' : parseMode(b.mode, cfg);
     const idleTimeoutS = parseIdleTimeout(b.idleTimeoutS, cfg);
+    const idleLifetimeS = parseLifetime(b.idleLifetimeS, cfg);
     await requireActive(deps, p, template, b.activate !== false);
     const now = seconds(deps);
     const id = sandboxId(deps.newId());
@@ -2787,7 +2879,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       wsk: id,
       labels,
       createdAt: now,
-      expiresAt: now + cfg.lifetimeS,
+      expiresAt: now + idleLifetimeS,
+      idleLifetimeS,
       mode,
       idleTimeoutS,
       // Per-exec is epoch 0, as every sandbox made before modes existed is. A lease mode starts at
@@ -2815,13 +2908,21 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     await audit(deps, p.sub, id, 'sandbox_created');
     // Its lease (§7.1): the caller's live lease on the build, by the activate record that granted it.
     const lease = liveLeases(template.build, now).find((l) => l.subject === p.sub);
-    await sandboxCreated(deps, rec, p.sub, lease?.record ?? null);
-    return { status: 201, body: sandboxBody(viewOf(rec, now)) };
+    // Every sandbox has its start record (§7.1): one whose record could not be written is undone
+    // before the error answers (500, as a failed append answers on every route), so the client,
+    // which never learned the id, is left nothing to clean up and may simply retry (#806).
+    try {
+      await sandboxCreated(deps, rec, p.sub, lease?.record ?? null);
+    } catch (err) {
+      await rollBackCreate(deps, store, rec, p.sub);
+      throw err;
+    }
+    return { status: 201, body: sandboxBody(viewOf(rec, now), cfg) };
   },
 
   listSandboxes: async (ctx, deps) => {
     const p = requireEnrolled(ctx, deps);
-    const { store } = service(deps);
+    const { cfg, store } = service(deps);
     // Presence, not value, is what needs the role (RouteSpec.adminOnlyQuery), as with ?owner=.
     const all = ctx.query.get('all');
     if (all !== null && !isAdmin(p))
@@ -2836,13 +2937,13 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const sandboxes = recs
       .map((r) => viewOf(r, now))
       .filter((v) => state === null || v.state === state)
-      .map(sandboxBody);
+      .map((v) => sandboxBody(v, cfg));
     return { status: 200, body: { sandboxes } };
   },
 
   getSandbox: async (ctx, deps) => {
     const rec = await assertSandboxOwner(ctx, deps, { admin: true });
-    return { status: 200, body: sandboxBody(viewOf(rec, seconds(deps))) };
+    return { status: 200, body: sandboxBody(viewOf(rec, seconds(deps)), service(deps).cfg) };
   },
 
   deleteSandbox: async (ctx, deps) => {
@@ -2906,12 +3007,19 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     };
   },
 
+  /**
+   * Mint an exec token. An activity mint (the default; `activity: false` opts out) first slides the
+   * sandbox's deadline to at least now plus its idle lifetime (idle-lifetime spec §4.2), and the
+   * token is capped at that moved deadline, which the response reports as `sandboxExpiresAt`.
+   */
   mintSandboxToken: async (ctx, deps) => {
     const read = await assertSandboxOwner(ctx, deps, { admin: false });
     const { cfg } = service(deps);
     const now = seconds(deps);
+    const activity = parseActivity(asRecord(ctx.body).activity);
     requireLive(read, now);
-    const rec = await underPolicy(deps, ctx.principal!.sub, read, now);
+    let rec = await underPolicy(deps, ctx.principal!.sub, read, now);
+    if (activity) rec = await extend(deps, rec, now);
     const { token, exp } = mintSandboxToken(deps.signer, {
       sub: rec.owner,
       tenant: rec.tenant,
@@ -2931,6 +3039,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       body: {
         token,
         expiresAt: exp,
+        sandboxExpiresAt: rec.expiresAt,
         execEndpoint: cfg.execEndpoint,
         wrk: rec.worker,
         wsk: rec.wsk,
@@ -2944,7 +3053,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
    * another user's sandbox gets the same 404 as anyone else, since a mode is what the owner's Execs
    * may do. Every accepted call raises the epoch, the same mode included, and
    * returns a set-mode token for that epoch, for the client's `LeaseControl set_mode`: a downgrade
-   * takes effect at once only through it (spec §8.2).
+   * takes effect at once only through it (spec §8.2). A mode change always counts as activity: it
+   * slides the deadline (idle-lifetime spec §4.2), and a body naming `activity` is refused.
    */
   setSandboxMode: async (ctx, deps) => {
     const rec = await assertSandboxOwner(ctx, deps, { admin: false });
@@ -2952,8 +3062,16 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     const now = seconds(deps);
     requireLive(rec, now);
     const b = asRecord(ctx.body);
+    if ('activity' in b)
+      throw new CpError(
+        'invalid_request',
+        'activity is not taken here: a mode change always counts as activity',
+      );
     const mode = parseMode(b.mode, cfg);
     const idleTimeoutS = parseIdleTimeout(b.idleTimeoutS, cfg);
+    // A mode change is activity: slide the deadline first, so a refusal (a delete that landed since
+    // the read) or a Redis failure leaves the epoch alone; setMode's read-back carries the move.
+    await extend(deps, rec, now);
     const changed = await store.setMode(rec.id, mode, idleTimeoutS, now);
     // Deleted, expired or past retention since the read above.
     if (!changed) return refuseGone(store, rec.id, now);
@@ -2970,7 +3088,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     return {
       status: 200,
       body: {
-        sandbox: sandboxBody(viewOf(next, now)),
+        sandbox: sandboxBody(viewOf(next, now), cfg),
         setModeToken: setModeTokenFor(deps, next, now),
       },
     };
@@ -2979,13 +3097,17 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   /**
    * A set-mode token for the mode and epoch the record holds now, raising nothing: what `mocactl sbx
    * get` re-sends when the worker reports the epoch unknown (spec §8.2). Owner only, as above. The
-   * one exception is a mode the policy no longer allows, downgraded first (underPolicy).
+   * one exception is a mode the policy no longer allows, downgraded first (underPolicy). Like a
+   * token mint it slides the deadline unless the body says `activity: false` (idle-lifetime spec
+   * §4.2), which a lease keepalive sends.
    */
   mintSandboxModeToken: async (ctx, deps) => {
     const read = await assertSandboxOwner(ctx, deps, { admin: false });
     const now = seconds(deps);
+    const activity = parseActivity(asRecord(ctx.body).activity);
     requireLive(read, now);
-    const rec = await underPolicy(deps, ctx.principal!.sub, read, now);
+    let rec = await underPolicy(deps, ctx.principal!.sub, read, now);
+    if (activity) rec = await extend(deps, rec, now);
     return { status: 200, body: { setModeToken: setModeTokenFor(deps, rec, now) } };
   },
 

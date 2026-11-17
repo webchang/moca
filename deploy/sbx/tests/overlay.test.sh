@@ -102,6 +102,15 @@ sidecar() { obj Deployment sandbox-relay | jq -r --arg c "$1" '.spec.template.sp
   fail 'the exec sidecar does not mount sbx-exec-tls'
 pass 'two ghostunnel sidecars: attach -> :9443, exec -> :9444'
 
+# #724: each sidecar is probed on its own status port, never with a bare TCP connect to its TLS port
+# (one handshake error in its log every 5 s).
+probe() { obj Deployment sandbox-relay | jq -c --arg c "$1" '.spec.template.spec.containers[] | select(.name == $c) | [.readinessProbe.httpGet, .readinessProbe.tcpSocket, ([.ports[].containerPort] | sort)]'; }
+[[ "$(probe tls)" == '[{"path":"/_metrics","port":"status"},null,[8444,8454]]' ]] || fail "the attach sidecar's probe is $(probe tls)"
+[[ "$(probe tls-exec)" == '[{"path":"/_metrics","port":"status-exec"},null,[8445,8455]]' ]] || fail "the exec sidecar's probe is $(probe tls-exec)"
+[[ "$(sidecar tls)" == *' --status http://0.0.0.0:8454'* && "$(sidecar tls-exec)" == *' --status http://0.0.0.0:8455'* ]] ||
+  fail 'a sidecar does not serve its status port'
+pass 'both sidecars are probed on /_metrics of their own status port (8454, 8455), not on the TLS port'
+
 relay_ref() { obj Deployment sandbox-relay | jq -c --arg e "$1" '.spec.template.spec.containers[] | select(.name == "sandbox-relay") | .env[]? | select(.name == $e) | .valueFrom'; }
 [[ -z "$(q '[.. | objects | select(.name? == "MOCA_RELAY_CLIENT_TOKENS")] | .[]' -c)" ]] || fail 'the 1a static client tokens are still wired'
 [[ -z "$(relay_ref MOCA_RELAY_EXEC_TOKEN)$(relay_env sandbox-relay MOCA_RELAY_EXEC_TOKEN)" ]] || fail 'the relay still reads a harness exec token'
@@ -129,6 +138,9 @@ for k in SH_ALLOWED_SUBJECTS SH_SANDBOX_TEMPLATES SH_SANDBOX_EXEC_ENDPOINT SH_SA
 done
 [[ "$(cp_env SH_SANDBOX_EXEC_CA | jq -r .valueFrom.configMapKeyRef.optional)" == true ]] ||
   fail 'SH_SANDBOX_EXEC_CA must be optional (absent when the exec certificate is issued)'
+# The maximum lifetime is optional: a ConfigMap from an older setup.sh still starts the control plane.
+[[ "$(cp_env SH_SANDBOX_MAX_LIFETIME_SECONDS | jq -r '.valueFrom.configMapKeyRef | "\(.name)/\(.key)/\(.optional)"')" == sbx-settings/SH_SANDBOX_MAX_LIFETIME_SECONDS/true ]] ||
+  fail 'SH_SANDBOX_MAX_LIFETIME_SECONDS must be read from sbx-settings, optional'
 # The lease policy keys are optional: absent, the control plane's defaults apply (per-exec, 1800 s).
 for k in SH_SANDBOX_MODES_ALLOWED SH_SANDBOX_IDLE_CEILING_S; do
   [[ "$(cp_env "$k" | jq -r .valueFrom.configMapKeyRef.optional)" == true ]] ||

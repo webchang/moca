@@ -21,14 +21,14 @@ the Knative/KEDA deployment model that once shared this name space was removed e
 (ADR-0041). [ADR-0037](../../docs/adrs/0037-p6-on-kubernetes-substrate.md) records the
 Kubernetes-substrate distinction.
 
-| Workload                        | Namespace          | Ports                                        | Reached by                                                                     |
-| ------------------------------- | ------------------ | -------------------------------------------- | ------------------------------------------------------------------------------ |
-| Deployment `moca-supervisor`    | `moca`             | 8080 data; 8081 admin; 8443 ghostunnel (OCP) | users: `port-forward` on Kind, the passthrough Route on OCP; kubelet on 8081   |
-| Deployment `sandbox-relay`      | `moca`             | 9443 Attach; 9444 SandboxExec                | sandboxes on 9443 only; supervisor pods on 9444 only                           |
-| StatefulSet `redis`             | `moca`             | 6379                                         | supervisor, relay, control plane                                               |
-| Deployment `moca-control-plane` | `moca`             | 8080                                         | users (`port-forward` on Kind, an edge Route on OCP); the supervisor's workers |
-| StatefulSet `moca-sandbox`      | `moca-sandbox`     | none                                         | nothing: each sandbox dials out to the relay                                   |
-| per-user credentials (Secrets)  | `moca-credentials` | none                                         | the control plane, through the kube API (`K8sSecretStore`)                     |
+| Workload                        | Namespace          | Ports                                                            | Reached by                                                                                     |
+| ------------------------------- | ------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Deployment `moca-supervisor`    | `moca`             | 8080 data; 8081 admin; 8443 ghostunnel and 8453 its status (OCP) | users: `port-forward` on Kind, the passthrough Route on OCP; kubelet on 8081 (and 8453 on OCP) |
+| Deployment `sandbox-relay`      | `moca`             | 9443 Attach; 9444 SandboxExec                                    | sandboxes on 9443 only; supervisor pods on 9444 only                                           |
+| StatefulSet `redis`             | `moca`             | 6379                                                             | supervisor, relay, control plane                                                               |
+| Deployment `moca-control-plane` | `moca`             | 8080                                                             | users (`port-forward` on Kind, an edge Route on OCP); the supervisor's workers                 |
+| StatefulSet `moca-sandbox`      | `moca-sandbox`     | none                                                             | nothing: each sandbox dials out to the relay                                                   |
+| per-user credentials (Secrets)  | `moca-credentials` | none                                                             | the control plane, through the kube API (`K8sSecretStore`)                                     |
 
 The relay has two Services, `sandbox-relay-attach` (9443) and `sandbox-relay-exec` (9444), so the
 address a sandbox is given has no route to the exec port. The supervisor's Service is
@@ -228,6 +228,13 @@ Route; connection reuse there is harmless.
 The image is `docker.io/ghostunnel/ghostunnel:v1.11.3`, pinned by digest in
 `overlays/ocp/kustomization.yaml`. Docker Hub is the project's official channel; it does not
 publish to GHCR.
+
+Each ghostunnel sidecar's readiness probe is `GET /_metrics` on its own status port (`--status`;
+8453 beside the supervisor, 8454 and 8455 beside the relay's attach and exec sidecars), never a TCP
+connect to its TLS port, which logged a handshake error every 5 s. `/_metrics` dials nothing
+(`/_status` would open a connection to the target on every probe), and no NetworkPolicy admits the
+status ports, so only the kubelet's probes reach them. A cluster that needs the node-CIDR fallback
+for probes (section 10) must admit the status ports there too.
 
 The manifest tests fail on any `Ingress` or `serving.knative.dev` object, and on an OCP supervisor
 Route that is not `passthrough` to the sidecar's port. Replacing the sidecar with an HTTP proxy
@@ -771,6 +778,12 @@ spec:
       ports: [{ protocol: TCP, port: 8081 }, { protocol: TCP, port: 8080 }]
 ```
 
+**On OpenShift, the ghostunnel sidecars are probed too,** on their status ports: 8453 on the
+supervisor pods, 8454 and 8455 on the relay pods (section 3). A cluster that needs this fallback
+adds `sandbox-relay` to the selector's values and `{ protocol: TCP, port: 8453 }`,
+`{ protocol: TCP, port: 8454 }` and `{ protocol: TCP, port: 8455 }` to its ports, or the sidecars
+stay NotReady.
+
 **It was not needed on Kind:** kindnet accepts traffic originated by the node's root user before
 any policy, which covers the kubelet. It is still to be checked on OVN-Kubernetes (section 9.2).
 
@@ -1280,8 +1293,7 @@ curl -s http://127.0.0.1:18081/metrics | jq '{async_queue_depth, async_oldest_ag
 A **number** (even `0`) means worker slot 0's drain loop is running and reporting. `"NaN"` means it
 never reported — the knob is off, or a prerequisite was missing and the worker said so and stayed
 off rather than failing: `kubectl -n moca logs deploy/moca-supervisor | grep '\[async\]'`. The drain
-also refuses to arm under `MOCA_TENANCY=multi`, because the control plane answers `501
-async_tenancy_unsupported` there and a loop that claimed would only refuse forever.
+arms under either tenancy: under `multi` the dequeue hands it grants instead of a key.
 
 ### 14.2 Submit and collect
 
@@ -1336,13 +1348,18 @@ for you.
 
 ### 14.4 Limits
 
-- **`MOCA_TENANCY=single` only.** Under `multi` the control plane refuses submission with `501
-async_tenancy_unsupported` and the drain does not arm. Lifting that needs MI1 S2's grants and token
-  endpoint (ADR-0047 §9's M2).
+- **Under `multi`, inference is isolated and egress is not yet.** `multi` works: the dequeue returns
+  MI1 §6.1 grants and the worker spends the inference one at the control plane's inference listener.
+  It costs three control-plane settings — `MOCA_GRANT_SIGNING_KEY`, `MOCA_INFERENCE_ADDR`, and
+  `MOCA_INFERENCE_URL` when the bind is a wildcard — and the boot refuses without them. These
+  manifests wire none of them: no ConfigMap key and no Service port ship for the listener, so
+  turning `multi` on here is a manifest change first. The residual: the SANDBOX grant has no
+  redeemer, so an async turn gets inference isolation and not egress isolation.
 - **Two leaves per pod at the default W.** The loop is sequential; see section 4 for the width rule
   and why no autoscaler ships.
-- **Caps are not enforced yet.** A submission may carry `caps`, and they are recorded, but
-  `turn_exp` and `MOCA_TURN_MAX_S` are M2.
+- **Caps: wall clock yes, the other two no.** Under `multi`, `turn_exp` is enforced — anchored at
+  the dequeue and clamped to `min(caps.wallClock, MOCA_TURN_MAX_S)` — and bounds how long the turn's
+  grants are usable. `tokens` and `costUsd` are recorded, not enforced.
 - **The scheduled on-ramp has no equivalent.** Archetype C went with the KEDA path and has no P6
   design ([#536](https://github.com/rossoctl/moca/issues/536)).
 
