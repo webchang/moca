@@ -440,12 +440,12 @@ grep -q "^kubectl --context kind-moca apply -k $REPO/deploy/k8s/.generated/kind\
 grep -q '^  - ../../overlays/kind$' "$MOCK_STATE/applied-kustomization.yaml" || fail 'the generated overlay does not build on overlays/kind'
 [[ "$(setting SH_PUBLIC_HARNESS_URL)" == http://127.0.0.1:8080 ]] || fail 'kind advertises the wrong harness URL'
 # The control plane's configMapKeyRefs are not optional, bar the two tier keys, the catalog
-# allow-list and the two async keys: a missing key stops the pod opaquely. Those and the token
-# lifetimes are written on every run too ('' when untiered, defaulted or empty, as here), so the
-# hash input is the same seventeen keys on every stack (SH_TEST_USERS is '0' unless an operator asked
-# for test users, ADR-0045).
-[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["LEAF_RESULT_TTL_SECONDS","SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_ASYNC_DRAIN","SH_GITHUB_CLIENT_ID","SH_IDENTITY_PROVIDER","SH_MODEL_CATALOG_HOSTS","SH_OIDC_CLIENT_ID","SH_OIDC_ISSUER","SH_OIDC_REDIRECT_URI","SH_OIDC_SCOPE","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS","SH_TEST_USERS"]' ]] ||
-  fail 'moca-settings must hold exactly the seventeen keys the control plane and the supervisor reference'
+# allow-list, the two async keys and the two #716 keys: a missing key stops the pod opaquely. Those
+# and the token lifetimes are written on every run too ('' when untiered, defaulted or empty, as
+# here), so the hash input is the same nineteen keys on every stack (SH_TEST_USERS is '0' unless an
+# operator asked for test users, ADR-0045; SH_TRUSTED_PROXY_HOPS is '1' unless one set another).
+[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__ConfigMap__moca-settings.json")" == '["LEAF_RESULT_TTL_SECONDS","SH_ADMIN_SUBJECTS","SH_ALLOW_OPERATOR_FALLBACK","SH_API_TOKEN_TTL_SECONDS","SH_ASYNC_DRAIN","SH_GITHUB_CLIENT_ID","SH_IDENTITY_PROVIDER","SH_MODEL_CATALOG_HOSTS","SH_OIDC_CLIENT_ID","SH_OIDC_ISSUER","SH_OIDC_MAX_PENDING_PER_SOURCE","SH_OIDC_REDIRECT_URI","SH_OIDC_SCOPE","SH_PUBLIC_HARNESS_URL","SH_SANDBOX_DEFAULT_TIER","SH_SANDBOX_TIERS","SH_SESSION_TOKEN_TTL_SECONDS","SH_TEST_USERS","SH_TRUSTED_PROXY_HOPS"]' ]] ||
+  fail 'moca-settings must hold exactly the nineteen keys the control plane and the supervisor reference'
 [[ -z "$(setting SH_SANDBOX_TIERS)" && -z "$(setting SH_SANDBOX_DEFAULT_TIER)" ]] || fail 'kind is never tiered'
 expect_out 'port-forward svc/moca-supervisor 8080:8080'
 pass 'kind: generated overlay applied; control plane held at 0 without a client id; access printed'
@@ -468,6 +468,25 @@ pass 'oidc: settings written, scope defaulted'
   fail 'a re-run without the oidc variables dropped the stored block'
 [[ "$(setting SH_GITHUB_CLIENT_ID)" == Iv1.gh ]] || fail 'a re-run dropped the stored github client id'
 pass 'oidc: sticky on re-run'
+
+# #716: the per-source login bound and the proxy hop count. The bound defaults to '' (the control
+# plane's 20) and travels with the oidc block; the hop count defaults to 1 (the Route's router).
+[[ -z "$(setting SH_OIDC_MAX_PENDING_PER_SOURCE)" ]] || fail 'the per-source bound must default to empty'
+[[ "$(setting SH_TRUSTED_PROXY_HOPS)" == 1 ]] || fail 'the hop count must default to 1'
+(export SH_OIDC_MAX_PENDING_PER_SOURCE=0 SH_TRUSTED_PROXY_HOPS=2; expect_ok --target ocp)
+[[ "$(setting SH_OIDC_MAX_PENDING_PER_SOURCE)" == 0 && "$(setting SH_TRUSTED_PROXY_HOPS)" == 2 ]] ||
+  fail 'the per-source bound or the hop count did not land'
+(expect_ok --target ocp)
+[[ "$(setting SH_OIDC_MAX_PENDING_PER_SOURCE)" == 0 && "$(setting SH_TRUSTED_PROXY_HOPS)" == 2 ]] ||
+  fail 'a re-run dropped the stored per-source bound or hop count'
+(export SH_OIDC_MAX_PENDING_PER_SOURCE='' SH_TRUSTED_PROXY_HOPS=''; expect_ok --target ocp)
+[[ -z "$(setting SH_OIDC_MAX_PENDING_PER_SOURCE)" && "$(setting SH_TRUSTED_PROXY_HOPS)" == 1 ]] ||
+  fail 'set-but-empty did not clear the per-source bound and the hop count to their defaults'
+(export SH_TRUSTED_PROXY_HOPS=one; expect_fail --target ocp)
+expect_out "SH_TRUSTED_PROXY_HOPS='one' must be a whole number"
+(export SH_OIDC_MAX_PENDING_PER_SOURCE=-1; expect_fail --target ocp)
+expect_out "SH_OIDC_MAX_PENDING_PER_SOURCE='-1' must be a whole number"
+pass 'oidc: the per-source bound and the hop count are sticky, clearable and validated (#716)'
 
 # Set-but-empty SH_IDENTITY_PROVIDER clears back to github and empties the block.
 reset_state
@@ -1338,8 +1357,8 @@ jq -nc '{apiVersion: "v1", kind: "Secret", metadata: {name: "op-cert", namespace
 for k in SH_SINGLE_NAMESPACE SH_ROUTE_DOMAIN SH_TLS_SECRET SH_SANDBOX_DEFAULT_TIER SH_SANDBOX_COUNT; do
   setup_cm moca-single | jq -e --arg k "$k" '.data | has($k)' >/dev/null || fail "ocp-single with Routes: moca-setup lacks $k"
 done
-[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 17 ]] ||
-  fail 'ocp-single with Routes: moca-settings does not hold exactly seventeen keys'
+[[ "$(jq -r '.data | keys | length' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == 19 ]] ||
+  fail 'ocp-single with Routes: moca-settings does not hold exactly nineteen keys'
 [[ "$(jq -r '.data.SH_PUBLIC_HARNESS_URL' "$MOCK_STATE/moca-single__ConfigMap__moca-settings.json")" == https://moca.example.test ]] ||
   fail 'ocp-single with Routes: SH_PUBLIC_HARNESS_URL is not the supervisor Route'
 [[ "$(annotation_adds moca-control-plane)" == 1 && "$(annotation_adds moca-supervisor)" == 1 ]] ||
@@ -1682,8 +1701,10 @@ reset_state
 ! grep -qE 'workload-sandboxes|moca-provisioner|ResourceQuota|PodTemplate' "$MOCK_STATE/applied-kustomization.yaml" ||
   fail 'the generated overlay names a workload-sandboxes object with the feature off'
 [[ ! -f "$MOCK_STATE/moca__Secret__moca-provisioner.json" ]] || fail 'a moca-provisioner Secret was made with the feature off'
+[[ ! -f "$MOCK_STATE/moca__Secret__moca-redis-provisioner.json" ]] || fail 'a moca-redis-provisioner Secret was made with the feature off'
+! sv moca moca-redis redis.conf | grep -q '^user ' || fail 'redis.conf defines an ACL user with the feature off'
 ! grep -qE 'get (--raw|endpointslices|statefulsets)|delete .*provisioner' "$MOCK_LOG" || fail 'the feature off read or deleted its objects'
-pass 'off by default: no component, quota, provisioner Secret or provisioner reads'
+pass 'off by default: no component, quota, provisioner Secret, provisioner Redis user or provisioner reads'
 
 reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1; expect_ok --target kind --skip-build)
@@ -1694,11 +1715,33 @@ grep -q '^  - ../../base/workload-sandboxes$' "$MOCK_STATE/applied-kustomization
 [[ "$(sv moca moca-provisioner MOCA_ATTACH_PUBLIC_KEYS)" != "$(sv moca moca-mu1 SH_SESSION_TOKEN_PUBLIC_KEYS)" ]] ||
   fail 'the attach key is the session-token key'
 grep -q 'rollout status deployment/moca-provisioner' "$MOCK_LOG" || fail 'the provisioner rollout is not awaited'
+# #626: the provisioner's own Redis user, GET on workload records only, in a Secret of its own; the
+# read-write password stays moca-redis's. redis.conf holds the user's password as its SHA-256 only.
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
+[[ -f "$MOCK_STATE/moca__Secret__moca-redis-provisioner.json" ]] || fail 'no moca-redis-provisioner Secret with the feature on'
+ppw="$(sv moca moca-redis-provisioner REDIS_PASSWORD)"
+pw="$(sv moca moca-redis REDIS_PASSWORD)"
+[[ "$ppw" =~ ^[0-9a-f]{64}$ && "$ppw" != "$pw" ]] || fail "moca-provisioner's Redis password is not its own 32-byte hex value"
+[[ "$(sv moca moca-redis-provisioner REDIS_URL)" == "redis://moca-provisioner:$ppw@redis.moca.svc:6379" ]] ||
+  fail "the provisioner's REDIS_URL does not name its own user and password"
+[[ "$(jq -c '.data | keys' "$MOCK_STATE/moca__Secret__moca-redis-provisioner.json")" == '["REDIS_PASSWORD","REDIS_URL"]' ]] ||
+  fail 'moca-redis-provisioner must carry REDIS_PASSWORD and REDIS_URL only'
+acl_line="user moca-provisioner reset on #$(printf '%s' "$ppw" | sha) ~sh:wl:* resetchannels +get"
+[[ "$(sv moca moca-redis redis.conf)" == "$(printf 'requirepass %s\nappendonly yes\ndir /data\n%s' "$pw" "$acl_line")" ]] ||
+  fail "redis.conf is not requirepass, AOF and the provisioner's GET-only user: $(sv moca moca-redis redis.conf | grep -v requirepass)"
+! sv moca moca-redis redis.conf | grep -qF -- "$ppw" || fail "redis.conf holds the provisioner's Redis password in clear"
+grep -qF "{ op: add, path: /spec/template/metadata/annotations, value: { moca.dev/redis-acl-hash: \"$(printf '%s' "$acl_line" | sha)\" } }" \
+  "$MOCK_STATE/applied-kustomization.yaml" || fail "Redis's pod template does not carry the provisioner user's hash (it would never load the user)"
+assert_no_secret_in_argv
+pass "SH_WORKLOAD_SANDBOXES=1 gives the provisioner its own GET-only Redis user and Secret, and rolls Redis on it (#626)"
+acl_conf="$(sv moca moca-redis redis.conf)"
 attach_key="$(sv moca moca-provisioner MOCA_ATTACH_PRIVATE_KEY)"
 : >"$MOCK_LOG"
 (export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target kind --skip-build)
 grep -q '^  - ../../base/workload-sandboxes$' "$MOCK_STATE/applied-kustomization.yaml" || fail 'SH_WORKLOAD_SANDBOXES is not sticky'
 [[ "$(sv moca moca-provisioner MOCA_ATTACH_PRIVATE_KEY)" == "$attach_key" ]] || fail 'a re-run rotated the attach key'
+[[ "$(sv moca moca-redis-provisioner REDIS_PASSWORD)" == "$ppw" && "$(sv moca moca-redis redis.conf)" == "$acl_conf" ]] ||
+  fail "a re-run rotated the provisioner's Redis password or changed redis.conf"
 ! grep -q 'run moca-genkeys' "$MOCK_LOG" || fail 'a re-run regenerated keys it already had'
 grep -qF '{ op: replace, path: /spec/egress, value: [{"to":[{"ipBlock":{"cidr":"10.96.0.1/32"}}],"ports":[{"protocol":"TCP","port":443}]},{"to":[{"ipBlock":{"cidr":"172.18.0.2/32"}}],"ports":[{"protocol":"TCP","port":6443}]}] }' "$MOCK_STATE/applied-kustomization.yaml" ||
   fail "the provisioner's egress is not the API server's ClusterIP and endpoint"
@@ -1715,6 +1758,9 @@ grep -q 'networkpolicy/moca-provisioner-redis networkpolicy/allow-openshift-dns-
   fail "turning it off left the provisioner's Redis and DNS policies"
 grep -q 'delete validatingadmissionpolicybinding/moca-provisioner' "$MOCK_LOG" || fail 'turning it off left the admission policy'
 ! grep -q 'images:' "$MOCK_STATE/applied-kustomization.yaml" || fail 'the off render on kind is not the pre-feature one'
+! sv moca moca-redis redis.conf | grep -q '^user ' || fail "turning it off left the provisioner's Redis user in redis.conf"
+! grep -q 'redis-acl-hash' "$MOCK_STATE/applied-kustomization.yaml" || fail 'turning it off left the hash that rolls Redis on'
+[[ "$(sv moca moca-redis-provisioner REDIS_PASSWORD)" == "$ppw" ]] || fail 'turning it off changed moca-redis-provisioner (it stays, unreferenced)'
 pass 'SH_WORKLOAD_SANDBOXES=1 adds the component and makes the provisioner Secret once; sticky; empty turns it off and removes the provisioner'
 
 reset_state

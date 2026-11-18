@@ -1,6 +1,8 @@
 package vmpool
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -134,7 +136,7 @@ func TestSweepOrphansSparesTheWorkersOwnCgroupAndStillKillsAVMOrphan(t *testing.
 	// orphan's real process is dead and its directory is gone.
 	select {
 	case <-vmReaped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testWaitBound):
 		t.Fatal("the VM-shaped orphan (vm-9) survived the sweep — the fail-closed filter has narrowed to nothing, which is the orphan leak spec §6 lists as its first practical failure mode")
 	}
 	if _, err := os.Stat(filepath.Join(root, "vm-9")); !os.IsNotExist(err) {
@@ -355,8 +357,48 @@ func TestSweepOrphansActuallyKillsALiveProcess(t *testing.T) {
 	case <-waitDone:
 		// Good: the kernel actually reaped the process, i.e. SweepOrphans really
 		// signalled it — not merely removed a cgroup directory around it.
-	case <-time.After(5 * time.Second):
+	case <-time.After(testWaitBound):
 		t.Fatal("real child process was still running well after SweepOrphans returned — the kill was not actually delivered")
+	}
+}
+
+// TestSweepOrphansSummaryTellsAKilledVMFromAnEmptyDirectory pins the startup log line's
+// split. Swept counts directories, so a VM that was still running and had to be killed and
+// a pool directory a clean shutdown left behind both added one to it, and the line
+// microvm-worker logged ("swept N VM cgroup(s)") read the same for both. The slice below
+// holds one of each, plus a directory whose only listed pid has already exited, which is
+// empty in the sense that matters: nothing was alive to kill.
+func TestSweepOrphansSummaryTellsAKilledVMFromAnEmptyDirectory(t *testing.T) {
+	livePid, liveReaped := startSleeper(t, true) // a leaked VMM, Setpgid'd as both launchers do
+
+	// A pid that names no running process: a child this test started and has reaped.
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatalf("running a short-lived child: %v", err)
+	}
+
+	root := fakeSlice(t, map[string][]string{
+		"vm-12":  {strconv.Itoa(livePid)},
+		"pool-0": {}, // a clean shutdown's leftover: an empty cgroup.procs
+		"vm-13":  {strconv.Itoa(gone.Process.Pid)},
+	})
+
+	res, err := SweepOrphans(root)
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+	select {
+	case <-liveReaped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the live process in vm-12 survived the sweep")
+	}
+	if res.Swept != 3 || res.Killed != 1 {
+		t.Fatalf("Swept = %d, Killed = %d; want 3 swept, 1 of them holding a live process", res.Swept, res.Killed)
+	}
+	const want = "swept 3 VM cgroup(s) from a previous incarnation: 1 held a live process (killed), 2 were empty; " +
+		"left alone 0 non-VM cgroup(s) []"
+	if got := res.Summary(); got != want {
+		t.Fatalf("Summary() = %q\nwant        %q", got, want)
 	}
 }
 
@@ -579,4 +621,60 @@ func TestSweepOrphansReportsACgroupWhoseProcessOutlivesTheWaitAsStuck(t *testing
 		t.Fatal("the stand-in process exited, so this test staged nothing stuck")
 	default:
 	}
+}
+
+func TestReadMemoryCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		want          int64
+		wantErr       bool
+	}{
+		{"kernel format", "12345\n", 12345, false},
+		{"surrounding whitespace", " \t12345 \n\n", 12345, false},
+		{"zero", "0\n", 0, false},
+		{"empty", "", 0, true},
+		{"newline only", "\n", 0, true},
+		{"max", "max\n", 0, true},
+		{"two numbers", "12 34\n", 0, true},
+		{"unit suffix", "12345K\n", 0, true},
+		{"overflow", "9223372036854775808\n", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readMemoryCurrent(dir)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("readMemoryCurrent(%q) = %d, want an error", tc.content, got)
+				}
+				if !strings.Contains(err.Error(), "memory.current") {
+					t.Errorf("error %q does not name the file", err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("readMemoryCurrent(%q) = %d, %v; want %d", tc.content, got, err, tc.want)
+			}
+		})
+	}
+
+	t.Run("missing file", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := readMemoryCurrent(dir)
+		if !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), filepath.Join(dir, "memory.current")) {
+			t.Fatalf("err = %v, want a not-exist error naming the path", err)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		// A directory where the file should be: ReadFile fails for root too, unlike chmod 000.
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "memory.current"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readMemoryCurrent(dir); err == nil {
+			t.Fatalf("readMemoryCurrent on a directory = %d, want an error", got)
+		}
+	})
 }

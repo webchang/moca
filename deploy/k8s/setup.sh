@@ -9,7 +9,9 @@
 # Environment: KIND_CLUSTER (kind only: the cluster name, default moca), SH_GITHUB_CLIENT_ID,
 # SH_ADMIN_SUBJECTS, SH_ALLOW_OPERATOR_FALLBACK (default false), SH_IDENTITY_PROVIDER (github, the
 # default, or oidc; with oidc: SH_OIDC_ISSUER, SH_OIDC_CLIENT_ID, SH_OIDC_REDIRECT_URI and optional
-# SH_OIDC_SCOPE are written to moca-settings, and the client secret must already sit in a Secret
+# SH_OIDC_SCOPE and SH_OIDC_MAX_PENDING_PER_SOURCE (live login starts per client address; empty
+# means the control plane's default, 20; 0 is off) are written to moca-settings, and the client
+# secret must already sit in a Secret
 # named moca-oidc, key SH_OIDC_CLIENT_SECRET -- setup.sh never touches it; see
 # docs/guides/oidc-login-w3id.md),
 # SH_SANDBOX_COUNT (default 2, at most 4 digits; 0 runs no container sandboxes), SH_WAIT_SECONDS
@@ -39,9 +41,11 @@
 # class as rwo; workload sandboxes spec §5.4, §6.3), SH_ASYNC_DRAIN=1 (every target: each P6 worker
 # also drains the async leaf queue, so turns submitted with POST /v1/turns run; off when unset or
 # empty; async fan-out spec §9.2), LEAF_RESULT_TTL_SECONDS (every target: how long a leaf result is
-# kept, whole seconds; empty means the default, 86400 -- read by BOTH the control plane and the
+# kept, whole seconds; empty means the default, 604800 (7 days) -- read by BOTH the control plane and the
 # supervisor from this one key, so the async turn record and the result it describes expire
-# together), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
+# together), SH_TRUSTED_PROXY_HOPS (every target: how many proxies in front of the control plane
+# append to X-Forwarded-For; empty means 1, the Route's router, whose Routes pin append; 0 keys
+# every client by the socket peer; #716), SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
@@ -116,6 +120,18 @@ WORKLOAD_CLASSES_GIVEN=''
 WORKLOAD_CLASSES_INPUT=''
 WORKLOAD_CLASSES=''
 OTHER_CLASSES=''
+# moca-provisioner's own Redis ACL user (#626; workload sandboxes spec §6.2, §9), after its
+# password: the orphan sweep's one command, GET, on workload records only, and no Pub/Sub channel.
+# The deployment's other callers keep the default user (requirepass); this one cannot write
+# sh:sandbox:records or any other key. node-redis's connect needs nothing more: its HELLO ... AUTH
+# is checked against the connection's user before it authenticates, and the CLIENT SETINFO it
+# sends after is allowed to fail. packages/provisioner/test/sweep.test.ts reads this line and
+# holds a real Valkey to it.
+REDIS_PROVISIONER_ACL='~sh:wl:* resetchannels +get'
+# sha256 of that user's redis.conf line, with SH_WORKLOAD_SANDBOXES=1 (ensure_redis_secret):
+# write_overlay stamps it on Redis's pod template, because Redis reads redis.conf only at start, so
+# adding, changing or dropping the user must roll it.
+REDIS_ACL_HASH=''
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() {
@@ -245,6 +261,12 @@ parse_args() {
   # must be refused here instead of crashlooping it after the apply.
   valid_catalog_hosts "${SH_MODEL_CATALOG_HOSTS-}" ||
     die "SH_MODEL_CATALOG_HOSTS='${SH_MODEL_CATALOG_HOSTS-}' must be comma-separated bare hostnames (no scheme, port or path), or empty"
+  # The per-source login bound and the proxy hop count (#716): the control plane refuses to BOOT on
+  # anything but a whole number, so a typo is refused here; a stored one is checked in write_settings.
+  local count
+  for count in SH_OIDC_MAX_PENDING_PER_SOURCE SH_TRUSTED_PROXY_HOPS; do
+    valid_count "${!count-}" || die "$count='${!count}' must be a whole number, 0 to 6 digits (empty: the default)"
+  done
   WORKLOAD_SANDBOXES_GIVEN="${SH_WORKLOAD_SANDBOXES+x}"
   case "${SH_WORKLOAD_SANDBOXES-}" in
   '' | 1) WORKLOAD_SANDBOXES="${SH_WORKLOAD_SANDBOXES-}" ;;
@@ -263,6 +285,10 @@ parse_args() {
 # most 8 digits (over three years): the control plane silently takes its default for anything it
 # cannot read as a positive number, so a typo must be refused here instead.
 valid_ttl() { [[ -z "$1" || "$1" =~ ^[1-9][0-9]{0,7}$ ]]; }
+
+# valid_count VALUE: empty (the default) or a whole number, 0 included, at most 6 digits. Mirrors
+# main.ts countEnv, which refuses to boot on anything else.
+valid_count() { [[ -z "$1" || "$1" =~ ^(0|[1-9][0-9]{0,5})$ ]]; }
 
 # valid_catalog_hosts VALUE: empty (the control plane's default, no extra hosts) or comma-separated
 # bare hostnames. Mirrors main.ts catalogHostsEnv, which trims, lower-cases and skips empty entries
@@ -714,14 +740,32 @@ ensure_p4_tokens() {
 }
 
 ensure_redis_secret() {
-  local json pw
+  local json pw ppw acl=''
   json="$(secret_json moca-redis "$NS")"
   pw="$(json_value "$json" REDIS_PASSWORD)"
   [[ -n "$pw" ]] || { log 'generating the Redis password'; pw="$(rand_hex)"; }
-  # URL and config are re-derived from the password on every run, so the three can never disagree.
+  # With workload sandboxes on, moca-provisioner gets a Redis user of its own (REDIS_PROVISIONER_ACL)
+  # in a Secret of its own, moca-redis-provisioner, so it never holds the read-write password. Its
+  # password is kept once made, like every other; redis.conf carries only its SHA-256 (#<hex>).
+  # Off, redis.conf has no such user, and the Secret, if an earlier run made it, stays unreferenced,
+  # as moca-provisioner's does.
+  if [[ "$WORKLOAD_SANDBOXES" == 1 ]]; then
+    json="$(secret_json moca-redis-provisioner "$NS")"
+    ppw="$(json_value "$json" REDIS_PASSWORD)"
+    json=''
+    [[ -n "$ppw" ]] || { log "generating moca-provisioner's Redis password"; ppw="$(rand_hex)"; }
+    acl="user moca-provisioner reset on #$(printf '%s' "$ppw" | sha256) $REDIS_PROVISIONER_ACL"
+    REDIS_ACL_HASH="$(printf '%s' "$acl" | sha256)"
+    (
+      export S_0="$ppw" S_1="redis://moca-provisioner:$ppw@redis.$NS.svc:6379"
+      apply_secret moca-redis-provisioner "$NS" REDIS_PASSWORD REDIS_URL
+    )
+  fi
+  # URLs and config are re-derived from the passwords on every run, so they can never disagree.
   (
     export S_0="$pw" S_1="redis://:$pw@redis.$NS.svc:6379"
     S_2="$(printf 'requirepass %s\nappendonly yes\ndir /data\n' "$pw")"
+    [[ -z "$acl" ]] || S_2="$S_2"$'\n'"$acl"
     export S_2
     apply_secret moca-redis "$NS" REDIS_PASSWORD REDIS_URL redis.conf
   )
@@ -1090,11 +1134,11 @@ hand_patched_catalog_hosts() {
 # SH_SANDBOX_TIERS and SH_SANDBOX_DEFAULT_TIER are derived too, by derive_tiers from the stack
 # (its sticky input lives in moca-setup). They are written even when '' so every stack hashes the
 # same key set; an empty token lifetime is the control plane's default, an empty catalog allow-list
-# its own, an empty LEAF_RESULT_TTL_SECONDS the 86400 both tiers default to, and an empty
+# its own, an empty LEAF_RESULT_TTL_SECONDS the 604800 both tiers default to, and an empty
 # SH_ASYNC_DRAIN the async drain off.
 write_settings() {
   local before after admins fb api_ttl session_ttl catalog_hosts catalog_src url
-  local idp oidc_issuer oidc_client_id oidc_redirect oidc_scope drain result_ttl
+  local idp oidc_issuer oidc_client_id oidc_redirect oidc_scope oidc_per_source hops drain result_ttl
   before="$(configmap_json moca-settings)"
   if [[ -n "${SH_GITHUB_CLIENT_ID+x}" ]]; then
     CLIENT_ID="$SH_GITHUB_CLIENT_ID"
@@ -1114,6 +1158,7 @@ write_settings() {
   if [[ -n "${SH_OIDC_CLIENT_ID+x}" ]]; then oidc_client_id="$SH_OIDC_CLIENT_ID"; else oidc_client_id="$(cm_value "$before" SH_OIDC_CLIENT_ID)"; fi
   if [[ -n "${SH_OIDC_REDIRECT_URI+x}" ]]; then oidc_redirect="$SH_OIDC_REDIRECT_URI"; else oidc_redirect="$(cm_value "$before" SH_OIDC_REDIRECT_URI)"; fi
   if [[ -n "${SH_OIDC_SCOPE+x}" ]]; then oidc_scope="$SH_OIDC_SCOPE"; else oidc_scope="$(cm_value "$before" SH_OIDC_SCOPE)"; fi
+  if [[ -n "${SH_OIDC_MAX_PENDING_PER_SOURCE+x}" ]]; then oidc_per_source="$SH_OIDC_MAX_PENDING_PER_SOURCE"; else oidc_per_source="$(cm_value "$before" SH_OIDC_MAX_PENDING_PER_SOURCE)"; fi
   idp="${idp:-github}"
   [[ "$idp" == github || "$idp" == oidc ]] ||
     die "SH_IDENTITY_PROVIDER must be exactly 'github' or 'oidc' (got '$idp')"
@@ -1122,10 +1167,21 @@ write_settings() {
     [[ -n "$oidc_client_id" ]] || die 'SH_IDENTITY_PROVIDER=oidc needs SH_OIDC_CLIENT_ID'
     [[ -n "$oidc_redirect" ]] || die 'SH_IDENTITY_PROVIDER=oidc needs SH_OIDC_REDIRECT_URI (the control plane callback URL registered with the provider)'
     [[ -n "$oidc_scope" ]] || oidc_scope='openid email profile'
-    # The five keys travel together; OIDC_ISSUER feeds write_overlay's replica decision.
+    # The oidc keys travel together; OIDC_ISSUER feeds write_overlay's replica decision. An empty
+    # per-source bound stays empty: the control plane's default (20).
+    valid_count "$oidc_per_source" ||
+      die "moca-settings holds SH_OIDC_MAX_PENDING_PER_SOURCE='$oidc_per_source': re-run with it set to a whole number (0 is off), or set but empty (SH_OIDC_MAX_PENDING_PER_SOURCE=) for the default"
   else
-    oidc_issuer='' oidc_client_id='' oidc_redirect='' oidc_scope=''
+    oidc_issuer='' oidc_client_id='' oidc_redirect='' oidc_scope='' oidc_per_source=''
   fi
+  # The client address behind the Route (#716), same sticky convention. Empty means 1, not the
+  # control plane's 0: every target reaches the control plane through the router (its Routes pin
+  # set-forwarded-headers: append) or a port-forward (no header, so the socket peer), and 0 behind
+  # the router would key every login by the router's address.
+  if [[ -n "${SH_TRUSTED_PROXY_HOPS+x}" ]]; then hops="$SH_TRUSTED_PROXY_HOPS"; else hops="$(cm_value "$before" SH_TRUSTED_PROXY_HOPS)"; fi
+  valid_count "$hops" ||
+    die "moca-settings holds SH_TRUSTED_PROXY_HOPS='$hops': re-run with it set to a whole number, or set but empty (SH_TRUSTED_PROXY_HOPS=) for the default"
+  hops="${hops:-1}"
   OIDC_ISSUER="$oidc_issuer"
   if [[ -z "$CLIENT_ID" && "$TARGET" == kind-ci ]]; then
     # The CI smoke mints its own API tokens; no login ever runs, but the control plane needs a value.
@@ -1184,6 +1240,7 @@ write_settings() {
     --arg catalog_hosts "$catalog_hosts" --arg test_users "$TEST_USERS" \
     --arg idp "$idp" --arg oidc_issuer "$oidc_issuer" --arg oidc_client_id "$oidc_client_id" \
     --arg oidc_redirect "$oidc_redirect" --arg oidc_scope "$oidc_scope" \
+    --arg oidc_per_source "$oidc_per_source" --arg hops "$hops" \
     --arg drain "$drain" --arg result_ttl "$result_ttl" \
     '{SH_GITHUB_CLIENT_ID: $id, SH_ADMIN_SUBJECTS: $admins, SH_PUBLIC_HARNESS_URL: $url, SH_ALLOW_OPERATOR_FALLBACK: $fb,
       SH_SANDBOX_TIERS: $tiers, SH_SANDBOX_DEFAULT_TIER: $dtier,
@@ -1191,6 +1248,7 @@ write_settings() {
       SH_MODEL_CATALOG_HOSTS: $catalog_hosts, SH_TEST_USERS: $test_users,
       SH_IDENTITY_PROVIDER: $idp, SH_OIDC_ISSUER: $oidc_issuer, SH_OIDC_CLIENT_ID: $oidc_client_id,
       SH_OIDC_REDIRECT_URI: $oidc_redirect, SH_OIDC_SCOPE: $oidc_scope,
+      SH_OIDC_MAX_PENDING_PER_SOURCE: $oidc_per_source, SH_TRUSTED_PROXY_HOPS: $hops,
       SH_ASYNC_DRAIN: $drain, LEAF_RESULT_TTL_SECONDS: $result_ttl}')"
   jq -n --arg ns "$NS" --argjson data "$after" \
     '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "moca-settings", namespace: $ns}, data: $data}' |
@@ -1536,6 +1594,11 @@ write_overlay() {
         printf '                  - { name: MOCA_WORKLOAD_STORAGE_CLASSES, value: "%s" }\n' "$classes_csv"
       done
       printf '  - target: { kind: NetworkPolicy, name: moca-provisioner }\n    patch: |-\n      - { op: replace, path: /spec/egress, value: %s }\n' "$KUBE_API_EGRESS"
+      # moca-provisioner's Redis user (ensure_redis_secret): Redis reads redis.conf only at start,
+      # so the user's hash on its pod template rolls it when the user is added or its password
+      # changes, and the annotation's going rolls it when the feature is turned off. Redis's pod
+      # template carries no annotations in the base or any overlay, so "add" creates the map.
+      printf '  - target: { kind: StatefulSet, name: redis }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/redis-acl-hash: "%s" } }\n' "$REDIS_ACL_HASH"
       if is_kind; then
         printf '  - target: { kind: Deployment, name: moca-provisioner }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/image-id: "%s" } }\n' "$HARNESS_IMAGE_ID"
         printf '  - target: { kind: PodTemplate, name: moca-workload-sandbox }\n    patch: |-\n      - { op: add, path: /template/metadata/annotations, value: { %s } }\n' "$sandbox_ann"

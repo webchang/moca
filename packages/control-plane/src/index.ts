@@ -139,6 +139,8 @@ export {
   OidcProvider,
   type PendingAuthStore,
   type PendingOidcAuth,
+  type PendingOidcPatch,
+  type PendingPutOutcome,
 } from './oidc.js';
 export {
   HANDLERS,
@@ -242,6 +244,18 @@ export {
 } from './turn-queue.js';
 export { asyncCounters, countAsync, resetAsyncCounters, type AsyncCounter } from './counters.js';
 export { buildHandler, startControlPlane } from './server.js';
+export {
+  SCHEMA_VERSION,
+  SCHEMA_VERSION_KEY,
+  SchemaVersionError,
+  checkSchemaVersion,
+  guardSchemaVersion,
+  type SchemaGuardOptions,
+  type SchemaVersionClient,
+  type SchemaVersionOutcome,
+  type SchemaVersionRedisLike,
+  type SchemaVersionResult,
+} from './schema-version.js';
 export {
   CREDENTIAL_STORES,
   configFromEnv,
