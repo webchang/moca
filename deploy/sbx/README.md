@@ -9,8 +9,8 @@ resource), **attach** (passthrough, KVM hosts' workers dial in) and **exec** (pa
 This page is the install reference. Day-to-day operation (users, templates, key rotation, outages,
 disk, status and upgrades) is [the runbook](RUNBOOK.md); onboarding a template from a container
 image is the template onboarding folder, `deploy/sbx/template-onboarding/`; users have
-[the user guide](../../docs/sbx/user-guide.md); the security gate's checklist is
-[the security review](../../docs/sbx/security-review.md).
+[the user guide](../../docs/sandbox/user-guide.md); the security gate's checklist is
+[the security review](../../docs/notes/sandbox-security-review.md).
 
 ## 1. Cluster side
 
@@ -68,13 +68,13 @@ them to `sbx-settings`, which the control plane reads:
 | `SBX_IDLE_CEILING_S` | 1800       | 300-86400: the longest lease idle timeout an owner may set, in seconds (`SH_SANDBOX_IDLE_CEILING_S`). An owner who sets none gets the worker's default, 300 s. It also goes into every worker bundle as `SH_LEASE_IDLE_CEILING_S`, so the workers clamp alike: after a change, re-run `install-host.sh` with the new bundle on every host (a running worker keeps its old ceiling) |
 
 **Lease mode stays off by default.** It stays off until plan 4's live smoke test passes and the
-[SBX security review](../../docs/sbx/security-review.md) has its lease section (lease-mode spec
+[SBX security review](../../docs/notes/sandbox-security-review.md) has its lease section (lease-mode spec
 §11). A microVM worker serves lease mode on its own once its snapshot advertises `lease-v1`, so the
 control plane's list is the only switch. After that gate, an operator opts in to level 1 with
 `SBX_MODES_ALLOWED=per-exec,lease` and a re-run of `setup.sh`.
 
 **Keep `lease+processes` (level 2) off** until the security review's level-2 section,
-[§7](../../docs/sbx/security-review.md#7-lease-mode-level-2-sbx03-draft), is signed off (it is a
+[§7](../../docs/notes/sandbox-security-review.md#7-lease-mode-level-2-sbx03-draft), is signed off (it is a
 draft that needs the security owner's sign-off) and live smoke step 9 has passed (RUNBOOK §13).
 Level 1's section comes first. Level 2 also needs template snapshots that advertise
 `lease-processes-v1`. A worker says it serves the process kinds in its Hello
@@ -121,9 +121,11 @@ control plane's signing key, in a shared namespace or copied in. The two stacks 
 under different issuers, so neither accepts the other's.
 
 **Rotating the signing key is a hard cut.** The keyset holds only the current key, so there is no
-overlap window. Delete `moca-mu1` and re-run: every API token and sandbox token already issued is
-refused at once. Refresh tokens are not signed and survive, so `mocactl sbx` gets new ones on its
-next call, but an Exec in flight fails, and a direct client must fetch a new sandbox token.
+overlap window. Remove only `SH_SESSION_TOKEN_PRIVATE_KEY` from `moca-mu1` and re-run, as
+[the runbook, §6](RUNBOOK.md#6-rotating-the-signing-key) shows: deleting the whole Secret would also
+rotate the janitor's token. Every token signed with the old key is refused at once. Refresh tokens
+are not signed and survive, so `mocactl sbx` gets new ones on its next call, but an Exec in flight
+fails, and a direct client must fetch a new sandbox token.
 
 **Changing `SBX_MAX_LIFETIME_DAYS` means reinstalling every host's workers.** The control plane
 takes the new maximum at once, but a running worker keeps the idle reclaim (`SH_WORKSPACE_IDLE`) it
@@ -231,7 +233,8 @@ in `pool-N` cgroups beside the unit's own, which a stop does not reach, so after
 those of that worker's slice and waits for them to empty ([the runbook](RUNBOOK.md#10-a-kvm-host-outage)).
 `install-host.sh --uninstall <id>` is the undo: it removes everything the install recorded in
 `/etc/sbx/manifest` for that worker (its unit instance, slice, env file and CA). The last uninstall on
-a host also removes the shared `sbx-worker@.service`, `sbx-reap-vms.sh` and `sbx.slice`. Workspace data under
+a host also removes the shared `sbx-worker@.service`, `sbx-reap-vms.sh`, `sbx.slice` and the host
+sampler (below); with `--keep-shared` it keeps them. Workspace data under
 `/srv/sbx/workspaces/<id>` and its jail `/srv/sbx/jail/j<12 hex of the id>` is kept; remove it by hand when no sandbox needs
 it.
 
@@ -242,6 +245,16 @@ snapshot's memory file faster, and installs `sbx-read-ahead.service` to set it a
 setting is device-wide: anything else on that volume (another Moca tier, other sandboxes) reads ahead
 as much. The last uninstall writes the device's earlier value back:
 [the runbook](RUNBOOK.md#snapshot-read-ahead).
+
+A worker install also installs the **host sampler**: `/usr/local/libexec/sbx-sampler.sh`,
+`sbx-sampler.service` and `sbx-sampler.timer` (enabled, whatever `SBX_WORKER_AT_BOOT` says). Every `SBX_SAMPLER_INTERVAL_S` seconds
+(default 15; 5-3600; `0` installs none and removes an installed one) it writes one JSON line to the
+journal: the host's load average, memory and swap, CPU, memory and I/O pressure (PSI), the workspace
+filesystem's bytes and inodes, the `sbx.slice` cgroup's CPU, memory and I/O, and per worker its
+running VMs, its memory budget and, when it runs with `SH_DIAG_STATS_ADDR`, the committed bytes
+and refusals from its `/stats`. It reads `/proc` and the cgroup files and needs nothing beyond the
+worker install's own tools (`curl` only for `/stats`). It needs no bundle, so there is no flag for
+it; it is shared like the template unit. Reading it: [the runbook](RUNBOOK.md#the-host-sampler).
 
 **A template's snapshot and worker from a container image** are what
 `deploy/sbx/template-onboarding/template-build.sh` (on the KVM host: the snapshot, checked in a
@@ -308,12 +321,12 @@ supervisor Route, in the generated folder) or the router's is not publicly trust
 
 `deploy/sbx/status.sh --env-file <file>` reports, read-only, which workers are attached, the live
 and retained sandboxes, and the last hour's Exec latency and error rate from the relay's audit lines.
-On a KVM host, `sudo deploy/sbx/status.sh --host` reports the units, the workspace disk and the
-janitor's last run (see [the runbook](RUNBOOK.md#8-status-and-the-audit-lines)).
+On a KVM host, `sudo deploy/sbx/status.sh --host` reports the units, the workspace disk, the
+janitor's last run and one host sample (see [the runbook](RUNBOOK.md#8-status-and-the-audit-lines)).
 
 ## 4. Users
 
-Users log in with GitHub, then bring a repository up in a sandbox; [the user guide](../../docs/sbx/user-guide.md)
+Users log in with GitHub, then bring a repository up in a sandbox; [the user guide](../../docs/sandbox/user-guide.md)
 covers it end to end:
 
     mocactl sbx login --control-plane-url https://<api host>
