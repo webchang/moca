@@ -71,6 +71,16 @@ describe('configFromEnv', () => {
     );
   });
 
+  it('trusts no X-Forwarded-For entry by default and reads SH_TRUSTED_PROXY_HOPS strictly (#716)', () => {
+    expect(configFromEnv(baseEnv).trustedProxyHops).toBe(0);
+    expect(configFromEnv({ ...baseEnv, SH_TRUSTED_PROXY_HOPS: '1' }).trustedProxyHops).toBe(1);
+    // A typo must fail the boot: silently trusting none lumps every client behind the Route into
+    // one source, and the per-source bound then caps the whole deployment.
+    expect(() => configFromEnv({ ...baseEnv, SH_TRUSTED_PROXY_HOPS: 'one' })).toThrow(
+      'SH_TRUSTED_PROXY_HOPS',
+    );
+  });
+
   it('uses the spec`s defaults', () => {
     const c = configFromEnv(baseEnv);
     expect(c.apiTokenTtlSeconds).toBe(900); // B14: 15 minutes bounds revocation latency
@@ -253,6 +263,17 @@ describe('async turn settings (async fan-out spec §4.3, §5.1, §9)', () => {
         'MOCA_ASYNC_QUEUED_PER_OWNER',
       );
     }
+  });
+
+  it('defaults the status read s summary cap to 2048 bytes and reads MOCA_TURN_SUMMARY_BYTES (#390)', () => {
+    expect(configFromEnv(baseEnv).turnSummaryBytes).toBe(2048);
+    expect(configFromEnv({ ...baseEnv, MOCA_TURN_SUMMARY_BYTES: '64' }).turnSummaryBytes).toBe(64);
+    // 0 means "no summary at all", the same way the quota's 0 means "no async": a strict parse, so
+    // a typo fails the boot rather than silently restoring 2048.
+    expect(configFromEnv({ ...baseEnv, MOCA_TURN_SUMMARY_BYTES: '0' }).turnSummaryBytes).toBe(0);
+    expect(() => configFromEnv({ ...baseEnv, MOCA_TURN_SUMMARY_BYTES: '2k' })).toThrow(
+      'MOCA_TURN_SUMMARY_BYTES',
+    );
   });
 
   it('reads MOCA_TENANCY, and refuses a near-miss NAME at boot', () => {

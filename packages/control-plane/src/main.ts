@@ -34,7 +34,7 @@ import {
   testUserSecretFromEnv,
   type IdentityProvider,
 } from './identity.js';
-import { OidcProvider } from './oidc.js';
+import { MAX_PENDING_LOGINS_PER_SOURCE, OidcProvider } from './oidc.js';
 import { K8sSecretStore } from './k8s-secret-store.js';
 import { defaultRunKubectl } from './kubectl.js';
 import { OwnershipIndex, type CpRedisLike } from './ownership.js';
@@ -58,6 +58,7 @@ import { refuseMisnamedIdentityProvider } from './identity-switch.js';
 import { TurnStore } from './turn-store.js';
 import { resultTtlSeconds, TURN_RECORD_TTL_MARGIN_SECONDS } from './turn-record.js';
 import { RedisTurnQueue } from './turn-queue.js';
+import { guardSchemaVersion } from './schema-version.js';
 import type { ResultRedisLike } from './turn-result.js';
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -125,6 +126,17 @@ function turnRecordTtlFromEnv(env: NodeJS.ProcessEnv): number {
 }
 
 /**
+ * `SH_TRUSTED_PROXY_HOPS`: how many reverse proxies in front of the control plane append the
+ * address they saw to X-Forwarded-For (server.ts clientSource). 0, the default, trusts the header
+ * not at all; behind an OpenShift Route it is 1. A malformed value refuses to boot: too high a
+ * count would let a client choose its own source, too low would lump every client behind the proxy
+ * into one.
+ */
+function trustedProxyHopsFromEnv(env: NodeJS.ProcessEnv): number {
+  return countEnv(env, 'SH_TRUSTED_PROXY_HOPS', 0);
+}
+
+/**
  * `SH_IDENTITY_PROVIDER`: `github` (the default, unchanged behavior) or `oidc`. A near-miss
  * refuses to boot, as routeProfileFromEnv refuses one, rather than silently serving GitHub.
  * The oidc client secret arrives through withCredentials (CONTROL_PLANE_SECRETS), so it is a
@@ -153,6 +165,13 @@ function identityProviderFromEnv(env: NodeJS.ProcessEnv): IdentityProvider {
     redirectUri,
     adminSubjects,
     ...(env.SH_OIDC_SCOPE ? { scope: env.SH_OIDC_SCOPE } : {}),
+    // Live login starts one client address may hold (#716); 0 turns the bound off, for a
+    // deployment whose clients all arrive from one address. A malformed value refuses to boot.
+    maxPendingPerSource: countEnv(
+      env,
+      'SH_OIDC_MAX_PENDING_PER_SOURCE',
+      MAX_PENDING_LOGINS_PER_SOURCE,
+    ),
   });
 }
 
@@ -329,6 +348,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   keksFromBase64(required(env, 'SH_CREDENTIAL_KEK'));
   const config: CpConfig = {
     ...tokenTtlsFromEnv(env),
+    trustedProxyHops: trustedProxyHopsFromEnv(env),
     templateHosts: templateHostsFromEnv(env, [env.SH_EXCHANGE_TOKEN ?? ''].filter(Boolean)),
     ...grantTtlsFromEnv(env),
     exchangeToken: required(env, 'SH_EXCHANGE_TOKEN'),
@@ -358,6 +378,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     // contract the worker has had, and the point of the check.
     tenancy: readTenancy(env),
     turnRecordTtlSeconds: turnRecordTtlFromEnv(env),
+    turnSummaryBytes: countEnv(env, 'MOCA_TURN_SUMMARY_BYTES', 2048),
     // Where a worker spends an inference grant (MI1 §6.3). Only the harness profile reads it: the
     // sandbox profile returns above and serves no turns.
     inferenceUrl: inferenceUrlFromEnv(env),
@@ -439,6 +460,8 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
     ]),
     ...tokenTtlsFromEnv(env),
     ...grantTtlsFromEnv(env),
+    // The sandbox profile serves the login routes too, so its login starts are bounded per source.
+    trustedProxyHops: trustedProxyHopsFromEnv(env),
     allowOperatorFallback: false,
     injectorConfigured: false,
     sandboxNamespace: 'default',
@@ -450,6 +473,7 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
     asyncQueuedPerOwner: 0,
     tenancy: 'single',
     turnRecordTtlSeconds: turnRecordTtlFromEnv(env),
+    turnSummaryBytes: countEnv(env, 'MOCA_TURN_SUMMARY_BYTES', 2048),
   };
   checkRefreshConfig(config);
   return config;
@@ -834,6 +858,12 @@ if (isMainModule) {
   const env = withCredentials(process.env, CONTROL_PLANE_SECRETS);
   const deps = depsFromEnv(env);
   startControlPlane(deps, portFromEnv(env), hostFromEnv(env));
+  // The Redis schema version (#509): written if absent, and the process exits on a newer one once
+  // Redis answers. In the background, because this server starts before Redis and waits for it.
+  void guardSchemaVersion({
+    component: 'control-plane',
+    url: env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+  });
   const addr = inferenceAddrFromEnv(env);
   // Not started without the address, so every existing deployment still opens exactly one port.
   if (addr) {

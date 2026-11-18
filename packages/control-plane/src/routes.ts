@@ -78,6 +78,17 @@ const HARNESS: readonly RouteProfile[] = ['harness'];
 const SANDBOX: readonly RouteProfile[] = ['sandbox'];
 
 export const ROUTES: readonly RouteSpec[] = [
+  // #779: the base URL a user is handed, opened in a browser or with curl. It answered the
+  // unknown-path 404, which said nothing about what was reached. Public like the probes, and fixed
+  // text: nothing of the request or the deployment's URLs goes into it.
+  {
+    method: 'GET',
+    path: '/',
+    auth: 'none',
+    sessionScoped: false,
+    profiles: BOTH,
+    operationId: 'getIndex',
+  },
   {
     method: 'GET',
     path: '/healthz',
@@ -303,6 +314,16 @@ export const ROUTES: readonly RouteSpec[] = [
     sessionScoped: true,
     profiles: HARNESS,
     operationId: 'getTurn',
+  },
+  {
+    // The output getTurn's projection leaves out (#390). One kind in M1, `patch`; the handler
+    // decides what a kind means, so a new one needs no route.
+    method: 'GET',
+    path: '/v1/sessions/{id}/turns/{turnId}/artifacts/{kind}',
+    auth: 'api',
+    sessionScoped: true,
+    profiles: HARNESS,
+    operationId: 'getTurnArtifact',
   },
   {
     method: 'DELETE',

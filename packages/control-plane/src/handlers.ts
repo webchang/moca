@@ -1,6 +1,7 @@
 import {
   assertValidDigest,
   BundleDigestMismatchError,
+  BundleFormatError,
   bundleKey,
   DEFAULT_BUNDLE_TTL_SECONDS,
   MAX_BUNDLE_BYTES,
@@ -112,6 +113,11 @@ export interface CpConfig {
   routeProfile?: RouteProfile;
   /** The template hosts (SH_TEMPLATE_HOSTS, template lifecycle spec §6.1); absent or empty: none. */
   templateHosts?: TemplateHost[];
+  /**
+   * How many reverse proxies in front of the control plane append to X-Forwarded-For
+   * (`SH_TRUSTED_PROXY_HOPS`); absent or 0 means none, and the socket peer is the source.
+   */
+  trustedProxyHops?: number;
   apiTokenTtlSeconds: number;
   sessionTokenTtlSeconds: number;
   /** A refresh family dies this long after its last use (`SH_REFRESH_IDLE_TTL_SECONDS`, B14). */
@@ -183,6 +189,12 @@ export interface CpConfig {
    * §5.1). A non-terminal record has no TTL at all, which is the invariant TurnStore owns.
    */
   turnRecordTtlSeconds: number;
+  /**
+   * `MOCA_TURN_SUMMARY_BYTES`, default 2048 (#390): the byte cap on the `summary` an async status
+   * read carries. Mirrors the worker's SH_TURN_STREAM_TOOL_RESULT_PREVIEW_BYTES, for the same
+   * reason -- a polled route must not return whatever a model happened to write.
+   */
+  turnSummaryBytes: number;
   /**
    * `MOCA_GRANT_TTL_S`, default 300 (MI1 §15): how long a session grant lives before the worker
    * must refresh it. Short on purpose -- with no revocation list, this IS the revocation latency.
@@ -315,6 +327,12 @@ export interface RequestCtx {
   egressHost?: EgressHost;
   /** Set by the router for `auth: 'host'` routes: the template host whose token was presented. */
   host?: string;
+  /**
+   * The client's address, as server.ts's clientSource derives it (the socket peer, or the
+   * X-Forwarded-For entry SH_TRUSTED_PROXY_HOPS trusts). A bound on unauthenticated work keys by
+   * it (the oidc login start, #716); it is not an identity, so nothing authorizes by it.
+   */
+  source?: string;
 }
 
 export type Handler = (
@@ -491,6 +509,10 @@ async function storeConfigBundle(
   } catch (err) {
     if (err instanceof CpError) throw err;
     if (err instanceof BundleDigestMismatchError) throw new CpError('digest_mismatch', err.message);
+    // A format this release cannot read (#510): refused here, where the client that built it hears
+    // why, instead of stored for every turn that names it to fail on. No new error code: the
+    // request is one this control plane cannot accept, and the message says what to upgrade.
+    if (err instanceof BundleFormatError) throw new CpError('invalid_request', err.message);
     console.error(
       `[control-plane] putConfigBundle configRef=${digest}: ${(err as Error)?.message ?? String(err)}`,
     );
@@ -721,8 +743,58 @@ async function oidcCallbackImpl(
   }
 }
 
+const INSTALL_MOCACTL =
+  'curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh';
+const GUIDE = 'https://github.com/rossoctl/moca/blob/main/docs';
+
+/**
+ * GET /'s text (#779): what this URL is, where its API is, how to get the client, and whom to ask
+ * for more egress. Plain text, so `curl` reads it as well as a browser does. It names no URL of the
+ * deployment: the page is the same wherever it is served or pasted, and echoing the request's Host
+ * would hand a caller its own input back. The URLs it does name are the project's public ones.
+ */
+export function indexPage(profile: RouteProfile, version?: string): string {
+  const sandbox = profile !== 'harness';
+  const harness = profile !== 'sandbox';
+  const what = profile === 'sandbox' ? ' (the sandbox service)' : '';
+  const lines = [
+    `This is a Moca control plane${what}${version ? `, version ${version}` : ''}.`,
+    '',
+    "It is Moca's API, not a website. Its routes are under /v1 at this URL, and",
+    'GET /v1/discovery (public, JSON) describes this deployment.',
+    '',
+    "Use mocactl, Moca's client. To install it:",
+    `  ${INSTALL_MOCACTL}`,
+    ...(sandbox
+      ? [
+          'For sandboxes, log in with:',
+          '  mocactl sbx login --control-plane-url <this URL>',
+          `  (guide: ${GUIDE}/sbx/user-guide.md)`,
+        ]
+      : []),
+    ...(harness
+      ? [
+          'For sessions, log in with:',
+          '  SH_CONTROL_PLANE_URL=<this URL> mocactl login',
+          `  (guide: ${GUIDE}/guides/manage-multi-user-sessions.md)`,
+        ]
+      : []),
+    '',
+    'A sandbox reaches only the hosts on its egress allowlist; any other host answers',
+    '403 destination_denied. To have a host added, or your account enrolled,',
+    'ask the operator of this deployment.',
+  ];
+  return lines.join('\n') + '\n';
+}
+
 export const HANDLERS: Record<string, Handler> = {
   healthz: async () => ({ status: 200, body: 'ok' }),
+
+  getIndex: async (_ctx, deps) => ({
+    status: 200,
+    body: indexPage(deps.config.routeProfile ?? 'harness', deps.config.version),
+    contentType: 'text/plain; charset=utf-8',
+  }),
 
   /**
    * §7's `async_quota_refusals`. Process-local and reset by a restart, like every count in the
@@ -779,9 +851,9 @@ export const HANDLERS: Record<string, Handler> = {
     };
   },
 
-  startDeviceAuth: async (_ctx, deps) => ({
+  startDeviceAuth: async (ctx, deps) => ({
     status: 200,
-    body: await deps.identity.startDeviceAuth(),
+    body: await deps.identity.startDeviceAuth(ctx.source),
   }),
 
   completeDeviceAuth: async (ctx, deps) => {

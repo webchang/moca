@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
 	"time"
 )
@@ -172,7 +173,7 @@ func TestAWarmAcquireIsRepricedAtPopTime(t *testing.T) {
 
 	// Once the running VM finishes, the same warm acquire fits and succeeds.
 	release()
-	waitFor(t, func() bool { return p.Stats().InFlight == 0 })
+	waitForValue(t, `p.Stats().InFlight`, func() int { return p.Stats().InFlight }, 0)
 	if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}); err != nil {
 		t.Fatalf("warm acquire after the running VM drained: %v", err)
 	}
@@ -196,6 +197,7 @@ func TestEvictionShedsAsMuchDirtyChargeAsAdmissionNeeds(t *testing.T) {
 	// need run-e held running.
 	go func() { _, _ = p.Exec(context.Background(), "run-e", Exec{Command: "sleep"}, &capturingSink{}) }()
 	<-entered
+	refusedAtHostFloor(t, p, "run-z")
 
 	before := p.Stats().BudgetEvictions
 	// In a goroutine: the exec's Run blocks on hold's gate, so a synchronous call
@@ -209,7 +211,7 @@ func TestEvictionShedsAsMuchDirtyChargeAsAdmissionNeeds(t *testing.T) {
 	case <-entered: // run-z's own Run started: the admission went through
 	case err := <-done:
 		t.Fatalf("new run against a standby-heavy host: %v — eviction must shed enough dirty charge to fund it", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testWaitBound):
 		t.Fatal("run-z neither reached Run nor returned — admission stuck")
 	}
 	if evicted := p.Stats().BudgetEvictions - before; evicted != 8 {
@@ -227,6 +229,90 @@ func primeFillerRuns(t *testing.T, p Pool, clk *fakeClock, first int, n int) {
 	for i := first; i < first+n; i++ {
 		primed(t, p, clk, fmt.Sprintf("fill-%02d", i))
 	}
+}
+
+// refusedAtHostFloor execs key with MemAvailable below a host floor, on a pool whose
+// next admission is fundable only by eviction, and asserts the RefuseHostMemory
+// refusal sheds nothing: reclaimLoop destroys asynchronously, so evicting could not
+// raise MemAvailable before the re-check. The floor is restored on return.
+func refusedAtHostFloor(t *testing.T, p Pool, key string) {
+	t.Helper()
+	pp := p.(*pool)
+	oldAvail := memAvailable
+	memAvailable = func() (int64, error) { return 512 << 20, nil }
+	pp.mu.Lock()
+	oldFloor := pp.cfg.HostMemFloorBytes
+	pp.cfg.HostMemFloorBytes = 1 << 30
+	pp.mu.Unlock()
+	invalidateMemAvailableCache()
+	defer func() {
+		pp.mu.Lock()
+		pp.cfg.HostMemFloorBytes = oldFloor
+		pp.mu.Unlock()
+		memAvailable = oldAvail
+		invalidateMemAvailableCache()
+	}()
+
+	before := p.Stats()
+	// In a goroutine: an admitted Exec would block in the callers' held Run.
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), key, Exec{Command: "true"}, &capturingSink{})
+		done <- err
+	}()
+	if err := recvWithin(t, done, "Exec below the host floor"); ReasonOf(err) != RefuseHostMemory {
+		t.Fatalf("Exec %s below the host floor: err = %v, want a %s refusal", key, err, RefuseHostMemory)
+	}
+	after := p.Stats()
+	if d := after.BudgetEvictions - before.BudgetEvictions; d != 0 {
+		t.Fatalf("BudgetEvictions delta = %d across a host-floor refusal, want 0", d)
+	}
+	if after.StandbysResident != before.StandbysResident {
+		t.Fatalf("StandbysResident = %d after a host-floor refusal, want %d unchanged",
+			after.StandbysResident, before.StandbysResident)
+	}
+}
+
+// TestAdmissionFundingIsOneReclaimBatch pins that one funding call hands all its
+// victims to reclaimLoop as a single reclaimQ slot, however many standbys it sheds.
+// reclaimLoop is held in the first Destroy it runs, so the queue then holds exactly
+// the batches sent after the one it took.
+func TestAdmissionFundingIsOneReclaimBatch(t *testing.T) {
+	// The dirty-charge eviction setup above: 8 floor-charged standbys + one running
+	// VM, so funding one full-price admission sheds all 8.
+	p, lc, clk := standbyPool(t, 2*perVM, 4, 1<<20)
+	for _, k := range []string{"run-a", "run-b", "run-c", "run-d"} {
+		primed(t, p, clk, k)
+	}
+	release, entered := hold(lc)
+	defer release()
+	go func() { _, _ = p.Exec(context.Background(), "run-e", Exec{Command: "sleep"}, &capturingSink{}) }()
+	<-entered
+	if n := lc.liveCount(); n != 9 {
+		t.Fatalf("liveCount = %d before funding, want 8 standbys + 1 running", n)
+	}
+
+	gate, destroying := make(chan struct{}), make(chan struct{}, 1)
+	unblock := sync.OnceFunc(func() { close(gate) })
+	defer unblock()
+	lc.setBeforeDestroy(func() {
+		select {
+		case destroying <- struct{}{}:
+		default:
+		}
+		<-gate
+	})
+
+	pp := p.(*pool)
+	pp.mu.Lock()
+	pp.evictForBudgetLocked(perVM)
+	pp.mu.Unlock()
+	recvWithin(t, destroying, "reclaimLoop's first Destroy")
+	if n := len(pp.reclaimQ); n != 0 {
+		t.Fatalf("reclaimQ holds %d batches behind the one reclaimLoop took, want 0", n)
+	}
+	unblock()
+	waitForValue(t, "lc.liveCount() once the batch is reclaimed", lc.liveCount, 1)
 }
 
 // TestSequentialWarmAcquiresOnOneRunShedIdleStandbys is the review's must-fix
@@ -254,6 +340,7 @@ func TestSequentialWarmAcquiresOnOneRunShedIdleStandbys(t *testing.T) {
 		t.Fatalf("CommittedBytes = %d, want %d (one full-price VM + 79 floor-charged standbys)",
 			s.CommittedBytes, 10*perVM-2*floorCharge)
 	}
+	refusedAtHostFloor(t, p, "run-z")
 
 	before := p.Stats().BudgetEvictions
 	done := make(chan error, 1)
@@ -265,7 +352,7 @@ func TestSequentialWarmAcquiresOnOneRunShedIdleStandbys(t *testing.T) {
 	case <-entered: // the second warm acquire reached Run: the promotion was funded
 	case err := <-done:
 		t.Fatalf("second warm acquire on run-z: %v — the promotion must be funded from other runs' standbys", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testWaitBound):
 		t.Fatal("second warm acquire neither reached Run nor returned — promotion stuck")
 	}
 	// 2816 - 32 + 288 = 3072 > 2880, short 192 MiB = six floor-charged standbys.
@@ -332,7 +419,7 @@ func TestPromotionEvictionSparesThePromotingRun(t *testing.T) {
 			t.Fatalf("warm acquire fundable only by the promoting run's own standbys: err = %v, want a %s refusal — those standbys are excluded from the victim set",
 				err, RefuseMemoryBudget)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testWaitBound):
 		t.Fatal("run-y's warm acquire was admitted instead of refused — it is now parked in hold's gate, which is exactly what spending the promoting run's own standbys would buy")
 	}
 	if evicted := p.Stats().BudgetEvictions - before; evicted != 0 {

@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parseArgs } from 'node:util';
+import { parseArgs, type ParseArgsConfig } from 'node:util';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { MAX_STDIN_BYTES, q, WORKSPACE, type SandboxModeName } from '@moca/sandbox-client';
 import {
@@ -77,20 +77,191 @@ import {
   readCreateInputs,
 } from './templates.js';
 import { cortexMode } from './agent-config.js';
+import { commandUsage, typedWords } from '../core/usage.js';
 import { isModeName, MODE_NAMES, modeRank, UPGRADE_NEEDS_TTY } from './mode.js';
 import { cmdGet, cmdMode, cmdReset } from './lease-commands.js';
 import { cmdProc, parseProcArgs, PROC_FLAG_OWNER, type ProcArgs } from './proc.js';
 
+/**
+ * What an sbx sandbox is, before the usage on `--help` and a bare `mocactl sbx` (#599): the plain
+ * `mocactl` session's tools also run in "a sandbox", but one these commands never see, so a new
+ * user needs the distinction before the command list. It defines the sandbox itself (made from a
+ * template; no repository needed: `create`, then `run` and `put` by ID), then `up` as the
+ * common way in, and says what the commands really do: `up`
+ * and `push` copy the working tree once each (nothing syncs by itself), `up` writes the agent
+ * configuration, and the agent's edits come back only through `pull`. Bob has no deny list, so its
+ * local tools are said to stay. Not printed after a usage error, where it would only bury the error.
+ */
+export const SBX_ABOUT = `An sbx sandbox is a workspace on the sandbox service, made from a template, where your coding
+agent's commands run in isolated VMs. In a git repository, \`mocactl sbx up\` creates or reuses one,
+copies the working tree into its /workspace and points Claude Code, OpenCode and IBM Bob, in this
+repository, at the sandbox's tools: their reads, edits and commands then run in the sandbox
+service's VMs, not on this machine (Bob's local tools stay available: it has no deny list). Your
+source files stay as they are, apart from the agent configuration \`up\` adds. The copy is not kept
+in sync: \`mocactl sbx push\` sends later local edits, and \`mocactl sbx pull --apply\` applies the
+agent's edits here as a patch. /workspace is kept between commands; the sandbox ends after a period
+without use (7 days by default). Without a repository, \`mocactl sbx create\` makes one (from the
+default template, or \`--template ID\`), and \`run\` and \`put\` use it by ID; \`proc\` needs one
+made with \`--mode lease+processes\`. (A bare \`mocactl\` session's tools run in a sandbox of moca's
+own server, SH_CONTROL_PLANE_URL: these commands do not see it.)`;
+
+/**
+ * The commands, grouped, each group in the order a user reaches for them (#599): the everyday
+ * workflow first, from login to rm and logout, then the by-hand, credential, template and admin
+ * commands.
+ */
 export const SBX_USAGE = `usage (the sandbox service, SBX0):
+a repository's sandbox, in the order you use it:
   mocactl sbx login [--control-plane-url URL] [--no-browser]
                                                  log in with the GitHub device flow (the URL is remembered;
                                                  in a local terminal: copies the code, opens the browser)
+  mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config] [--cortex]
+                 [--lifetime DURATION]
+                                                 in a git repository: create or reuse its sandbox,
+                                                 push the working tree, bind it in .sbx/sandbox.json,
+                                                 and point Claude Code, OpenCode and IBM Bob at the
+                                                 sandbox's MCP tools, with their local tools denied
+                                                 (Bob's cannot be: it has no deny list) (merged
+                                                 into .mcp.json, .claude/settings.json,
+                                                 opencode.json, .bob/settings.json, .bob/mcp.json,
+                                                 CLAUDE.md, AGENTS.md; a value there that conflicts
+                                                 stops up before anything is done)
+                                                 (a reused sandbox with changes not yet pulled is
+                                                 left unpushed, with a warning, and up exits 0)
+                                                 (--cortex: Cortex v0.9.3+ blocks the local tools
+                                                 instead of a deny list, so Claude Code loads the
+                                                 project's CLAUDE.md; kept by later runs)
+                                                 (--lifetime: a new sandbox ends after DURATION
+                                                 (36h, 14d, 90m or seconds; at least 1 h) without
+                                                 use; default: the deployment's, 7 d; at most its
+                                                 maximum, 30 d by default; a reused sandbox keeps
+                                                 its own)
+  mocactl sbx claude [-- CLAUDE_ARGS ...]        run Claude Code on this sandbox's MCP tools, for
+                                                 one run (--mcp-config + --strict-mcp-config,
+                                                 nothing written, no approval asked: the first
+                                                 bare claude session's approval question is why
+                                                 this exists, #577; Claude Code still asks once
+                                                 whether you trust the folder. The session loads
+                                                 no MCP server but the sandbox's; run claude
+                                                 yourself for your own servers). Its local tools
+                                                 are denied (--disallowed-tools) from any
+                                                 directory, except in a repo up --cortex set up,
+                                                 where Cortex blocks them
+  mocactl sbx codex [-- CODEX_ARGS ...]          run Codex CLI on this sandbox's MCP tools, for one
+                                                 run (-c, nothing written: Codex reads no
+                                                 project-local config, so up cannot configure it).
+                                                 Its shell tool is off, but unified_exec cannot be
+                                                 disabled, so local execution is restricted, not
+                                                 denied: use Codex's own sandbox_mode as well
+  mocactl sbx mcp [--sandbox ID]                 the stdio MCP server for Claude Code / OpenCode
+  mocactl sbx run [--sandbox ID] [--timeout S] [-- CMD ...]   run CMD (or the script on stdin) in /workspace
+                                                 (CMD's words are quoted, so they run exactly as typed:
+                                                 for pipes, $VARS or globs use stdin or -- sh -c '...';
+                                                 exit: the command's code; 124 timed out or killed;
+                                                 125 sandbox failure; 75 refused before it started,
+                                                 every try (retried MOCACTL_SBX_BUSY_RETRIES times,
+                                                 default 4, at most 20; nothing ran); 130
+                                                 interrupted; S defaults to, and is capped at, the
+                                                 sandbox token's lifetime minus 60 s)
+  mocactl sbx put PATH [--sandbox ID]            write stdin to PATH under /workspace
+                                                 (a refusal before start: retried, 75, as run's)
+  mocactl sbx pull [--apply] [-o FILE]           the sandbox's changes as a patch, on stdout or in
+                                                 FILE (--apply: apply it here, then advance the
+                                                 sandbox's baseline)
+  mocactl sbx push [--force] [--include-secrets] [--max-push MiB]   push the working tree again
+                                                 (refused while the sandbox has changes not yet
+                                                 pulled, unless --force; .env*, *.pem, *.key and
+                                                 id_* stay behind unless --include-secrets)
+  mocactl sbx ls [--all] [--json]                your sandboxes (--all: everyone's; admins only)
+  mocactl sbx doctor [--sandbox ID] [--json]     check login, sandbox, agent config, exec and recent
+                                                 calls (exit 0 when every check passes, else 1)
+  mocactl sbx rm [ID] [--keep-config] [--force] [--json]
+                                                 delete a sandbox (its lease ended first); for the
+                                                 bound one, also take back the agent configuration
+                                                 sbx up added, and .sbx/ (unless --keep-config)
+                                                 (refused while the sandbox has changes not yet
+                                                 pulled, unless --force, or when that cannot be
+                                                 checked)
   mocactl sbx logout                             end the sandbox-service login (deletes sbx-auth.json)
+
+a sandbox by hand: create one, its lease and processes, a direct client:
+  mocactl sbx create [--template ID[:TAG|@BUILD]] [--name N] [--label k=v ...] [--seed]
+                     [--mode per-exec|lease|lease+processes] [--idle-timeout S] [--lifetime DURATION]
+                     [--json]
+                                                 create a sandbox (template: default); prints its id;
+                                                 --seed: run the served build's seed, then check
+                                                 /workspace is a clean tree (its HEAD becomes the
+                                                 baseline pull and rm measure changes from);
+                                                 --mode (default per-exec): a lease mode keeps the
+                                                 guest between commands (the deployment must allow
+                                                 it; an upgrade, so only from a terminal), its
+                                                 lease ending after S idle seconds (default: the
+                                                 worker's);
+                                                 --lifetime: the sandbox ends after DURATION (36h,
+                                                 14d, 90m or seconds; at least 1 h) without use
+                                                 (default: the deployment's, 7 d; at most its
+                                                 maximum, 30 d by default)
+  mocactl sbx get [ID] [--json]                  a sandbox's mode, epoch and idle timeout, and its
+                                                 lease's state (a lease mode the worker has not
+                                                 taken yet is sent again)
+  mocactl sbx mode per-exec|lease|lease+processes [ID] [--idle-timeout S]
+                                                 change the sandbox's mode (an upgrade only from a
+                                                 terminal; the idle timeout is kept unless given); a
+                                                 worker that cannot be reached takes it at the next
+                                                 command; a downgrade to per-exec ends the lease;
+                                                 lease+processes to lease keeps it and stops the
+                                                 tracked processes (it prints those it stopped)
+  mocactl sbx reset [ID]                         end the sandbox's lease: the next command starts a
+                                                 new guest (/tmp, installs outside /workspace and
+                                                 background processes are gone)
+  mocactl sbx proc start [--name N] [--cwd D] [ID] -- CMD ...
+                                                 start CMD as a tracked process, which outlives the
+                                                 command (lease+processes only; CMD quoted as run's;
+                                                 D inside /workspace; N unique among the running
+                                                 ones); prints its id, name and pid
+  mocactl sbx proc ls [ID] [--json]              the tracked processes: id, name, pid, state
+                                                 (running, exited(code) or killed(signal)), age and
+                                                 memory; an exited one stays until the lease ends
+  mocactl sbx proc logs (NAME|ID) [--tail N] [--raw] [ID]
+                                                 the last N lines (default 200) of a tracked
+                                                 process's stdout and stderr; on a terminal its
+                                                 control sequences are removed (--raw keeps them;
+                                                 piped output is always as written)
+  mocactl sbx proc stop (NAME|ID) [--signal S] [ID]
+                                                 send S (default TERM), then kill what is left
+                                                 after 10 s; prints its final state
+                                                 (the process: its name, or its id, p<n> or n; the
+                                                 last ID is the sandbox's)
+  mocactl sbx token [ID] [--renew-every S] [--json]
+                                                 print a fresh sandbox token (15 minutes by default);
+                                                 --renew-every: a new line every S seconds until stopped
+  mocactl sbx env [ID]                           shell exports for a direct sandbox/v1 client
+  mocactl sbx egress [ID] [--json | --ndjson | --verify]
+                                                 what the sandbox reached through its host's egress
+                                                 proxy: per host, and whether the log is complete;
+                                                 --ndjson prints the log whose sha256 its end record names;
+                                                 --verify checks the log served against the control
+                                                 plane's summary of it (sha256 and count; once the log
+                                                 is sealed, 10 minutes after the end, it is final)
+
+the credentials the host swaps in:
+  mocactl sbx credentials [list] [--json]       the credentials the host swaps into your sandboxes' HTTPS requests
+  mocactl sbx credentials add NAME (--host DEST ... [--kind K] | --preset ID)
+                                                 store one (the secret is read from stdin, never argv);
+                                                 DEST is host[:port][/prefix]; K: bearer (default), basic,
+                                                 api-key, oauth2-token (basic: stdin is username=...
+                                                 and password=... lines)
+  mocactl sbx credentials presets [--json]       the presets \`add --preset\` knows
+  mocactl sbx credentials delete NAME            delete one
+
+templates: what a sandbox is created from:
   mocactl sbx templates [--json]                 the templates a sandbox can be created from, with
                                                  their readiness and tags
   mocactl sbx quota [--json]                     your template quotas and use, and your live-sandbox cap
   mocactl sbx policy [--json]                    the deployment's template policy: profiles (envelope,
                                                  egress, rules), allowed registries, quotas, digest
+  mocactl sbx hosts [--json]                     per KVM host: active slots, start line, memory
+                                                 headroom and floor, idle grace, disk
   mocactl sbx templates create --spec F [--spec F ...] [--id ID] [--image REF] [--profile P]
                                [--visibility private|deployment] [--gate-record F] [--dry-run]
                                [--timeout S] [--json]
@@ -123,9 +294,6 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx templates untag ID TAG [--json]    remove a tag; its build stays (never default)
   mocactl sbx templates edit ID [--visibility private|deployment] [--description TEXT] [--json]
                                                  change who sees it, or its description
-  mocactl sbx templates transfer ID SUBJECT [--json]
-                                                 make SUBJECT (github:<id> or oidc:<sub>) its owner
-                                                 (admins only)
   mocactl sbx templates activate ID [--build BUILD] [--lease S] [--wait [--timeout S]] [--json]
                                                  take or renew your activation lease on a build (tag
                                                  default, or BUILD; S seconds, 60-86400); a host agent
@@ -147,6 +315,11 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  exit 5 on a timeout), at once for a build no
                                                  host holds, or one whose worker a build neither
                                                  retired nor rejected uses
+
+admins only:
+  mocactl sbx templates transfer ID SUBJECT [--json]
+                                                 make SUBJECT (github:<id> or oidc:<sub>) its owner
+                                                 (admins only)
   mocactl sbx templates quota TARGET --templates N --builds-queued N --active N [--owned N] [--json]
   mocactl sbx templates quota TARGET --clear [--json]
                                                  set a subject's template quotas (TARGET
@@ -160,8 +333,6 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  writes only if unchanged since the read: prints
                                                  old -> new; exit 1, nothing written, if another
                                                  admin changed it in between
-  mocactl sbx hosts [--json]                     per KVM host: active slots, start line, memory
-                                                 headroom and floor, idle grace, disk
   mocactl sbx admin subjects [--json]            every enrolled subject and its roles (admins only)
   mocactl sbx admin subjects enroll|unenroll SUBJECT [--json]
                                                  enroll SUBJECT (github:<id> or oidc:<sub>) or unenroll
@@ -174,139 +345,6 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  lapse by itself (each
                                                  change prints old -> new, and fails if the value
                                                  changed between its read and its write)
-  mocactl sbx create [--template ID[:TAG|@BUILD]] [--name N] [--label k=v ...] [--seed]
-                     [--mode per-exec|lease|lease+processes] [--idle-timeout S] [--lifetime DURATION]
-                     [--json]
-                                                 create a sandbox (template: default); prints its id;
-                                                 --seed: run the served build's seed, then check
-                                                 /workspace is a clean tree (its HEAD becomes the
-                                                 baseline pull and rm measure changes from);
-                                                 --mode (default per-exec): a lease mode keeps the
-                                                 guest between commands (the deployment must allow
-                                                 it; an upgrade, so only from a terminal), its
-                                                 lease ending after S idle seconds (default: the
-                                                 worker's);
-                                                 --lifetime: the sandbox ends after DURATION (36h,
-                                                 14d, 90m or seconds; at least 1 h) without use
-                                                 (default: the deployment's, 7 d; at most its
-                                                 maximum, 30 d by default)
-  mocactl sbx ls [--all] [--json]                your sandboxes (--all: everyone's; admins only)
-  mocactl sbx get [ID] [--json]                  a sandbox's mode, epoch and idle timeout, and its
-                                                 lease's state (a lease mode the worker has not
-                                                 taken yet is sent again)
-  mocactl sbx mode per-exec|lease|lease+processes [ID] [--idle-timeout S]
-                                                 change the sandbox's mode (an upgrade only from a
-                                                 terminal; the idle timeout is kept unless given); a
-                                                 worker that cannot be reached takes it at the next
-                                                 command; a downgrade to per-exec ends the lease;
-                                                 lease+processes to lease keeps it and stops the
-                                                 tracked processes (it prints those it stopped)
-  mocactl sbx reset [ID]                         end the sandbox's lease: the next command starts a
-                                                 new guest (/tmp, installs outside /workspace and
-                                                 background processes are gone)
-  mocactl sbx proc start [--name N] [--cwd D] [ID] -- CMD ...
-                                                 start CMD as a tracked process, which outlives the
-                                                 command (lease+processes only; CMD quoted as run's;
-                                                 D inside /workspace; N unique among the running
-                                                 ones); prints its id, name and pid
-  mocactl sbx proc ls [ID] [--json]              the tracked processes: id, name, pid, state
-                                                 (running, exited(code) or killed(signal)), age and
-                                                 memory; an exited one stays until the lease ends
-  mocactl sbx proc logs (NAME|ID) [--tail N] [--raw] [ID]
-                                                 the last N lines (default 200) of a tracked
-                                                 process's stdout and stderr; on a terminal its
-                                                 control sequences are removed (--raw keeps them;
-                                                 piped output is always as written)
-  mocactl sbx proc stop (NAME|ID) [--signal S] [ID]
-                                                 send S (default TERM), then kill what is left
-                                                 after 10 s; prints its final state
-                                                 (the process: its name, or its id, p<n> or n; the
-                                                 last ID is the sandbox's)
-  mocactl sbx rm [ID] [--keep-config] [--force] [--json]
-                                                 delete a sandbox (its lease ended first); for the
-                                                 bound one, also take back the agent configuration
-                                                 sbx up added, and .sbx/ (unless --keep-config)
-                                                 (refused while the sandbox has changes not yet
-                                                 pulled, unless --force, or when that cannot be
-                                                 checked)
-  mocactl sbx token [ID] [--renew-every S] [--json]
-                                                 print a fresh sandbox token (15 minutes by default);
-                                                 --renew-every: a new line every S seconds until stopped
-  mocactl sbx env [ID]                           shell exports for a direct sandbox/v1 client
-  mocactl sbx egress [ID] [--json | --ndjson | --verify]
-                                                 what the sandbox reached through its host's egress
-                                                 proxy: per host, and whether the log is complete;
-                                                 --ndjson prints the log whose sha256 its end record names;
-                                                 --verify checks the log served against the control
-                                                 plane's summary of it (sha256 and count; once the log
-                                                 is sealed, 10 minutes after the end, it is final)
-  mocactl sbx run [--sandbox ID] [--timeout S] [-- CMD ...]   run CMD (or the script on stdin) in /workspace
-                                                 (CMD's words are quoted, so they run exactly as typed:
-                                                 for pipes, $VARS or globs use stdin or -- sh -c '...';
-                                                 exit: the command's code; 124 timed out or killed;
-                                                 125 sandbox failure; 75 refused before it started,
-                                                 every try (retried MOCACTL_SBX_BUSY_RETRIES times,
-                                                 default 4, at most 20; nothing ran); 130
-                                                 interrupted; S defaults to, and is capped at, the
-                                                 sandbox token's lifetime minus 60 s)
-  mocactl sbx put PATH [--sandbox ID]            write stdin to PATH under /workspace
-                                                 (a refusal before start: retried, 75, as run's)
-  mocactl sbx mcp [--sandbox ID]                 the stdio MCP server for Claude Code / OpenCode
-  mocactl sbx claude [-- CLAUDE_ARGS ...]        run Claude Code on this sandbox's MCP tools, for
-                                                 one run (--mcp-config + --strict-mcp-config,
-                                                 nothing written, no approval asked: the first
-                                                 bare claude session's approval question is why
-                                                 this exists, #577; Claude Code still asks once
-                                                 whether you trust the folder. The session loads
-                                                 no MCP server but the sandbox's; run claude
-                                                 yourself for your own servers). Its local tools
-                                                 are denied (--disallowed-tools) from any
-                                                 directory, except in a repo up --cortex set up,
-                                                 where Cortex blocks them
-  mocactl sbx codex [-- CODEX_ARGS ...]          run Codex CLI on this sandbox's MCP tools, for one
-                                                 run (-c, nothing written: Codex reads no
-                                                 project-local config, so up cannot configure it).
-                                                 Its shell tool is off, but unified_exec cannot be
-                                                 disabled, so local execution is restricted, not
-                                                 denied: use Codex's own sandbox_mode as well
-  mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config] [--cortex]
-                 [--lifetime DURATION]
-                                                 in a git repository: create or reuse its sandbox,
-                                                 push the working tree, bind it in .sbx/sandbox.json,
-                                                 and point Claude Code, OpenCode and IBM Bob at the
-                                                 sandbox's MCP tools, with their local tools denied
-                                                 (Bob's cannot be: it has no deny list) (merged
-                                                 into .mcp.json, .claude/settings.json,
-                                                 opencode.json, .bob/settings.json, .bob/mcp.json,
-                                                 CLAUDE.md, AGENTS.md; a value there that conflicts
-                                                 stops up before anything is done)
-                                                 (a reused sandbox with changes not yet pulled is
-                                                 left unpushed, with a warning, and up exits 0)
-                                                 (--cortex: Cortex v0.9.3+ blocks the local tools
-                                                 instead of a deny list, so Claude Code loads the
-                                                 project's CLAUDE.md; kept by later runs)
-                                                 (--lifetime: a new sandbox ends after DURATION
-                                                 (36h, 14d, 90m or seconds; at least 1 h) without
-                                                 use; default: the deployment's, 7 d; at most its
-                                                 maximum, 30 d by default; a reused sandbox keeps
-                                                 its own)
-  mocactl sbx push [--force] [--include-secrets] [--max-push MiB]   push the working tree again
-                                                 (refused while the sandbox has changes not yet
-                                                 pulled, unless --force; .env*, *.pem, *.key and
-                                                 id_* stay behind unless --include-secrets)
-  mocactl sbx pull [--apply] [-o FILE]           the sandbox's changes as a patch, on stdout or in
-                                                 FILE (--apply: apply it here, then advance the
-                                                 sandbox's baseline)
-  mocactl sbx credentials [list] [--json]       the credentials the host swaps into your sandboxes' HTTPS requests
-  mocactl sbx credentials add NAME (--host DEST ... [--kind K] | --preset ID)
-                                                 store one (the secret is read from stdin, never argv);
-                                                 DEST is host[:port][/prefix]; K: bearer (default), basic,
-                                                 api-key, oauth2-token (basic: stdin is username=...
-                                                 and password=... lines)
-  mocactl sbx credentials presets [--json]       the presets \`add --preset\` knows
-  mocactl sbx credentials delete NAME            delete one
-  mocactl sbx doctor [--sandbox ID] [--json]     check login, sandbox, agent config, exec and recent
-                                                 calls (exit 0 when every check passes, else 1)
 --record F (every command that calls the API but token, login, logout and credentials): one
 NDJSON line per HTTP attempt appended to F (0600), with no token, host or free text in it.
 ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json. The control plane
@@ -314,6 +352,31 @@ comes from --control-plane-url, MOCACTL_SBX_URL, the bound sandbox's, the one re
 login, or the login's own (a login minted by an operator). The login is kept apart from \`mocactl login\`'s, so both can be active at once.
 exit: 0 ok, 1 failed, 2 usage, 3 log in first, 4 control plane unreachable, 5 a wait timed out,
 130 interrupted (Ctrl-C)`;
+
+/**
+ * `mocactl sbx COMMAND [SUB...] --help`: that command's entries (commandUsage), then the notes that
+ * apply to them. Undefined for a command with no entry, which then gets the whole usage. A usage
+ * error (`forError`) leaves out the exit codes: the user just saw which one they got.
+ */
+export function sbxCommandUsage(
+  words: string[],
+  opts: { forError?: boolean } = {},
+): string | undefined {
+  const body = commandUsage(SBX_USAGE, '  mocactl sbx ', words);
+  if (body === undefined) return undefined;
+  const notes = [
+    // A sandbox ID (`[ID]`, `--sandbox ID`), not `--id ID` or `--preset ID`.
+    /\[ID\]|--sandbox ID/.test(body)
+      ? 'ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json.'
+      : undefined,
+    opts.forError
+      ? undefined
+      : 'exit codes: 0 ok, 1 failed, 2 usage error, 3 not logged in, 4 control plane unreachable,\n' +
+        '5 a wait timed out, 130 stopped by Ctrl-C',
+    'Run `mocactl sbx --help` for the list of all commands.',
+  ].filter((l): l is string => l !== undefined);
+  return `usage:\n${body}\n${notes.join('\n')}`;
+}
 
 export interface SbxDeps {
   signal?: AbortSignal;
@@ -473,7 +536,7 @@ export async function openSbx(
     io.err(`sbx: not logged in to the sandbox service${where}: run \`${login}\`${other}`);
     return SBX_EXIT.loginRequired;
   }
-  if (auth.kind === 'unreachable') return failRefresh(io, auth.error);
+  if (auth.kind === 'unreachable') return failRefresh(io, auth.error, url);
   return opened;
 }
 
@@ -658,6 +721,62 @@ export async function sbxMain(
   }
 }
 
+/** `mocactl sbx`'s flags: one table, for the parse and for typedWords. */
+const SBX_OPTIONS = {
+  'control-plane-url': { type: 'string' },
+  template: { type: 'string' },
+  build: { type: 'string' },
+  description: { type: 'string' },
+  visibility: { type: 'string' },
+  seed: { type: 'boolean' },
+  mode: { type: 'string' },
+  'idle-timeout': { type: 'string' },
+  lifetime: { type: 'string' },
+  name: { type: 'string' },
+  cwd: { type: 'string' },
+  tail: { type: 'string' },
+  raw: { type: 'boolean' },
+  signal: { type: 'string' },
+  label: { type: 'string', multiple: true },
+  all: { type: 'boolean' },
+  json: { type: 'boolean' },
+  ndjson: { type: 'boolean' },
+  verify: { type: 'boolean' },
+  sandbox: { type: 'string' },
+  timeout: { type: 'string' },
+  lease: { type: 'string' },
+  wait: { type: 'boolean' },
+  reason: { type: 'string' },
+  templates: { type: 'string' },
+  'builds-queued': { type: 'string' },
+  active: { type: 'string' },
+  owned: { type: 'string' },
+  clear: { type: 'boolean' },
+  'stop-now': { type: 'boolean' },
+  force: { type: 'boolean' },
+  'include-secrets': { type: 'boolean' },
+  'max-push': { type: 'string' },
+  apply: { type: 'boolean' },
+  out: { type: 'string', short: 'o' },
+  'no-agent-config': { type: 'boolean' },
+  cortex: { type: 'boolean' },
+  'keep-config': { type: 'boolean' },
+  'no-browser': { type: 'boolean' },
+  host: { type: 'string', multiple: true },
+  kind: { type: 'string' },
+  preset: { type: 'string' },
+  'renew-every': { type: 'string' },
+  record: { type: 'string' },
+  spec: { type: 'string', multiple: true },
+  id: { type: 'string' },
+  image: { type: 'string' },
+  profile: { type: 'string' },
+  'gate-record': { type: 'string' },
+  'dry-run': { type: 'boolean' },
+  until: { type: 'string' },
+  help: { type: 'boolean', short: 'h' },
+} satisfies ParseArgsConfig['options'];
+
 async function sbxMainWith(
   argv: string[],
   env: NodeJS.ProcessEnv,
@@ -665,6 +784,9 @@ async function sbxMainWith(
   deps: SbxDeps,
   record: { recorder?: CallRecorder },
 ): Promise<number> {
+  // A usage error shows the help of the command it is about (sbxCommandUsage), as --help does.
+  const words = typedWords(argv, SBX_OPTIONS);
+  const usage = sbxCommandUsage(words, { forError: true }) ?? SBX_USAGE;
   let parsed;
   try {
     parsed = parseArgs({
@@ -673,63 +795,10 @@ async function sbxMainWith(
       strict: true,
       // `proc start [ID] -- CMD`: where `--` was tells the ID from the command.
       tokens: true,
-      options: {
-        'control-plane-url': { type: 'string' },
-        template: { type: 'string' },
-        build: { type: 'string' },
-        description: { type: 'string' },
-        visibility: { type: 'string' },
-        seed: { type: 'boolean' },
-        mode: { type: 'string' },
-        'idle-timeout': { type: 'string' },
-        lifetime: { type: 'string' },
-        name: { type: 'string' },
-        cwd: { type: 'string' },
-        tail: { type: 'string' },
-        raw: { type: 'boolean' },
-        signal: { type: 'string' },
-        label: { type: 'string', multiple: true },
-        all: { type: 'boolean' },
-        json: { type: 'boolean' },
-        ndjson: { type: 'boolean' },
-        verify: { type: 'boolean' },
-        sandbox: { type: 'string' },
-        timeout: { type: 'string' },
-        lease: { type: 'string' },
-        wait: { type: 'boolean' },
-        reason: { type: 'string' },
-        templates: { type: 'string' },
-        'builds-queued': { type: 'string' },
-        active: { type: 'string' },
-        owned: { type: 'string' },
-        clear: { type: 'boolean' },
-        'stop-now': { type: 'boolean' },
-        force: { type: 'boolean' },
-        'include-secrets': { type: 'boolean' },
-        'max-push': { type: 'string' },
-        apply: { type: 'boolean' },
-        out: { type: 'string', short: 'o' },
-        'no-agent-config': { type: 'boolean' },
-        cortex: { type: 'boolean' },
-        'keep-config': { type: 'boolean' },
-        'no-browser': { type: 'boolean' },
-        host: { type: 'string', multiple: true },
-        kind: { type: 'string' },
-        preset: { type: 'string' },
-        'renew-every': { type: 'string' },
-        record: { type: 'string' },
-        spec: { type: 'string', multiple: true },
-        id: { type: 'string' },
-        image: { type: 'string' },
-        profile: { type: 'string' },
-        'gate-record': { type: 'string' },
-        'dry-run': { type: 'boolean' },
-        until: { type: 'string' },
-        help: { type: 'boolean', short: 'h' },
-      },
+      options: SBX_OPTIONS,
     });
   } catch (err) {
-    io.err(`${(err as Error).message}\n${SBX_USAGE}`);
+    io.err(`${(err as Error).message}\n${usage}`);
     return SBX_EXIT.usage;
   }
   const { values, positionals } = parsed;
@@ -738,11 +807,13 @@ async function sbxMainWith(
   const afterDash = dash ? argv.slice(dash.index + 1) : undefined;
   const [command, arg, ...extra] = positionals;
   if (values.help) {
-    io.out(SBX_USAGE + '\n');
+    // `sbx COMMAND --help`: that command's syntax, not every command's (the words before `--`).
+    // Bare `sbx --help` opens with what an sbx sandbox is (#599).
+    io.out((sbxCommandUsage(words) ?? `${SBX_ABOUT}\n\n${SBX_USAGE}`) + '\n');
     return SBX_EXIT.ok;
   }
   if (!command) {
-    io.err(SBX_USAGE);
+    io.err(`${SBX_ABOUT}\n\n${usage}`);
     return SBX_EXIT.usage;
   }
   const known = [
@@ -775,29 +846,29 @@ async function sbxMainWith(
     'proc',
   ];
   if (!known.includes(command)) {
-    io.err(`sbx: unknown command '${command}'\n${SBX_USAGE}`);
+    io.err(`sbx: unknown command '${command}'\n${usage}`);
     return SBX_EXIT.usage;
   }
   // These print no JSON (login and logout report on stderr, env prints shell exports), so a
   // --json would be silently ignored: refuse it rather than hand a script something it cannot parse.
   if (values.json && NO_JSON.has(command)) {
-    io.err(`sbx: ${command} has no --json output\n${SBX_USAGE}`);
+    io.err(`sbx: ${command} has no --json output\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.sandbox !== undefined && !TAKES_SANDBOX_FLAG.has(command)) {
-    io.err(`sbx: --sandbox does not apply to ${command}\n${SBX_USAGE}`);
+    io.err(`sbx: --sandbox does not apply to ${command}\n${usage}`);
     return SBX_EXIT.usage;
   }
   if ((values.ndjson || values.verify) && command !== 'egress') {
-    io.err(`sbx: --ndjson and --verify only apply to egress\n${SBX_USAGE}`);
+    io.err(`sbx: --ndjson and --verify only apply to egress\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.ndjson && values.json) {
-    io.err(`sbx: egress takes --json or --ndjson, not both\n${SBX_USAGE}`);
+    io.err(`sbx: egress takes --json or --ndjson, not both\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.verify && values.ndjson) {
-    io.err(`sbx: egress takes --ndjson or --verify, not both\n${SBX_USAGE}`);
+    io.err(`sbx: egress takes --ndjson or --verify, not both\n${usage}`);
     return SBX_EXIT.usage;
   }
   // `templates SUB`: the template subcommand, for the flags that apply to some of them only.
@@ -810,7 +881,7 @@ async function sbxMainWith(
     !(sub !== undefined && TAKES_TIMEOUT.includes(sub))
   ) {
     io.err(
-      `sbx: --timeout only applies to run and templates ${TAKES_TIMEOUT.join(', ')}\n${SBX_USAGE}`,
+      `sbx: --timeout only applies to run and templates ${TAKES_TIMEOUT.join(', ')}\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
@@ -818,44 +889,44 @@ async function sbxMainWith(
     (f) => values[f] !== undefined,
   );
   if (createFlag && !(sub === 'create' || sub === 'build')) {
-    io.err(`sbx: --${createFlag} only applies to templates create and build\n${SBX_USAGE}`);
+    io.err(`sbx: --${createFlag} only applies to templates create and build\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.timeout !== undefined && (activating || retiring) && !values.wait) {
-    io.err(`sbx: --timeout with templates ${sub} needs --wait\n${SBX_USAGE}`);
+    io.err(`sbx: --timeout with templates ${sub} needs --wait\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.id !== undefined && sub !== 'create') {
-    io.err(`sbx: --id only applies to templates create\n${SBX_USAGE}`);
+    io.err(`sbx: --id only applies to templates create\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.visibility !== undefined && !(sub === 'create' || sub === 'edit')) {
-    io.err(`sbx: --visibility only applies to templates create and edit\n${SBX_USAGE}`);
+    io.err(`sbx: --visibility only applies to templates create and edit\n${usage}`);
     return SBX_EXIT.usage;
   }
   if ((sub === 'create' || sub === 'build') && !values.spec?.length) {
-    io.err(`sbx: templates ${sub} needs --spec F\n${SBX_USAGE}`);
+    io.err(`sbx: templates ${sub} needs --spec F\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub === 'build' && (values.spec?.length ?? 0) > 1) {
-    io.err(`sbx: templates build takes one --spec\n${SBX_USAGE}`);
+    io.err(`sbx: templates build takes one --spec\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.lease !== undefined && !activating) {
-    io.err(`sbx: --lease only applies to templates activate\n${SBX_USAGE}`);
+    io.err(`sbx: --lease only applies to templates activate\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.wait !== undefined && !(activating || retiring)) {
-    io.err(`sbx: --wait only applies to templates activate and templates retire\n${SBX_USAGE}`);
+    io.err(`sbx: --wait only applies to templates activate and templates retire\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.reason !== undefined && !retiring) {
-    io.err(`sbx: --reason only applies to templates retire\n${SBX_USAGE}`);
+    io.err(`sbx: --reason only applies to templates retire\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.reason !== undefined && values.build !== undefined) {
     io.err(
-      `sbx: --reason is kept for a whole template's retire; retiring one build (--build) takes none\n${SBX_USAGE}`,
+      `sbx: --reason is kept for a whole template's retire; retiring one build (--build) takes none\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
@@ -865,18 +936,18 @@ async function sbxMainWith(
   );
   const settingQuota = command === 'templates' && arg === 'quota';
   if (quotaFlags.length > 0 && !settingQuota) {
-    io.err(`sbx: --${quotaFlags[0]} only applies to templates quota\n${SBX_USAGE}`);
+    io.err(`sbx: --${quotaFlags[0]} only applies to templates quota\n${usage}`);
     return SBX_EXIT.usage;
   }
   let quotaBody: SbxQuota | null | undefined;
   if (settingQuota) {
     if (values.clear) {
       if (quotaFlags.length > 1) {
-        io.err(`sbx: --clear takes no other quota flag\n${SBX_USAGE}`);
+        io.err(`sbx: --clear takes no other quota flag\n${usage}`);
         return SBX_EXIT.usage;
       }
       if (extra[0] === 'default') {
-        io.err(`sbx: the default quota is set, never cleared\n${SBX_USAGE}`);
+        io.err(`sbx: the default quota is set, never cleared\n${usage}`);
         return SBX_EXIT.usage;
       }
       quotaBody = null;
@@ -889,20 +960,20 @@ async function sbxMainWith(
       };
       if (![q.templates, q.buildsQueued, q.active].every(Number.isSafeInteger)) {
         io.err(
-          `sbx: templates quota needs --templates, --builds-queued and --active (whole numbers), or --clear\n${SBX_USAGE}`,
+          `sbx: templates quota needs --templates, --builds-queued and --active (whole numbers), or --clear\n${usage}`,
         );
         return SBX_EXIT.usage;
       }
       const owned = values.owned === undefined ? undefined : n(values.owned);
       if (owned !== undefined && !Number.isSafeInteger(owned)) {
-        io.err(`sbx: --owned must be a whole number\n${SBX_USAGE}`);
+        io.err(`sbx: --owned must be a whole number\n${usage}`);
         return SBX_EXIT.usage;
       }
       quotaBody = owned === undefined ? q : { ...q, owned };
     }
   }
   if (values['stop-now'] !== undefined && !(command === 'templates' && arg === 'deactivate')) {
-    io.err(`sbx: --stop-now only applies to templates deactivate\n${SBX_USAGE}`);
+    io.err(`sbx: --stop-now only applies to templates deactivate\n${usage}`);
     return SBX_EXIT.usage;
   }
   let leaseSeconds: number | undefined;
@@ -918,55 +989,55 @@ async function sbxMainWith(
     ([flag, cmds]) => values[flag] !== undefined && !cmds.includes(command),
   );
   if (flagMisuse) {
-    io.err(`sbx: --${flagMisuse[0]} only applies to ${flagMisuse[1].join(' and ')}\n${SBX_USAGE}`);
+    io.err(`sbx: --${flagMisuse[0]} only applies to ${flagMisuse[1].join(' and ')}\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.record !== undefined && NO_RECORD.has(command)) {
-    io.err(`sbx: ${command} takes no --record (it would record a secret)\n${SBX_USAGE}`);
+    io.err(`sbx: ${command} takes no --record (it would record a secret)\n${usage}`);
     return SBX_EXIT.usage;
   }
   const renewEvery = wholeSeconds(io, 'renew-every', values['renew-every']);
   if (renewEvery === null) return SBX_EXIT.usage;
   const credFlag = (['host', 'kind', 'preset'] as const).find((f) => values[f] !== undefined);
   if (credFlag && !(command === 'credentials' && arg === 'add')) {
-    io.err(`sbx: --${credFlag} only applies to credentials add\n${SBX_USAGE}`);
+    io.err(`sbx: --${credFlag} only applies to credentials add\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.cortex && values['no-agent-config']) {
     io.err(
-      `sbx: --cortex is a choice about the agent configuration, which --no-agent-config does not write\n${SBX_USAGE}`,
+      `sbx: --cortex is a choice about the agent configuration, which --no-agent-config does not write\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
   if (values.template !== undefined && !values.template.trim()) {
-    io.err(`sbx: --template needs a template id (see mocactl sbx templates)\n${SBX_USAGE}`);
+    io.err(`sbx: --template needs a template id (see mocactl sbx templates)\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (
     (values.template !== undefined || (values.name !== undefined && command !== 'proc')) &&
     !['create', 'up'].includes(command)
   ) {
-    io.err(`sbx: --template and --name only apply to create and up\n${SBX_USAGE}`);
+    io.err(`sbx: --template and --name only apply to create and up\n${usage}`);
     return SBX_EXIT.usage;
   }
   const procFlag = (['cwd', 'tail', 'raw', 'signal'] as const).find((f) => values[f] !== undefined);
   if (procFlag && command !== 'proc') {
-    io.err(`sbx: --${procFlag} only applies to proc ${PROC_FLAG_OWNER[procFlag]}\n${SBX_USAGE}`);
+    io.err(`sbx: --${procFlag} only applies to proc ${PROC_FLAG_OWNER[procFlag]}\n${usage}`);
     return SBX_EXIT.usage;
   }
   // `templates SUB ...` (template lifecycle spec §4), the owner's and admin's actions (§5.1-§5.2,
   // retire among them; quota TARGET: §5.2), and activate and deactivate (§6.3); bare `templates`
   // lists them.
   if (sub !== undefined && !TEMPLATE_SUBS.includes(sub)) {
-    io.err(`sbx: unknown templates command '${sanitizeRemote(sub)}'\n${SBX_USAGE}`);
+    io.err(`sbx: unknown templates command '${sanitizeRemote(sub)}'\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub !== undefined && TEMPLATE_ADMIN_SUBS.includes(sub) && extra.some((x) => !x.trim())) {
-    io.err(`sbx: templates ${sub} takes no empty argument\n${SBX_USAGE}`);
+    io.err(`sbx: templates ${sub} takes no empty argument\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub === 'create' && extra.length > 0) {
-    io.err(`sbx: templates create takes no ID (the spec names it, or --id)\n${SBX_USAGE}`);
+    io.err(`sbx: templates create takes no ID (the spec names it, or --id)\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (
@@ -975,38 +1046,38 @@ async function sbxMainWith(
     (extra.length !== 1 || !extra[0]!.trim())
   ) {
     io.err(
-      `sbx: templates ${sub} takes one ${sub === 'quota' ? 'TARGET (default or a subject)' : 'template ID'}\n${SBX_USAGE}`,
+      `sbx: templates ${sub} takes one ${sub === 'quota' ? 'TARGET (default or a subject)' : 'template ID'}\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
   if ((sub === 'untag' || sub === 'transfer') && extra.length !== 2) {
     io.err(
-      `sbx: templates ${sub} takes a template ID and ${sub === 'untag' ? 'a TAG' : 'a SUBJECT'}\n${SBX_USAGE}`,
+      `sbx: templates ${sub} takes a template ID and ${sub === 'untag' ? 'a TAG' : 'a SUBJECT'}\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
   if (sub === 'tag' && extra.length < 2) {
-    io.err(`sbx: templates tag takes a template ID and at least one TAG\n${SBX_USAGE}`);
+    io.err(`sbx: templates tag takes a template ID and at least one TAG\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.build !== undefined && !(sub !== undefined && TAKES_BUILD.includes(sub))) {
-    io.err(`sbx: --build only applies to templates ${TAKES_BUILD.join(', ')}\n${SBX_USAGE}`);
+    io.err(`sbx: --build only applies to templates ${TAKES_BUILD.join(', ')}\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub === 'cancel' && values.build === undefined) {
-    io.err(`sbx: templates cancel needs --build BUILD\n${SBX_USAGE}`);
+    io.err(`sbx: templates cancel needs --build BUILD\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub === 'tag' && values.build === undefined) {
-    io.err(`sbx: templates tag needs --build BUILD\n${SBX_USAGE}`);
+    io.err(`sbx: templates tag needs --build BUILD\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.description !== undefined && sub !== 'edit') {
-    io.err(`sbx: --description only applies to templates edit\n${SBX_USAGE}`);
+    io.err(`sbx: --description only applies to templates edit\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (sub === 'edit' && values.visibility === undefined && values.description === undefined) {
-    io.err(`sbx: templates edit needs --visibility or --description\n${SBX_USAGE}`);
+    io.err(`sbx: templates edit needs --visibility or --description\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (
@@ -1015,17 +1086,17 @@ async function sbxMainWith(
     values.visibility !== 'private' &&
     values.visibility !== 'deployment'
   ) {
-    io.err(`sbx: --visibility must be private or deployment\n${SBX_USAGE}`);
+    io.err(`sbx: --visibility must be private or deployment\n${usage}`);
     return SBX_EXIT.usage;
   }
   if (values.build !== undefined && !values.build.trim()) {
-    io.err(`sbx: --build needs a build id (see mocactl sbx templates show ID)\n${SBX_USAGE}`);
+    io.err(`sbx: --build needs a build id (see mocactl sbx templates show ID)\n${usage}`);
     return SBX_EXIT.usage;
   }
   const subjectAction =
     command === 'admin' && arg === 'subjects' && extra.length > 0 ? extra[0] : undefined;
   if (values.until !== undefined && subjectAction !== 'grant') {
-    io.err(`sbx: --until only applies to admin subjects grant\n${SBX_USAGE}`);
+    io.err(`sbx: --until only applies to admin subjects grant\n${usage}`);
     return SBX_EXIT.usage;
   }
   let until: number | undefined;
@@ -1033,7 +1104,7 @@ async function sbxMainWith(
     until = parseUntil(values.until, Math.floor(Date.now() / 1000));
     if (until === undefined) {
       io.err(
-        `sbx: --until must be a duration (30m, 2h, 1d) or epoch seconds (not milliseconds) in the future, at most 365 days ahead (got '${sanitizeRemote(values.until)}')\n${SBX_USAGE}`,
+        `sbx: --until must be a duration (30m, 2h, 1d) or epoch seconds (not milliseconds) in the future, at most 365 days ahead (got '${sanitizeRemote(values.until)}')\n${usage}`,
       );
       return SBX_EXIT.usage;
     }
@@ -1078,7 +1149,7 @@ async function sbxMainWith(
             : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
   if (!argsOk) {
     io.err(
-      `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${SBX_USAGE}`,
+      `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${usage}`,
     );
     return SBX_EXIT.usage;
   }
@@ -1141,7 +1212,7 @@ async function sbxMainWith(
     const head = positionals.slice(0, positionals.length - (afterDash?.length ?? 0));
     const r = parseProcArgs(head[1], head.slice(2), afterDash, values);
     if (typeof r === 'string') {
-      io.err(`sbx: ${r}\n${SBX_USAGE}`);
+      io.err(`sbx: ${r}\n${usage}`);
       return SBX_EXIT.usage;
     }
     proc = r.args;
@@ -1278,14 +1349,14 @@ async function sbxMainWith(
 
   if (command === 'credentials') {
     if (arg !== undefined && !['add', 'delete', 'presets', 'list'].includes(arg)) {
-      io.err(`sbx: unknown credentials command '${sanitizeRemote(arg)}'\n${SBX_USAGE}`);
+      io.err(`sbx: unknown credentials command '${sanitizeRemote(arg)}'\n${usage}`);
       return SBX_EXIT.usage;
     }
     // The catalog is local: no login, no request, no stdin.
     if (arg === 'presets') return listPresets({ io, json: values.json === true });
     if (arg === 'add' || arg === 'delete') {
       if (!extra[0]) {
-        io.err(`sbx: credentials ${arg} needs a NAME\n${SBX_USAGE}`);
+        io.err(`sbx: credentials ${arg} needs a NAME\n${usage}`);
         return SBX_EXIT.usage;
       }
     }

@@ -284,10 +284,13 @@ install_egress() {
   fi
   install -d -m 0755 "$SBX_UNIT_DIR"
   install -d -m 0700 "$SBX_ENV_DIR"
+  # Every exit after the mktemp removes the file: under `set -e` a bare failing step would end the
+  # script with the temp file left behind.
   tmp="$(mktemp)"
-  egress_unit_text >"$tmp"
+  egress_unit_text >"$tmp" ||
+    { rm -f "$tmp"; die "cannot read the moca-egress unit source $SCRIPT_DIR/../microvm/moca-egress.service: install-host.sh runs from a full checkout"; }
   if ! cmp -s "$tmp" "$unit" 2>/dev/null; then
-    install -m 0644 "$tmp" "$unit"
+    install -m 0644 "$tmp" "$unit" || { rm -f "$tmp"; die "cannot install $unit"; }
     changed=1
   fi
   rm -f "$tmp"
@@ -328,7 +331,7 @@ ca_fingerprint() {
   local der
   der="$(mktemp)"
   openssl x509 -in "$1" -outform DER >"$der" || { rm -f "$der"; die "cannot read the certificate $1"; }
-  sha256_of "$der"
+  sha256_of "$der" || { rm -f "$der"; die "cannot hash the certificate $1"; }
   rm -f "$der"
 }
 
@@ -467,9 +470,23 @@ warn_untrusting_workers() {
 }
 
 # remove_credential_file PATH: the drop-in, token and api CA go; the host CA stays (snapshots carry it).
+# PATH comes from the manifest, which is a file and not proof that the path is this script's: only the
+# drop-in and the files directly in the credential directory are ever removed. Anything else (an edited
+# or corrupted manifest line) is kept and named, never deleted as root.
 remove_credential_file() {
+  local d name
+  d="$(EGRESS_CRED_DIR)"
   case "$1" in
-  "$(EGRESS_CRED_DIR)/ca.crt" | "$(EGRESS_CRED_DIR)/ca.key") log "kept for the snapshot: $1 (it was built with this CA)"; return 1 ;;
+  "$d/ca.crt" | "$d/ca.key") log "kept for the snapshot: $1 (it was built with this CA)"; return 1 ;;
+  "$(egress_dropin)") ;;
+  "$d"/*)
+    name="${1#"$d"/}"
+    if [[ -z "$name" || "$name" == */* || "$name" == . || "$name" == .. ]]; then
+      log "kept $1 (not a credential file of this script)"
+      return 1
+    fi
+    ;;
+  *) log "kept $1 (not a credential file of this script)"; return 1 ;;
   esac
   rm -f "$1"
   rmdir "$(dirname "$1")" 2>/dev/null || true
@@ -876,7 +893,9 @@ install_janitor() {
   # stays there (spec §8.1), where the lifetime is known.
   [[ "$age" =~ ^(0|[1-9][0-9]{0,8})$ ]] || die "SBX_JANITOR_AGE in $b/janitor.env must be whole seconds, in decimal without a leading zero"
   ((10#$age > 60)) || die "SBX_JANITOR_AGE in $b/janitor.env is ${age} s: it must exceed 60 s (re-run deploy/sbx/setup.sh and copy the new bundle)"
-  [[ "$(<"$b/janitor.token")" =~ ^[!-~]{32,}$ ]] || die "$b/janitor.token does not hold a token of 32+ printable characters: copy the bundle again"
+  # [[:graph:]], not [!-~]: under a UTF-8 locale the latter can NOMATCH printable ASCII it should
+  # match (the LC_ALL=C workaround's bug class; same fix as setup.sh's janitor-token check).
+  [[ "$(<"$b/janitor.token")" =~ ^[[:graph:]]{32,}$ ]] || die "$b/janitor.token does not hold a token of 32+ printable characters: copy the bundle again"
   if [[ -f "$b/api-ca.crt" ]]; then
     grep -q -- '-----BEGIN CERTIFICATE-----' "$b/api-ca.crt" || die "$b/api-ca.crt holds no PEM certificate"
     ca="$SBX_ENV_DIR/janitor-api-ca.crt"

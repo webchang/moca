@@ -34,6 +34,10 @@ const NOT_ENV_ON_K8S: Record<string, string> = {
   // rig with an SSH tunnel; no manifest sets them, and deploy/sbx's overlay test forbids them on ocp-sbx.
   MOCA_RELAY_CLIENT_TOKENS:
     'VM rig only: demo-grade per-client tokens set by hand; no manifest sets them (ocp-sbx forbids them)',
+  // Tuning knobs with a code default (#439); no manifest sets them, so the default applies.
+  MOCA_RELAY_KEEPALIVE_TIME_MS: 'a tuning knob with a code default (#439); unset on every manifest',
+  MOCA_RELAY_KEEPALIVE_TIMEOUT_MS:
+    'a tuning knob with a code default (#439); unset on every manifest',
   // An operator's debug switch, off unless set by hand; no manifest sets it, ocp-sbx included.
   SH_SANDBOX_AUDIT_COMMANDS:
     'SBX0 only: an operator debug flag (commands in audit lines), off unless set by hand; no manifest sets it',

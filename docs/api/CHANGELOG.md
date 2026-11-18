@@ -8,10 +8,94 @@ that shipped it ("The data plane's twin … goes to"):
 
 | `harness-openapi.yaml` | Shipped with                   |
 | ---------------------- | ------------------------------ |
+| 1.5.0                  | [1.28.0](#1280)                |
+| 1.4.0                  | [1.26.0](#1260)                |
 | 1.3.0                  | [1.17.0](#1170)                |
 | 1.2.0                  | [1.16.0](#1160)                |
 | 1.1.0                  | [1.15.0](#1150)                |
 | 1.0.0                  | the first document, 2026-10-09 |
+
+## 1.29.0
+
+A per-source bound on login starts ([#716](https://github.com/rossoctl/moca/issues/716)).
+Additive.
+
+- `POST /v1/auth/device` now documents its `429 quota_exceeded`, which the oidc provider has
+  answered since it shipped (the 10,000-state total cap) and which now has a second cause: one
+  client address holding `SH_OIDC_MAX_PENDING_PER_SOURCE` (default 20) live login states. The
+  message tells the two apart ("...from this address"); the code and the status are the same. The
+  address is the socket peer, or the X-Forwarded-For entry `SH_TRUSTED_PROXY_HOPS` names (the
+  socket peer when the header holds fewer entries than that). The GitHub provider is unchanged.
+- For a deployment with its own `PendingAuthStore` (the control plane's extension point for a
+  shared pending-login store): `put` now answers which bound refused the entry (`'parked'`,
+  `'full'` or `'source_full'`) instead of a boolean. A store still answering the boolean keeps
+  working: `true` reads as parked and `false` as the total cap's refusal. To enforce the
+  per-source bound, a store answers `'source_full'`.
+
+## 1.28.0
+
+A config bundle's format version, checked where a bundle is stored and where it is applied
+([#510](https://github.com/rossoctl/moca/issues/510)), per the
+[change policy](../reference/change-policy.md#version-markers) (decision 7). Additive on the wire.
+
+- POST /v1/config-bundles refuses a bundle whose `format.json` names a format newer than this
+  release reads, or is not a format version, with `400 invalid_request` and the reason in
+  `message`. A bundle without `format.json` is format 1, so every bundle stored before it existed
+  keeps its digest and stays usable.
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.5.0: POST /v1/turn
+answers `422 config_bundle_unsupported` when the session's bundle is stored and intact but in a
+format the harness does not read, with the reason and what to upgrade in `message`, on the sync
+path and before the first SSE frame alike; after it, the terminal `error` frame carries the same
+reason.
+
+## 1.27.0
+
+The base URL says what it is ([#779](https://github.com/rossoctl/moca/issues/779)). Additive on the
+wire.
+
+- `GET /` answers `200` with a short `text/plain` page on every profile: that this is a Moca control
+  plane, where its API is (`/v1`, and `GET /v1/discovery`), how to install `mocactl` and log in, and
+  that a sandbox's egress is an allowlist the operator extends. Before, it was the unknown-path
+  `404 not_found`. The page names no URL of the deployment and echoes nothing of the request. Its
+  wording is not a contract: a client reads `/v1/discovery`.
+
+## 1.26.0
+
+Per-turn artifacts and a bounded status read
+([#390](https://github.com/rossoctl/moca/issues/390)), per the
+[async fan-out spec](../specs/2026-11-05-p6-async-fan-out-design.md) §4.4 and §9.2. The data plane's
+twin goes to **1.4.0** with it. One **narrowing** on the wire, deliberate and named below — allowed
+because `/v1` is Preview ([maturity](../reference/maturity-and-lifecycle.md)), and recorded here
+because that is what Preview requires.
+
+- `GET /v1/sessions/{id}/turns/{turnId}` no longer inlines the turn's OUTPUT. `result.patch` and
+  `result.text` are **removed** from that body: the route is polled, and a 4 MiB patch rode every
+  poll. In their place, additively: `result.summary` (one line — the assistant's text, a gate's
+  summary, the patch's diffstat or the failure's reason — clipped to `MOCA_TURN_SUMMARY_BYTES`,
+  default 2048 bytes), `result.artifacts` (`[{kind, bytes, sha256?}]`) and `result.workspace` on a
+  solve result as well as a `responded` one. The synchronous `POST /v1/runs` and `GET /runs/status`
+  bodies are untouched — they still carry `patch` and `text` in full.
+- The same cap now holds every **model-written** string in that body, not just `summary`:
+  `result.verdict.reason` and `result.gate.summary`/`proposed_action` are clipped to
+  `MOCA_TURN_SUMMARY_BYTES` with the same trailing `…[truncated]`. Nothing upstream caps them, so
+  unclipped they kept a `done` turn's polled body unbounded. The cap bounds each string's CONTENT,
+  so a clipped one is `MOCA_TURN_SUMMARY_BYTES` plus that 14-byte marker. `MOCA_TURN_SUMMARY_BYTES=0`
+  omits all four keys rather than returning a bare marker; `verdict` and `gate` keep their shaped
+  fields (`item_id`, `verdict`, `gateId`), so a client can still branch on them.
+- `GET /v1/sessions/{id}/turns/{turnId}/artifacts/{kind}` serves the output whole: bytes, with
+  `text/x-diff` and an `ETag` — always `"sha256:<hex>"`, the one format
+  `result.artifacts[].sha256` uses: the capture's own digest when the record carries one, else a
+  digest of the bytes served. `If-None-Match` is not honoured, so the ETag is for comparison, not
+  for skipping a fetch. `patch` is the only kind. Every absence is 404 (unknown kind, a turn
+  not yet terminal, no stored result, a capture refused for size).
+- The data plane's `TurnWorkspace` gains `diffstat` (`{files, insertions, deletions}`), counted from
+  the diff's hunks and present even when `patchRefused` left the bytes behind; `LeafResult`'s
+  `solved` branch gains `workspace`, the descriptor (`baseline`, `patchSha256`, `patchBytes`,
+  `diffstat`) for the patch in `patch`. `RunStatus`'s `solved` branch is unchanged.
+- Async results and turn records are kept for **7 days** by default, up from 24 h
+  (`LEAF_RESULT_TTL_SECONDS` `604800`), so a Friday turn is still readable on Monday. Not a wire
+  change; it is what makes the two routes above worth polling.
 
 ## 1.25.0
 

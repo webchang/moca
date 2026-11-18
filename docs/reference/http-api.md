@@ -54,6 +54,11 @@ Send `Authorization: Bearer <session token>`. The token is an Ed25519 JWT checke
 | `GET /runs/status?sessionId=`            | session token | Read a leaf's stored result                                                          |
 | `POST /run-leaf`, `GET /run-leaf/status` | session token | **Deprecated** aliases of `/runs` and `/runs/status`; log a warning once per process |
 
+The unprefixed `POST /turn` and `POST /runs` are supported, frozen aliases of the `/v1` routes: the same handler, so
+the same auth, body and responses, with no removal date ([change policy](change-policy.md), decision 3). New
+features appear under `/v1` only, so the detachable-turn routes have no unprefixed form; a new client should use
+`/v1`. `docs/api/harness-openapi.yaml` describes both aliases.
+
 Matching is by URL and not uniform. `/health`, `/turn`, `/v1/turn` (POST), `/v1/turn/cancel`, `/runs`,
 `/v1/runs` and `/run-leaf` match the exact URL, so a query string defeats them. `GET /v1/turn` requires
 and accepts a query string, `/runs/status` and `/run-leaf/status` match by prefix, and `/workloads`
@@ -171,7 +176,12 @@ is the leaf result; both are specified in [Leaf envelope and result](leaf-and-en
   worker needs `SH_ASYNC_DRAIN=1` (off by default) to drain the queue. Under `MOCA_TENANCY=multi` the
   dequeue hands the worker grants instead of a key, so the control plane needs the grant ring and the
   inference listener configured — it refuses to boot without them. Poll
-  `GET /v1/sessions/{id}/turns/{turnId}` for state and result. See
+  `GET /v1/sessions/{id}/turns/{turnId}` for state and result. That body is **bounded**: the turn's
+  output is not inlined, because the route is polled — `result.summary` is one clipped line
+  (`MOCA_TURN_SUMMARY_BYTES`, default 2048, which also caps `result.verdict.reason` and the gate's
+  two lines, the body's other model-written strings), `result.workspace` describes the patch (baseline,
+  sha256, size, diffstat) and `result.artifacts` names what
+  `GET /v1/sessions/{id}/turns/{turnId}/artifacts/patch` will serve whole, with an `ETag`. See
   [dispatch archetypes](../concepts/dispatch-archetypes.md) for the operator steps.
 - On a saturated pool the sync path waits with backoff (up to `KAGENTI_SYNC_SATURATION_WAIT_MS`, 30 s)
   and then returns 503 with `Retry-After` and `{"status":"failed","reason":"saturated"}`.
@@ -180,25 +190,25 @@ is the leaf result; both are specified in [Leaf envelope and result](leaf-and-en
 
 The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.yaml). In outline:
 
-| Area           | Routes                                                                                                                                                                                                  |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Probes         | `GET /healthz`, `GET /readyz`, `GET /v1/discovery` (harness URL, sandbox tiers, version; no auth)                                                                                                       |
-| Login          | `POST /v1/auth/device`, `/v1/auth/device/token`, `/v1/auth/token` (refresh), `/v1/auth/revoke`, `/v1/auth/revoke-all`, `GET /v1/me`                                                                     |
-| Sessions       | `POST` and `GET /v1/sessions`, `GET`, `PATCH` and `DELETE /v1/sessions/{id}`, `GET /v1/sessions/{id}/resources`, `POST /v1/sessions/{id}/token`                                                         |
-| Async turns    | `POST /v1/sessions/{id}/turns` (submit, `202`), `GET /v1/sessions/{id}/turns/{turnId}` (state, attempts, result), `DELETE` the same path (cancel while `queued`)                                        |
-| Models         | `GET /v1/models?credential=` (the models a credential's endpoint lists), `GET /v1/sessions/{id}/models` (the models the session's credential lists)                                                     |
-| Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                                                                                        |
-| Config bundles | `POST` and `GET /v1/config-bundles` (your own, newest first), `DELETE /v1/config-bundles/{digest}`                                                                                                      |
-| Internal       | `POST /internal/credentials` (session token → credential) and `POST /internal/turn-credentials` (queued turn id → credential, at dequeue): data plane only, both authenticated with `SH_EXCHANGE_TOKEN` |
-| Templates      | `GET /v1/templates`, `GET /v1/templates/{id}`, `GET /v1/templates/{id}/builds[/{build}]`, `GET /v1/templates/{id}/tags`: both route profiles (API 1.4.0)                                                |
-| Self-serve     | `POST /v1/templates`, `POST /v1/templates/{id}/builds`, `POST /v1/templates/{id}/builds/{build}/cancel`, `GET` and `PUT /v1/policy`, `GET /v1/quota`: both route profiles (API 1.5.0)                   |
-| Template admin | `POST /v1/templates/{id}/tags`, `DELETE /v1/templates/{id}/tags/{tag}`, `PATCH /v1/templates/{id}` (the owner, or an admin), `PUT /v1/templates/{id}/owner` (an admin): both route profiles (API 1.8.0) |
-| Host agents    | `POST /v1/hosts/{host}/inventory`, `/builds/claim`, `/builds/{build}/log` and `/report`, `GET /v1/hosts/{host}/blobs/{digest}`: a host's own bearer, both route profiles (API 1.10.0)                   |
-| Activation     | `POST /v1/templates/{id}/activate` and `/deactivate` (both route profiles); `GET /v1/hosts/{host}/wanted`, `POST /v1/hosts/{host}/workers/report` (a host's own bearer) (API 1.11.0)                    |
-| Egress records | `GET /v1/sandboxes/{id}/egress` (the owner or an admin; sandbox profile); `POST /v1/hosts/{host}/egress` (a host's own bearer) (API 1.14.0)                                                             |
-| Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.18.0)                                                                                          |
-| Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}[/roles/admin]` (enroll, unenroll; grant with an optional `until`, revoke): both route profiles (API 1.20.0)                                   |
-| Admin          | `PUT /v1/quota/{subject\|default}`, `POST /v1/templates/{id}/builds/{build}/reject`: admins, both route profiles (API 1.21.0)                                                                           |
+| Area           | Routes                                                                                                                                                                                                                               |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Probes         | `GET /healthz`, `GET /readyz`, `GET /v1/discovery` (harness URL, sandbox tiers, version; no auth)                                                                                                                                    |
+| Login          | `POST /v1/auth/device`, `/v1/auth/device/token`, `/v1/auth/token` (refresh), `/v1/auth/revoke`, `/v1/auth/revoke-all`, `GET /v1/me`                                                                                                  |
+| Sessions       | `POST` and `GET /v1/sessions`, `GET`, `PATCH` and `DELETE /v1/sessions/{id}`, `GET /v1/sessions/{id}/resources`, `POST /v1/sessions/{id}/token`                                                                                      |
+| Async turns    | `POST /v1/sessions/{id}/turns` (submit, `202`), `GET /v1/sessions/{id}/turns/{turnId}` (state, attempts, bounded result), `GET …/turns/{turnId}/artifacts/{kind}` (the patch, whole), `DELETE` the turn path (cancel while `queued`) |
+| Models         | `GET /v1/models?credential=` (the models a credential's endpoint lists), `GET /v1/sessions/{id}/models` (the models the session's credential lists)                                                                                  |
+| Credentials    | `GET /v1/credentials`, `PUT` and `DELETE /v1/credentials/{name}`                                                                                                                                                                     |
+| Config bundles | `POST` and `GET /v1/config-bundles` (your own, newest first), `DELETE /v1/config-bundles/{digest}`                                                                                                                                   |
+| Internal       | `POST /internal/credentials` (session token → credential) and `POST /internal/turn-credentials` (queued turn id → credential, at dequeue): data plane only, both authenticated with `SH_EXCHANGE_TOKEN`                              |
+| Templates      | `GET /v1/templates`, `GET /v1/templates/{id}`, `GET /v1/templates/{id}/builds[/{build}]`, `GET /v1/templates/{id}/tags`: both route profiles (API 1.4.0)                                                                             |
+| Self-serve     | `POST /v1/templates`, `POST /v1/templates/{id}/builds`, `POST /v1/templates/{id}/builds/{build}/cancel`, `GET` and `PUT /v1/policy`, `GET /v1/quota`: both route profiles (API 1.5.0)                                                |
+| Template admin | `POST /v1/templates/{id}/tags`, `DELETE /v1/templates/{id}/tags/{tag}`, `PATCH /v1/templates/{id}` (the owner, or an admin), `PUT /v1/templates/{id}/owner` (an admin): both route profiles (API 1.8.0)                              |
+| Host agents    | `POST /v1/hosts/{host}/inventory`, `/builds/claim`, `/builds/{build}/log` and `/report`, `GET /v1/hosts/{host}/blobs/{digest}`: a host's own bearer, both route profiles (API 1.10.0)                                                |
+| Activation     | `POST /v1/templates/{id}/activate` and `/deactivate` (both route profiles); `GET /v1/hosts/{host}/wanted`, `POST /v1/hosts/{host}/workers/report` (a host's own bearer) (API 1.11.0)                                                 |
+| Egress records | `GET /v1/sandboxes/{id}/egress` (the owner or an admin; sandbox profile); `POST /v1/hosts/{host}/egress` (a host's own bearer) (API 1.14.0)                                                                                          |
+| Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.18.0)                                                                                                                       |
+| Subjects       | `GET /v1/subjects`; `PUT`, `DELETE /v1/subjects/{subject}[/roles/admin]` (enroll, unenroll; grant with an optional `until`, revoke): both route profiles (API 1.20.0)                                                                |
+| Admin          | `PUT /v1/quota/{subject\|default}`, `POST /v1/templates/{id}/builds/{build}/reject`: admins, both route profiles (API 1.21.0)                                                                                                        |
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
