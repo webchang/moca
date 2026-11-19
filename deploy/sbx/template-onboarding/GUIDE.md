@@ -7,7 +7,7 @@ This guide takes a container image to a **sandbox template**: a named image that
 agent session, asks for by id, and whose commands then run in microVMs restored from that image's
 snapshot. It walks through two worked examples end to end: Moca's public sandbox image (anyone can
 reproduce it) and a SWE-bench instance (a benchmark case, used here as an example: nothing in Moca's
-templates is benchmark-specific). It was validated against an SBX0 deployment: the control plane
+templates is benchmark-specific). It was validated against a sandbox-service deployment: the control plane
 and relay on OpenShift, and the workers on a bare-metal KVM host. The same flow has also run
 self-serve through the API, and for two kinds of client (a stock agent and Moca Pi) on one control
 plane and one build (§8).
@@ -18,9 +18,9 @@ plane and one build (§8).
 - **Everything for templates is in [this folder](README.md):** the tools, the two sample specs,
   their tests, and pointers to the related files elsewhere.
 - The short reference for the same steps is [`deploy/sbx/template-onboarding/ONBOARDING.md`](ONBOARDING.md).
-  Deploying SBX0 itself is [`deploy/sbx/README.md`](../README.md) and
+  Deploying the sandbox service itself is [`deploy/sbx/README.md`](../README.md) and
   [`RUNBOOK.md`](../RUNBOOK.md); using a sandbox is the
-  [user guide](../../../docs/sbx/user-guide.md); templates in Moca's own agent sessions are designed in
+  [user guide](../../../docs/sandbox/user-guide.md); templates in Moca's own agent sessions are designed in
   [`docs/specs/2026-10-30-session-sandbox-templates-design.md`](../../../docs/specs/2026-10-30-session-sandbox-templates-design.md).
 - **Every host and registry below is a placeholder:** `sbx-api.example.com`, `registry.example.com`.
   No real host, account id or token appears here.
@@ -98,13 +98,13 @@ hardlink and gets only its own workspace disk, so more sandboxes of a template c
 
 ### Where things run
 
-| Component              | Runs on                                     | Does                                                                 |
-| ---------------------- | ------------------------------------------- | -------------------------------------------------------------------- |
-| `template-build.sh`    | the KVM host, as root                       | image → snapshot, checked in a microVM → a template record           |
-| `template-register.sh` | the operator's machine                      | record → SBX0's inputs (`SBX_WORKERS`, the templates file)           |
-| `setup.sh`             | the operator's machine, against the cluster | mints the worker's token and bundle; restarts the control plane only |
-| `install-host.sh`      | the KVM host, as root                       | installs the worker, which attaches to the relay                     |
-| `mocactl sbx`          | anywhere                                    | lists templates, creates sandboxes, runs commands                    |
+| Component              | Runs on                                     | Does                                                                      |
+| ---------------------- | ------------------------------------------- | ------------------------------------------------------------------------- |
+| `template-build.sh`    | the KVM host, as root                       | image → snapshot, checked in a microVM → a template record                |
+| `template-register.sh` | the operator's machine                      | record → the sandbox service's inputs (`SBX_WORKERS`, the templates file) |
+| `setup.sh`             | the operator's machine, against the cluster | mints the worker's token and bundle; restarts the control plane only      |
+| `install-host.sh`      | the KVM host, as root                       | installs the worker, which attaches to the relay                          |
+| `mocactl sbx`          | anywhere                                    | lists templates, creates sandboxes, runs commands                         |
 
 ### Names
 
@@ -175,7 +175,7 @@ wrong).
 ## 4. Example 1: Moca's public sandbox image
 
 Moca's own sandbox image, `ghcr.io/rossoctl/moca-remote-worker`, is public, so this example needs no
-registry key. It is the image SBX0's `default` template runs on. This exact spec was built with
+registry key. It is the image the sandbox service's `default` template runs on. This exact spec was built with
 `template-build.sh` (with `--egress-ca`, for egress credentials) and its probe passed in the restored
 VM.
 
@@ -698,7 +698,7 @@ needs (4096 + 32) × 3 + 1024 MiB for one session at standby depth 2.
 A new sandbox's `/workspace` is empty, and the client seeds it. On a deployment with the template
 store, `mocactl sbx create --template django-django-11133 --seed` runs the served build's seed,
 checks that `/workspace` is a clean tree, and makes the seeded HEAD the sandbox's baseline, so
-`sbx pull` and `sbx rm` measure changes from it ([user guide](../../../docs/sbx/user-guide.md), §8).
+`sbx pull` and `sbx rm` measure changes from it ([Make your own templates](../../../docs/sandbox/how-to/templates.md)).
 Without the store, the client runs the seed as its first command, as below. Either way use
 `sbx create`, not `sbx up`: `up` pushes the client's own repository into `/workspace` before the
 seed runs.
@@ -782,11 +782,11 @@ bc34802 baseline
 The SWE-bench template also has no network (`egress: false`, checked:
 `connect: Network is unreachable`). `default`'s egress (`egress: true`, through the host's
 allowlisting proxy, so `git` and `curl` over HTTPS rather than raw TCP) was checked
-with SBX0's egress credentials: a second user's sandbox cloned, committed and pushed a branch of a
+with the sandbox service's egress credentials: a second user's sandbox cloned, committed and pushed a branch of a
 private repository with its stored PAT, which never entered the sandbox; another user's sandbox got
 `401`; deleting the credential revoked it within its cache TTL ([`smoke.sh`](../smoke.sh) step 7).
 
-What SBX0 guarantees, as checked live with two templates
+What the sandbox service guarantees, as checked live with two templates
 ([`deploy/sbx/templates-check.sh`](../templates-check.sh)):
 
 - the list names every template and **no worker id**;

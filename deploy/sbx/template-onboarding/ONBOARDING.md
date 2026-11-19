@@ -4,12 +4,12 @@ The walk-through, with two worked examples (Moca's public image and a SWE-bench 
 client choosing between them, is the [Template Onboarding Guide](GUIDE.md). This page is the short
 reference.
 
-This page turns a container image into an SBX0 template that clients can ask for by id, and checks
+This page turns a container image into a sandbox-service template that clients can ask for by id, and checks
 it. It is the long form of [RUNBOOK](../RUNBOOK.md) §5, and uses two tools, both in this folder:
 
 - `template-build.sh` runs on the KVM host. It turns a spec into a snapshot that has been checked
   in a microVM, plus a template record.
-- `template-register.sh` runs on the operator's machine. It turns that record into SBX0's inputs.
+- `template-register.sh` runs on the operator's machine. It turns that record into the sandbox service's inputs.
 
 A sandbox of a template runs every command in a microVM restored from the template's snapshot.
 Each template has its own worker (`microvm-worker`, one snapshot each), so onboarding a template
@@ -243,7 +243,7 @@ it they stay on the host's disk.
    baseline), or the template's `seed` as its first command. The seed is in the record, and in the
    description for SWE-bench templates.
 3. Works through `mocactl sbx` (`run`, `put`, `pull`) or an agent wired to `mocactl sbx mcp`
-   (Claude Code, OpenCode: the [user guide](../../../docs/sbx/user-guide.md)).
+   (Claude Code, OpenCode: the [user guide](../../../docs/sandbox/user-guide.md)).
 
 **A template that brings its own repository (a seed), such as a SWE-bench template:** use
 `sbx create`, not `sbx up`. `sbx up` pushes the client's repository into `/workspace`, `.git`
@@ -261,7 +261,7 @@ baseline. So:
    `git diff --binary <baseline>` in `/workspace`, rather than `sbx pull`, which diffs against the
    client's repository.
 
-A headless OpenCode run of a SWE-bench instance on SBX0 was driven this way.
+A headless OpenCode run of a SWE-bench instance on the sandbox service was driven this way.
 
 Limits a long-running client meets:
 

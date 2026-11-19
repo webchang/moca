@@ -1,13 +1,13 @@
-# SBX0 operator runbook
+# Sandbox service operator runbook
 
-> **Preview.** The SBX0 sandbox service is implemented for an internal cohort, but not yet
+> **Preview.** The sandbox service is implemented, but not yet
 > declared Stable; interfaces and limits may change.
 
-For the operators of an SBX0 deployment: the sandbox control plane, the relay and Redis in one
+For the operators of a sandbox-service deployment: the sandbox control plane, the relay and Redis in one
 namespace of a shared OpenShift cluster, and template workers plus the janitor on a KVM host. The
 install reference (every input and its rule) is [the deploy README](README.md); users have
-[the user guide](../../docs/sbx/user-guide.md). The design is
-[the SBX0 spec](../../docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md) (§8 for
+[the user guide](../../docs/sandbox/user-guide.md). The design is
+[the sandbox service spec](../../docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md) (§8 for
 operations).
 
 Throughout, `<env file>` is the operator's settings file outside the repository (README §1),
@@ -17,7 +17,7 @@ gitignored).
 
 ## 1. Deploy from scratch
 
-1. **The namespace.** An existing namespace, dedicated to SBX0, where you have edit rights.
+1. **The namespace.** An existing namespace, dedicated to the sandbox service, where you have edit rights.
 2. **A GitHub OAuth app** of this deployment's own, with device flow enabled: its client id is
    `SBX_GITHUB_CLIENT_ID`.
 3. **The snapshots.** On the KVM host, one golden snapshot per template, built with
@@ -27,7 +27,7 @@ gitignored).
    Build them with a `build-snapshot.sh` from P4.1 or later: an older snapshot has no guest egress
    listener (see [Guest egress](#guest-egress)). The host also needs `/usr/local/bin/moca-egress`
    (`CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress`); the
-   worker install refuses without it, unless you pass `--no-egress`. And SBX0's own worker binary,
+   worker install refuses without it, unless you pass `--no-egress`. And the sandbox service's own worker binary,
    `CGO_ENABLED=0 go build -o /usr/local/libexec/sbx/microvm-worker ./remote-worker/cmd/microvm-worker`
    (`SBX_WORKER_BIN`): the install refuses without it, and never runs
    `/usr/local/bin/microvm-worker`, which a P4 worker on the same host may run.
@@ -78,11 +78,11 @@ gitignored).
    timer active, then log in as a user and run `mocactl sbx doctor` in a repository.
 
 **Which `mocactl` users install.** Since v0.7.0 the default channel, the latest release, carries
-`mocactl sbx`, as [the user guide](../../docs/sbx/user-guide.md#2-install) says:
+`mocactl sbx`, as [the user guide](../../docs/sandbox/how-to/set-up.md) says:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh
-mocactl sbx --help    # what an sbx sandbox is, then: usage (the sandbox service, SBX0):
+mocactl sbx --help    # what an sbx sandbox is, then: usage (the sandbox service):
 ```
 
 A `mocactl` older than v0.7.0 has no `sbx`: its `mocactl sbx --help` prints the general
@@ -138,7 +138,7 @@ Then re-run `install-host.sh` with the new bundle for every worker (step 5 of §
 bundle. The run deletes the static client tokens and removes the relay's harness exec token. **1a
 workspaces are not migrated:** tell 1a users to pull their work out first.
 
-**The worker binary.** `install-host.sh` runs SBX0's own build at `SBX_WORKER_BIN` (default
+**The worker binary.** `install-host.sh` runs the sandbox service's own build at `SBX_WORKER_BIN` (default
 `/usr/local/libexec/sbx/microvm-worker`), no longer `/usr/local/bin/microvm-worker`: build it there
 (§1 step 3) before re-running `install-host.sh` on a host installed before, or the install refuses.
 A new worker binary takes effect when its workers restart.
@@ -399,7 +399,7 @@ record). What an operator sets there:
 - **Quotas:** `quota`, and `quotaBySubject` for an override.
 - **What clients see of it:** `mocactl sbx policy`, `mocactl sbx quota` and `mocactl sbx hosts`;
   they create, follow and activate their templates with `mocactl sbx templates`
-  ([the user guide](../../docs/sbx/user-guide.md), §8).
+  ([Make your own templates](../../docs/sandbox/how-to/templates.md)).
 
 **Writing the policy.** A `PUT /v1/policy` stores the whole policy, quota overrides included, so
 send it as a compare-and-set: `?expect=` the `digest` of the `GET /v1/policy` it was built from.
@@ -543,10 +543,16 @@ sudo <checkout>/deploy/sbx/status.sh --host --token-ttl-seconds 900
 ```
 unit sbx-worker@sbx_default.service: active
 unit sbx-janitor.timer: active
+unit sbx-sampler.timer: active
 workspace filesystem: 45% used, 90G of 200G (110G free) on /srv
 janitor last run: {"janitor":"summary",…}
 janitor wait: 3600 s (outlasts the token lifetime 900 s + 30 s)
+host sample: {"sampler":"sample",…}
 ```
+
+`host sample` is one run of [the host sampler](#the-host-sampler), the line its timer writes to the
+journal, now; a `host sample error` line before it names each field it could not read. To read it:
+`… | sed -n 's/^host sample: //p' | jq .`.
 
 Pass `--token-ttl-seconds` the cluster's `token lifetime`, or set `SBX_STATUS_HOSTS="<host> …"` (ssh
 targets whose user has passwordless sudo) in `<env file>`, and the cluster-side run reports each
@@ -577,7 +583,7 @@ adds each command's first 200 bytes as `cmd`.
   "sandbox busy"). It keeps one user from filling a template's worker.
 - **The deaf-worker slot hold.** When an Exec outlives its token, the relay cancels it and then
   waits for the worker's acknowledgement before freeing its in-flight slot. A wedged worker that
-  never answers holds that slot until its attach stream drops: SBX0 has no bound on that drain, so
+  never answers holds that slot until its attach stream drops: the sandbox service has no bound on that drain, so
   with the default cap of 2, one wedged Exec halves the sandbox's concurrency until the worker
   disconnects. Restarting the worker (`systemctl restart sbx-worker@<id>`) drops the stream and
   frees every slot it held, and also ends every running Exec on that worker, for every user of the
@@ -745,12 +751,20 @@ ssh <host> "sudo journalctl -u moca-egress.service --since '$FROM UTC' --until '
 
 A janitor run's `summary` line has its own `ts`; the lines before it in the same run do not.
 
-**4. How loaded the host was.** Nothing samples the host's CPU, memory, pressure or disk I/O
-today; the host resource sampler of #857 (R2) will add those samples to the journal, and this step
-will then read them for the window. Until then, `sudo <checkout>/deploy/sbx/status.sh --host` gives
-a one-shot view of now, not of the window: each `sbx-worker@*` unit's state, the
-`sbx-janitor.timer`'s, the workspace filesystem's `df`, the janitor's last run and result, and the
-janitor wait and worker idle checks (§8).
+**4. How loaded the host was.** [The host sampler](#the-host-sampler) writes one JSON line every
+15 s; take the window's, from a little before `FROM`, so the first counter difference covers it:
+
+```bash
+ssh <host> "sudo journalctl -u sbx-sampler.service --since '$FROM UTC' --until '$TO UTC' -o cat \
+  --no-pager" > samples.ndjson
+jq -c 'select(.sampler == "sample") | {ts, load1: .load.avg1, mem_avail_kb: .mem_kb.available,
+  psi_mem_full10: .psi.memory.full_avg10, psi_io_some10: .psi.io.some_avg10, errors,
+  workers: [.workers[] | {wrk, vms, committed: .stats.committedBytes, budget_mb, reserve_mb}]}' samples.ndjson
+jq -c 'select(.sampler != "sample")' samples.ndjson   # the fields it could not read, and when
+```
+
+The worker's `wrk` is the relay's (step 3). `sudo <checkout>/deploy/sbx/status.sh --host` (§8) adds
+a view of now: the units' states, the janitor's last run and one sample.
 
 **What is not stored.** No command text and no output is stored anywhere server-side. The relay's
 audit line has neither (`docs/sbx/security-review.md` §1.5 lists it as tested), unless the relay
@@ -767,7 +781,8 @@ for how long, today:
 - **Egress logs:** at most 10,000 events or 4 MiB per sandbox, 64 MiB for all
   (`packages/control-plane/src/egress-log.ts`), kept as long as the sandbox's record
   (`SBX_RETENTION_DAYS`, default 14).
-- **Host journald:** the host's own journald settings; `install-host.sh` sets none.
+- **Host journald:** the host's own journald settings; `install-host.sh` sets none. The host sampler
+  adds about 1 KB per sample with a few workers, about 6-8 MB a day at the default 15 s.
 
 **Once a log pipeline is chosen** (#857, R1), the control-plane, relay and host lines are queried
 there instead, by the same fields (`sandboxId`, `subject`; `sbx`, `sub`; the workspace key), and
@@ -794,7 +809,11 @@ agent's sandbox instructions carry the rule there. The allowlist below is where 
   `sudo systemctl restart moca-egress`; to change the default for new hosts, edit
   `deploy/sbx/egress-allow.env` in the repo (see its header for the format and the entry groups).
   Open tunnels end on the restart, new ones work at once. The same restart is needed after
-  rebuilding the binary.
+  rebuilding the binary. A bare `MOCA_EGRESS_ALLOW=*` (nothing else on the line) is allow-everything
+  mode: every destination is permitted, private and local addresses included -- only the
+  always-refused tier stays (cloud metadata endpoints, link-local, multicast), so a sandbox still
+  cannot fetch the host's instance credentials. For trusted research rigs only; the startup log
+  says `allow-all mode` plainly, so a journal reader cannot miss it.
 - **Another install's `moca-egress.service`.** A host that also runs `deploy/microvm`'s P6 worker
   already has one. If `/etc/systemd/system/moca-egress.service` exists and `/etc/sbx/manifest` has no
   `egress unit` line for it, `install-host.sh` logs
@@ -826,7 +845,7 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   `moca-egress.service` another install owns (a P6 worker's) without enabling it, and that install may
   start it only for a while. So on such a host, whether the agent reads the proxy's journal follows
   that unit's state: while it runs for its own install, the agent reads its events every
-  15 s, ships only this host's SBX0 sandboxes' (`egressSids`), and counts the rest `egressNotOurs`.
+  15 s, ships only this host's own sandboxes' (`egressSids`), and counts the rest `egressNotOurs`.
   Nothing of the other install's leaves the host, but check the unit's state before relying on it. Off, the agent reads no journal, posts nothing and writes no cursor; its summary
   says `"egress":"off"`.
 - **Only this host's sandboxes' events leave it.** The wanted state names them (`egressSids`: the
@@ -873,7 +892,7 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
   most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
   back. Each post reads the length of every retained log, so its cost grows with the number of
-  sandboxes retained with a log: small at SBX0's scale.
+  sandboxes retained with a log: small at the sandbox service's scale.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is); the agent reads the journal with `--all`, so one up to 8 KiB is sent whole (without it journalctl prints a field over 4096 bytes as `null`). A journal entry whose message is not text (not UTF-8) cannot be read for its sandbox: the agent says so in an error line. A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
@@ -970,6 +989,125 @@ failed install.
 - **Turn it off:** re-run a worker's install with `SBX_READ_AHEAD_KB=0`. That writes the recorded
   value back and removes the unit. A later install without `SBX_READ_AHEAD_KB=0` sets it again.
 
+## The host sampler
+
+Every worker install also installs `sbx-sampler.timer` (#857, R2), so a KVM host with a worker
+samples its own load from then on. Every 15 s (`SBX_SAMPLER_INTERVAL_S`, 5-3600, at the install; in practice every
+15-16 s, the timer's 1 s accuracy on top) a
+oneshot, `sbx-sampler.service`, runs `/usr/local/libexec/sbx-sampler.sh` (`deploy/sbx/sampler.sh`),
+which writes one JSON line to the journal. It reads `/proc` and the cgroup files; it starts `df`
+twice (3 s each at most; after one that does not answer, as on a hung filesystem, it skips the
+second and reports `workspaces` null) and, per worker that runs with `SH_DIAG_STATS_ADDR`, one `curl` of that worker's
+`/stats` on this host (1 s at most; an address that is neither loopback nor a wildcard is refused, never
+curled); and it never fails its unit. A sample, shortened:
+
+```json
+{
+  "sampler": "sample",
+  "ts": "2026-11-17T10:30:00Z",
+  "load": { "avg1": 3.1, "avg5": 2.8, "avg15": 2.2 },
+  "mem_kb": {
+    "total": 65536000,
+    "available": 40000000,
+    "swap_total": 0,
+    "swap_free": 0,
+    "swap_used": 0
+  },
+  "psi": {
+    "memory": { "some_avg10": 0.2, "some_avg60": 0.1, "full_avg10": 0.1, "full_avg60": 0.05 },
+    "…": "cpu, io"
+  },
+  "workspaces": {
+    "bytes_total": 214748364800,
+    "bytes_used": 96636764160,
+    "…": "bytes_avail, inodes_total, inodes_used, inodes_free"
+  },
+  "slice": {
+    "cpu_usage_usec": 9000000,
+    "cpu_nr_throttled": 0,
+    "memory_current": 6442450944,
+    "memory_peak": 8589934592,
+    "io_rbytes": 1024,
+    "…": "…"
+  },
+  "workers": [
+    {
+      "wrk": "sbx_default",
+      "vms": 3,
+      "memory_current": 4294967296,
+      "budget_mb": 17536,
+      "reserve_mb": 1024,
+      "stats": {
+        "committedBytes": 3221225472,
+        "standbyCommittedBytes": 268435456,
+        "refusals": { "memory-budget": 2 }
+      }
+    }
+  ],
+  "errors": []
+}
+```
+
+- **`load`, `mem_kb`, `psi`** are the host's: `/proc/loadavg`, `/proc/meminfo` (kB; `swap_used` is
+  SwapTotal minus SwapFree) and `/proc/pressure/{cpu,memory,io}` (the share of time some or all
+  tasks waited, over 10 and 60 s, in percent).
+- **`workspaces`** is the filesystem holding `/srv/sbx/workspaces`, in bytes and inodes.
+- **`slice`** is `sbx.slice`, every worker and its VMs: `cpu.stat`, `memory.current`, `memory.peak`
+  (null before Linux 5.19) and `io.stat` summed over devices. The CPU, throttling and I/O figures
+  are counters since the slice was made: the use in a window is the difference between two samples
+  (below). `memory.current` counts page cache too.
+- **`workers`**, one per `/etc/sbx/workers/<id>.env`: `vms` is the VM cgroups in that worker's slice
+  that hold a process, running and paused standby VMs alike (a stopped worker has 0);
+  `memory_current` is its slice's (null when it is not running); `budget_mb` and `reserve_mb` are
+  its `SH_MAX_COMMITTED_MB` and `SH_MEMORY_RESERVE_MB`, from the running worker's environment (the
+  process named `microvm-worker` in its unit's cgroup; else its env file). A VM is admitted while `committedBytes` stays within `budget_mb` minus
+  `reserve_mb`. `stats` is from the worker's `/stats`, named as the worker names them, and null
+  unless the worker runs with `SH_DIAG_STATS_ADDR`, which is off by default. To turn it on for one
+  worker, a drop-in (an install rewrites the env file, never this), with a port of its own per
+  worker: `sudo systemctl edit sbx-worker@<id>`, then `[Service]` and
+  `Environment=SH_DIAG_STATS_ADDR=127.0.0.1:9901`, and `sudo systemctl restart sbx-worker@<id>`,
+  which ends that worker's running commands. It serves the pool's counters only, on its own
+  listener.
+- **`errors`** names each field group it could not read in this sample; their values are null. The
+  first sample in which a kind fails is preceded by one `{"sampler":"error","kind":…,"why":…}` line,
+  and the first one in which it reads again by one `{"sampler":"recovered","kind":…}` line, so a
+  lasting failure (a kernel without PSI, a worker's `/stats` not answering) is one line in the
+  journal, not one every 15 s.
+
+The unit logs at `notice` and drops anything below it, so systemd's own lines about each run
+(started, finished) stay out of the journal. On the host:
+
+```bash
+sudo journalctl -u sbx-sampler.service -o cat --since -5min | jq -c 'select(.sampler == "sample")'
+# How loaded was it at 10:30 UTC: the samples around it.
+sudo journalctl -u sbx-sampler.service -o cat --since '2026-11-17 10:29:30 UTC' \
+  --until '2026-11-17 10:30:30 UTC' | jq -c 'select(.sampler == "sample") | {ts, load, mem_kb, psi}'
+# sbx.slice's CPU in cores, between consecutive samples.
+sudo journalctl -u sbx-sampler.service -o cat --since -10min | jq -sc '[.[] | select(.sampler == "sample")]
+  | . as $s | range(1; length) as $i | {ts: $s[$i].ts, slice_cores: (($s[$i].slice.cpu_usage_usec
+  - $s[$i - 1].slice.cpu_usage_usec) / ((($s[$i].ts | fromdate) - ($s[$i - 1].ts | fromdate)) * 1e6))}'
+```
+
+These run `jq` on the host; on a host without it, run the `journalctl` over ssh and `jq` on your
+machine, as [Reproducing a member's issue](#reproducing-a-members-issue) does. The journal keeps the samples for as
+long as the host's journald settings keep anything. Once a log pipeline is chosen (#857, R1), it
+ships the same lines.
+
+- **Its own cost.** The target is under 1% of one core. Measure it on the host: 200 runs as the
+  timer runs them, then the CPU time per run over the interval:
+
+  ```bash
+  sudo env SBX_ENV_DIR=/etc/sbx SBX_SRV=/srv/sbx SBX_SAMPLER_STATE_DIR= bash -c \
+    'time (for i in $(seq 200); do /usr/local/libexec/sbx-sampler.sh >/dev/null; done)'
+  sudo systemd-run --wait -p CPUAccounting=yes /usr/local/libexec/sbx-sampler.sh   # one run, as a unit
+  ```
+
+  (user + sys) / 200 / 15 s is the share of one core; `systemd-run --wait` prints one run's
+  `CPU time consumed`.
+
+- **Change the interval, or turn it off:** re-run a worker's install with `SBX_SAMPLER_INTERVAL_S=60`
+  (or `0`, which removes it). The last worker's uninstall removes it; `--keep-shared` keeps it.
+
 ## 10. A KVM-host outage
 
 **What users see.** Every sandbox whose template runs on the host fails: `mocactl sbx run` and the
@@ -1026,7 +1164,8 @@ sudo <checkout>/deploy/sbx/install-host.sh --uninstall-janitor
 ```
 
 They remove exactly what the installs recorded in `/etc/sbx/manifest`; the last worker's uninstall
-also removes the shared `sbx-worker@.service`, `sbx-reap-vms.sh` and `sbx.slice`, and the `moca-egress.service` it
+also removes the shared `sbx-worker@.service`, `sbx-reap-vms.sh` and `sbx.slice`, the host sampler
+([The host sampler](#the-host-sampler)), and the `moca-egress.service` it
 installed ([Guest egress](#guest-egress)). Workspace data under `/srv/sbx/workspaces/<id>` and its jail `/srv/sbx/jail/j<12 hex of the id>` (the uninstall names it) is left; remove it by hand.
 
 In the cluster, delete what `setup.sh` applied, then its Secrets and ConfigMaps:
@@ -1133,7 +1272,7 @@ SBX_LIVE_SMOKE=1 SBX_API_URL=https://<api host> SBX_SMOKE_HOME_A="$HOME" SBX_SMO
 ```
 
 `SBX_MODES_ALLOWED` is deployment-wide: listing `lease` for the smoke lets every enrolled user create
-lease sandboxes. Until `docs/sbx/security-review.md` §6 is signed off, run step 8 on a test
+lease sandboxes. Until `docs/notes/sandbox-security-review.md` §6 is signed off, run step 8 on a test
 deployment, or list `lease` for the run only and set `SBX_MODES_ALLOWED` back afterwards (§2's
 re-run of `setup.sh`; the next token mint then moves any lease sandbox left to `per-exec`). The
 create is an upgrade, which `mocactl` takes only from a terminal, so the step runs it under `script`
@@ -1153,7 +1292,7 @@ SBX_LIVE_SMOKE=1 SBX_API_URL=https://<api host> SBX_SMOKE_HOME_A="$HOME" SBX_SMO
   deploy/sbx/smoke.sh
 ```
 
-Until `docs/sbx/security-review.md` §7 (level 2, a draft) is signed off, run step 9 as step 8: on a
+Until `docs/notes/sandbox-security-review.md` §7 (level 2, a draft) is signed off, run step 9 as step 8: on a
 test deployment, or with `lease+processes` listed for the run only and `SBX_MODES_ALLOWED` set back
 afterwards. Its create runs under `script` too; the rest of the step needs no terminal.
 
@@ -1210,7 +1349,7 @@ What each step does:
 
 What it cannot check for you: the agents' own logs (kept on a failure) show whether an agent
 fixed the test by the shortest route, or tried its local tools first and was denied. The
-`no network in the guest` claim is not one of its steps (`docs/sbx/security-review.md` §2).
+`no network in the guest` claim is not one of its steps (`docs/notes/sandbox-security-review.md` §2).
 
 ## 14. Checking the templates
 
@@ -1394,7 +1533,7 @@ pending)`, `used` being its running workers' cost, their VMs' committed memory a
   reason. A build waiting for memory reads `readiness: unavailable` with `readinessReason: memory`
   (`mocactl sbx templates show ID`), and `mocactl sbx hosts` shows each host's headroom, floor and
   brake.
-- **With the sandbox lease mode** (SBX0.3), a lease VM's guest memory is in its worker's slice, so
+- **With the sandbox lease mode**, a lease VM's guest memory is in its worker's slice, so
   `vmCommittedMib` counts it. Its reclaim acts on VMs and this floor on whole workers: on one host,
   set the floor at or above lease mode's reclaim target.
 - **Version skew, both ways:** an agent older than memory-aware placement sends no `memory`, and
@@ -1537,7 +1676,7 @@ template: add a worker id to `SBX_WORKERS` and the template to `SBX_TEMPLATES_FI
 `--snapshot <snapshot>` (the record's `snapshot`, `$SBX_SRV/templates/<snapshot>.json`).
 `install-host.sh` then names the record in the worker's env (`SH_TEMPLATE_RECORD`) and its id as
 `SANDBOX_TEMPLATE`, and the worker checks the record against its snapshot and its own id at every
-start, refusing a mismatch. The worker runs SBX0's own binary, `SBX_WORKER_BIN` (default
+start, refusing a mismatch. The worker runs the sandbox service's own binary, `SBX_WORKER_BIN` (default
 `/usr/local/libexec/sbx/microvm-worker`: `CGO_ENABLED=0 go build -o
 /usr/local/libexec/sbx/microvm-worker ./remote-worker/cmd/microvm-worker`), never
 `/usr/local/bin/microvm-worker`, which a P4 worker on the same host may run; a missing one is
