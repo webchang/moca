@@ -24,7 +24,14 @@ import { DiscoveringHarness } from './api/discovery.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
 import { openCallRecord, RUN_LENGTH_FIELDS, type CallRecorder } from './sbx/call-record.js';
 import { sbxMain } from './sbx/cli.js';
-import { cmdGet, cmdSpawn, cmdSubagents, MAX_PROMPT_BYTES, runSpawnWorker } from './subagent.js';
+import {
+  cmdGet,
+  cmdSpawn,
+  cmdSubagents,
+  cmdWatch,
+  MAX_PROMPT_BYTES,
+  runSpawnWorker,
+} from './subagent.js';
 import { WORKLOAD_MOUNTS, type WorkloadMount } from './api/workloads.js';
 import {
   cmdWorkloadCreate,
@@ -76,8 +83,21 @@ export const USAGE = `usage:
   mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]
                                                  run the subagent on a workload's context
                                                  (--writable: its own copy, discarded after)
+  mocactl spawn "prompt" --async [...]            dispatch as a cancellable async turn instead of a
+                                                 local worker process (needs SH_ASYNC_DRAIN on the
+                                                 deployment; not available with --workload)
+  mocactl spawn "prompt" --max-concurrent N [...]
+                                                 refuse the dispatch when N of your subagents are
+                                                 already running (default 4)
   mocactl subagents [--tag T] [--json]            list spawned subagents + current state
+  mocactl watch [--tag T] [--json]                one line per state change, until every watched
+                                                 subagent is finished (--json: one JSON object per
+                                                 line, for an agent's background monitor)
   mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
+  mocactl get SESSIONID --wait [--timeout S]     block until the result is there, then write it
+                                                 (default 300 s; exit 1 and status 'queued' if the
+                                                 budget runs out, 'unknown' if the run is over
+                                                 without one)
   mocactl workloads create --context FILE [--name NAME] [--json]
       [--sandboxes N [--mount read-only|writable]]
                                                  upload a context file (contextctl ctx pack) to a
@@ -180,8 +200,12 @@ const OPTIONS = {
   tag: { type: 'string' },
   label: { type: 'string' },
   out: { type: 'string' },
+  wait: { type: 'boolean' },
+  timeout: { type: 'string' },
+  'max-concurrent': { type: 'string' },
   workload: { type: 'string' },
   writable: { type: 'boolean' },
+  async: { type: 'boolean' },
   context: { type: 'string' },
   name: { type: 'string' },
   sandboxes: { type: 'string' },
@@ -301,8 +325,10 @@ async function mainWith(
     io.err(`--repo and --ref only apply to \`mocactl spawn\`\n${help}`);
     return 2;
   }
-  if (values.tag !== undefined && command !== 'spawn' && command !== 'subagents') {
-    io.err(`--tag only applies to \`mocactl spawn\` and \`mocactl subagents\`\n${help}`);
+  if (values.tag !== undefined && !['spawn', 'subagents', 'watch'].includes(command ?? '')) {
+    io.err(
+      `--tag only applies to \`mocactl spawn\`, \`mocactl subagents\` and \`mocactl watch\`\n${help}`,
+    );
     return 2;
   }
   if (values.label !== undefined && command !== 'spawn') {
@@ -313,8 +339,27 @@ async function mainWith(
     io.err(`--out only applies to \`mocactl get\`\n${help}`);
     return 2;
   }
+  const getOnly = (['wait', 'timeout'] as const).find((f) => values[f] !== undefined);
+  if (getOnly && command !== 'get') {
+    io.err(`--${getOnly} only applies to \`mocactl get\`\n${help}`);
+    return 2;
+  }
+  // Refused rather than ignored: a timeout on a non-blocking read asks for nothing, and silently
+  // dropping a flag in a script is worse than saying so (#419).
+  if (values.timeout !== undefined && values.wait !== true) {
+    io.err(`--timeout needs --wait: without it \`get\` reads once and returns\n${help}`);
+    return 2;
+  }
+  if (values['max-concurrent'] !== undefined && command !== 'spawn') {
+    io.err(`--max-concurrent only applies to \`mocactl spawn\`\n${help}`);
+    return 2;
+  }
   if (values.workload !== undefined && command !== 'spawn') {
     io.err(`--workload only applies to \`mocactl spawn\`\n${help}`);
+    return 2;
+  }
+  if (values.async !== undefined && command !== 'spawn') {
+    io.err(`--async only applies to \`mocactl spawn\`\n${help}`);
     return 2;
   }
   if (values.writable !== undefined && command !== 'spawn') {
@@ -528,6 +573,15 @@ async function mainWith(
         io.err(`--config needs a bundle digest (sha256:…); omit it to run without one\n${help}`);
         return 2;
       }
+      const rawCap = values['max-concurrent'];
+      let maxConcurrent: number | undefined;
+      if (rawCap !== undefined) {
+        if (!/^[1-9][0-9]{0,3}$/.test(rawCap)) {
+          io.err(`--max-concurrent must be a whole number of at least 1\n${help}`);
+          return 2;
+        }
+        maxConcurrent = Number(rawCap);
+      }
       return cmdSpawn(rt, io, {
         prompt,
         kind,
@@ -538,6 +592,8 @@ async function mainWith(
         label: values.label,
         workloadId: values.workload,
         writable: values.writable === true,
+        async: values.async === true,
+        ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
         json,
       });
     }
@@ -545,10 +601,29 @@ async function mainWith(
       if (rest.length > 0) return usage(io, help);
       return cmdSubagents(rt, io, { tag: values.tag, json, signal });
     }
+    case 'watch': {
+      if (rest.length > 0) return usage(io, help);
+      return cmdWatch(rt, io, { tag: values.tag, json, signal });
+    }
     case 'get': {
       const [sid, ...extra] = rest;
       if (sid === undefined || extra.length > 0) return usage(io, help);
-      return cmdGet(rt, io, { sessionId: sid, outDir: values.out, json, signal });
+      let timeoutS: number | undefined;
+      if (values.timeout !== undefined) {
+        if (!/^[1-9][0-9]{0,4}$/.test(values.timeout)) {
+          io.err(`--timeout must be a whole number of seconds, at least 1\n${help}`);
+          return 2;
+        }
+        timeoutS = Number(values.timeout);
+      }
+      return cmdGet(rt, io, {
+        sessionId: sid,
+        outDir: values.out,
+        wait: values.wait === true,
+        ...(timeoutS !== undefined ? { timeoutS } : {}),
+        json,
+        signal,
+      });
     }
     case 'workloads': {
       const [sub, id, ...extra] = rest;

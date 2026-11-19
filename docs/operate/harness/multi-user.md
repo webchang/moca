@@ -1,10 +1,14 @@
+---
+sidebar_position: 5
+---
+
 # Manage multi-user sessions
 
-> **Preview.** For the single-VM deployment ([`deploy/vm`](../operate/harness/single-vm.md)), the path the multi-user demos
-> were run on. Commands are taken from [`docs/demos/vm-two-user-acceptance.md`](../demos/vm-two-user-acceptance.md) and
-> [`vm-multi-user-demo.md`](../demos/vm-multi-user-demo.md), which were run by one person with two GitHub accounts on
+> **Preview.** For the single-VM deployment ([`deploy/vm`](single-vm.md)), the path the multi-user demos
+> were run on. Commands are taken from [`docs/demos/vm-two-user-acceptance.md`](../../demos/vm-two-user-acceptance.md) and
+> [`vm-multi-user-demo.md`](../../demos/vm-multi-user-demo.md), which were run by one person with two GitHub accounts on
 > one laptop. Two people on two laptops was not tried. I have not re-run them. Read the
-> [security model](../reference/security-model.md) and [multi-user concepts](../harness/concepts/multi-user.md) first: ownership is enforced at the API, but sandboxes are not
+> [security model](../../reference/security-model.md) and [multi-user concepts](../../harness/concepts/multi-user.md) first: ownership is enforced at the API, but sandboxes are not
 > isolated between users.
 
 ## Before you start
@@ -100,7 +104,7 @@ mocactl run "hello, reply with one short sentence"       # prints "session <id>"
 mocactl run "what did I just say?" --session <id>
 ```
 
-Each `XDG_CONFIG_HOME` holds one identity. See the [`mocactl` reference](../harness/reference/cli-mocactl.md) for flags.
+Each `XDG_CONFIG_HOME` holds one identity. See the [`mocactl` reference](../../harness/reference/cli-mocactl.md) for flags.
 
 ### Optional: an operator fallback key
 
@@ -123,7 +127,7 @@ created on the fallback keeps using it.
 ## 2. Verify isolation
 
 Each user runs these against their own session, then swaps ids with the other. The helpers `ids_set`, `probe` and
-`not_mine` are defined in Act 2 of [`vm-two-user-acceptance.md`](../demos/vm-two-user-acceptance.md); copy them from there.
+`not_mine` are defined in Act 2 of [`vm-two-user-acceptance.md`](../../demos/vm-two-user-acceptance.md); copy them from there.
 
 - **Session lists are disjoint:** `mocactl sessions --json | jq -r '.sessions[].sessionId'` shows only your own.
 - **Another user's session answers 404**, the same as one that never existed, for a read, a delete and a token mint:
@@ -180,7 +184,7 @@ mocactl run --new --option sandboxTier=microvm "In your sandbox: ..."
 `--option` is ignored when resuming. The tier is fixed for the session's life and never crosses tiers. With several tiers
 and no choice, the server default applies. The container tier has network access and per-session directories under one `/workspace`, which are not isolated from
 each other; the microVM tier has no network device and reaches only an allowlist of hosts, through the
-host's proxy ([Sandboxes and tiers](../harness/concepts/sandboxes-and-tiers.md)).
+host's proxy ([Sandboxes and tiers](../../harness/concepts/sandboxes-and-tiers.md)).
 
 ## 5. Choose a model
 
@@ -210,24 +214,26 @@ own scheme (`<endpoint>/v1/models` when its host is `api.anthropic.com`, `<endpo
 It calls only `api.anthropic.com`, the default endpoint's host, and the hosts in `SH_MODEL_CATALOG_HOSTS`: add each
 other gateway host your users' credentials name. Egress policies must allow those calls. A host outside the
 allow-list, or a call that fails, lists nothing (`model_catalog_unavailable`), and a chosen model is accepted
-unverified. See [Configuration: control plane](../reference/configuration.md#control-plane).
+unverified. See [Configuration: control plane](../../reference/configuration.md#control-plane).
 
 ## 6. Revoke access
 
-| To remove...               | Do this                                                                                                                                                                  |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| One login                  | `mocactl logout` ends this login on the server and deletes the local file. `mocactl logout --all` ends all of that user's logins                                         |
-| A credential               | `mocactl credentials delete NAME`. A session on a deleted credential has its next turn refused                                                                           |
-| Admin rights               | Remove the subject from `SH_ADMIN_SUBJECTS` and restart the control plane (it reads the list only at boot); it then takes effect within the 15-minute API token lifetime |
-| A user's network path      | Close their tunnel (`ssh -S ~/.ssh/moca-tunnel -O exit <account>@<vm>`), `sudo userdel -r <account>`, remove their `Match` block, then `sshd -t` and reload              |
-| Their GitHub authorization | The user revokes the app under Settings, Applications, Authorized OAuth Apps. The control plane keeps no GitHub token                                                    |
+| To remove...               | Do this                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One login                  | `mocactl logout` ends this login on the server and deletes the local file. `mocactl logout --all` ends all of that user's logins                                                                                                                                                                                                                                |
+| A credential               | `mocactl credentials delete NAME`. A session on a deleted credential has its next turn refused                                                                                                                                                                                                                                                                  |
+| Admin rights               | Remove the subject from `SH_ADMIN_SUBJECTS` and restart the control plane (it reads the list only at boot); it then takes effect within the 15-minute API token lifetime, or at the subject's next request with a template store (`SH_PROVENANCE_DIR`). An API grant is revoked with `DELETE /v1/subjects/{subject}/roles/admin`, effective at the next request |
+| A user's network path      | Close their tunnel (`ssh -S ~/.ssh/moca-tunnel -O exit <account>@<vm>`), `sudo userdel -r <account>`, remove their `Match` block, then `sshd -t` and reload                                                                                                                                                                                                     |
+| Their GitHub authorization | The user revokes the app under Settings, Applications, Authorized OAuth Apps. The control plane keeps no GitHub token                                                                                                                                                                                                                                           |
 
 API tokens last 15 minutes and are never revoked, so a logged-out client can keep calling the control plane until its
 token expires. An already-open SSH tunnel keeps its rights until it closes.
 
-**There is no way to remove a user** from the control plane: no route deletes a subject, and there is no allowlist.
+**There is no way to remove a user** from a harness control plane: login is open to any account that reaches it, and
+sessions are not gated by enrollment, so `DELETE /v1/subjects/{subject}` changes nothing a harness user can do.
 Removal means closing the network path. The only cleanup the demos document is deleting a smoke-test subject's record
-file by hand.
+file by hand. What stays behind on each profile is in
+[Users, enrollment and roles](../../reference/users-and-roles.md#when-a-user-leaves).
 
 ## What this does not give you
 

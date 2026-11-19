@@ -60,8 +60,21 @@ usage:
   mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]
                                                  run the subagent on a workload's context
                                                  (--writable: its own copy, discarded after)
+  mocactl spawn "prompt" --async [...]            dispatch as a cancellable async turn instead of a
+                                                 local worker process (needs SH_ASYNC_DRAIN on the
+                                                 deployment; not available with --workload)
+  mocactl spawn "prompt" --max-concurrent N [...]
+                                                 refuse the dispatch when N of your subagents are
+                                                 already running (default 4)
   mocactl subagents [--tag T] [--json]            list spawned subagents + current state
+  mocactl watch [--tag T] [--json]                one line per state change, until every watched
+                                                 subagent is finished (--json: one JSON object per
+                                                 line, for an agent's background monitor)
   mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
+  mocactl get SESSIONID --wait [--timeout S]     block until the result is there, then write it
+                                                 (default 300 s; exit 1 and status 'queued' if the
+                                                 budget runs out, 'unknown' if the run is over
+                                                 without one)
   mocactl workloads create --context FILE [--name NAME] [--json]
       [--sandboxes N [--mount read-only|writable]]
                                                  upload a context file (contextctl ctx pack) to a
@@ -83,8 +96,9 @@ flags for every command: --control-plane-url URL
 All flags are accepted by one parser. An unknown flag, or a missing flag value, prints the usage and
 exits 2. Some flags are always rejected (exit 2) outside their command: `--consumer`, `--host` and
 `--endpoint` outside `credentials add`; `--kind` outside `credentials add` and `spawn`; `--config`
-outside `run` and `spawn`; `--repo` and `--ref` outside `spawn`; `--tag` outside `spawn` and
-`subagents`; `--label` outside `spawn`; `--out` outside `get`; `--workload` outside `spawn`;
+outside `run` and `spawn`; `--repo` and `--ref` outside `spawn`; `--tag` outside `spawn`,
+`subagents` and `watch`; `--label` outside `spawn`; `--out`, `--wait` and `--timeout` outside `get`;
+`--max-concurrent` outside `spawn`; `--workload` outside `spawn`; `--async` outside `spawn`;
 `--prompt-file` outside `spawn`; `--record` outside `run`;
 `--context`, `--name`, `--sandboxes` and `--mount` outside `workloads create`; and `--all` outside `logout`. Other flags a
 command does not use are not rejected and may be ignored.
@@ -146,6 +160,7 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 | `mocactl credentials delete NAME [--json]`                                                                                        | Deletes a credential; exit 1 if you own none of that name                                                                                                                                                                                                                                                                                                                                                                |
 | `mocactl spawn "prompt" [--config DIGEST] --kind prompt\|solve [--repo URL --ref REF] [--tag T] [--label L] [--json]`             | Creates a session, writes a ledger record, forks a detached worker that holds a `POST /v1/runs`. Prints the sessionId on stdout. `--label` names one dispatch within a `--tag` group (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), surfaced on `mocactl subagents --json` as `label`. Pass `--prompt-file FILE` (regular file, no symlinks, UTF-8, trimmed) instead of an inline prompt when the content would be awkward on argv |
 | `mocactl subagents [--tag T] [--json]`                                                                                            | Lists spawned subagents from the ledger joined with `GET /runs/status`                                                                                                                                                                                                                                                                                                                                                   |
+| `mocactl watch [--tag T] [--json]`                                                                                                | Prints one line per state change of the watched subagents and exits when every one is finished. See below                                                                                                                                                                                                                                                                                                                |
 | `mocactl get SESSIONID [--out DIR] [--json]`                                                                                      | Fetches a terminal result from `GET /runs/status` and writes `<sid>.text` / `<sid>.verdict.json` / `<sid>.patch`                                                                                                                                                                                                                                                                                                         |
 | `mocactl workloads create --context FILE [--name NAME] [--sandboxes N [--mount read-only\|writable]] [--json]`                    | `POST /workloads` (with `sandboxes: {count: N}` and `workspace: {mount}` when given), uploads `FILE` to the returned grant, then `POST /workloads/{id}/activate`, and with `--sandboxes` waits until the workload is `ready`. Prints the workload id                                                                                                                                                                     |
 | `mocactl workloads list [--json]`                                                                                                 | Lists your own live workloads, newest first (`GET /workloads`, following its cursor to the end). See [`workloads list`](#workloads-list)                                                                                                                                                                                                                                                                                 |
@@ -246,7 +261,7 @@ Anthropic's own apps — storing one here is your call about your own account's 
 shared operator fallback refuses them for exactly that reason: one subscription must not serve every
 caller.
 
-### `spawn`, `subagents`, `get`
+### `spawn`, `subagents`, `watch`, `get`
 
 See [Use mocactl](../how-to/use-mocactl.md) and
 [`docs/specs/2026-10-12-mocactl-subagent-commands-design.md`](../../specs/2026-10-12-mocactl-subagent-commands-design.md)
@@ -262,12 +277,74 @@ hex>`, `--kind` other than `prompt`/`solve`, `--kind solve` without both `--repo
 - `spawn` on a sync 503 `saturated`: the worker retries up to 3 times honoring `Retry-After`,
   bounded by a 5-minute wall budget; after that the ledger row is `failed` with
   `stateDetail: 'saturated — exhausted retries'`.
-- `get` exit 2: sessionId outside `[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]`. Exit 0 only on
+- `spawn --max-concurrent N` (default 4) refuses the dispatch, exit 1, when N of your subagents are
+  already running — before the session is created and before the worker is forked, so a refused
+  dispatch costs nothing. The count is of this machine's ledger rows that are both non-terminal and
+  have a live child pid; a row whose child is gone holds no slot, so an unreconciled crash cannot
+  wedge `spawn`. An `--async` row has no child, so it holds its slot until a `subagents` or `get`
+  call reads the turn and records a terminal state. The server's own pool is the real bound (a sync
+  503 `saturated`, retried as above). Exit 2 for an `N` that is not a whole number of at least 1.
+- `spawn --async` dispatches the leaf as an async turn (`POST /v1/sessions/{id}/turns`) instead of
+  forking a local worker that holds a synchronous `/v1/runs`. What it buys: a turn record, which is
+  what makes a subagent cancellable, and no local process — nothing on this machine has to survive
+  the command, so a laptop can close on a running subagent. The turn id is recorded in the ledger
+  row and is what `subagents` and `get` read the leaf through from then on. Exit 2 with `--workload`:
+  the control plane refuses a workload on the async path (501), so it is refused before the session
+  is created. It needs `SH_ASYNC_DRAIN=1` on at least one worker of the deployment — that is off by
+  default, and without a drain the turn sits `queued` until the server's reaper calls it `lost`.
+  A row spawned with `--async` on another machine is invisible to this one's `get`: there is no
+  ledger row to carry the turn id.
+- `watch [--tag T]` prints one line per state change of the rows it watches — the same ledger rows
+  `subagents` lists, read the same way (a `turnId` row through its turn, any other through
+  `GET /runs/status`), and persisted the same way. The first sweep reports every row, so watching a
+  batch that is already over says so rather than printing nothing; after that a row is printed only
+  when its state or detail changes. It polls every 5 s, slower than `get --wait`'s 2 s, because it
+  is meant to run as a background monitor rather than as an interactive wait. The ledger is re-read
+  each tick, so a `spawn --tag T` from another terminal joins a running `watch --tag T` — spawn
+  some, watch, spawn more. It exits 0 once every watched row is `done`, `failed`, `paused` or
+  `unknown`. `unknown` counts as finished even though it is not a terminal state: it is the client's
+  "no result is coming" — a child that exited without writing one, past the 60 s result-write grace,
+  or a status read that failed — so a read failure ends the watch with a line that says so instead
+  of retrying silently; re-run it for another look. Ctrl-C exits 130, and the subagents keep
+  running. There is no `--timeout`: every row reaches a finished state on its own (the sync path
+  bounded by its child, an `--async` row by the server's reaper marking the turn `lost`), so wrap it
+  in `timeout` if a script needs a hard cap. Exit 0 with a `no subagents` line on stderr when the
+  ledger has no matching row.
+- `get` exit 2: sessionId outside `[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]`, or `--timeout` without
+  `--wait`, or a `--timeout` that is not a whole number of seconds of at least 1. Exit 0 only on
   `responded`/`done`/`solved`; `queued`/`paused`/`failed` exit 1.
+- `get --wait [--timeout S]` blocks until the result is collectable instead of reading once, then
+  writes and summarizes it exactly as a plain `get` does — one call, result inline, for a caller
+  that spawns and collects in the same turn. It polls `GET /runs/status` every 2 s within an `S`
+  budget (default 300, never overrun) and re-mints the session token as it nears expiry, since
+  `SH_SESSION_TOKEN_TTL_SECONDS` also defaults to 300. On an `--async` row it polls
+  `GET /v1/sessions/{id}/turns/{turnId}` instead, with the API token the command already holds, and
+  fetches the reply and the patch from the turn's artifact routes once it has a result. It stops early, exit 1 and
+  `status: "unknown"`, when the ledger says no result is coming: the row already went terminal
+  client-side (a fork failure), or its child exited without writing one, past the 60 s
+  result-write grace. On the budget running out the output is what a not-finished `get` has
+  always printed — `status: "queued"`, exit 1 — so `queued` and `unknown` distinguish "not yet"
+  from "never". Ctrl-C ends the wait with exit 130 and no error line, whether it lands during a
+  poll or between two; the subagent itself keeps running, so a later `get` still collects it.
 - `--json`:
-  - `spawn` → `{"type":"session","sessionId","pid"}`.
+  - `spawn` → `{"type":"session","sessionId","pid"}`, or `{"type":"session","sessionId","turnId"}`
+    with `--async`, which has no local process to name.
   - `subagents` → `{"subagents":[{"sessionId","tag","label"?,"kind","state","detail","bundle","workload","writable"?,"submittedAt"}]}` (`label` and `writable` are present only on rows dispatched with them). The non-`--json` table columns are `SESSION TAG LABEL KIND STATE BUNDLE` (`-` on unlabeled rows).
-  - `get` → `{"sessionId","status","files":[…],"reason"?,"message"?}`.
+  - `watch` → NDJSON, one event per line:
+    `{"sessionId","tag","label"?,"kind","state","detail","at"}` (`at` is epoch milliseconds; the
+    other fields are `subagents --json`'s, so one parser reads both). Without `--json` each line is
+    `state  sessionId  [label or tag]  (detail)`, the state padded so the ids line up.
+  - `get` → `{"sessionId","status","files":[…],"reason"?,"message"?}`, or
+    `{"sessionId","status":"queued"}` with nothing to collect, or
+    `{"sessionId","status":"unknown","detail"}` when `--wait` stops because no result is coming.
+
+### Following up on a subagent
+
+There is no `follow-up` command: `mocactl run "prompt" --session ID` already is one, on a session
+`spawn` created. It sends the new turn to `/v1/turn`, which writes no leaf result record —
+`writeResult` is called only from the `/v1/runs` handler — so the result a previous `mocactl get`
+would collect survives the follow-up rather than being overwritten. Collect first anyway if you
+want the files on disk before the session moves on.
 
 ### `workloads`
 

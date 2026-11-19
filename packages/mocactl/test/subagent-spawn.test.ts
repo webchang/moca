@@ -76,6 +76,68 @@ const baseOpts = (over: Partial<SpawnOptions> = {}): SpawnOptions => ({
   ...over,
 });
 
+/* --- the client-side concurrency cap --- */
+
+describe('cmdSpawn — --max-concurrent', () => {
+  /** Seed `n` rows holding a slot: non-terminal, with a pid that is really alive. */
+  function seedRunning(ledger: Ledger, n: number, childPid = process.pid): void {
+    for (let i = 0; i < n; i++) {
+      ledger.append({
+        sessionId: `held-${i}`,
+        envelope: { kind: 'prompt', prompt: 'p' },
+        submittedAt: i,
+        lastKnownState: 'running',
+        stateObservedAt: i,
+        childPid,
+      });
+    }
+  }
+
+  it('refuses at the cap, before a session or a worker exists', async () => {
+    const { rt, cp } = makeRt();
+    const ledger = withLedger(rt);
+    seedRunning(ledger, 2);
+    const { io, err } = makeIo();
+    const fork = vi.fn(() => 1);
+    const r = await cmdSpawn(rt, io, baseOpts({ maxConcurrent: 2, forkFn: fork, ledger }));
+    expect(r).toBe(1);
+    expect(cp.createSession).not.toHaveBeenCalled();
+    expect(fork).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('--max-concurrent is 2');
+  });
+
+  it('allows the dispatch below the cap', async () => {
+    const { rt, cp } = makeRt();
+    const ledger = withLedger(rt);
+    seedRunning(ledger, 1);
+    const { io } = makeIo();
+    const r = await cmdSpawn(rt, io, baseOpts({ maxConcurrent: 2, forkFn: () => 1, ledger }));
+    expect(r).toBe(0);
+    expect(cp.createSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let stale rows whose children are gone hold a slot for good', async () => {
+    const { rt } = makeRt();
+    const ledger = withLedger(rt);
+    // Pid 2^31-1 is almost certainly not alive: exactly the unreconciled-crash rows that a bare
+    // non-terminal count would wedge `spawn` on permanently.
+    seedRunning(ledger, 8, 0x7fffffff);
+    const { io } = makeIo();
+    const r = await cmdSpawn(rt, io, baseOpts({ maxConcurrent: 2, forkFn: () => 1, ledger }));
+    expect(r).toBe(0);
+  });
+
+  it('defaults to 4', async () => {
+    const { rt } = makeRt();
+    const ledger = withLedger(rt);
+    seedRunning(ledger, 4);
+    const { io, err } = makeIo();
+    const r = await cmdSpawn(rt, io, baseOpts({ forkFn: () => 1, ledger }));
+    expect(r).toBe(1);
+    expect(err.join('\n')).toContain('--max-concurrent is 4');
+  });
+});
+
 /* --- flag validation --- */
 
 describe('cmdSpawn — flag validation refuses before any session is created', () => {
@@ -558,5 +620,123 @@ describe('cmdSpawn — --workload', () => {
       'tok',
     );
     expect(bodies[0]).toMatchObject({ kind: 'prompt', workloadId: 'demo' });
+  });
+});
+
+/* --- --async: dispatch as a turn record instead of a local worker --- */
+
+describe('cmdSpawn --async', () => {
+  const turnsReturning = (turnId = 'turn-1') => ({
+    submit: vi.fn(async (_envelope: LeafEnvelope) => turnId),
+  });
+
+  it('submits the turn, records it and never forks', async () => {
+    const { rt, cp } = makeRt();
+    const ledger = withLedger(rt);
+    const { io, out, err } = makeIo();
+    const turns = turnsReturning();
+    const fork = vi.fn(() => 1);
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ async: true, turns, forkFn: fork, ledger, json: true }),
+    );
+    expect(r).toBe(0);
+    expect(cp.createSession).toHaveBeenCalledTimes(1);
+    expect(fork).not.toHaveBeenCalled();
+    expect(turns.submit).toHaveBeenCalledWith({
+      sessionId: 'sess-abc',
+      kind: 'prompt',
+      prompt: 'summarize the repo',
+    });
+    expect(err.join('\n')).toContain('spawned sess-abc  (turn turn-1)');
+    expect(JSON.parse(out.join(''))).toEqual({
+      type: 'session',
+      sessionId: 'sess-abc',
+      turnId: 'turn-1',
+    });
+    const row = openLedger(ledgerPath).find('sess-abc')!;
+    expect(row.turnId).toBe('turn-1');
+    expect(row.childPid).toBeUndefined();
+    expect(row.lastKnownState).toBe('running');
+  });
+
+  it('refuses --workload before the session exists: the async path 501s it', async () => {
+    const { rt, cp } = makeRt();
+    const { io, err } = makeIo();
+    const turns = turnsReturning();
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ async: true, workloadId: 'demo', turns, ledger: withLedger(rt) }),
+    );
+    expect(r).toBe(2);
+    expect(cp.createSession).not.toHaveBeenCalled();
+    expect(turns.submit).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('--async and --workload are exclusive');
+  });
+
+  it('writes no row when the submission is refused', async () => {
+    const { rt } = makeRt();
+    const { io, err } = makeIo();
+    const turns = {
+      submit: vi.fn(async () => {
+        throw new ApiError('control-plane', 429, 'async_quota_exhausted');
+      }),
+    };
+    const fork = vi.fn(() => 1);
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({ async: true, turns, forkFn: fork, ledger: withLedger(rt) }),
+    );
+    expect(r).toBe(1);
+    expect(fork).not.toHaveBeenCalled();
+    expect(openLedger(ledgerPath).readAll()).toEqual([]);
+    expect(err.join('\n')).not.toBe('');
+  });
+
+  it('counts an async row against --max-concurrent, having no pid to probe', async () => {
+    const { rt, cp } = makeRt();
+    const ledger = withLedger(rt);
+    ledger.append({
+      sessionId: 'held-async',
+      turnId: 'turn-held',
+      envelope: { kind: 'prompt', prompt: 'p' },
+      submittedAt: 1,
+      lastKnownState: 'running',
+      stateObservedAt: 1,
+    });
+    const { io, err } = makeIo();
+    const r = await cmdSpawn(rt, io, baseOpts({ maxConcurrent: 1, forkFn: () => 1, ledger }));
+    expect(r).toBe(1);
+    expect(cp.createSession).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('--max-concurrent is 1');
+  });
+
+  it('sends the solve fields when the leaf is a solve', async () => {
+    const { rt } = makeRt();
+    const turns = turnsReturning('turn-s');
+    const { io } = makeIo();
+    const r = await cmdSpawn(
+      rt,
+      io,
+      baseOpts({
+        async: true,
+        kind: 'solve',
+        repoUrl: 'https://example.test/r.git',
+        ref: 'main',
+        turns,
+        ledger: withLedger(rt),
+      }),
+    );
+    expect(r).toBe(0);
+    expect(turns.submit).toHaveBeenCalledWith({
+      sessionId: 'sess-abc',
+      kind: 'solve',
+      problemStatement: 'summarize the repo',
+      repoUrl: 'https://example.test/r.git',
+      ref: 'main',
+    });
   });
 });

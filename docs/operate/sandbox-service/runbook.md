@@ -238,9 +238,11 @@ not exceed the maximum.
 
 ## 4. Adding or removing a user
 
-Users are `SBX_ALLOWED_SUBJECTS`: comma-separated `github:<numeric id>`, no spaces. Look an id up
-with `gh api users/<login> --jq .id`. A user who is not enrolled is told their own `github:<id>` by
-`mocactl sbx login`.
+Users are `SBX_ALLOWED_SUBJECTS`: comma-separated `github:<numeric id>` or `oidc:<provider sub>`
+(a mixed list is accepted), no spaces. Look a GitHub id up with `gh api users/<login> --jq .id`. A
+user who is not enrolled is told their own subject by `mocactl sbx login`. The model behind this
+section (who is enrolled, who is an admin, the installer token, what a removed user leaves behind)
+is in [Users, enrollment and roles](../../reference/users-and-roles.md).
 
 Edit the list and re-run `setup.sh`. The control plane rolls with the new list:
 
@@ -398,6 +400,48 @@ curl -sS -o put.json -w '%{http_code}\n' -X PUT -H @"$HDR" -H 'Content-Type: app
 # 200: put.json is the policy as set (its new digest, its record, any `narrowed` builds).
 # 409 policy_changed: nothing written; put.json's `digest` is the policy's now. Read again, then write.
 ```
+
+**Which policy writes need an admin named in the settings.** Any admin may narrow the policy and
+change quotas. A write that **widens** it is refused `403 forbidden` for an admin whose role comes
+from an API grant (`mocactl sbx admin subjects grant`); only an admin named in
+`SBX_ADMIN_SUBJECTS` (`SH_ADMIN_SUBJECTS`) may make it. Widening is any of:
+
+- adding a sha256 to `trustedGateRecords`, or a registry to `allowedRegistries`;
+- adding a repository to a registry's `allowedRepositories`, or dropping an allowed registry's list
+  (which opens the whole registry); registry keys that differ only in case count as one;
+- adding a profile, or loosening one: a rule dropped from `requires`, `requireOfflineGate` turned
+  off, `selfAttest` or `selfAttestEgress` turned on, an `envelope` bound raised, or its `exact`
+  size changed or removed;
+- moving `defaultProfile` to a profile that accepts more.
+
+The check and the write are one locked step, so a write built from an older policy cannot restore
+trust a settings admin removed meanwhile.
+
+**Trusting a gate record, and self-attested templates.** Trust comes from who submitted a gate
+record or from an admin's list, never from what the record says:
+
+- **Deployment-wide trust** is the record's sha256 in `trustedGateRecords`, which a settings admin
+  adds with `PUT /v1/policy` (above). The `benchmark` profile accepts only such a record.
+- **Self-attested** (the `benchmark-self` and `general-self` profiles, `selfAttest: true`): a record
+  the policy does not trust still passes `X1.trusted` for the template's owner, the creator (or, when
+  an admin adds a build to another subject's template, that template's owner). A template the
+  deployment declared has no owner, so it takes no self-attested build. A self-attested template
+  stays private: `deployment` visibility and a transfer are refused `409 self_attested` until an
+  admin trusts the record. Removing a record from `trustedGateRecords` makes those templates private
+  again on the next read; the `PUT /v1/policy` answer and its `policy` record list them as
+  `narrowed`.
+- **One subject per self-attested record.** An admitted self-attested create claims the record for
+  its owner. The claim holds while any build citing it is queued, building, probing, built,
+  registered, rejected or retired; only a `failed` build (a cancel included) releases it. A create
+  made while the record was trusted, and a refused create, claim nothing. Another subject's create
+  with a claimed record is refused, rule `X1.self.scope`. The lookup and the write run as one step
+  per sha256, so two subjects sending the same record at once cannot both claim it.
+- **A self-attested record must show commits refused** (`X12.self`: `agent_can_commit: "no"` and
+  `git_identity: "none"`), whatever the spec says, and the spec may set `egress: true` only on a
+  profile with `selfAttestEgress` (`X1.self.egress`).
+- **`skip_git_identity_check` needs a gate record under every profile**, `base` included: a skip no
+  gate record backs, or one whose record does not show commits refused, is `422 policy_refused`, rule
+  `X12`. Send such a gate record, or drop the skip.
 
 ## 6. Rotating the signing key
 
@@ -649,9 +693,11 @@ the control plane stores it, one event per line (host, method, path, status, byt
 decision, credential name). `--verify` reads the log again and checks its sha256 and line count
 against the control plane's summary: `verified: N events, sha256:…` (with `INCOMPLETE: N dropped`
 when the log lost events, and `sealed` or `open (not sealed yet)`), or `NOT verified: …`, exit 1
-(`cmdEgress` and `verifyEgress` in `packages/mocactl/src/sbx/commands.ts`). Until the log is sealed,
-600 s after the sandbox ends, it can still gain events: take the copy after that, as
-[Egress records](#egress-records) explains.
+(`cmdEgress` and `verifyEgress` in `packages/mocactl/src/sbx/commands.ts`). Until the log is sealed, it can
+still gain events: take the copy after that, as [Egress records](#egress-records) explains. It is
+sealed at the host janitor's first sweep at least 600 s after the sandbox ends (`EGRESS_GRACE_S`),
+not at the 600 s themselves, so `--verify` can read `open (not sealed yet)` well past them; with no
+host janitor running (the host stopped), it stays open until one runs.
 
 **3. The control plane's, the relay's and the host's lines.** The control plane writes one
 `"event":"audit"` JSON line per decision to stdout (`packages/control-plane/src/handler-util.ts`,
@@ -746,7 +792,7 @@ The worker's `wrk` is the relay's (step 3). `sudo <checkout>/deploy/sbx/status.s
 a view of now: the units' states, the janitor's last run and one sample.
 
 **What is not stored.** No command text and no output is stored anywhere server-side. The relay's
-audit line has neither (`docs/sbx/security-review.md` §1.5 lists it as tested), unless the relay
+audit line has neither (`docs/notes/sandbox-security-review.md` §1.5 lists it as tested), unless the relay
 runs with `SH_SANDBOX_AUDIT_COMMANDS=1`, the debug flag of §8, which adds each command's first 200
 bytes as `cmd`. The egress log is the network's shape only, with paths but no bodies. The member's
 `--record` file is the only trace of what was sent, and only of the HTTP calls. What is kept, and
@@ -867,11 +913,12 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   had not reached are not read.
 - **What is kept:** each event with its fields and values as the proxy wrote them (the agent decodes and
   re-encodes each one, so the bytes may differ, and the control plane stores its own canonical line), for as long as the sandbox record
-  (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`, about 3 MB), and all
-  logs together at most 200,000 (`EGRESS_TOTAL_BUDGET`): with 256 MiB for Redis, egress logs take at
-  most about 64 MB. The total counts the logs that still exist, so an expired log gives its share
-  back. Each post reads the length of every retained log, so its cost grows with the number of
-  sandboxes retained with a log: small at the sandbox service's scale.
+  (`SBX_RETENTION_DAYS`). A log holds at most 10,000 events (`EGRESS_LOG_CAP`) and 4 MiB of stored lines
+  (`EGRESS_LOG_BYTES`), and all logs together at most 64 MiB of stored lines (`EGRESS_TOTAL_BYTES`),
+  inside the 256 MiB Redis has in all; Redis's own overhead per entry comes on top. The total is a
+  running sum kept by the store's append (`packages/control-plane/src/egress-log.ts`), so an expired
+  log gives its bytes back at a later append, and a post costs the same however many logs are
+  retained.
 - **Completeness:** an event over 8 KiB isn't sent (only its sandbox id is); the agent reads the journal with `--all`, so one up to 8 KiB is sent whole (without it journalctl prints a field over 4096 bytes as `null`). A journal entry whose message is not text (not UTF-8) cannot be read for its sandbox: the agent says so in an error line. A log's `dropped` counts
   those (`invalid`), events past its cap (`cap`) or past the total budget (`budget`), and the proxy's own `audit_dropped` reports, charged to every sandbox on
   the host's workers live within 60 s before each. `complete` is `dropped == 0`. The sandbox's end
@@ -879,7 +926,8 @@ Paths are logged without query, fragment or userinfo, and an injected credential
   arrive in the 600 s after the end, a later `sandbox` record with `state: egress` names the final
   log. The grader decides whether an incomplete log still counts.
 - **Check a saved copy offline:** wait until the log is sealed: `sealed` in `mocactl sbx egress ID`
-  (`summary.sealed: true` with `--json`), 600 s after the sandbox ends. Until then the control plane
+  (`summary.sealed: true` with `--json`), at the host janitor's first sweep at least 600 s after the
+  sandbox ends. Until then the control plane
   still takes the sandbox's last events, and if the log changes, the janitor's seal writes a later
   `state: egress` record that a copy saved earlier no longer matches. Then save it with
   `mocactl sbx egress ID --ndjson > log.ndjson`, take the provenance export, and run
@@ -1677,3 +1725,111 @@ delete the four units,
 `/usr/local/libexec/sbx-host-agent.sh`, `/etc/sbx/host-agent.env` and `/etc/sbx/host-agent.token`,
 and `systemctl daemon-reload`; drop the host from `SBX_TEMPLATE_HOSTS` and re-run `setup.sh` to
 revoke its token.
+
+## Provenance records: export, verify and redact
+
+Every template change is a provenance record in the template store (`SH_PROVENANCE_DIR`; on
+`deploy/sbx`, the PVC `moca-sbx-templates`, mounted at `/var/lib/moca/templates` in the
+`control-plane` container of the `moca-control-plane` Deployment). Nothing is signed: each record
+is canonical JSON named by its sha256, and names the digest of the record before it, so an edit to
+a stored record breaks the chain. Keep a copy of the heads elsewhere: that is what proves an export
+complete.
+
+**The store** is append-only:
+
+- `records/<hex>.json`: one file per record, its canonical bytes; the file's sha256 is its name.
+- `heads/<hex>.json`: per stream, `{stream, head, count}`; `<hex>` is the sha256 of the stream's
+  name. A stream is `policy`, `members` or `template/<id>`.
+- `blobs/<hex>`: the documents records cite by sha256, byte for byte (gate records, template
+  records, snapshot manifests).
+
+A record is written before its stream's head moves, so a crash leaves an orphan record, never a
+head naming a missing one. A record (`moca-provenance-record/1`) is `{schema, stream, seq, kind,
+prev, at, subject, body}`: `prev` is the previous record's digest (null at `seq` 1), `at` is UTC in
+whole seconds, and `subject` is who wrote it: a subject, `policy` (an automatic decision),
+`host:<id>` or `janitor`.
+
+| Kind                         | Written when                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `policy`                     | an admin's `PUT /v1/policy` or `PUT /v1/quota/…`; the default policy, at its first use                                                    |
+| `create`, `gate`             | an admitted create or new build (`gate` when it sends a gate record)                                                                      |
+| `check`                      | the policy check of a create, and of a build at registration (a refused create on a new or another subject's id writes none)              |
+| `build`                      | a host's `built` or `failed` report; a cancel                                                                                             |
+| `activate`, `deactivate`     | a lease taken or released; a host's `attached` or `refused` report (`activate`) and `detached` report (`deactivate`)                      |
+| `tag`, `visibility`, `owner` | a tag moved or removed, a visibility or description change, a transfer                                                                    |
+| `retire`, `reject`           | a retire or a reject; a host's removal of a retired build (`retire` by `host:<id>`); a rebuild superseding a build (`retire` by `policy`) |
+| `sandbox`                    | a sandbox's create and end (deleted, or expired by the janitor); its egress events arriving after the end                                 |
+| `session`                    | a pinned Moca Pi session's create and delete                                                                                              |
+| `member`, `role`             | enrollment and admin-role changes, on the `members` stream                                                                                |
+
+The kind `use` is defined, but nothing writes it yet.
+
+**Export.** There is no export route. Export by hand, from a copy of the store:
+
+1. Copy `heads/`, then `records/` and `blobs/`, off the volume into an empty directory, say
+   `store-copy/` (for example with `kubectl cp` from the control-plane pod) _(unverified on a
+   cluster)_. Heads first: every head then names a record the copy holds.
+2. If a gate record a `gate` record cites is missing from `blobs/`, add it there as
+   `blobs/<sha256 hex>`: the export leaves out a blob the store does not hold, and the verifier
+   then fails.
+3. From a checkout at the control plane's version, with its dependencies installed, export every
+   stream the copy has a head for, using the control plane's own `ProvenanceStore.export`:
+
+   ```bash
+   cat > /tmp/export-provenance.mts <<'TS'
+   import { readdirSync, readFileSync } from 'node:fs';
+   import { join } from 'node:path';
+   const dir = process.argv[2];
+   const { ProvenanceStore } = await import(join(process.cwd(), 'src/provenance.ts'));
+   const streams = readdirSync(join(dir, 'heads')).map(
+     (f) => JSON.parse(readFileSync(join(dir, 'heads', f), 'utf8')).stream,
+   );
+   process.stdout.write(JSON.stringify(await new ProvenanceStore({ dir }).export(streams)));
+   TS
+   cd packages/control-plane
+   npx tsx /tmp/export-provenance.mts /abs/path/to/store-copy > EXPORT.json
+   ```
+
+   The result is one `moca-provenance-export/1` document: the streams, the policy stream they cite,
+   and every gate record their `gate` records cite.
+
+**Verify** anywhere with Python 3, no moca, cluster or network needed:
+
+```bash
+python3 deploy/sbx/template-onboarding/verify-provenance.py EXPORT.json \
+  --head 'template/<id>=sha256:<the head you kept>'
+```
+
+It checks every record's digest, every stream's `seq` and `prev` chain up to its head and count,
+every blob against its sha256, and that each `check` cites a policy record and each `gate` a blob of
+the export. An export can only prove itself consistent; `--head STREAM=sha256:…` (repeatable)
+compares a stream's head with one kept elsewhere, which catches an export that dropped its latest
+records. `--egress <sandbox id>=<file>` checks a saved egress log against the sandbox's record
+([Egress records](#egress-records)). Exit 0 verified, 1 a check failed (each printed), 2 a usage
+error or an unreadable file.
+
+**Redact** only data that must not be kept: it rewrites the chain, and the redaction itself is
+logged. Stop the control plane first (one process owns the store), and run the script against the
+store's directory (`STORE_DIR`, the volume's root) _(unverified on a cluster)_. Without `--apply` it
+prints what it would change, counts only, and changes nothing; patterns are never printed.
+
+```bash
+# One template's stream (template/<id>) and its catalog entry:
+python3 deploy/sbx/template-onboarding/redact-provenance.py STORE_DIR TEMPLATE_ID \
+  --pattern 'REGEX' [--pattern 'REGEX' ...] [--apply]
+
+# The catalog only: every catalog entry (catalog/*.json), no provenance record touched:
+python3 deploy/sbx/template-onboarding/redact-provenance.py STORE_DIR --catalog-only \
+  --pattern 'REGEX' [--pattern 'REGEX' ...] [--apply]
+```
+
+- **The stream form** replaces each match in a record's string values (never its keys) with
+  `<redacted>`, rewrites that record and every later record of the stream (each names the one
+  before), moves the stream's head, and redacts the template's catalog entry the same way.
+- **`--catalog-only` takes no template id.** It redacts every catalog entry, and no record: for
+  text that reached only the catalog, such as a build's stored log, which no record copies.
+- With `--apply`, both append a line to `STORE_DIR/redactions.log`, never the matched text: the
+  stream form names the stream, its old and new head and how many records it rewrote;
+  `--catalog-only` how many entries it redacted.
+- An export taken before a redaction no longer verifies against the new head: by design. Keep the
+  new head in place of the old one.

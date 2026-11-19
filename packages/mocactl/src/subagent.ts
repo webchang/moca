@@ -1,10 +1,10 @@
-/** `mocactl spawn | subagents | get`, built on the leaf-turn transport and subagent ledger. */
+/** `mocactl spawn | subagents | watch | get`, built on the leaf-turn transport and subagent ledger. */
 import { spawn as spawnChild } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync, openSync, closeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { ApiError } from './api/errors.js';
 import { validWorkloadId, WorkloadsClient } from './api/workloads.js';
-import type { ControlPlaneApi, CreateSessionRequest } from './api/types.js';
+import type { ControlPlaneApi, CreateSessionRequest, SessionToken } from './api/types.js';
 import { describeError } from './core/messages.js';
 import { sanitizeRemote } from './core/sanitize.js';
 import {
@@ -17,12 +17,14 @@ import {
 import type { Io } from './headless.js';
 import type { Runtime } from './runtime.js';
 import { describeWorkloadError } from './workloads.js';
+import { AsyncTurnTransport } from './transport/async-turn.js';
 import {
   DEFAULT_UNKNOWN_GRACE_MS,
   LeafTransport,
   isTerminalState,
   mapHonestState,
   terminalFromBody,
+  type HonestState,
   type LeafEnvelope,
   type LeafResultBody,
   type StateView,
@@ -40,6 +42,8 @@ const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$/;
  * up by key value, so shell meta or whitespace would make callers quote defensively.
  */
 const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** `spawn --max-concurrent`'s default. Matches the VM pool cap (`deploy/vm` supervisor). */
+export const DEFAULT_MAX_CONCURRENT = 4;
 
 interface SpawnedSession {
   sessionId: string;
@@ -87,6 +91,10 @@ export interface SpawnOptions {
   workloadId?: string;
   /** Give the run its own writable copy of the workload's context (`--writable`). */
   writable?: boolean;
+  /** Refuse the dispatch when this many of this user's subagents are still running. */
+  maxConcurrent?: number;
+  /** Dispatch as an async turn (cancellable, no local worker) instead of the sync `/runs` path. */
+  async?: boolean;
   json: boolean;
   /** Test seams: fork + ledger injection. */
   forkFn?: (
@@ -98,6 +106,8 @@ export interface SpawnOptions {
   ledger?: Ledger;
   /** Test seam for the `--workload` preflight; otherwise built from the runtime. */
   workloads?: Pick<WorkloadsClient, 'get'>;
+  /** Test seam for `--async`; otherwise built from the runtime's control-plane client. */
+  turns?: Pick<AsyncTurnTransport, 'submit'>;
 }
 
 /** Create session, record it, fork a detached worker, return. Worker survives mocactl exit. */
@@ -143,6 +153,38 @@ export async function cmdSpawn(rt: Runtime, io: Io, opts: SpawnOptions): Promise
       io.err(`invalid workload id '${sanitizeRemote(opts.workloadId)}'`);
       return 2;
     }
+    if (opts.async) {
+      // The control plane refuses a workload on the async path with 501 rather than queueing a turn
+      // that could only dead-letter. Refused here so the session is never created.
+      io.err('--async and --workload are exclusive: an async turn cannot run on a workload');
+      return 2;
+    }
+  }
+
+  // The cap is checked first because it is the only preflight that costs nothing: no session, no
+  // worker and not even a round trip for a dispatch that is refused.
+  // shortcut: counts this user's ledger on this machine; the server's own pool is the real bound
+  // (503 saturated, already retried in runSpawnWorker). Revisit if the cap needs to be global.
+  const ledger = opts.ledger ?? openLedger(rt.paths.subagentsFile);
+  const cap = opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+  // Liveness-gated, not a bare non-terminal count: a stale `running` or `unknown` row — exactly
+  // what an unreconciled crash leaves behind — would otherwise hold a slot for good and wedge
+  // `spawn` permanently. A child that is gone holds nothing.
+  // shortcut: an async row has no child to probe, so it holds its slot until `subagents` or `get`
+  // reads the turn and writes a terminal state — both do. Revisit if the turn state is worth
+  // reading here too: it costs a round trip per row, which is what this preflight exists to avoid.
+  const running = ledger
+    .readAll()
+    .filter((r) => !isTerminalState(r.lastKnownState))
+    .filter((r) =>
+      r.turnId !== undefined ? true : r.childPid !== undefined && isAlive(r.childPid),
+    );
+  if (running.length >= cap) {
+    io.err(
+      `${running.length} subagents are already running and --max-concurrent is ${cap}; ` +
+        '`mocactl subagents` shows them, `mocactl get` collects one',
+    );
+    return 1;
   }
 
   // Preflight, before a session or a worker exists: a run on a workload that is missing or not
@@ -182,10 +224,26 @@ export async function cmdSpawn(rt: Runtime, io: Io, opts: SpawnOptions): Promise
   }
 
   const envelope: LeafEnvelope = buildEnvelope(session.sessionId, opts);
-  const ledger = opts.ledger ?? openLedger(rt.paths.subagentsFile);
-  // Record before fork so a crash in between leaves a durable row to recover from.
+
+  // The async path queues the turn BEFORE the ledger row, the sync path records before forking: the
+  // turn id is part of the row and cannot be written later (`append` is the only writer of it).
+  // The window is one call wide, and what it leaks is an orphan turn the control plane will run to
+  // completion — visible as a session, just not as a subagent. The sync path's own window leaks the
+  // same session, so neither is the one to close first.
+  let turnId: string | undefined;
+  if (opts.async) {
+    try {
+      const turns = opts.turns ?? new AsyncTurnTransport(rt.cp);
+      turnId = await turns.submit(envelope);
+    } catch (err) {
+      io.err(describeError(err));
+      return 1;
+    }
+  }
+
   const record: LedgerRecord = {
     sessionId: session.sessionId,
+    ...(turnId ? { turnId } : {}),
     ...(opts.tag ? { tag: opts.tag } : {}),
     ...(opts.label ? { label: opts.label } : {}),
     envelope: envelopeForLedger(opts),
@@ -199,6 +257,18 @@ export async function cmdSpawn(rt: Runtime, io: Io, opts: SpawnOptions): Promise
     stateObservedAt: rt.now(),
   };
   ledger.append(record);
+
+  if (turnId) {
+    // No fork: the turn record is the subagent, so there is nothing local to keep alive. The
+    // session token goes unused here — `get` mints its own when it needs one.
+    io.err(`spawned ${session.sessionId}  (turn ${turnId})`);
+    if (opts.json) {
+      io.out(JSON.stringify({ type: 'session', sessionId: session.sessionId, turnId }) + '\n');
+    } else {
+      io.out(`${session.sessionId}\n`);
+    }
+    return 0;
+  }
 
   // Resolve the harness URL in the parent so the child never re-discovers.
   let resolvedHarnessUrl: string | undefined;
@@ -456,6 +526,8 @@ export interface SubagentsOptions {
   /** Test seams. */
   ledger?: Ledger;
   transport?: LeafTransport;
+  /** Test seam for the async rows (those with a `turnId`). */
+  turns?: Pick<AsyncTurnTransport, 'readTurnState'>;
 }
 
 export async function cmdSubagents(rt: Runtime, io: Io, opts: SubagentsOptions): Promise<number> {
@@ -463,43 +535,14 @@ export async function cmdSubagents(rt: Runtime, io: Io, opts: SubagentsOptions):
   initLedger(rt.paths.subagentsFile);
   const ledger = opts.ledger ?? openLedger(rt.paths.subagentsFile);
   const transport = opts.transport ?? new LeafTransport(rt.harness, rt.fetchImpl);
+  const turns = opts.turns ?? new AsyncTurnTransport(rt.cp);
   const records = ledger.readAll().filter((r) => (opts.tag ? r.tag === opts.tag : true));
   if (records.length === 0) {
     io.err('no subagents' + (opts.tag ? ` with tag '${sanitizeRemote(opts.tag)}'` : ''));
     if (opts.json) io.out(JSON.stringify({ subagents: [] }) + '\n');
     return 0;
   }
-  const now = rt.now();
-  const views: Array<{ record: LedgerRecord; view: StateView }> = [];
-  for (const r of records) {
-    // Ledger is authoritative past terminal: /runs/status's 24h TTL would otherwise regress
-    // `done` to `unknown` once the server-side record ages out.
-    if (isTerminalState(r.lastKnownState)) {
-      views.push({ record: r, view: { state: r.lastKnownState, detail: r.stateDetail } });
-      continue;
-    }
-    const alive = r.childPid !== undefined && isAlive(r.childPid);
-    const observedAt = alive ? now : r.stateObservedAt;
-    let raw: LeafResultBody | 'queued';
-    try {
-      const token = await rt.cp.mintSessionToken(r.sessionId);
-      raw = await transport.readLeafState(r.sessionId, token.token, opts.signal);
-    } catch (err) {
-      // One row's failure doesn't fail the list.
-      views.push({ record: r, view: { state: 'unknown', detail: describeError(err) } });
-      continue;
-    }
-    views.push({
-      record: r,
-      view: mapHonestState(raw, { alive, observedAt }, now, DEFAULT_UNKNOWN_GRACE_MS),
-    });
-  }
-  // Persist any state changes so the next `subagents` call starts closer to the truth.
-  for (const { record, view } of views) {
-    if (view.state !== record.lastKnownState || view.detail !== record.stateDetail) {
-      ledger.updateState(record.sessionId, view.state, { detail: view.detail, now });
-    }
-  }
+  const views = await sweepStates(rt, { ledger, transport, turns, records, signal: opts.signal });
   if (opts.json) {
     io.out(
       JSON.stringify({
@@ -534,6 +577,170 @@ export async function cmdSubagents(rt: Runtime, io: Io, opts: SubagentsOptions):
   return 0;
 }
 
+// --- watch ---
+
+export interface WatchOptions {
+  tag?: string;
+  json: boolean;
+  signal?: AbortSignal;
+  /** Test seams, as on `subagents`. */
+  ledger?: Ledger;
+  transport?: LeafTransport;
+  turns?: Pick<AsyncTurnTransport, 'readTurnState'>;
+}
+
+/**
+ * shortcut: fixed interval, one read per non-final row per tick — `watch` is a background monitor,
+ * not an interactive wait, so it polls slower than `get --wait`. Revisit when the owner-scoped
+ * event stream (#392) lands and this can be a subscription instead.
+ */
+const WATCH_POLL_MS = 5_000;
+
+/** Behind a call so a second check further down the loop isn't narrowed away as unreachable. */
+const aborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
+
+/** Final for watching: nothing further is coming, so there is nothing left to report on this row. */
+function isFinalForWatch(state: HonestState): boolean {
+  // `unknown` is not `isTerminalState` — a later read could still find a result — but it is the
+  // client's "no result is coming": a child that exited without writing one past the 60 s grace, or
+  // a status read that failed. `watch` has to end, so it ends on the line that says so, and a
+  // monitor that wants another look re-runs it.
+  return isTerminalState(state) || state === 'unknown';
+}
+
+/**
+ * One line per state change until every watched subagent is final. Written for a coding agent's
+ * background monitor (Claude Code's Monitor tool), where each stdout line becomes one event.
+ */
+export async function cmdWatch(rt: Runtime, io: Io, opts: WatchOptions): Promise<number> {
+  if (!requireReady(rt, io)) return 2;
+  initLedger(rt.paths.subagentsFile);
+  const ledger = opts.ledger ?? openLedger(rt.paths.subagentsFile);
+  const transport = opts.transport ?? new LeafTransport(rt.harness, rt.fetchImpl);
+  const turns = opts.turns ?? new AsyncTurnTransport(rt.cp);
+  const match = (r: LedgerRecord): boolean => (opts.tag ? r.tag === opts.tag : true);
+  if (!ledger.readAll().some(match)) {
+    io.err('no subagents' + (opts.tag ? ` with tag '${sanitizeRemote(opts.tag)}'` : ''));
+    return 0;
+  }
+  // What was last printed per session, so only changes produce a line. The first sweep therefore
+  // reports every row: watching a batch that is already over should say so, not print nothing.
+  const printed = new Map<string, string>();
+  for (;;) {
+    // Re-read each tick so a `spawn --tag T` from another terminal joins a running `watch --tag T`,
+    // which is how a coding agent fans out: spawn some, watch, spawn more.
+    const records = ledger.readAll().filter(match);
+    const views = await sweepStates(rt, { ledger, transport, turns, records, signal: opts.signal });
+    // A Ctrl-C lands in the in-flight read, which the sweep reports as `unknown` — final, so the
+    // loop below would print it and exit 0. The signal, not the aborted read, is the answer.
+    if (aborted(opts.signal)) return 130;
+    for (const { record, view } of views) {
+      const line = view.state + ' ' + (view.detail ?? '');
+      if (printed.get(record.sessionId) === line) continue;
+      printed.set(record.sessionId, line);
+      io.out(watchLine(record, view, rt.now(), opts.json));
+    }
+    if (views.every(({ view }) => isFinalForWatch(view.state))) return 0;
+    await rt.sleep(WATCH_POLL_MS, opts.signal);
+    // `sleep` resolves on abort rather than rejecting, so without this the loop would go round once
+    // more and turn a Ctrl-C into a full sweep of failed reads.
+    if (aborted(opts.signal)) return 130;
+  }
+}
+
+/** One event: NDJSON under `--json` (same field names as `subagents --json`), else one text line. */
+function watchLine(record: LedgerRecord, view: StateView, at: number, json: boolean): string {
+  if (json) {
+    return (
+      JSON.stringify({
+        sessionId: record.sessionId,
+        tag: record.tag ?? null,
+        ...(record.label ? { label: record.label } : {}),
+        kind: record.envelope.kind,
+        state: view.state,
+        detail: view.detail ?? null,
+        at,
+      }) + '\n'
+    );
+  }
+  const name = record.label ?? record.tag;
+  // Padded to the longest state ('running') so the session ids line up in a terminal.
+  return (
+    [
+      view.state.padEnd(7),
+      sanitizeRemote(record.sessionId),
+      name ? sanitizeRemote(name) : undefined,
+      view.detail ? `(${sanitizeRemote(view.detail)})` : undefined,
+    ]
+      .filter((p) => p !== undefined)
+      .join('  ') + '\n'
+  );
+}
+
+/** A ledger row joined with the state just read for it. */
+interface RowView {
+  record: LedgerRecord;
+  view: StateView;
+}
+
+/**
+ * One state read per row — routed to whichever backend holds that leaf — mapped to an honest
+ * state and persisted, so the next call starts closer to the truth. Shared by `subagents` (one
+ * sweep, then render) and `watch` (a sweep per tick).
+ */
+async function sweepStates(
+  rt: Runtime & Required<Pick<Runtime, 'cp' | 'harness'>>,
+  deps: {
+    ledger: Ledger;
+    transport: LeafTransport;
+    turns: Pick<AsyncTurnTransport, 'readTurnState'>;
+    records: LedgerRecord[];
+    signal?: AbortSignal;
+  },
+): Promise<RowView[]> {
+  const now = rt.now();
+  const views: RowView[] = [];
+  for (const r of deps.records) {
+    // Ledger is authoritative past terminal: /runs/status's 24h TTL would otherwise regress
+    // `done` to `unknown` once the server-side record ages out.
+    if (isTerminalState(r.lastKnownState)) {
+      views.push({ record: r, view: { state: r.lastKnownState, detail: r.stateDetail } });
+      continue;
+    }
+    // An async row counts as alive while the turn is non-terminal: the turn record IS its liveness,
+    // so the 60 s child-exit grace — which exists to cover a dead child's result write — never
+    // applies to one.
+    const alive = r.turnId !== undefined || (r.childPid !== undefined && isAlive(r.childPid));
+    const observedAt = alive ? now : r.stateObservedAt;
+    let raw: LeafResultBody | 'queued';
+    try {
+      if (r.turnId !== undefined) {
+        raw = await deps.turns.readTurnState(r.sessionId, r.turnId, deps.signal);
+      } else {
+        const token = await rt.cp.mintSessionToken(r.sessionId);
+        raw = await deps.transport.readLeafState(r.sessionId, token.token, deps.signal);
+      }
+    } catch (err) {
+      // One row's failure doesn't fail the list.
+      views.push({ record: r, view: { state: 'unknown', detail: describeError(err) } });
+      continue;
+    }
+    views.push({
+      record: r,
+      view: mapHonestState(raw, { alive, observedAt }, now, DEFAULT_UNKNOWN_GRACE_MS),
+    });
+  }
+  // An interrupted sweep records nothing: the abort arrives in the catch above as `unknown`, and a
+  // read that never finished is not an observation to persist.
+  if (deps.signal?.aborted === true) return views;
+  for (const { record, view } of views) {
+    if (view.state !== record.lastKnownState || view.detail !== record.stateDetail) {
+      deps.ledger.updateState(record.sessionId, view.state, { detail: view.detail, now });
+    }
+  }
+  return views;
+}
+
 /** `kill(pid, 0)` liveness probe. OS pid-reuse is the known blind spot — see spec §5. */
 function isAlive(pid: number): boolean {
   try {
@@ -558,11 +765,24 @@ export interface GetOptions {
   sessionId: string;
   outDir?: string;
   json: boolean;
+  /** `--wait`: block until the result is collectable instead of reading once. */
+  wait?: boolean;
+  /** How long `--wait` blocks, in whole seconds. */
+  timeoutS?: number;
   signal?: AbortSignal;
   transport?: LeafTransport;
+  /** Test seam; otherwise the on-disk ledger, which says which backend holds this leaf. */
+  ledger?: Ledger;
+  /** Test seam for an async row (one with a `turnId`). */
+  turns?: Pick<AsyncTurnTransport, 'readTurnState' | 'collect'>;
 }
 
 const GET_SUMMARY_LINES = 10;
+/** `--wait`'s default budget, in seconds. */
+export const DEFAULT_WAIT_TIMEOUT_S = 300;
+/** shortcut: fixed interval, no backoff — `--wait` exists for collect latency. Revisit if
+ *  server-side run events (#392) land and the poll can become a subscription. */
+const WAIT_POLL_MS = 2_000;
 
 export async function cmdGet(rt: Runtime, io: Io, opts: GetOptions): Promise<number> {
   if (!requireReady(rt, io)) return 2;
@@ -571,19 +791,10 @@ export async function cmdGet(rt: Runtime, io: Io, opts: GetOptions): Promise<num
     return 2;
   }
   const transport = opts.transport ?? new LeafTransport(rt.harness, rt.fetchImpl);
-  let raw: LeafResultBody | 'queued';
-  try {
-    const token = await rt.cp.mintSessionToken(opts.sessionId);
-    raw = await transport.readLeafState(opts.sessionId, token.token, opts.signal);
-  } catch (err) {
-    // Match on code, not bare status: a route/auth 404 should surface its real error.
-    if (err instanceof ApiError && err.status === 404 && err.code === 'session_not_found') {
-      io.err(`no session '${sanitizeRemote(opts.sessionId)}'`);
-      return 1;
-    }
-    io.err(describeError(err));
-    return 1;
-  }
+  const read = await readLeafResult(rt, io, opts, transport);
+  // A number is an exit code for a failure `readLeafResult` has already reported.
+  if (typeof read === 'number') return read;
+  const raw = read;
   if (raw === 'queued') {
     io.err(`session '${sanitizeRemote(opts.sessionId)}' has not finished yet`);
     if (opts.json) io.out(JSON.stringify({ sessionId: opts.sessionId, status: 'queued' }) + '\n');
@@ -634,4 +845,109 @@ export async function cmdGet(rt: Runtime, io: Io, opts: GetOptions): Promise<num
     io.out(sanitizeRemote(head) + (head.includes('\n') ? '\n' : ''));
   }
   return completed ? 0 : 1;
+}
+
+/**
+ * One status read, or — under `--wait` — polls until the session has a record, the ledger says no
+ * record is coming, or the timeout runs out. Returns the body, `'queued'` (nothing to collect,
+ * which `cmdGet` reports as it always has) or an exit code for a reported failure.
+ */
+async function readLeafResult(
+  rt: Runtime & Required<Pick<Runtime, 'cp' | 'harness'>>,
+  io: Io,
+  opts: GetOptions,
+  transport: LeafTransport,
+): Promise<LeafResultBody | 'queued' | number> {
+  const deadline = rt.now() + (opts.timeoutS ?? DEFAULT_WAIT_TIMEOUT_S) * 1000;
+  // The row says which backend holds this leaf, so it is read whether or not we are waiting.
+  // shortcut: the sessionId may well not be ours (another machine spawned it), in which case there
+  // is no row and this reads the sync path — an async turn spawned elsewhere is invisible to `get`.
+  // Revisit with `get --turn ID`, or by asking the control plane for the session's turns.
+  const ledger = opts.ledger ?? openLedger(rt.paths.subagentsFile);
+  const record = ledger.find(opts.sessionId);
+  const turnId = record?.turnId;
+  let token: SessionToken | undefined;
+  const read = async (): Promise<LeafResultBody | 'queued'> => {
+    if (turnId !== undefined) {
+      const turns = opts.turns ?? new AsyncTurnTransport(rt.cp);
+      const body = await turns.readTurnState(opts.sessionId, turnId, opts.signal);
+      // The bytes are fetched once, on the read that found a result: `get` writes them to files,
+      // and a poll that is still `queued` has nothing to fetch.
+      return body === 'queued' ? body : turns.collect(opts.sessionId, turnId, body, opts.signal);
+    }
+    // Session tokens default to a 300 s TTL (SH_SESSION_TOKEN_TTL_SECONDS) — the same as
+    // `--wait`'s default budget — so one mint up front would expire mid-wait.
+    if (token === undefined || rt.now() / 1000 >= token.expiresAt - 30) {
+      token = await rt.cp.mintSessionToken(opts.sessionId);
+    }
+    return transport.readLeafState(opts.sessionId, token.token, opts.signal);
+  };
+  for (;;) {
+    let raw: LeafResultBody | 'queued';
+    try {
+      raw = await read();
+    } catch (err) {
+      // Ctrl-C mid-read: the transport wraps the abort as a network error, which is not worth
+      // printing when the user is the one who stopped it.
+      if (opts.signal?.aborted === true) return 130;
+      // Match on code, not bare status: a route/auth 404 should surface its real error.
+      if (err instanceof ApiError && err.status === 404 && err.code === 'session_not_found') {
+        io.err(`no session '${sanitizeRemote(opts.sessionId)}'`);
+        return 1;
+      }
+      io.err(describeError(err));
+      return 1;
+    }
+    if (raw !== 'queued') {
+      // Record what we just read, for an async row. `cmdSubagents`'s persist loop is otherwise the
+      // only writer of a turn's state, so a subagent collected with `get` would go on holding its
+      // `--max-concurrent` slot — the `spawn --async` ×N, `get` each, spawn more workflow would
+      // refuse at the cap with every one of those subagents already done (#922 review). The sync
+      // path needs none of this: the detached worker records its own outcome.
+      if (record?.turnId !== undefined) {
+        const view = terminalFromBody(raw);
+        if (view.state !== record.lastKnownState || view.detail !== record.stateDetail) {
+          ledger.updateState(opts.sessionId, view.state, { detail: view.detail, now: rt.now() });
+        }
+      }
+      return raw;
+    }
+    if (!opts.wait) return raw;
+    const hopeless = record && noResultComing(record, rt.now());
+    if (hopeless) {
+      const detail = sanitizeRemote(hopeless);
+      io.err(`session '${sanitizeRemote(opts.sessionId)}' will not produce a result — ${detail}`);
+      if (opts.json) {
+        io.out(JSON.stringify({ sessionId: opts.sessionId, status: 'unknown', detail }) + '\n');
+      }
+      return 1;
+    }
+    // Checked before sleeping so the wait never overruns the budget.
+    if (rt.now() + WAIT_POLL_MS > deadline) return 'queued';
+    await rt.sleep(WAIT_POLL_MS, opts.signal);
+    // `sleep` resolves on abort rather than rejecting, so without this the loop would go round
+    // once more and turn a Ctrl-C into a mint plus a failed read.
+    if (opts.signal?.aborted === true) return 130;
+  }
+}
+
+/**
+ * Why no record will ever arrive for this ledger row, or undefined if one still might. Keeps
+ * `--wait` from sitting out its whole budget on a subagent that is already over — the two cases
+ * being a row that went terminal client-side (a fork failure, say) and a child that exited
+ * without writing a result. The ledger is authoritative past terminal for the same reason it is
+ * in `cmdSubagents`: the server's record ages out, the row does not.
+ */
+function noResultComing(record: LedgerRecord, now: number): string | undefined {
+  if (isTerminalState(record.lastKnownState)) {
+    const detail = record.stateDetail ? ` (${record.stateDetail})` : '';
+    return `the ledger has it ${record.lastKnownState}${detail}`;
+  }
+  // An async row has no child: the turn state the caller just read is its liveness, and a turn that
+  // is going nowhere ends as `lost` rather than as a dead pid.
+  if (record.turnId !== undefined) return undefined;
+  if (record.childPid === undefined || isAlive(record.childPid)) return undefined;
+  // Same liveness + grace mapping `cmdSubagents` applies, so both commands agree on `unknown`.
+  const view = mapHonestState('queued', { alive: false, observedAt: record.stateObservedAt }, now);
+  return view.state === 'unknown' ? (view.detail ?? 'child exited with no result') : undefined;
 }

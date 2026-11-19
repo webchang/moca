@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cmdGet, type GetOptions } from '../src/subagent.js';
+import type { Ledger, LedgerRecord } from '../src/core/subagent-ledger.js';
 import { LeafTransport } from '../src/transport/leaf-turn.js';
 import { ApiError } from '../src/api/errors.js';
 
@@ -14,16 +15,25 @@ function makeRt(scratch: string) {
     healthz: vi.fn(),
   };
   const harness = { baseUrl: vi.fn(async () => 'https://harness.test') };
+  // `--wait` sleeps on the runtime clock, so advancing it from `sleep` drives the poll loop
+  // without any real time passing.
+  const clock = { ms: 1 };
+  const sleep = vi.fn(async (ms: number) => {
+    clock.ms += ms;
+  });
   return {
     rt: {
       cp,
       harness,
       auth: { subject: 'alice', apiToken: 'api-tok', expiresAt: 999 },
       paths: { stateDir: scratch, subagentsFile: join(scratch, 'subagents.jsonl') },
-      now: () => 1,
+      now: () => clock.ms,
+      sleep,
       fetchImpl: fetch,
     } as any,
     cp,
+    sleep,
+    clock,
   };
 }
 
@@ -189,6 +199,205 @@ describe('cmdGet — ApiError translation', () => {
   });
 });
 
+/* --- --wait --- */
+
+/** Successive `readLeafState` replies; the last one repeats once the list is exhausted. */
+function sequenceTransport(resps: unknown[]): LeafTransport {
+  let i = 0;
+  return {
+    readLeafState: vi.fn(async () => resps[Math.min(i++, resps.length - 1)]),
+  } as unknown as LeafTransport;
+}
+
+/** A ledger holding at most the one row `get` looks up, recording what is written back. */
+function ledgerWith(record?: LedgerRecord): Ledger & { updates: unknown[] } {
+  const updates: unknown[] = [];
+  return {
+    updates,
+    find: () => record,
+    readAll: () => (record ? [record] : []),
+    append: () => {},
+    updateState: (sessionId, lastKnownState, opts) => {
+      updates.push({ sessionId, lastKnownState, detail: opts?.detail });
+    },
+    compact: () => {},
+  };
+}
+
+const runningRow = (over: Partial<LedgerRecord> = {}): LedgerRecord => ({
+  sessionId: 'sess-abc',
+  envelope: { kind: 'prompt', prompt: 'p' },
+  submittedAt: 1,
+  lastKnownState: 'running',
+  stateObservedAt: 1,
+  ...over,
+});
+
+describe('cmdGet --wait', () => {
+  it('polls past queued and collects the result in the one call', async () => {
+    const { rt, sleep } = makeRt(scratch);
+    const { io, out } = makeIo();
+    const transport = sequenceTransport([
+      'queued',
+      'queued',
+      { status: 'responded', text: 'the answer' },
+    ]);
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({ wait: true, transport, outDir: scratch, ledger: ledgerWith() }),
+    );
+    expect(r).toBe(0);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(readFileSync(join(scratch, 'sess-abc.text'), 'utf8')).toBe('the answer');
+    expect(out.join('')).toContain('the answer');
+  });
+
+  it('reads exactly once without --wait, however queued the session is', async () => {
+    const { rt, sleep } = makeRt(scratch);
+    const { io } = makeIo();
+    const transport = sequenceTransport(['queued', { status: 'responded', text: 'late' }]);
+    const r = await cmdGet(rt, io, baseOpts({ transport, outDir: scratch }));
+    expect(r).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('gives up at --timeout with the shape a not-finished `get` already has', async () => {
+    const { rt, sleep } = makeRt(scratch);
+    const { io, out, err } = makeIo();
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        json: true,
+        wait: true,
+        timeoutS: 10,
+        transport: sequenceTransport(['queued']),
+        outDir: scratch,
+        ledger: ledgerWith(),
+      }),
+    );
+    expect(r).toBe(1);
+    // A 10 s budget at a 2 s interval: five sleeps spend it exactly, and the sixth read finds no
+    // room left for another. The budget is never overrun.
+    expect(sleep).toHaveBeenCalledTimes(5);
+    expect(err.join('\n')).toContain('has not finished yet');
+    expect(JSON.parse(out[0]!.trim())).toEqual({ sessionId: 'sess-abc', status: 'queued' });
+  });
+
+  it('stops on a dead child instead of waiting out the budget, and says unknown', async () => {
+    const { rt, sleep, clock } = makeRt(scratch);
+    // Past stateObservedAt + the 60 s result-write grace, so the dead child is genuinely over.
+    clock.ms = 10_000_000;
+    const { io, out, err } = makeIo();
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        json: true,
+        wait: true,
+        transport: sequenceTransport(['queued']),
+        outDir: scratch,
+        // Pid 2^31-1 is almost certainly not alive on any dev machine.
+        ledger: ledgerWith(runningRow({ childPid: 0x7fffffff })),
+      }),
+    );
+    expect(r).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('will not produce a result');
+    expect(JSON.parse(out[0]!.trim())).toMatchObject({ status: 'unknown' });
+  });
+
+  it('stops on a ledger row that already went terminal client-side (a fork failure)', async () => {
+    const { rt, sleep } = makeRt(scratch);
+    const { io, err } = makeIo();
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        wait: true,
+        transport: sequenceTransport(['queued']),
+        outDir: scratch,
+        ledger: ledgerWith(runningRow({ lastKnownState: 'failed', stateDetail: 'spawn EACCES' })),
+      }),
+    );
+    expect(r).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(err.join('\n')).toContain('spawn EACCES');
+  });
+
+  it('waits on a row whose child is still alive', async () => {
+    const { rt, sleep } = makeRt(scratch);
+    const { io } = makeIo();
+    const transport = sequenceTransport(['queued', { status: 'done', text: 'ok' }]);
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        wait: true,
+        transport,
+        outDir: scratch,
+        ledger: ledgerWith(runningRow({ childPid: process.pid })),
+      }),
+    );
+    expect(r).toBe(0);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('a Ctrl-C during the sleep exits 130 instead of going round for one more read', async () => {
+    const { rt, cp } = makeRt(scratch);
+    const { io, err } = makeIo();
+    const ac = new AbortController();
+    // The real `sleep` resolves on abort rather than rejecting, so the loop has to notice by
+    // itself; aborting from inside the mock is a Ctrl-C landing mid-sleep.
+    rt.sleep = vi.fn(async () => {
+      ac.abort();
+    });
+    const transport = sequenceTransport(['queued']);
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        wait: true,
+        transport,
+        outDir: scratch,
+        ledger: ledgerWith(),
+        signal: ac.signal,
+      }),
+    );
+    expect(r).toBe(130);
+    expect(transport.readLeafState).toHaveBeenCalledTimes(1);
+    expect(cp.mintSessionToken).toHaveBeenCalledTimes(1);
+    // Nothing printed: the user is the one who stopped it.
+    expect(err.join('')).toBe('');
+  });
+
+  it('a Ctrl-C mid-read exits 130 and not 1, without the wrapped network error', async () => {
+    const { rt } = makeRt(scratch);
+    const { io, err } = makeIo();
+    const ac = new AbortController();
+    const transport = {
+      readLeafState: vi.fn(async () => {
+        ac.abort();
+        throw new ApiError('harness', 0, 'network_error');
+      }),
+    } as unknown as LeafTransport;
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        wait: true,
+        transport,
+        outDir: scratch,
+        ledger: ledgerWith(),
+        signal: ac.signal,
+      }),
+    );
+    expect(r).toBe(130);
+    expect(err.join('')).toBe('');
+  });
+});
+
 describe('cmdGet — paused is not success', () => {
   it('exits 1 for a paused body (terminal, but still awaiting a gate decision)', async () => {
     const { rt } = makeRt(scratch);
@@ -216,5 +425,134 @@ describe('cmdGet — paused is not success', () => {
     expect(parsed.status).toBe('paused');
     expect(parsed.files).toHaveLength(1);
     expect(parsed.files[0]).toMatch(/sess-abc\.text$/);
+  });
+});
+
+/* --- async rows: the turn routes, not /runs/status --- */
+
+describe('cmdGet on an async row', () => {
+  const asyncRow = (over: Partial<LedgerRecord> = {}): LedgerRecord => ({
+    ...runningRow(),
+    turnId: 'turn-1',
+    ...over,
+  });
+
+  it('reads the turn, fetches the artifacts once and writes them', async () => {
+    const { rt, cp, sleep } = makeRt(scratch);
+    const { io, out } = makeIo();
+    let reads = 0;
+    const turns = {
+      readTurnState: vi.fn(async () =>
+        ++reads < 3 ? ('queued' as const) : { status: 'responded' as const, artifacts: ['text'] },
+      ),
+      collect: vi.fn(async (_s: string, _t: string, body: any) => ({
+        ...body,
+        text: 'the answer',
+      })),
+    };
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({ wait: true, turns, outDir: scratch, ledger: ledgerWith(asyncRow()) }),
+    );
+    expect(r).toBe(0);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    // Never minted: the turn routes take the API token the command already holds.
+    expect(cp.mintSessionToken).not.toHaveBeenCalled();
+    expect(turns.collect).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(scratch, 'sess-abc.text'), 'utf8')).toBe('the answer');
+    expect(out.join('')).toContain('the answer');
+  });
+
+  it('routes a row without a turnId to the sync path', async () => {
+    const { rt, cp } = makeRt(scratch);
+    const { io } = makeIo();
+    const turns = { readTurnState: vi.fn(), collect: vi.fn() };
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        transport: fakeTransport({ status: 'responded', text: 'sync' }),
+        turns,
+        outDir: scratch,
+        ledger: ledgerWith(runningRow()),
+      }),
+    );
+    expect(r).toBe(0);
+    expect(turns.readTurnState).not.toHaveBeenCalled();
+    expect(cp.mintSessionToken).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a cancelled turn as aborted, exit 1', async () => {
+    const { rt } = makeRt(scratch);
+    const { io, err } = makeIo();
+    const turns = {
+      readTurnState: vi.fn(async () => ({ status: 'aborted' as const, reason: 'cancelled' })),
+      collect: vi.fn(async (_s: string, _t: string, body: any) => body),
+    };
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({ turns, outDir: scratch, ledger: ledgerWith(asyncRow()) }),
+    );
+    expect(r).toBe(1);
+    expect(err.join('\n')).toContain('status  aborted');
+    expect(err.join('\n')).toContain('reason  cancelled');
+  });
+
+  it("waits out the budget rather than reading a dead pid's grace: there is no child", async () => {
+    const { rt } = makeRt(scratch);
+    const { io, err } = makeIo();
+    const turns = {
+      readTurnState: vi.fn(async () => 'queued' as const),
+      collect: vi.fn(),
+    };
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        wait: true,
+        timeoutS: 4,
+        turns,
+        outDir: scratch,
+        // A pid that is long gone would stop the sync path on `noResultComing`.
+        ledger: ledgerWith(asyncRow({ childPid: 0x7fffffff, stateObservedAt: -600_000 })),
+      }),
+    );
+    expect(r).toBe(1);
+    expect(err.join('\n')).toContain('has not finished yet');
+    expect(turns.readTurnState).toHaveBeenCalledTimes(3);
+  });
+
+  it('records the terminal state it read, so the row stops holding a --max-concurrent slot', async () => {
+    const { rt } = makeRt(scratch);
+    const { io } = makeIo();
+    const turns = {
+      readTurnState: vi.fn(async () => ({ status: 'failed' as const, reason: 'caps_exceeded' })),
+      collect: vi.fn(async (_s: string, _t: string, body: any) => body),
+    };
+    const ledger = ledgerWith(asyncRow());
+    const r = await cmdGet(rt, io, baseOpts({ turns, outDir: scratch, ledger }));
+    expect(r).toBe(1);
+    expect(ledger.updates).toEqual([
+      { sessionId: 'sess-abc', lastKnownState: 'failed', detail: 'caps_exceeded' },
+    ]);
+  });
+
+  it('leaves a sync row to its own worker to record', async () => {
+    const { rt } = makeRt(scratch);
+    const { io } = makeIo();
+    const ledger = ledgerWith(runningRow({ childPid: process.pid }));
+    const r = await cmdGet(
+      rt,
+      io,
+      baseOpts({
+        transport: fakeTransport({ status: 'responded', text: 'sync' }),
+        outDir: scratch,
+        ledger,
+      }),
+    );
+    expect(r).toBe(0);
+    expect(ledger.updates).toEqual([]);
   });
 });
