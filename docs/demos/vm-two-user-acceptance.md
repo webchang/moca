@@ -2,7 +2,7 @@
 
 > **Preview.** Run by one person with two GitHub accounts on one laptop. It predates the `mocactl` installer (use the
 > one-line installer in [Get started](../get-started/index.md)) and says the container worker ignores the workspace key,
-> which is out of date. The task version is [Manage multi-user sessions](../guides/manage-multi-user-sessions.md).
+> which is out of date. The task version is [Manage multi-user sessions](../operate/harness/multi-user.md).
 > Labels: [Maturity and lifecycle](../reference/maturity-and-lifecycle.md).
 
 > **The claim:** two people, each on their own laptop with their own GitHub account, log in to the
@@ -46,7 +46,7 @@ run proves the real login.
 
 A VM brought up by `deploy/vm/setup-vm.sh` (item A, #366), with the control plane running and the
 supervisor started. Use a GitHub OAuth app with **Enable Device Flow** ticked
-(`deploy/vm/README.md`, "The GitHub OAuth app"). On the default SSH-tunnel topology, run setup
+([Single VM](../operate/harness/single-vm.md#the-github-oauth-app), "The GitHub OAuth app"). On the default SSH-tunnel topology, run setup
 with both control-plane settings. On a fresh VM this is the **second** run, once `SH_RELAY_TOKEN`
 is set; the first stops at that check (README, "Bring it up"):
 
@@ -193,7 +193,7 @@ onboarding flow; a plain `mocactl` with a control-plane URL and a login goes str
 Add one credential with consumer `inference`:
 
 - **A gateway token** (LiteLLM and the like): kind `bearer`, with the fields in
-  `packages/mocactl/QUICKSTART.md`, step 4.
+  `docs/harness/how-to/set-up-mocactl.md`, step 4.
 - **An Anthropic API key** (`sk-ant-api…`): kind `api-key`, destination host `api.anthropic.com`,
   gateway endpoint `https://api.anthropic.com` (no `/v1`), and the key itself, pasted as is into
   the **API key** field. The form stores that field verbatim, so a `key=` prefix would become part

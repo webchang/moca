@@ -3,7 +3,7 @@
 > **Preview.** Describes P6 on `main` as of 2026-10-13: what each component holds, who can reach it, and what is and
 > is not enforced. Every claim comes from code or a manifest unless marked _(documented only)_ (a README, ADR or spec
 > says so; I did not find it in code), _(designed, not built)_, or _(inferred)_. To report a vulnerability see
-> [`SECURITY.md`](../../SECURITY.md); for a checklist see [Hardening](../operations/hardening.md).
+> [`SECURITY.md`](../../SECURITY.md); for a checklist see [Hardening](../operate/day-2/hardening.md).
 
 ## Read this first
 
@@ -61,7 +61,8 @@ The control plane has no rate limiting; its only caps are the request body size 
 ### Tokens
 
 All JWS and refresh tokens are issued by the control plane; the data plane gets only public keys, so a compromised harness can verify
-tokens but not mint them. No credential travels in a token.
+tokens but not mint them. No credential travels in a token. The sandbox service's tokens, the turn grants and the
+installer token are listed in [Users, enrollment and roles](users-and-roles.md#credentials-and-their-lifetimes).
 
 | Token          | Scope                       | Lifetime                       | Notes                                                                                                                                                                                                                                                                                                                                                              |
 | -------------- | --------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -78,9 +79,15 @@ session's token can still read run status until it expires _(inferred)_.
 
 ### Identity and roles
 
-A user is `github:<numeric id>` from the GitHub device flow. `admin` comes only from `SH_ADMIN_SUBJECTS`, re-evaluated
-at each refresh. Admin has two powers: listing another user's sessions (`?owner=`) and deleting any config bundle. It
-does not bypass session ownership. Another user's session answers 404, never 403, so ids cannot be probed.
+A user is `github:<numeric id>` from the GitHub device flow, or `oidc:<sub>` from an OIDC provider. `admin` comes from
+`SH_ADMIN_SUBJECTS` or, on a control plane with a template store (`SH_PROVENANCE_DIR`), from an API grant on
+`/v1/subjects`. Without a store, a token's roles are those of `SH_ADMIN_SUBJECTS` (read at boot) at its mint or refresh;
+with one, the router replaces them on every request with the subject's roles now, so a grant or revoke takes effect at
+the next request (`server.ts`, `members.ts`). Only an admin named in `SH_ADMIN_SUBJECTS`, or the sandbox profile's
+installer token (`SH_INSTALLER_TOKEN`), may change enrollment or roles. On the harness profile an admin can list another
+user's sessions (`?owner=`) and delete any config bundle, and with a template store it also administers templates, the
+template policy and quotas. It does not bypass session ownership. See
+[Users, enrollment and roles](users-and-roles.md). Another user's session answers 404, never 403, so ids cannot be probed.
 
 A `403 single_tenant_deployment` appears in specs and the VM README but not in the code _(designed, not built)_.
 
@@ -204,7 +211,7 @@ per-connection hand-off and the turn cap; that is a correctness constraint, not 
 The control plane records credential issuance, the operator fallback, session create and delete, credential writes,
 bundle uploads and refresh-token decisions in a Redis stream, with names and ids but never secret values. Errors leave
 the control plane as opaque codes. A search of the obvious paths found no logging of tokens or headers, but that was a
-grep, not an audit. See [Observability](../operations/observability.md#the-audit-stream).
+grep, not an audit. See [Observability](../operate/day-2/observability.md#the-audit-stream).
 
 ## Supply chain
 

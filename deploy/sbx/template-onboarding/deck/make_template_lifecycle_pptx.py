@@ -8,7 +8,7 @@ Sources, in the order they win (a slide restates them; change the source first):
      host agent §6.1, first use §6.4, provenance §7, policy §8, validation §10.1)
   2. docs/specs/2026-11-05-combined-control-plane-design.md (one control plane, turns by build)
   3. deploy/sbx/template-onboarding/governance/GAPS-AND-ASSUMPTIONS.md (G19-G43)
-  4. deploy/sbx/RUNBOOK.md §15 (the host agent, its units)
+  4. docs/operate/sandbox-service/runbook.md, "The template host agent" (its units)
   5. the run record of windows 1-4 (on the user's machine; its numbers are copied below with the
      window they come from); spec §10.1's Lite-28 and Moca Pi window entries (words, no counts)
   6. docs/specs/2026-10-30-session-sandbox-templates-design.md §5, §5.1 (seed from the build, the

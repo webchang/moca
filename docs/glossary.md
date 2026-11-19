@@ -61,7 +61,7 @@ leaves). B is served by the P6 runtime. A runs on P6 again, opt-in behind `SH_AS
 single-tenant only in v0.10.0 (multi-tenant is targeted for v0.12.0), submitted to the control
 plane's `POST /v1/sessions/{id}/turns`; the data plane's `async: true` stays removed. C was removed
 with the Knative/KEDA path and has no P6 design yet
-([#536](https://github.com/rossoctl/moca/issues/536)). See [dispatch archetypes](concepts/dispatch-archetypes.md).
+([#536](https://github.com/rossoctl/moca/issues/536)). See [dispatch archetypes](harness/concepts/dispatch-archetypes.md).
 
 ## brain and hands
 
@@ -83,11 +83,19 @@ image. The worker entry point lives in `packages/server/src/worker.ts`. Not to b
 
 ## sandbox
 
-The isolated environment where a session's tools run. Two tiers exist: a container, and (P4) a
-Firecracker microVM per `Exec`. A sandbox runs a `remote-worker` process that dials out to the relay,
-so it needs no inbound route ([ADR-0024](adrs/0024-sandbox-transport-remote-exec.md),
-[ADR-0035](adrs/0035-per-exec-microvm-warm-standby.md)). On the removed Knative path a sandbox was
-the single pod reached with `kubectl exec` (`sandbox-0`).
+Two different things share the word, and neither sees the other.
+
+- **A harness session's sandbox:** the isolated environment where a harness session's tools run.
+  Two tiers exist: a container, and (P4) a Firecracker microVM per `Exec`. A sandbox runs a
+  `remote-worker` process that dials out to the relay, so it needs no inbound route
+  ([ADR-0024](adrs/0024-sandbox-transport-remote-exec.md),
+  [ADR-0035](adrs/0035-per-exec-microvm-warm-standby.md)). On the removed Knative path a sandbox
+  was the single pod reached with `kubectl exec` (`sandbox-0`).
+- **A sandbox-service sandbox:** a workspace on the [sandbox service](#sandbox-service), made from
+  a [template](#template-build-and-tag), where a coding agent's commands run in isolated VMs. You
+  drive it with `mocactl sbx`; its files persist in `/workspace` between commands.
+
+The `mocactl sbx` commands neither see nor manage a harness session's sandbox.
 
 ## relay
 
@@ -111,12 +119,69 @@ The multi-user service (MU1) that handles login, session ownership and credentia
 exchanges a user's session token for the credentials a turn needs. `mocactl` is its terminal client
 ([ADR-0033](adrs/0033-multi-user-control-plane.md)).
 
+It is one package, `@moca/control-plane`, with three **route profiles** (`SH_ROUTE_PROFILE`):
+`harness` (the default: login, sessions, credentials, config bundles), `sandbox` (the
+[sandbox service](#sandbox-service): login, sandboxes and templates), and `combined` (both in one
+process). So "the control plane" of a sandbox-service deployment is the same package on the
+`sandbox` profile.
+
+## harness
+
+**The moca harness** is the capability that runs agent sessions: the [supervisor](#supervisor)
+hands each connection to a warm [worker](#worker), sessions are durable in Redis, and the agent's
+tools run in a harness [sandbox](#sandbox). Its sibling capability is the
+[sandbox service](#sandbox-service).
+
+Narrower uses of the word: the `@moca/harness` package (`harness/`) is the turn-execution library
+the worker (`@moca/server`) and the sandbox relay import: `runTurn`, `run-leaf`, turn streaming,
+the audit log, pool records and sandbox selection (the Pi session-log adapter,
+`BufferedRedisBackend`, is one module in it); and names such as
+`~/.serverless-harness`, `/etc/serverless-harness` and the `SH_*` variables keep the project's
+historical prefix.
+
+## sandbox service
+
+moca's other capability: a coding agent stays on the user's machine, and every command it runs
+goes to a [sandbox-service sandbox](#sandbox), each in a fresh VM, through `mocactl sbx`. It is
+deployed as a control plane on the `sandbox` [route profile](#control-plane), the relay, Redis and
+KVM hosts running `microvm-worker`; see
+[Install the sandbox service](operate/sandbox-service/install.md).
+
+## template, build and tag
+
+A **template** is what a sandbox-service sandbox is made from (`mocactl sbx templates` lists
+them). A **build** is one immutable snapshot of a template; a new build of a template does not
+change the sandboxes made from an earlier one. A **tag** names a registered build
+(`ID:TAG`, or `ID@BUILD` for a build itself); `default` is the tag used when none is given, and it
+cannot be removed; moving a tag leaves the sandboxes made earlier on their build. See
+[Templates, builds and activation](sandbox/concepts/templates.md).
+
+## activation lease
+
+On a deployment with template host agents, a build's worker runs only while someone holds an
+activation lease on it: `mocactl sbx templates activate` takes or renews one, and when the last
+lease is released (`deactivate`) the worker drains and stops, after the host's idle grace.
+
+## sandbox mode
+
+How a sandbox-service sandbox runs its commands: `per-exec` (the default, a fresh VM per
+command), `lease` (the guest is kept between commands) or `lease+processes` (tracked processes
+outlive a command too). The deployment decides which modes users may pick; see
+[Keep a guest between commands](sandbox/how-to/lease-mode.md).
+
+## subject
+
+The identity a login maps to, written `github:<numeric GitHub user id>` or `oidc:<provider sub>`.
+`SH_ADMIN_SUBJECTS` and, on the sandbox and combined profiles, `SH_ALLOWED_SUBJECTS` take subjects; a user who
+is not enrolled is told their own subject by `mocactl sbx login`. See
+[Users, enrollment and roles](reference/users-and-roles.md).
+
 ## config bundle
 
 A content-addressed tar built by `@moca/config-bundle` from a user's `.claude` skills and commands,
 the `CLAUDE.md` chain and the memory index and files (under `context/`), that a session or leaf runs
 with, referenced by digest (`configRef: sha256:…`). Built and credential-scanned client-side;
-see [Promoting a local Claude Code workflow](guides/promote-claude-workflow.md).
+see [Promoting a local Claude Code workflow](harness/how-to/promote-claude-workflow.md).
 
 ## human gate
 

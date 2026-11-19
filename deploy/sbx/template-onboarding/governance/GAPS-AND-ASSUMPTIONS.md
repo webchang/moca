@@ -18,7 +18,7 @@ below describes the fork's earlier code, upstream's behaviour now holds. Two dif
 admin rejects is stopped, never removed (upstream's rule; PV6's "the host's removal" is a retired build's only);
 and upstream's general gate record schema defaults to `moca-gate-record/1` (`SH_GATE_RECORD_SCHEMA`), so a
 deployment that takes the image builder's general-gate records sets `SBX_GATE_RECORD_SCHEMA` in setup.sh's env
-file ([`deploy/sbx/README.md`](../../README.md)).
+file ([Install the sandbox service](../../../../docs/operate/sandbox-service/install.md)).
 
 ## The user's decisions this rests on (2026-11-02, D12-D13 2026-11-03)
 

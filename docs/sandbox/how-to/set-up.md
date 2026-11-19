@@ -33,7 +33,7 @@ re-run the install line above (or with `MOCACTL_VERSION=edge` for the newest bui
 ## Log in and bring a repository up
 
 You need the URL of your sandbox service deployment, `https://<api host>`: moca is self-hosted,
-so it is the deployment you or your team run ([install](../../../deploy/sbx/README.md)).
+so it is the deployment you or your team run ([install](../../operate/sandbox-service/install.md)).
 
 **Log in** with GitHub's device flow. The URL is remembered, so this is the only time you pass it:
 
@@ -69,6 +69,12 @@ sandbox sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default), expires 2026-10-26T09:00:00.00
 Without `--template`, `up` uses the `default` template; `mocactl sbx templates` lists the others,
 and `mocactl sbx up --template <id>` picks one. Run `up` again at any time: it reuses this
 repository's sandbox while it is live.
+
+**Moving to another control plane.** The other commands use the bound sandbox's control plane. So
+after `mocactl sbx login --control-plane-url <new URL>`, a repository bound on the old one is
+refused until you run `up` in it. `up` sees the binding's control plane has no login on this
+machine, uses the new URL and rebinds. Work not pulled from the old sandbox stays on the old
+control plane. `MOCACTL_SBX_URL` sets the control plane for one shell.
 
 A new sandbox ends after 7 days without use by default; `--lifetime DURATION` (`36h`, `14d`,
 `90m`, or whole seconds) picks another: at least 1 h, at most the deployment's maximum (30 days
