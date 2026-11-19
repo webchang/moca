@@ -1,6 +1,6 @@
 # Upgrades
 
-> **Preview.** For P6 on Kubernetes ([`deploy/k8s`](../../deploy/k8s/README.md)). The repository documents no
+> **Preview.** For P6 on Kubernetes ([`deploy/k8s`](../operate/harness/kubernetes.md)). The repository documents no
 > rollback procedure; what is below is what the scripts and manifests do.
 
 ## Upgrading means passing a new image
@@ -70,7 +70,7 @@ period is only an outer bound. Practically:
   bundle format ([#510](https://github.com/rossoctl/moca/issues/510)). Nothing enforces this order, and the
   supervisor, control plane and relay use the same image, so one `--image` bump moves all three and they roll in
   parallel (the rule is in [ADR-0038](../adrs/0038-mocactl-config-bundle-promotion.md) and the
-  [promote guide](../guides/promote-claude-workflow.md)). For a release whose notes say it changes config-bundle handling, roll the supervisor
+  [promote guide](../harness/how-to/promote-claude-workflow.md)). For a release whose notes say it changes config-bundle handling, roll the supervisor
   first (see below). Do not split the image to get this ordering.
 - **Tier lists must match.** `SH_SANDBOX_TIERS` and `SH_SANDBOX_DEFAULT_TIER` are read by both from the same
   ConfigMap.
@@ -126,6 +126,14 @@ that use a promoted bundle.
 Changes that alter a default or what a re-run of `setup.sh` writes ([change policy](../reference/change-policy.md),
 rule 5).
 
+- **A turn is told when its session's workspace was reset
+  ([#338](https://github.com/rossoctl/moca/issues/338)).** The harness keeps a `.moca-session` marker in each
+  session's workspace and checks it at every turn's start: one extra Exec per turn, about 2 ms on the container
+  tier and one VM acquire (a standby restore, then its replenish) on the microVM per-exec tier. A reclaimed
+  workspace is reported as `workspace_reset` with reason `reclaimed`; a `mocactl` from before harness API 1.7.0
+  prints that as its "sandbox is gone" message, so upgrade `mocactl` to see the right one. In a git repository
+  (a worktree or submodule included) the marker is added to the repository's `info/exclude`, so `git status`,
+  `git add -A` and `git clean -fd` leave it alone.
 - **Container sandboxes keep an idle workspace for 8 hours, not 30 minutes
   ([#338](https://github.com/rossoctl/moca/issues/338)).** The first `setup.sh` run after the upgrade writes
   `SH_WORKSPACE_IDLE=8h` to `moca-settings` and to a new ConfigMap, `moca-sandbox-settings`, in the sandbox
