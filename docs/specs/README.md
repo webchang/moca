@@ -274,7 +274,7 @@ density work. The long-term multi-tenant design (SBX1) is exploratory and not in
 [memory-aware placement](2026-11-09-memory-aware-placement-design.md) and
 [mocactl for templates](2026-11-10-mocactl-template-commands-design.md), the designs as the fork
 built them. Upstream folded them into the template lifecycle design (§6.4, §6.5) and the
-[user guide](../sbx/user-guide.md); where they differ, upstream's holds.
+[templates how-to](../sandbox/how-to/templates.md); where they differ, upstream's holds.
 
 ---
 
