@@ -739,7 +739,8 @@ kubectl logs deployment/moca-control-plane -c control-plane -n "$NS" \
 ```
 
 The relay writes the `"audit":"sandbox_exec"` line of §8 per Exec, and `sandbox_abort`,
-`sandbox_release` and `sandbox_lease_control` lines, each with its own `ts`, and `sub` and `sbx`
+`sandbox_release`, `sandbox_lease_control` and `sandbox_workspace_release` (a client's `Release` of
+its workspace at its end, #338) lines, each with its own `ts`, and `sub` and `sbx`
 when the token verified (`packages/sandbox-relay/src/sandbox-caller.ts`, `makeAudit`). Checked
 against the code:
 
@@ -861,7 +862,10 @@ agent's sandbox instructions carry the rule there. The allowlist below is where 
   rebuilding the binary. A bare `MOCA_EGRESS_ALLOW=*` (nothing else on the line) is allow-everything
   mode: every destination is permitted, private and local addresses included -- only the
   always-refused tier stays (cloud metadata endpoints, link-local, multicast), so a sandbox still
-  cannot fetch the host's instance credentials. For trusted research rigs only; the startup log
+  cannot fetch the host's instance credentials. It includes the host's own loopback (`127.0.0.0/8`,
+  `::1`) and interface addresses: a sandbox can reach every service listening on the KVM host.
+  Don't use it on a host that runs anything else, or where loopback services trust the local
+  network. For trusted research rigs only; the startup log
   says `allow-all mode` plainly, so a journal reader cannot miss it.
 - **Another install's `moca-egress.service`.** A host that also runs `deploy/microvm`'s P6 worker
   already has one. If `/etc/systemd/system/moca-egress.service` exists and `/etc/sbx/manifest` has no
@@ -982,6 +986,10 @@ before systemd is touched.
 2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<image>`,
    or for a template, `template-build.sh SPEC --egress-ca /etc/sbx/egress/ca.crt ...`
    (`deploy/sbx/template-onboarding/ONBOARDING.md`).
+   A self-serve template is built by the host agent, which passes `--egress-ca` itself once the
+   drop-in exists (step 4; [The template host agent](#the-template-host-agent)). From creating the
+   CA until the drop-in is in, stop `sbx-host-agent` (or let no build be queued): a build claimed in
+   between lacks the CA, is refused at worker install, and is rebuilt.
 3. `sudo deploy/sbx/install-host.sh WORKER_BUNDLE --snapshot <image>`.
 4. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
 
@@ -1490,7 +1498,12 @@ registers or rejects each built build by policy; nobody approves it. It needs:
 
 It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), claims at most
 `SBX_BUILD_CONCURRENCY` builds a poll (default 1, at most 4), and checks a gate record's bytes
-against their sha256 before building with it. The token stays in a 0600 header file, never in argv
+against their sha256 before building with it. On a host with egress credentials on (the `--egress` drop-in exists; see
+[Credential injection](#credential-injection---egress)), a spec with `egress: true` is built with
+`--egress-ca /etc/sbx/egress/ca.crt`, so its snapshot trusts the host's interception CA and the
+worker install's CA check passes; with credentials on and no CA file, the build is reported failed
+(`step: egress`). The CA is part of the build's identity (its manifest hash), so turning credentials
+on, or rotating the CA, needs a rebuild of the egress templates the host already holds. The token stays in a 0600 header file, never in argv
 or the log. A bad setting is refused (exit 2) before any call. Each run ends with one summary line,
 `{"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}`, in the unit's
 journal, with `"psi":"absent"`, `"sliceUnread":[...]` and `"memfileMismatch":<n>` when there is

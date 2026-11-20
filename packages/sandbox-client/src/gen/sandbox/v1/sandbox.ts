@@ -229,6 +229,61 @@ export function leaseOpToJSON(object: LeaseOp): string {
   }
 }
 
+/** What a release did. */
+export enum ReleaseOutcome {
+  RELEASE_OUTCOME_UNSPECIFIED = 0,
+  /** RELEASE_OUTCOME_RELEASED - The standbys and the workspace are freed. */
+  RELEASE_OUTCOME_RELEASED = 1,
+  /**
+   * RELEASE_OUTCOME_KEPT_BUSY - An Exec (or a live lease) was using the workspace: the standbys are freed, the workspace
+   * is kept and is freed when it is no longer in use.
+   */
+  RELEASE_OUTCOME_KEPT_BUSY = 2,
+  /**
+   * RELEASE_OUTCOME_UNKNOWN_KEY - The worker holds no workspace for the key (never used here, or already reclaimed). The
+   * key is refused for new Execs all the same.
+   */
+  RELEASE_OUTCOME_UNKNOWN_KEY = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function releaseOutcomeFromJSON(object: any): ReleaseOutcome {
+  switch (object) {
+    case 0:
+    case "RELEASE_OUTCOME_UNSPECIFIED":
+      return ReleaseOutcome.RELEASE_OUTCOME_UNSPECIFIED;
+    case 1:
+    case "RELEASE_OUTCOME_RELEASED":
+      return ReleaseOutcome.RELEASE_OUTCOME_RELEASED;
+    case 2:
+    case "RELEASE_OUTCOME_KEPT_BUSY":
+      return ReleaseOutcome.RELEASE_OUTCOME_KEPT_BUSY;
+    case 3:
+    case "RELEASE_OUTCOME_UNKNOWN_KEY":
+      return ReleaseOutcome.RELEASE_OUTCOME_UNKNOWN_KEY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ReleaseOutcome.UNRECOGNIZED;
+  }
+}
+
+export function releaseOutcomeToJSON(object: ReleaseOutcome): string {
+  switch (object) {
+    case ReleaseOutcome.RELEASE_OUTCOME_UNSPECIFIED:
+      return "RELEASE_OUTCOME_UNSPECIFIED";
+    case ReleaseOutcome.RELEASE_OUTCOME_RELEASED:
+      return "RELEASE_OUTCOME_RELEASED";
+    case ReleaseOutcome.RELEASE_OUTCOME_KEPT_BUSY:
+      return "RELEASE_OUTCOME_KEPT_BUSY";
+    case ReleaseOutcome.RELEASE_OUTCOME_UNKNOWN_KEY:
+      return "RELEASE_OUTCOME_UNKNOWN_KEY";
+    case ReleaseOutcome.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** ---- worker → relay ---- */
 export interface WorkerFrame {
   /** sent first: identity + capabilities */
@@ -256,7 +311,11 @@ export interface WorkerFrame {
     | LeaseEvent
     | undefined;
   /** the answer to a LeaseControlFrame, by ctl_id */
-  leaseResult?: LeaseControlResult | undefined;
+  leaseResult?:
+    | LeaseControlResult
+    | undefined;
+  /** the answer to a ReleaseFrame, by ctl_id */
+  releaseResult?: ReleaseResult | undefined;
 }
 
 /** ---- relay → worker ---- */
@@ -274,7 +333,11 @@ export interface ServerFrame {
     | LeaseControlFrame
     | undefined;
   /** keepalive-loss heartbeat for a live lease; never resets idle; no answer */
-  keepalive?: LeaseKeepaliveFrame | undefined;
+  keepalive?:
+    | LeaseKeepaliveFrame
+    | undefined;
+  /** the workspace's session or sandbox has ended; answered by release_result */
+  release?: ReleaseFrame | undefined;
 }
 
 export interface Hello {
@@ -557,6 +620,52 @@ export interface LeaseKeepaliveRequest {
 export interface LeaseKeepaliveResponse {
 }
 
+/** ---- client ↔ relay (SandboxExec Release) ---- */
+export interface ReleaseRequest {
+  sandboxId: string;
+}
+
+export interface ReleaseResponse {
+  outcome: ReleaseOutcome;
+}
+
+/**
+ * relay → worker: the session or sandbox that owns workspace_key has ended, so the worker
+ * may free the key's standbys and workspace now instead of at its idle reclaim. ADDITIVE: a
+ * worker that predates it ignores an unknown ServerFrame, and a relay that never sends it
+ * leaves idle reclaim as the only release. A worker that serves it advertises
+ * "sbx:release-v1" in Hello.capabilities. ctl_id correlates the ReleaseResult.
+ *
+ * A release never cuts an Exec: with one in flight the worker keeps the workspace and frees
+ * it when that Exec ends. Either way the key is then refused for new Execs (a turn still
+ * running after its session ended must not re-create an empty workspace), with the
+ * ExecError "released: <detail>", for a bounded time (the worker's WorkspaceIdle).
+ *
+ * SENDER CONTRACT. Send it only at the owner's terminal end: a sandbox's deletion or
+ * expiry, or a session's deletion. The harness uses the session id as workspace_key
+ * (harness/src/select-sandbox.ts), so a release sent while a session can still resume
+ * locks that session out of its workspace for WorkspaceIdle.
+ */
+export interface ReleaseFrame {
+  ctlId: number;
+  workspaceKey: string;
+}
+
+/**
+ * worker → relay: the answer to a ReleaseFrame. An empty error means outcome holds;
+ * otherwise outcome is UNSPECIFIED and error is one of these wire strings:
+ *   "release_unsupported: <detail>"   the worker's runner has no Release; don't retry
+ *   "busy: <detail>"                  too many releases in flight on the worker; retry later
+ *   "invalid-workspace-key: <detail>" or "empty-workspace-key: <detail>": the key is refused; don't retry
+ *   any other string                  the worker failed (shutting down, a filesystem error); retry,
+ *                                     and idle reclaim stays the backstop
+ */
+export interface ReleaseResult {
+  ctlId: number;
+  outcome: ReleaseOutcome;
+  error: string;
+}
+
 function createBaseWorkerFrame(): WorkerFrame {
   return {
     hello: undefined,
@@ -566,6 +675,7 @@ function createBaseWorkerFrame(): WorkerFrame {
     error: undefined,
     lease: undefined,
     leaseResult: undefined,
+    releaseResult: undefined,
   };
 }
 
@@ -591,6 +701,9 @@ export const WorkerFrame: MessageFns<WorkerFrame> = {
     }
     if (message.leaseResult !== undefined) {
       LeaseControlResult.encode(message.leaseResult, writer.uint32(58).fork()).join();
+    }
+    if (message.releaseResult !== undefined) {
+      ReleaseResult.encode(message.releaseResult, writer.uint32(66).fork()).join();
     }
     return writer;
   },
@@ -658,6 +771,14 @@ export const WorkerFrame: MessageFns<WorkerFrame> = {
           message.leaseResult = LeaseControlResult.decode(reader, reader.uint32());
           continue;
         }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.releaseResult = ReleaseResult.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -676,6 +797,7 @@ export const WorkerFrame: MessageFns<WorkerFrame> = {
       error: isSet(object.error) ? ExecError.fromJSON(object.error) : undefined,
       lease: isSet(object.lease) ? LeaseEvent.fromJSON(object.lease) : undefined,
       leaseResult: isSet(object.leaseResult) ? LeaseControlResult.fromJSON(object.leaseResult) : undefined,
+      releaseResult: isSet(object.releaseResult) ? ReleaseResult.fromJSON(object.releaseResult) : undefined,
     };
   },
 
@@ -702,6 +824,9 @@ export const WorkerFrame: MessageFns<WorkerFrame> = {
     if (message.leaseResult !== undefined) {
       obj.leaseResult = LeaseControlResult.toJSON(message.leaseResult);
     }
+    if (message.releaseResult !== undefined) {
+      obj.releaseResult = ReleaseResult.toJSON(message.releaseResult);
+    }
     return obj;
   },
 
@@ -725,12 +850,15 @@ export const WorkerFrame: MessageFns<WorkerFrame> = {
     message.leaseResult = (object.leaseResult !== undefined && object.leaseResult !== null)
       ? LeaseControlResult.fromPartial(object.leaseResult)
       : undefined;
+    message.releaseResult = (object.releaseResult !== undefined && object.releaseResult !== null)
+      ? ReleaseResult.fromPartial(object.releaseResult)
+      : undefined;
     return message;
   },
 };
 
 function createBaseServerFrame(): ServerFrame {
-  return { exec: undefined, abort: undefined, leaseControl: undefined, keepalive: undefined };
+  return { exec: undefined, abort: undefined, leaseControl: undefined, keepalive: undefined, release: undefined };
 }
 
 export const ServerFrame: MessageFns<ServerFrame> = {
@@ -746,6 +874,9 @@ export const ServerFrame: MessageFns<ServerFrame> = {
     }
     if (message.keepalive !== undefined) {
       LeaseKeepaliveFrame.encode(message.keepalive, writer.uint32(34).fork()).join();
+    }
+    if (message.release !== undefined) {
+      ReleaseFrame.encode(message.release, writer.uint32(42).fork()).join();
     }
     return writer;
   },
@@ -789,6 +920,14 @@ export const ServerFrame: MessageFns<ServerFrame> = {
           message.keepalive = LeaseKeepaliveFrame.decode(reader, reader.uint32());
           continue;
         }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.release = ReleaseFrame.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -804,6 +943,7 @@ export const ServerFrame: MessageFns<ServerFrame> = {
       abort: isSet(object.abort) ? Abort.fromJSON(object.abort) : undefined,
       leaseControl: isSet(object.leaseControl) ? LeaseControlFrame.fromJSON(object.leaseControl) : undefined,
       keepalive: isSet(object.keepalive) ? LeaseKeepaliveFrame.fromJSON(object.keepalive) : undefined,
+      release: isSet(object.release) ? ReleaseFrame.fromJSON(object.release) : undefined,
     };
   },
 
@@ -821,6 +961,9 @@ export const ServerFrame: MessageFns<ServerFrame> = {
     if (message.keepalive !== undefined) {
       obj.keepalive = LeaseKeepaliveFrame.toJSON(message.keepalive);
     }
+    if (message.release !== undefined) {
+      obj.release = ReleaseFrame.toJSON(message.release);
+    }
     return obj;
   },
 
@@ -836,6 +979,9 @@ export const ServerFrame: MessageFns<ServerFrame> = {
       : undefined;
     message.keepalive = (object.keepalive !== undefined && object.keepalive !== null)
       ? LeaseKeepaliveFrame.fromPartial(object.keepalive)
+      : undefined;
+    message.release = (object.release !== undefined && object.release !== null)
+      ? ReleaseFrame.fromPartial(object.release)
       : undefined;
     return message;
   },
@@ -3227,6 +3373,290 @@ export const LeaseKeepaliveResponse: MessageFns<LeaseKeepaliveResponse> = {
   },
 };
 
+function createBaseReleaseRequest(): ReleaseRequest {
+  return { sandboxId: "" };
+}
+
+export const ReleaseRequest: MessageFns<ReleaseRequest> = {
+  encode(message: ReleaseRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sandboxId !== "") {
+      writer.uint32(10).string(message.sandboxId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReleaseRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReleaseRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sandboxId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReleaseRequest {
+    return { sandboxId: isSet(object.sandboxId) ? globalThis.String(object.sandboxId) : "" };
+  },
+
+  toJSON(message: ReleaseRequest): unknown {
+    const obj: any = {};
+    if (message.sandboxId !== "") {
+      obj.sandboxId = message.sandboxId;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ReleaseRequest>, I>>(base?: I): ReleaseRequest {
+    return ReleaseRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ReleaseRequest>, I>>(object: I): ReleaseRequest {
+    const message = createBaseReleaseRequest();
+    message.sandboxId = object.sandboxId ?? "";
+    return message;
+  },
+};
+
+function createBaseReleaseResponse(): ReleaseResponse {
+  return { outcome: 0 };
+}
+
+export const ReleaseResponse: MessageFns<ReleaseResponse> = {
+  encode(message: ReleaseResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.outcome !== 0) {
+      writer.uint32(8).int32(message.outcome);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReleaseResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReleaseResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.outcome = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReleaseResponse {
+    return { outcome: isSet(object.outcome) ? releaseOutcomeFromJSON(object.outcome) : 0 };
+  },
+
+  toJSON(message: ReleaseResponse): unknown {
+    const obj: any = {};
+    if (message.outcome !== 0) {
+      obj.outcome = releaseOutcomeToJSON(message.outcome);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ReleaseResponse>, I>>(base?: I): ReleaseResponse {
+    return ReleaseResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ReleaseResponse>, I>>(object: I): ReleaseResponse {
+    const message = createBaseReleaseResponse();
+    message.outcome = object.outcome ?? 0;
+    return message;
+  },
+};
+
+function createBaseReleaseFrame(): ReleaseFrame {
+  return { ctlId: 0, workspaceKey: "" };
+}
+
+export const ReleaseFrame: MessageFns<ReleaseFrame> = {
+  encode(message: ReleaseFrame, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ctlId !== 0) {
+      writer.uint32(8).uint64(message.ctlId);
+    }
+    if (message.workspaceKey !== "") {
+      writer.uint32(18).string(message.workspaceKey);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReleaseFrame {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReleaseFrame();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ctlId = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.workspaceKey = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReleaseFrame {
+    return {
+      ctlId: isSet(object.ctlId) ? globalThis.Number(object.ctlId) : 0,
+      workspaceKey: isSet(object.workspaceKey) ? globalThis.String(object.workspaceKey) : "",
+    };
+  },
+
+  toJSON(message: ReleaseFrame): unknown {
+    const obj: any = {};
+    if (message.ctlId !== 0) {
+      obj.ctlId = Math.round(message.ctlId);
+    }
+    if (message.workspaceKey !== "") {
+      obj.workspaceKey = message.workspaceKey;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ReleaseFrame>, I>>(base?: I): ReleaseFrame {
+    return ReleaseFrame.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ReleaseFrame>, I>>(object: I): ReleaseFrame {
+    const message = createBaseReleaseFrame();
+    message.ctlId = object.ctlId ?? 0;
+    message.workspaceKey = object.workspaceKey ?? "";
+    return message;
+  },
+};
+
+function createBaseReleaseResult(): ReleaseResult {
+  return { ctlId: 0, outcome: 0, error: "" };
+}
+
+export const ReleaseResult: MessageFns<ReleaseResult> = {
+  encode(message: ReleaseResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ctlId !== 0) {
+      writer.uint32(8).uint64(message.ctlId);
+    }
+    if (message.outcome !== 0) {
+      writer.uint32(16).int32(message.outcome);
+    }
+    if (message.error !== "") {
+      writer.uint32(26).string(message.error);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReleaseResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReleaseResult();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ctlId = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.outcome = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.error = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReleaseResult {
+    return {
+      ctlId: isSet(object.ctlId) ? globalThis.Number(object.ctlId) : 0,
+      outcome: isSet(object.outcome) ? releaseOutcomeFromJSON(object.outcome) : 0,
+      error: isSet(object.error) ? globalThis.String(object.error) : "",
+    };
+  },
+
+  toJSON(message: ReleaseResult): unknown {
+    const obj: any = {};
+    if (message.ctlId !== 0) {
+      obj.ctlId = Math.round(message.ctlId);
+    }
+    if (message.outcome !== 0) {
+      obj.outcome = releaseOutcomeToJSON(message.outcome);
+    }
+    if (message.error !== "") {
+      obj.error = message.error;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ReleaseResult>, I>>(base?: I): ReleaseResult {
+    return ReleaseResult.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ReleaseResult>, I>>(object: I): ReleaseResult {
+    const message = createBaseReleaseResult();
+    message.ctlId = object.ctlId ?? 0;
+    message.outcome = object.outcome ?? 0;
+    message.error = object.error ?? "";
+    return message;
+  },
+};
+
 /**
  * Worker (any language) dials the relay and holds ONE bidi stream.
  * worker→relay carries results/liveness; relay→worker carries commands.
@@ -3314,6 +3744,24 @@ export const SandboxExecService = {
     responseSerialize: (value: LeaseKeepaliveResponse) => Buffer.from(LeaseKeepaliveResponse.encode(value).finish()),
     responseDeserialize: (value: Buffer) => LeaseKeepaliveResponse.decode(value),
   },
+  /**
+   * Release (#338). The caller's sandbox has ended: the relay sends a ReleaseFrame for the
+   * sandbox's own workspace key to its worker and returns the worker's outcome. Authorized as
+   * an Exec is (the sandbox token's worker and workspace key). Errors are gRPC statuses:
+   * FAILED_PRECONDITION "release_unsupported: …" (the worker predates release; don't retry),
+   * RESOURCE_EXHAUSTED "busy: …" (retry later), INVALID_ARGUMENT for a refused key (don't
+   * retry), DEADLINE_EXCEEDED or UNAVAILABLE (retry; idle reclaim stays the backstop).
+   * Follow the ReleaseFrame's SENDER CONTRACT: send it only at the sandbox's terminal end.
+   */
+  release: {
+    path: "/sandbox.v1.SandboxExec/Release",
+    requestStream: false,
+    responseStream: false,
+    requestSerialize: (value: ReleaseRequest) => Buffer.from(ReleaseRequest.encode(value).finish()),
+    requestDeserialize: (value: Buffer) => ReleaseRequest.decode(value),
+    responseSerialize: (value: ReleaseResponse) => Buffer.from(ReleaseResponse.encode(value).finish()),
+    responseDeserialize: (value: Buffer) => ReleaseResponse.decode(value),
+  },
 } as const;
 
 export interface SandboxExecServer extends UntypedServiceImplementation {
@@ -3329,6 +3777,16 @@ export interface SandboxExecServer extends UntypedServiceImplementation {
    */
   leaseControl: handleUnaryCall<LeaseControlRequest, LeaseControlResponse>;
   leaseKeepalive: handleUnaryCall<LeaseKeepaliveRequest, LeaseKeepaliveResponse>;
+  /**
+   * Release (#338). The caller's sandbox has ended: the relay sends a ReleaseFrame for the
+   * sandbox's own workspace key to its worker and returns the worker's outcome. Authorized as
+   * an Exec is (the sandbox token's worker and workspace key). Errors are gRPC statuses:
+   * FAILED_PRECONDITION "release_unsupported: …" (the worker predates release; don't retry),
+   * RESOURCE_EXHAUSTED "busy: …" (retry later), INVALID_ARGUMENT for a refused key (don't
+   * retry), DEADLINE_EXCEEDED or UNAVAILABLE (retry; idle reclaim stays the backstop).
+   * Follow the ReleaseFrame's SENDER CONTRACT: send it only at the sandbox's terminal end.
+   */
+  release: handleUnaryCall<ReleaseRequest, ReleaseResponse>;
 }
 
 export interface SandboxExecClient extends Client {
@@ -3386,6 +3844,30 @@ export interface SandboxExecClient extends Client {
     metadata: Metadata,
     options: Partial<CallOptions>,
     callback: (error: ServiceError | null, response: LeaseKeepaliveResponse) => void,
+  ): ClientUnaryCall;
+  /**
+   * Release (#338). The caller's sandbox has ended: the relay sends a ReleaseFrame for the
+   * sandbox's own workspace key to its worker and returns the worker's outcome. Authorized as
+   * an Exec is (the sandbox token's worker and workspace key). Errors are gRPC statuses:
+   * FAILED_PRECONDITION "release_unsupported: …" (the worker predates release; don't retry),
+   * RESOURCE_EXHAUSTED "busy: …" (retry later), INVALID_ARGUMENT for a refused key (don't
+   * retry), DEADLINE_EXCEEDED or UNAVAILABLE (retry; idle reclaim stays the backstop).
+   * Follow the ReleaseFrame's SENDER CONTRACT: send it only at the sandbox's terminal end.
+   */
+  release(
+    request: ReleaseRequest,
+    callback: (error: ServiceError | null, response: ReleaseResponse) => void,
+  ): ClientUnaryCall;
+  release(
+    request: ReleaseRequest,
+    metadata: Metadata,
+    callback: (error: ServiceError | null, response: ReleaseResponse) => void,
+  ): ClientUnaryCall;
+  release(
+    request: ReleaseRequest,
+    metadata: Metadata,
+    options: Partial<CallOptions>,
+    callback: (error: ServiceError | null, response: ReleaseResponse) => void,
   ): ClientUnaryCall;
 }
 

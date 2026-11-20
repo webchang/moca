@@ -28,7 +28,7 @@ import type { ExecFactory } from '../../src/sbx/exec.js';
 export const URL_ = 'https://sbx-api.example.invalid';
 export const SBX = 'sbx-0123456789abcdef0123456789';
 
-export type Req = { method: string; path: string; body: unknown; auth?: string };
+type Req = { method: string; path: string; body: unknown; auth?: string };
 export type Handler = (
   req: Req,
 ) => { status: number; body?: unknown; headers?: Record<string, string> } | Error;
@@ -398,11 +398,31 @@ export function workspaces(o: Parameters<typeof localWorkspace>[0] = {}) {
   };
   let opened = 0;
   let closed = 0;
+  let execs = 0;
+  let released = 0;
   const factory = (c: ExecConnOptions) => {
     opened++;
-    return { exec: get(c.workspaceKey).exec, close: () => void closed++, ...NO_LEASE };
+    const exec = get(c.workspaceKey).exec;
+    return {
+      exec: ((...a: Parameters<typeof exec>) => {
+        execs++;
+        return exec(...a);
+      }) as typeof exec,
+      close: () => void closed++,
+      ...NO_LEASE,
+      release: async () => {
+        released++;
+        return 'released' as const;
+      },
+    };
   };
-  return { get, factory, counts: () => ({ opened, closed }) };
+  return {
+    get,
+    factory,
+    counts: () => ({ opened, closed }),
+    /** Execs run and Releases sent (#338) across every connection. */
+    calls: () => ({ execs, released }),
+  };
 }
 
 /** A `claude --version` the deny list covers: doctor never asks the real one in a test. */
