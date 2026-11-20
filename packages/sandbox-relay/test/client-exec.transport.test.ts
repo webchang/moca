@@ -52,7 +52,11 @@ async function relayWithWorker() {
   closers.push(() => server.forceShutdown());
   const addr = `127.0.0.1:${port}`;
 
-  const seen: { execs: string[]; aborts: number[] } = { execs: [], aborts: [] };
+  const seen: { execs: string[]; aborts: number[]; releases: string[] } = {
+    execs: [],
+    aborts: [],
+    releases: [],
+  };
   const worker = new WorkerClient(addr, credentials.createInsecure()) as unknown as Client & {
     attach: () => ClientDuplexStream<WorkerFrame, ServerFrame>;
   };
@@ -66,6 +70,7 @@ async function relayWithWorker() {
         } as WorkerFrame);
       }
     }
+    if (f.release) seen.releases.push(f.release.workspaceKey);
     if (f.abort) {
       seen.aborts.push(Number(f.abort.reqId));
       stream.write({
@@ -78,7 +83,7 @@ async function relayWithWorker() {
     hello: {
       sandboxId: 'w',
       labels: {},
-      capabilities: [],
+      capabilities: ['sbx:release-v1'],
       image: '',
       arch: 'amd64',
       capacityMax: 4,
@@ -138,7 +143,22 @@ function abort(addr: string, token: string, reqId: number): Promise<number> {
   ).finally(() => client.close());
 }
 
+function release(addr: string, token: string): Promise<number> {
+  const client = new SandboxExecClient(addr, credentials.createInsecure());
+  return new Promise<number>((resolve) =>
+    client.release({ sandboxId: 'w' }, md(token), (err: { code: number } | null) =>
+      resolve(err ? err.code : status.OK),
+    ),
+  ).finally(() => client.close());
+}
+
 describe('client tokens on SandboxExec', () => {
+  it('refuses a client token Release as PERMISSION_DENIED, before any frame reaches the worker', async () => {
+    const { addr, seen } = await relayWithWorker();
+    expect(await release(addr, ALICE)).toBe(status.PERMISSION_DENIED);
+    expect(seen.releases).toEqual([]);
+  });
+
   it('runs a client Exec inside its prefix', async () => {
     const { addr, seen } = await relayWithWorker();
     expect(await startExec(addr, ALICE, { key: 'sbx-alice-calc' }).done).toBe(status.OK);
