@@ -7,6 +7,7 @@ import {
   type LeaseOpName,
   type LeaseStatusView,
   type ProcessCall,
+  type ReleaseOutcomeName,
   type SandboxModeName,
   type SandboxTokenGrant,
   type TokenFn,
@@ -37,7 +38,11 @@ export type ExecFactory = (o: ExecConnOptions) => {
   leaseControl: LeaseControlFn;
   leaseKeepalive: () => Promise<void>;
   process?: ProcessCall;
+  /** Release of the sandbox's workspace (#338); optional so a fake need not have one. */
+  release?: ReleaseFn;
 };
+/** The connection's release call: what the worker did with the workspace. */
+export type ReleaseFn = (o?: { signal?: AbortSignal }) => Promise<ReleaseOutcomeName>;
 const realFactory: ExecFactory = (o) => {
   const c = new SandboxExecConn(o);
   return {
@@ -46,7 +51,13 @@ const realFactory: ExecFactory = (o) => {
     leaseControl: c.leaseControl,
     leaseKeepalive: c.leaseKeepalive,
     process: c.process,
+    release: c.release,
   };
+};
+
+/** A connection without release (a test fake, or a client before #338) fails a release plainly. */
+const noRelease: ReleaseFn = async () => {
+  throw new Error('this connection has no release call');
 };
 
 /** A connection without process calls (a test fake) fails a process call plainly. */
@@ -67,7 +78,7 @@ const SHORT_TOKEN_S = 300;
  * `iat` and `exp` from a JWT's payload, read WITHOUT verifying it: only to learn the token's
  * lifetime (the relay verifies it). Undefined for anything that is not a readable JWT.
  */
-export function jwtTimes(token: string): { iat: number; exp: number } | undefined {
+function jwtTimes(token: string): { iat: number; exp: number } | undefined {
   const payload = token.split('.')[1];
   if (!payload) return undefined;
   try {
@@ -100,7 +111,7 @@ export function jwtMode(token: string): SandboxModeName {
 }
 
 /** What the connection needs of a minted token: `lifetimeS` is `exp − iat`, 0 if unreadable. */
-export function grantOf(t: SbxToken): SandboxTokenGrant {
+function grantOf(t: SbxToken): SandboxTokenGrant {
   const times = jwtTimes(t.token);
   const lifetimeS = times && times.exp > times.iat ? times.exp - times.iat : 0;
   return {
@@ -223,6 +234,8 @@ export interface OpenedExec {
   leaseKeepalive(): Promise<void>;
   /** The process calls (plan 5, spec §7). */
   process: ProcessCall;
+  /** Releases the sandbox's workspace on its worker (#338): only at the sandbox's end. */
+  release: ReleaseFn;
   /**
    * Mints a fresh sandbox token now, as the next Exec would after a refusal (P5-R29). `signal`
    * (a cancelled tool call's) aborts it.
@@ -285,6 +298,7 @@ export async function openExec(
     leaseControl: c.leaseControl,
     leaseKeepalive: c.leaseKeepalive,
     process: c.process ?? noProcess,
+    release: c.release ?? noRelease,
     remint: async (signal?: AbortSignal) => {
       await t.force(signal);
     },
@@ -294,7 +308,7 @@ export async function openExec(
 }
 
 /** `sbx run`'s exit for a sandbox failure: neither the command's code nor its timeout. */
-export const EXIT_SANDBOX_FAILED = 125;
+const EXIT_SANDBOX_FAILED = 125;
 /** `sbx run`'s exit for a command that timed out or was killed (spec §6.1). */
 export const EXIT_KILLED = 124;
 /**

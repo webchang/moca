@@ -22,7 +22,7 @@ func nextBackoff(d time.Duration) time.Duration {
 	return min(d*2, replenishBackoffMax)
 }
 
-// scheduleReplenish arms a refill of ONE slot for key.
+// scheduleReplenishLocked arms a refill of ONE slot for rp. Caller holds p.mu.
 //
 // DELAYED, NOT IMMEDIATE, and spec §4.4 is worth restating because the number is
 // large: every Exec schedules a replenishment, so an unconditional refill hands D
@@ -38,15 +38,6 @@ func nextBackoff(d time.Duration) time.Duration {
 // refill for a run that is already over. StandbyIdle ages that remainder out; only
 // spec §9's Release removes it, and §7.3's idle-standby-residency metric is what
 // measures it.
-func (p *pool) scheduleReplenish(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if rp := p.runs[key]; rp != nil {
-		p.scheduleReplenishLocked(rp)
-	}
-}
-
-// scheduleReplenishLocked arms the timer. Caller holds p.mu.
 func (p *pool) scheduleReplenishLocked(rp *runPool) {
 	if p.closed {
 		return
@@ -55,6 +46,11 @@ func (p *pool) scheduleReplenishLocked(rp *runPool) {
 	// lease would be charged while nothing can pop it, and a busy run's standbys are
 	// beyond both the sweep and eviction.
 	if rp.lease != nil {
+		return
+	}
+	// A run a Release met busy (release.go) is over: its standbys were dropped, and none
+	// is restored for it.
+	if rp.releaseOnIdle {
 		return
 	}
 	// Refill toward D, counting what is already Ready or on its way.
@@ -84,7 +80,9 @@ func (p *pool) scheduleReplenishLocked(rp *runPool) {
 func (p *pool) replenishOne(key string) {
 	p.mu.Lock()
 	rp := p.runs[key]
-	if rp == nil || p.closed || rp.lease != nil {
+	// releaseOnIdle: a timer armed before a Release, or already waiting on p.mu when it
+	// landed, restores nothing for the released key.
+	if rp == nil || p.closed || rp.lease != nil || rp.releaseOnIdle {
 		p.mu.Unlock()
 		return
 	}
@@ -126,10 +124,16 @@ func (p *pool) replenishOne(key string) {
 	switch {
 	case err != nil:
 		rp.backoff = nextBackoff(rp.backoff)
-		p.scheduleReplenishLocked(rp)
+		p.scheduleReplenishLocked(rp) // a no-op for a released run
+		release := rp.releaseOnIdle
 		p.mu.Unlock()
 		p.counters.replenishFailed()
 		log.Printf("vmpool: replenish %q: %v", key, err)
+		if release {
+			// A Release landed during this warm (kept_busy): the run is freed now if nothing
+			// else uses it, as on the success branch below, not at the next sweep.
+			p.releaseIfPending(key)
+		}
 		return
 	case p.closed:
 		p.mu.Unlock()
@@ -141,6 +145,17 @@ func (p *pool) replenishOne(key string) {
 			p.counters.destroyFailed()
 			log.Printf("vmpool: destroy replenished VM for %q on a closed pool: %v", key, err)
 		}
+		return
+	case rp.releaseOnIdle:
+		// A Release landed while this warm was in flight (the warming made the run busy, so
+		// it was kept_busy): the VM is not a standby for a run that is over, and the run is
+		// freed now if nothing else uses it.
+		p.mu.Unlock()
+		if err := vm.Destroy(); err != nil {
+			p.counters.destroyFailed()
+			log.Printf("vmpool: destroy replenished VM for released %q: %v", key, err)
+		}
+		p.releaseIfPending(key)
 		return
 	case rp.lease != nil:
 		// A lease started while this warm was in flight: no standby beside it.

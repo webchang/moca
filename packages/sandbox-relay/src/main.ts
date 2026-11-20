@@ -26,6 +26,8 @@ import {
   type LeaseControlResponse,
   type LeaseKeepaliveRequest,
   type LeaseKeepaliveResponse,
+  type ReleaseRequest,
+  type ReleaseResponse,
   MAX_EXEC_MESSAGE_BYTES,
   SandboxMode,
   ExecKind,
@@ -85,6 +87,8 @@ export interface RelayServerDeps extends RelayDeps {
    * LeaseGraceLimit plus 60 s) for the mutate ops; tests set short ones.
    */
   leaseTimeoutsMs?: LeaseTimeoutsMs;
+  /** How long a Release waits for the worker's answer. Defaults to 15 s; tests set a short one. */
+  releaseTimeoutMs?: number;
   /** In-flight Execs admitted per `sbx` (SBX0 §3.6). Defaults to 2. */
   sandboxMaxInflight?: number;
   /** Seconds past a token's `exp` at which its running Exec is cancelled. Defaults to 30; tests set 0. */
@@ -215,6 +219,7 @@ type ExecAuth = Pick<
   | 'verifySandboxToken'
   | 'verifySetModeToken'
   | 'leaseTimeoutsMs'
+  | 'releaseTimeoutMs'
   | 'sandboxMaxInflight'
   | 'sandboxLeewayS'
   | 'sandboxDrainGraceS'
@@ -345,6 +350,13 @@ function addWorkerService(server: Server, relay: ReturnType<typeof createRelay>)
 /** The lease calls are a sandbox's own (lease-mode §8.2): the harness never uses leases. */
 const HARNESS_NO_LEASES = 'lease calls not permitted: the harness never uses leases';
 const CLIENT_NO_LEASES = 'lease calls not permitted: a client token never uses leases';
+/**
+ * Release is a sandbox's own call here (#338): the harness's exec token is unrestricted, so it never
+ * carries a release; the control plane's release comes with its own release-only bearer.
+ */
+const HARNESS_NO_RELEASE = 'release not permitted: the harness exec token never releases';
+/** A client token (this fork's MOCA_RELAY_CLIENT_TOKENS) is refused Release like the lease calls. */
+const CLIENT_NO_RELEASE = 'release not permitted: a client token never releases';
 
 function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
   // Audit lines (SBX0 §3.5) only on a relay with sandbox keys, so a MOCA relay's output is
@@ -364,6 +376,7 @@ function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
     audit,
     ...(auth.verifySetModeToken ? { verifySetMode: auth.verifySetModeToken } : {}),
     ...(auth.leaseTimeoutsMs ? { leaseTimeoutsMs: auth.leaseTimeoutsMs } : {}),
+    ...(auth.releaseTimeoutMs !== undefined ? { releaseTimeoutMs: auth.releaseTimeoutMs } : {}),
   });
 
   // A client may abort only the Execs it started: req_ids are not secret, so without this one client
@@ -548,6 +561,45 @@ function addExecService(server: Server, relay: Relay, auth: ExecAuth): void {
         return;
       }
       cb(null, {});
+    },
+    // #338: a sandbox-token caller releases its own workspace at its end.
+    release: (
+      call: ServerUnaryCall<ReleaseRequest, ReleaseResponse>,
+      cb: sendUnaryData<ReleaseResponse>,
+    ) => {
+      const t0 = Date.now();
+      const caller = execCaller(call.metadata, auth);
+      const req = call.request;
+      if (caller.kind !== 'sandbox') {
+        const reason =
+          caller.kind === 'harness'
+            ? HARNESS_NO_RELEASE
+            : caller.kind === 'client'
+              ? CLIENT_NO_RELEASE
+              : caller.reason;
+        if (reason) audit.release(t0, { wrk: req.sandboxId, outcome: 'refused', reason });
+        cb(
+          caller.kind === 'harness' || caller.kind === 'client'
+            ? grpcError(status.PERMISSION_DENIED, reason as string)
+            : unauthenticated(),
+          null,
+        );
+        return;
+      }
+      const cancelled = new AbortController();
+      const onCancelled = () => cancelled.abort();
+      call.on('cancelled', onCancelled);
+      if (call.cancelled) cancelled.abort();
+      sandbox.release(caller.claims, req, t0, cancelled.signal).then(
+        (res) => {
+          call.off('cancelled', onCancelled);
+          cb(null, res);
+        },
+        (err: Error) => {
+          call.off('cancelled', onCancelled);
+          cb(err, null);
+        },
+      );
     },
   };
   server.addService(SandboxExecService, execImpl);

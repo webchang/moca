@@ -22,6 +22,15 @@
 #                           in SBX_ALLOWED_SUBJECTS and SBX_ADMIN_SUBJECTS are then oidc:<provider
 #                           sub> entries, per the control plane's subject grammar; a mixed list is
 #                           accepted, so a GitHub enrollment survives the switch
+#   SBX_TRUSTED_PROXY_HOPS  optional, with oidc only; how many proxies in front of the control plane
+#                           append to X-Forwarded-For, default 1 (the sbx-api Route's router, whose
+#                           Route pins append); 0 keys every client by the socket peer. It decides
+#                           the client address the OIDC login start's per-source bound keys on
+#                           (#716): with 0 behind the router, every login shares the router's
+#                           address
+#   SBX_OIDC_MAX_PENDING_PER_SOURCE
+#                           optional, with oidc only; live OIDC login starts one client address may
+#                           hold; empty (the default) is the control plane's 20, 0 turns it off
 #   SBX_ALLOWED_SUBJECTS    required; comma-separated github:<numeric id> or oidc:<provider sub>,
 #                           who may log in
 #   SBX_ADMIN_SUBJECTS      optional; comma-separated github:<numeric id> or oidc:<provider sub>
@@ -81,15 +90,18 @@
 #                           StatefulSet's volumeClaimTemplates outright, a PVC's
 #                           storageClassName once set -- the API allows only nil to set), so a run
 #                           whose knob disagrees with what is live (a different class, or a class
-#                           where the live object has one and the knob is unset: the server-side
-#                           apply would DROP the field its manager owns) is refused before
+#                           an earlier knob run applied while the knob is now unset: apply_stack's
+#                           client-side apply of the overlay would DROP it by its three-way merge,
+#                           from the StatefulSet's volumeClaimTemplates or from a claim; a class the
+#                           cluster's default StorageClass filled in is kept) is refused before
 #                           anything is applied (check_storage_class, on the StatefulSet and on
 #                           every claim this run renders). To move a deployment onto the knob,
 #                           keep SBX_STORAGE_CLASS at the live class; to change an existing one,
 #                           kubectl delete sts redis --cascade=orphan first (the pod and the
 #                           data-redis-0 claim survive; the re-run's StatefulSet adopts both),
 #                           and delete any PVC whose class must change (its contents do not
-#                           survive).
+#                           survive). A claim class the cluster's default StorageClass filled in
+#                           (no SBX_STORAGE_CLASS run applied it) is left alone with the knob unset.
 #   SBX_REDIS_IMAGE         optional; repository[:tag]@sha256:<digest>: the image Redis runs instead of the
 #                           base's valkey/valkey:9-alpine. For a namespace whose data a Redis 7.4 wrote
 #                           (RDB format 12, which Valkey 9 cannot read: its AOF load aborts), e.g.
@@ -136,7 +148,8 @@
 # synthetic subject `installer` with the admin role, so automation (an enrollment sync, say) needs
 # no login and no refresh tokens. Read it from the Secret (kubectl get secret moca-mu1 -o
 # jsonpath='{.data.SH_INSTALLER_TOKEN}' | base64 -d); rotate it by deleting the key and re-running
-# (every pod rolls). Refused everywhere when the key is absent.
+# (the control plane rolls: moca-mu1 is in its settings hash). Refused everywhere when the key is
+# absent.
 # SBX_CLIENTS, increment 1a's static client tokens, is gone and refused.
 #
 # Re-runnable: every token, password, key and certificate is generated once and kept. A worker
@@ -244,12 +257,22 @@ validate() {
   if [[ "$SBX_IDENTITY_PROVIDER" == github ]]; then
     [[ "${SBX_GITHUB_CLIENT_ID:-}" =~ ^[A-Za-z0-9._-]+$ ]] ||
       die 'SBX_GITHUB_CLIENT_ID is required with SBX_IDENTITY_PROVIDER=github (the GitHub OAuth app for device-flow login)'
+    # The two oidc-only knobs (#937) are written only with oidc: say so rather than drop them silently.
+    local gv
+    for gv in SBX_TRUSTED_PROXY_HOPS SBX_OIDC_MAX_PENDING_PER_SOURCE; do
+      [[ -z "${!gv:-}" ]] || log "WARNING: $gv is set but ignored: the identity provider is github"
+    done
   else
     # The base's env wiring reads all four from moca-settings; the client secret never does (it is
     # a file under CREDENTIALS_DIRECTORY, projected from the moca-oidc Secret the operator creates).
     local ov
     for ov in SBX_OIDC_ISSUER SBX_OIDC_CLIENT_ID SBX_OIDC_REDIRECT_URI; do
       [[ -n "${!ov:-}" ]] || die "$ov is required with SBX_IDENTITY_PROVIDER=oidc"
+    done
+    # The control plane refuses to BOOT on anything but a whole number, so a typo is refused here.
+    for ov in SBX_TRUSTED_PROXY_HOPS SBX_OIDC_MAX_PENDING_PER_SOURCE; do
+      [[ -z "${!ov:-}" || "${!ov}" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+        die "$ov must be a whole number, 0 to 6 digits (empty: the default), got '${!ov}'"
     done
   fi
   [[ "${SBX_ALLOWED_SUBJECTS:-}" =~ $SUBJECTS_RE ]] ||
@@ -701,8 +724,8 @@ rendered_pvc_claims() {
 # applied. A fresh namespace (no StatefulSet) and an already-matching class pass. The component
 # PVCs fail the same way one object later in the stream: PVC.spec.storageClassName is immutable
 # once set (the API allows only nil -> set), so each claim this run renders is preflighted alike
-# (check_claim_class) -- a differing class, or a run that drops the field its field manager owns,
-# is refused before anything is applied.
+# (check_claim_class) -- a differing class, or a run whose apply would drop a class an earlier run
+# applied, is refused before anything is applied.
 check_storage_class() {
   local json claim
   # Captured first (errexit), as in check_redis_image: a failing get must not read as "no StatefulSet".
@@ -725,20 +748,28 @@ check_sts_class() {
       die "StatefulSet redis in $NS already exists with volumeClaimTemplates its API refuses to change in place (live class: '${live:-unset}'), so SBX_STORAGE_CLASS=$SBX_STORAGE_CLASS cannot be applied: keep SBX_STORAGE_CLASS=$live for this deployment (its claim keeps the class it was created with), or, to change it, kubectl -n $NS delete sts redis --cascade=orphan (the pod and the data-redis-0 claim survive; a re-run's StatefulSet adopts both, and the claim keeps its class) and re-run"
   else
     # Reverse (review round 2): a live class can only have come from an earlier knob run
-    # (base/redis.yaml sets none), and the apply is server-side with one field manager: a run
-    # without the knob DROPS the storageClassName that manager owns, which changes
-    # volumeClaimTemplates -- the same Forbidden, partway through the object stream. Refused.
+    # (base/redis.yaml sets none, and admission does not fill volumeClaimTemplates), and
+    # apply_stack applies the overlay, the StatefulSet with it, client-side: its three-way merge
+    # DROPS the storageClassName the last applied configuration had and this one lacks, which
+    # changes volumeClaimTemplates -- the same Forbidden, partway through the object stream. Refused.
     [[ -z "$live" ]] ||
-      die "StatefulSet redis in $NS carries storageClassName '$live' an earlier SBX_STORAGE_CLASS run set, and this run has SBX_STORAGE_CLASS unset: the apply would remove the field (server-side apply drops what its field manager no longer owns), which changes volumeClaimTemplates and is Forbidden. Set SBX_STORAGE_CLASS=$live (the claim keeps that class either way)"
+      die "StatefulSet redis in $NS carries storageClassName '$live' an earlier SBX_STORAGE_CLASS run set, and this run has SBX_STORAGE_CLASS unset: the apply would remove the field (the client-side apply's three-way merge drops what the last applied configuration had and this one lacks), which changes volumeClaimTemplates and is Forbidden. Set SBX_STORAGE_CLASS=$live (the claim keeps that class either way)"
   fi
 }
 
 # The claim half (review round 3): PVC.spec.storageClassName is immutable once set (the API allows
-# only nil -> set), and apply_manifest applies with the same field manager as the redis patch, so a
-# run whose knob disagrees with a live claim this run renders is the same Forbidden one object later
-# in the stream -- redis applies, then the claim fails, partway through. A claim with NO class
+# only nil -> set), and apply_stack applies the claims in the same client-side apply of the overlay
+# as the StatefulSet, so a run whose knob disagrees with a live claim this run renders is the same
+# Forbidden one object later in the stream -- redis applies, then the claim fails, partway through.
+# A claim with NO class
 # passes in both directions: nil -> set is the one transition the API allows, and a knob-unset run
-# writes nothing.
+# writes nothing. A knob-unset run is refused only when an earlier SBX_STORAGE_CLASS run applied the
+# live class, since only then does the apply drop it (#935). The claims come from the overlay,
+# which apply_stack applies client-side (`kc apply -k`): its three-way merge removes a field only
+# when the last-applied-configuration annotation has it and the new config does not. On a cluster
+# with a default StorageClass, the DefaultStorageClass admission plugin fills the class in when the
+# claim is created, so it is on the claim but not in last-applied, and a knob-unset apply leaves it
+# alone. The StatefulSet half above has no such case: admission does not fill volumeClaimTemplates.
 check_claim_class() {
   local json live
   # Captured first (errexit), as in check_redis_image: a failing get must not read as "no PVC".
@@ -746,12 +777,35 @@ check_claim_class() {
   [[ -n "$json" ]] || return 0
   live="$(jq -r '.spec.storageClassName // empty' <<<"$json")"
   [[ -z "$live" ]] && return 0
+  if [[ -z "${SBX_STORAGE_CLASS:-}" ]]; then
+    case "$(claim_class_owner "$json")" in
+      none)
+        log "PVC $1 carries storageClassName '$live' that no SBX_STORAGE_CLASS run applied (the cluster's default class); kept"
+        return 0 ;;
+      unknown)
+        die "PVC $1 in $NS carries storageClassName '$live', and its kubectl.kubernetes.io/last-applied-configuration annotation is not valid JSON, so this run cannot tell whether an earlier SBX_STORAGE_CLASS run applied the class (a knob-unset apply would then remove it, which the API refuses on a set class). Set SBX_STORAGE_CLASS=$live (the claim keeps that class either way)" ;;
+    esac
+  fi
   if [[ -n "${SBX_STORAGE_CLASS:-}" ]]; then
     [[ "$live" == "$SBX_STORAGE_CLASS" ]] ||
       die "PVC $1 in $NS already exists with storageClassName '$live', which the API refuses to change in place (PVC.spec.storageClassName is immutable, apart from nil to set), so SBX_STORAGE_CLASS=$SBX_STORAGE_CLASS cannot be applied: keep SBX_STORAGE_CLASS=$live for this deployment (the claim keeps the class it was created with), or, to change it, kubectl -n $NS delete pvc $1 (its contents do not survive) and re-run"
   else
-    die "PVC $1 in $NS carries storageClassName '$live' an earlier SBX_STORAGE_CLASS run set, and this run has SBX_STORAGE_CLASS unset: the apply would remove the field (server-side apply drops what its field manager no longer owns), which the API refuses on a set class. Set SBX_STORAGE_CLASS=$live (the claim keeps that class either way)"
+    die "PVC $1 in $NS carries storageClassName '$live' an earlier SBX_STORAGE_CLASS run set, and this run has SBX_STORAGE_CLASS unset: the apply would remove the field (the client-side merge drops what the last applied configuration had and this one lacks), which the API refuses on a set class. Set SBX_STORAGE_CLASS=$live (the claim keeps that class either way)"
   fi
+}
+
+# Who applied spec.storageClassName to the PVC whose JSON is $1, printed as one word: `run` (an
+# earlier run applied it), `none` (no run did: a class the cluster defaulted at create), or `unknown`
+# (the annotation is there but is not valid JSON, so the run cannot tell; refused, fail-closed). The
+# overlay is applied client-side, so what a run applied is its last-applied-configuration
+# annotation, which is also what the client-side three-way merge removes fields by; no annotation
+# means no run applied anything.
+claim_class_owner() {
+  jq -r '(.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] // "{}")
+    | (fromjson? // "\u0000unparsable")
+    | if . == "\u0000unparsable" then "unknown"
+      elif type == "object" and ((.spec.storageClassName? // "") | tostring | length > 0) then "run"
+      else "none" end' <<<"$1"
 }
 
 # SBX_PROFILE=combined in an SBX0 namespace would add the harness's keys to its moca-mu1 and switch
@@ -1069,12 +1123,12 @@ apply_configmap() {
 # moca-settings (the keys base/control-plane.yaml reads) and sbx-settings (the sandbox profile's and
 # the relay's), then two hashes of what each pod reads at boot (write_overlay stamps them, so a change
 # rolls the pod that reads it): SETTINGS_HASH, the control plane's, covers every setting, the public
-# keyset and the certificates; RELAY_HASH covers only the relay's (ocp-sbx/patch-relay.yaml: the
-# issuer and the in-flight cap) with the keyset and the certificates. So a template, subject or quota
+# keyset, the certificates and moca-mu1's keys; RELAY_HASH covers only the relay's
+# (ocp-sbx/patch-relay.yaml: the issuer and the in-flight cap) with the keyset and the certificates. So a template, subject or quota
 # change rolls the control plane alone and leaves running Execs be (docs/operate/sandbox-service/runbook.md §5). Runs after
 # route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx relay keys attach_crt exec_crt moca_crt egress hosts
+  local ca='' moca sbx relay keys attach_crt exec_crt moca_crt mu1 egress hosts
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   # The identity block follows the provider: github writes only the client id (an empty
@@ -1094,6 +1148,13 @@ ensure_settings() {
       'SH_SESSION_TOKEN_TTL_SECONDS=' "SH_IDENTITY_PROVIDER=oidc" "SH_OIDC_ISSUER=$SBX_OIDC_ISSUER"
       "SH_OIDC_CLIENT_ID=$SBX_OIDC_CLIENT_ID" "SH_OIDC_REDIRECT_URI=$SBX_OIDC_REDIRECT_URI")
     [[ -z "${SBX_OIDC_SCOPE:-}" ]] || moca+=("SH_OIDC_SCOPE=$SBX_OIDC_SCOPE")
+    # The client address behind the Route (#716, #937): the per-source login bound keys on the
+    # X-Forwarded-For entry the sbx-api Route appends, so the hop count is 1 unless the operator
+    # sets another (the control plane's own default, 0, would key every login by the router's
+    # address). An empty bound is the control plane's default. GitHub logins have no per-source
+    # bound, so the github array above stays as it was.
+    moca+=("SH_TRUSTED_PROXY_HOPS=${SBX_TRUSTED_PROXY_HOPS:-1}"
+      "SH_OIDC_MAX_PENDING_PER_SOURCE=${SBX_OIDC_MAX_PENDING_PER_SOURCE:-}")
   fi
   # Combined: the keys the base's control plane reads beside these (base/control-plane.yaml), with
   # the harness's public URL the supervisor Route serves; no operator key fallback, no tiers.
@@ -1124,9 +1185,15 @@ ensure_settings() {
   exec_crt="$(secret_json sbx-exec-tls)"
   moca_crt=''
   [[ -z "$COMBINED" ]] || moca_crt="$(secret_json moca-supervisor-tls)"
+  # moca-mu1's data is hashed too (names and base64 values, sorted, never logged): the control plane
+  # reads its signing key, janitor token and installer token once at start, so a rotated one (a key
+  # deleted and re-run, ensure_signing_key) must roll it, or it keeps accepting the old token (#939).
+  # The hash is a truncated sha256 over secret values, the precedent sbx-egress and the template
+  # hosts' Secret already set below: over high-entropy keys, 16 hex characters reveal nothing usable.
   # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
   # token or KEK changes the pod template, so the control plane rolls and rereads its files.
   # With the store on, the host tokens' Secret likewise: a new or revoked host token rolls it.
+  mu1="$(secret_json moca-mu1 | jq -cS '.data // {}')"
   egress='' hosts=''
   [[ -z "$EGRESS_ON" ]] || egress="$(secret_json sbx-egress | jq -cS '.data // {}')"
   [[ -z "$STORE_ON" ]] || hosts="$(secret_json sbx-template-hosts | jq -cS '.data // {}')"
@@ -1136,6 +1203,7 @@ ensure_settings() {
     json_value "$attach_crt" tls.crt
     json_value "$exec_crt" tls.crt
     [[ -z "$COMBINED" ]] || json_value "$moca_crt" tls.crt
+    printf '%s\n' "$mu1"
     [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
     [[ -z "$STORE_ON" ]] || printf '%s\n' "$hosts"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
