@@ -10,7 +10,7 @@ under. Each entry has an id so the spec, the code and the validation can cite it
 Sources: the inventory [`INVENTORY-2026-11-02.md`](INVENTORY-2026-11-02.md) (Moca at sbx-template 22e19036), the
 2026-10-31 and 2026-11-01/02 bm1 runs, image-factory's records, and the user's decisions below.
 
-**Since the syncs with upstream main (2026-11-16 to 2026-11-19, now API 1.31.0, harness API 1.7.0):** the code on this branch is
+**Since the syncs with upstream main (2026-11-16 to 2026-11-20, now Moca v0.11.0: API 1.33.0, harness API 1.7.0):** the code on this branch is
 upstream's reviewed version of this work, including the pinned-session retire guard and G29's reuse only while a
 host holds the snapshot, which landed upstream. The fork-only parts are deploy tooling and docs:
 `install-host.sh --uninstall-shared`, `mint-login.sh`, and setup.sh's `SBX_GATE_RECORD_SCHEMA` key. Where an entry
