@@ -73,8 +73,8 @@
 #                           default idle timeout, which it refuses to start above its ceiling
 #   SBX_GATE_RECORD_SCHEMA  optional; unset by default: the schema of the general-gate records the control
 #                           plane reads (its SH_GATE_RECORD_SCHEMA; unset, its default moca-gate-record/1).
-#                           The image builder's general-gate records use image-factory/gate/1, so a
-#                           deployment that takes them sets that value
+#                           Moca's gate-image.py writes that default: set this only for records of
+#                           another schema (e.g. image-factory/gate/1 records an earlier gate wrote)
 #   SBX_EGRESS_CREDENTIALS  optional; unset, 0 or 1 (SBX0.2b, spec §4.3). 1 turns on user-scoped egress
 #                           credentials: the control plane's file store (a PVC) and credential routes,
 #                           a KEK and one bearer per KVM host in the Secret sbx-egress, and an egress

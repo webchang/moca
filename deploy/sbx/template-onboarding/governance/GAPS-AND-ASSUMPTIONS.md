@@ -10,15 +10,16 @@ under. Each entry has an id so the spec, the code and the validation can cite it
 Sources: the inventory [`INVENTORY-2026-11-02.md`](INVENTORY-2026-11-02.md) (Moca at sbx-template 22e19036), the
 2026-10-31 and 2026-11-01/02 bm1 runs, image-factory's records, and the user's decisions below.
 
-**Since the syncs with upstream main (2026-11-16 to 2026-11-20, now Moca v0.11.0: API 1.33.0, harness API 1.7.0):** the code on this branch is
+**Since the syncs with upstream main (2026-11-16 to 2026-11-22, now upstream 49cce285, Moca v0.11.0 plus #953-#976: API 1.35.0, harness API 1.7.0):** the code on this branch is
 upstream's reviewed version of this work, including the pinned-session retire guard and G29's reuse only while a
 host holds the snapshot, which landed upstream. The fork-only parts are deploy tooling and docs:
 `install-host.sh --uninstall-shared`, `mint-login.sh`, and setup.sh's `SBX_GATE_RECORD_SCHEMA` key. Where an entry
 below describes the fork's earlier code, upstream's behaviour now holds. Two differences matter here: a build an
 admin rejects is stopped, never removed (upstream's rule; PV6's "the host's removal" is a retired build's only);
-and upstream's general gate record schema defaults to `moca-gate-record/1` (`SH_GATE_RECORD_SCHEMA`), so a
-deployment that takes the image builder's general-gate records sets `SBX_GATE_RECORD_SCHEMA` in setup.sh's env
-file ([Install the sandbox service](../../../../docs/operate/sandbox-service/install.md)).
+and upstream's general gate record schema defaults to `moca-gate-record/1` (`SH_GATE_RECORD_SCHEMA`), which
+Moca's own gate, `gate-image.py` (#960), now writes. `SBX_GATE_RECORD_SCHEMA` in setup.sh's env file is needed only
+for records of another schema, such as the image builder's earlier `image-factory/gate/1` ones
+([Install the sandbox service](../../../../docs/operate/sandbox-service/install.md)).
 
 ## The user's decisions this rests on (2026-11-02, D12-D13 2026-11-03)
 
