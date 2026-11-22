@@ -308,6 +308,12 @@ func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 	p.reclaimQ = make(chan reclaimBatch, 64)
 	p.reclaimDone.Add(1)
 	go p.reclaimLoop()
+	// Before anything is served, and after endLeasesOpenAtStart: what a previous process
+	// left under WorkspaceRoot (#338's restart leak). The deletes run on reclaimLoop.
+	if swept, tombs := p.startupSweep(); swept > 0 || tombs > 0 {
+		log.Printf("vmpool: startup sweep: %d unknown workspace(s) idle past %s and %d tombstone(s) queued for removal",
+			swept, cfg.WorkspaceIdle, tombs)
+	}
 	p.mu.Lock()
 	p.armTickerLocked()
 	if cfg.LeaseEnabled {
@@ -509,6 +515,7 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	if ph != nil {
 		ph.Acquire = p.clk.Now().Sub(t0)
 		ph.Cold = cause
+		ph.Normalise = 0 // a per-Exec Exec starts no lease: never a reused Phases' walk
 	}
 	if err != nil {
 		if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {

@@ -20,11 +20,15 @@ UPDATE_MOCACTL_REFERENCE=1 pnpm -C packages/mocactl exec vitest run test/mocactl
 
 ```text
 usage:
-  mocactl [--setup] [--no-animation]             interactive terminal UI
+  mocactl [--setup] [--no-animation]             interactive terminal UI (--setup: run the first-start
+                                                 setup again: the server form, then login and
+                                                 credential, each skipped when already done;
+                                                 --no-animation: a still spinner)
   mocactl --version                              print this build's version (a release tag, edge-<sha>,
                                                  or dev-<sha> from a source checkout)
   mocactl login [--no-browser]                   log in with the GitHub device flow (in a local
-                                                 terminal: copies the code, opens the browser)
+                                                 terminal: copies the code, opens the browser;
+                                                 --no-browser: only prints the URL and the code)
   mocactl login --test-user N                    log in as test user N (needs the control plane's
                                                  SH_TEST_USERS; secret in MOCA_TEST_USER_SECRET)
   mocactl logout [--all]                         end this login (--all: every login of yours)
@@ -32,6 +36,14 @@ usage:
                                                  (exit 3: log in first; 4: control plane unreachable)
   mocactl doctor [--json]                        check the setup; one fix per failure
   mocactl run "prompt" [--session ID | --new] [--option key=value ...] [--json]
+                                                 run one turn and print its reply: in session ID
+                                                 (--session), or in a new session (--new, the
+                                                 default); --option sets a new session's model,
+                                                 inferenceCredential, sandboxTier or sandboxTemplate
+                                                 (repeatable; other keys are ignored; with several
+                                                 inference credentials and none given, refused,
+                                                 naming them; the others not given take the
+                                                 server's default; ignored with --session)
   mocactl run "prompt" --config DIGEST            start the new session with a promoted config bundle
   mocactl run "prompt" --show-tools              print each tool call the turn makes, between its
                                                  text (not with --json, which streams the frames)
@@ -48,37 +60,57 @@ usage:
   mocactl sessions delete ID [--json]
   mocactl credentials [--json]                   list your credentials (never their secrets)
   mocactl credentials add NAME --host HOST [--host HOST ...] [--kind KIND] [--consumer CONSUMER]
-      [--endpoint URL] [--json]                  the secret is read from stdin
+      [--endpoint URL] [--json]                  the secret is read from stdin; --host: a host it is
+                                                 sent to (repeatable, or a comma list); --kind:
+                                                 bearer (default), api-key, oauth2-token or basic
+                                                 (stdin is username=... and password=... lines;
+                                                 basic needs --consumer sandbox-egress or
+                                                 control-plane: inference takes one secret);
+                                                 --consumer: inference (default: the model calls),
+                                                 sandbox-egress or control-plane; --endpoint: the
+                                                 model API URL it is for (inference only)
   mocactl credentials delete NAME [--json]
   mocactl spawn "prompt" [--config DIGEST] --kind prompt|solve
       [--repo URL --ref REF] [--tag T] [--label L] [--json]
-                                                 fork a detached subagent (solve needs --repo/--ref;
+                                                 fork a detached subagent (--kind prompt: it answers
+                                                 in text; solve: it returns a patch to the
+                                                 repository --repo at --ref, which solve needs;
+                                                 --config: its session's promoted config bundle;
+                                                 --tag groups spawns for subagents and watch;
                                                  --label names one dispatch within a --tag group,
                                                  surfaced on 'mocactl subagents --json' as label)
   mocactl spawn --prompt-file FILE [...]         read the prompt from FILE (UTF-8, trimmed); use when
                                                  the prompt would otherwise be awkward on argv
   mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]
-                                                 run the subagent on a workload's context
-                                                 (--writable: its own copy, discarded after)
+                                                 run the subagent on the context of workload ID
+                                                 (--workload needs --kind prompt; --writable: its
+                                                 own copy, discarded after)
   mocactl spawn "prompt" --async [...]            dispatch as a cancellable async turn instead of a
                                                  local worker process (needs SH_ASYNC_DRAIN on the
                                                  deployment; not available with --workload)
   mocactl spawn "prompt" --max-concurrent N [...]
                                                  refuse the dispatch when N of your subagents are
                                                  already running (default 4)
-  mocactl subagents [--tag T] [--json]            list spawned subagents + current state
-  mocactl watch [--tag T] [--json]                one line per state change, until every watched
-                                                 subagent is finished (--json: one JSON object per
-                                                 line, for an agent's background monitor)
-  mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary
-  mocactl get SESSIONID --wait [--timeout S]     block until the result is there, then write it
-                                                 (default 300 s; exit 1 and status 'queued' if the
+  mocactl subagents [--tag T] [--json]            list spawned subagents + current state (--tag:
+                                                 only those spawned with --tag T)
+  mocactl watch [--tag T] [--since C] [--json]   one line per state change, until every watched
+                                                 subagent is finished (--tag: only those spawned
+                                                 with --tag T; --json: one JSON object per line,
+                                                 for an agent's background monitor; --since
+                                                 resumes the event stream after cursor C)
+  mocactl get SESSIONID [--out DIR] [--json]      write result files + bounded summary (--out: into
+                                                 DIR; default: the current directory)
+  mocactl get SESSIONID --wait [--timeout S]     --wait: block until the result is there, then write
+                                                 it (--timeout: at most S seconds, default 300;
+                                                 exit 1 and status 'queued' if the
                                                  budget runs out, 'unknown' if the run is over
                                                  without one)
   mocactl workloads create --context FILE [--name NAME] [--json]
       [--sandboxes N [--mount read-only|writable]]
-                                                 upload a context file (contextctl ctx pack) to a
-                                                 new workload; prints its id (--sandboxes: N
+                                                 upload a context file (--context, made by
+                                                 contextctl ctx pack) to a new workload; prints
+                                                 its id (--name: the id; default: wl- and 8 hex
+                                                 digits; --sandboxes: N
                                                  sandboxes of its own; --mount: its context on
                                                  their own volume, no per-run copy)
   mocactl workloads list [--json]                your own live workloads, newest first
@@ -86,6 +118,7 @@ usage:
   mocactl workloads delete ID [--json]           delete a workload and its context
 flags for every command: --control-plane-url URL
   (the control plane says where the harness is; --harness-url URL overrides that)
+--json: print the result as JSON on stdout, for a script
 ```
 
 <!-- END GENERATED: mocactl --help -->
@@ -298,9 +331,17 @@ hex>`, `--kind` other than `prompt`/`solve`, `--kind solve` without both `--repo
   `subagents` lists, read the same way (a `turnId` row through its turn, any other through
   `GET /runs/status`), and persisted the same way. The first sweep reports every row, so watching a
   batch that is already over says so rather than printing nothing; after that a row is printed only
-  when its state or detail changes. It polls every 5 s, slower than `get --wait`'s 2 s, because it
-  is meant to run as a background monitor rather than as an interactive wait. The ledger is re-read
-  each tick, so a `spawn --tag T` from another terminal joins a running `watch --tag T` — spawn
+  when its state or detail changes. It follows the owner-scoped event stream
+  `GET /v1/events` (#392), so a transition appears within about a second instead of at the next poll,
+  and a turn that starts and finishes quickly still produces its `running` line. `--since C` resumes
+  the stream after cursor `C`; every `--json` line carries the `cursor` of the event that produced
+  it (`null` on a line from the fallback read), which is what a reattach hook stores. A cursor older
+  than the server's retention window prints a note on stderr and the state comes from a read.
+  Behind the stream is a 60 s read of every non-final row, which is what `watch` did before the
+  stream existed and is still the whole answer for three cases: a synchronous row, which has no turn
+  and therefore no events; a deployment whose control plane has no `/v1/events`, which is not an
+  error; and an event the server lost. The ledger is re-read
+  each sweep, so a `spawn --tag T` from another terminal joins a running `watch --tag T` — spawn
   some, watch, spawn more. It exits 0 once every watched row is `done`, `failed`, `paused` or
   `unknown`. `unknown` counts as finished even though it is not a terminal state: it is the client's
   "no result is coming" — a child that exited without writing one, past the 60 s result-write grace,
@@ -331,8 +372,9 @@ hex>`, `--kind` other than `prompt`/`solve`, `--kind solve` without both `--repo
     with `--async`, which has no local process to name.
   - `subagents` → `{"subagents":[{"sessionId","tag","label"?,"kind","state","detail","bundle","workload","writable"?,"submittedAt"}]}` (`label` and `writable` are present only on rows dispatched with them). The non-`--json` table columns are `SESSION TAG LABEL KIND STATE BUNDLE` (`-` on unlabeled rows).
   - `watch` → NDJSON, one event per line:
-    `{"sessionId","tag","label"?,"kind","state","detail","at"}` (`at` is epoch milliseconds; the
-    other fields are `subagents --json`'s, so one parser reads both). Without `--json` each line is
+    `{"sessionId","tag","label"?,"kind","state","detail","cursor","at"}` (`at` is epoch
+    milliseconds; `cursor` is the event this line came from, `null` on a line from the fallback
+    read; the other fields are `subagents --json`'s, so one parser reads both). Without `--json` each line is
     `state  sessionId  [label or tag]  (detail)`, the state padded so the ids line up.
   - `get` → `{"sessionId","status","files":[…],"reason"?,"message"?}`, or
     `{"sessionId","status":"queued"}` with nothing to collect, or

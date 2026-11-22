@@ -154,3 +154,95 @@ func TestReleaseOfASymlinkedWorkspaceLeavesItsTarget(t *testing.T) {
 		t.Fatalf("the link's target lost %s: %q, %v", kept, got, err)
 	}
 }
+
+// #338: at startup the container worker removes a previous process's tombstones, and
+// never an unknown directory: Root is also the shared workspace, so a name alone cannot
+// tell a key's workspace from shared content. A tombstone that is a symlink is unlinked,
+// and its target survives.
+func TestStartupSweepRemovesTombstonesOnly(t *testing.T) {
+	root := t.TempDir()
+	tomb := filepath.Join(root, ".reclaiming-"+"sess-a-1-1")
+	if err := os.MkdirAll(filepath.Join(tomb, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	keep := filepath.Join(target, "repo-file")
+	if err := os.WriteFile(keep, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkTomb := filepath.Join(root, ".reclaiming-"+"sess-l-2-2")
+	if err := os.Symlink(target, linkTomb); err != nil {
+		t.Fatal(err)
+	}
+	unknown := filepath.Join(root, "sess-unknown")
+	shared := filepath.Join(root, "cloned-repo")
+	for _, d := range []string{unknown, shared} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-48 * time.Hour)
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := &wexec.WorkspaceRunner{Root: root, Idle: time.Minute}
+	if n := w.SweepTombstonesAtStart(); n != 2 {
+		t.Fatalf("removed %d, want 2 tombstones", n)
+	}
+	for _, p := range []string{tomb, linkTomb} {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Fatalf("tombstone %s is still there: %v", p, err)
+		}
+	}
+	for _, p := range []string{unknown, shared} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("an unknown directory was removed: %s: %v", p, err)
+		}
+	}
+	if b, err := os.ReadFile(keep); err != nil || string(b) != "keep me" {
+		t.Fatalf("the symlinked tombstone's target lost %s: %q, %v", keep, b, err)
+	}
+}
+
+// A Release whose rename fails (here: Root not writable) answers an error, not RELEASED,
+// since the directory is still there; the key is refused all the same, and stays tracked,
+// so a later Release (or the sweep) finishes the job. vmpool's Release answers the same.
+func TestReleaseWhoseDetachFailsAnswersAnErrorNotReleased(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root renames in a read-only directory")
+	}
+	w, _ := newWorkspaceRunner(t, wexec.BashRunner{})
+	runIn(t, w, "sess-d", "echo d > clone.txt")
+	dir := filepath.Join(w.Root, "sess-d")
+	if err := os.Chmod(w.Root, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(w.Root, 0o755) })
+
+	o, err := w.Release(context.Background(), "sess-d")
+	if err == nil || o != pb.ReleaseOutcome_RELEASE_OUTCOME_UNSPECIFIED {
+		t.Fatalf("Release with a failing rename = (%v, %v), want (UNSPECIFIED, an error)", o, err)
+	}
+	// The error travels to the client and the relay's audit: no host path, no OS error text.
+	if msg := err.Error(); strings.Contains(msg, "/") || strings.Contains(msg, w.Root) {
+		t.Fatalf("Release's error %q names a path; it must be path-free", msg)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "clone.txt")); err != nil {
+		t.Fatalf("the workspace is gone though the rename failed: %v", err)
+	}
+	var rec recorder
+	if _, err := w.Run(context.Background(), wexec.Spec{Command: "true", WorkspaceKey: "sess-d"}, &rec); err == nil ||
+		!strings.HasPrefix(err.Error(), "released: ") {
+		t.Fatalf("Run after a failed Release: err = %v, want a released: refusal", err)
+	}
+
+	if err := os.Chmod(w.Root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if o := release(t, w, "sess-d"); o != pb.ReleaseOutcome_RELEASE_OUTCOME_RELEASED {
+		t.Fatalf("Release once the rename can succeed = %v, want RELEASED (the key stayed tracked)", o)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("stat(%s) after the retried Release = %v, want it removed", dir, err)
+	}
+}
