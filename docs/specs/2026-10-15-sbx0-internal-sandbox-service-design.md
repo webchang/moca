@@ -195,11 +195,18 @@ attach side already heartbeats.
 ### 3.5 Audit
 
 One JSON line per `Exec`, to stdout:
-`{audit, ts, sub, sbx, wrk, req_id, ms, outcome, exit_code, truncated, out_bytes, reason, cmd}`.
+`{audit, ts, caller, sub, sbx, wrk, req_id, wid, call_id, ms, outcome, exit_code, truncated, out_bytes, reason, cmd}`.
 
 - `audit` is `"sandbox_exec"`, the marker a log reader selects on.
 - `ts` is when the relay received the Exec. `ms` is the time from then until the line was written.
 - `req_id` is the caller's (§3.6), and `wrk` is the `sandbox_id` the caller asked for.
+- `wid` is the id the worker knows the Exec by (§3.6), the `req=` of the worker's own log lines, so
+  a line joins the worker's record of the same Exec exactly. It is absent when the relay refused the
+  Exec before mapping it. Logging it does not weaken §3.6's rule: a `wid` reveals nothing about the
+  key, and a sandbox still cannot predict another sandbox's.
+- `call_id` is the client's own correlation id, from gRPC metadata `x-moca-call-id`, when it matches
+  `[A-Za-z0-9._:-]{1,64}`. Any other value is dropped and never echoed. It is a label only: the relay
+  never reads it for auth or routing.
 - `out_bytes` counts stdout only. `exit_code` and `truncated` appear only when the worker sent
   `End`, and `reason` only on `refused`.
 
@@ -218,7 +225,9 @@ One JSON line per `Exec`, to stdout:
   §3.6) or `INVALID_ARGUMENT`, with a fixed `reason`.
 
 The lines are written only when the relay has sandbox keys configured, so a MOCA relay's output is
-unchanged. Harness callers' Execs write no line. Command text and output are never logged, and
+unchanged. A harness caller's Exec writes the same line with `caller: "harness"`, no `sub`, `sbx` or `cmd` (its
+token carries no subject, and its commands are Moca Pi's), and `wid` equal to its `req_id`, which the relay
+forwards unchanged. Command text and output are never logged, and
 neither is the token. An operator debug flag (`SH_SANDBOX_AUDIT_COMMANDS=1`, exactly `1`) adds the
 command's first 200 bytes as `cmd`, cut at a UTF-8 character boundary, and only for a token that
 verified. Every line carries the token's `sub` and `sbx` only when it verified. An `UNAUTHENTICATED`
@@ -615,6 +624,22 @@ nothing here changes, and moca does not need Cortex.
   `<mocactl state dir>/sbx/<id>.log`. `ok` is false for any tool error, the command's own non-zero
   exit included. `error` is set only when the failure was not the command's, and never carries
   command text or output. `doctor` summarizes it.
+  - **Format 2** (additive; a line with `"v":2` and an `event`), so a session's tool calls join its
+    Execs without anything asked of the agent:
+    - `session`, once per `sbx mcp` process after MCP `initialize`: `mcp_session` (minted by the
+      server), `sbx`, `client` (the handshake's `clientInfo` as sent, each string capped at 128),
+      `mocactl`, `run` (MOCACTL_SBX_RUN_ID, optional);
+    - `call`, the line above plus `mcp_session`, `sbx`, `n` (the server's own counter), `rpc_id` (the
+      JSON-RPC id as sent), `exec[]` (each attempt's `req_id, start, ms, exit, outcome`) and
+      `meta_tool_use_id` (a tool-use id the client happens to send in `_meta`, else null);
+    - `exec`, one per attempt for every other command (`sbx run`, `push`, `pull`, …): `sbx`,
+      `command`, `invocation` (`--record`'s id when that is on), `req_id, start, ms, exit, outcome`,
+      `run`;
+    - `session_end` when the server stops (`why`: `eof` or `signal`; best effort).
+  - Every Exec carries `x-moca-call-id` in its gRPC metadata (`<mcp_session>:<n>` or
+    `<invocation>:<k>`, `[A-Za-z0-9._:-]{1,64}`), for the relay's audit line to name. A `req_id`
+    matches the relay's `sandbox_exec.req_id`; a token refusal retries the same one, a `stale_mode`
+    refusal a fresh one.
 
 ### 6.5 The gRPC client
 
