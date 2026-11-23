@@ -111,6 +111,25 @@ export function turnStoreContract(name: string, make: MakeTurnStore): void {
       await done();
     });
 
+    it('round-trips the gate deadline and its timeout action (#393)', async () => {
+      const { store, done } = await make();
+      await store.create(
+        rec({ turnId: 't-gate', gateDeadlineS: 60, onTimeout: 'reject', resumeOf: 't-0' }),
+      );
+      expect(await store.get('t-gate')).toMatchObject({
+        gateDeadlineS: 60,
+        onTimeout: 'reject',
+        resumeOf: 't-0',
+      });
+      // A turn with no deadline reads back as undefined, never as `NaN` from `Number('')`: the
+      // sweep's index is scored from this number, and a NaN score is a Redis error on every add.
+      await store.create(rec({ turnId: 't-nogate' }));
+      const plain = await store.get('t-nogate');
+      expect(plain?.gateDeadlineS).toBeUndefined();
+      expect(plain?.onTimeout).toBeUndefined();
+      await done();
+    });
+
     it('counts only NON-TERMINAL turns per owner, and never another owner s (§4.3)', async () => {
       const { store, now, done } = await make();
       await store.create(rec({ turnId: 't-a' }));
@@ -498,7 +517,8 @@ export function turnStoreContract(name: string, make: MakeTurnStore): void {
         expect(await hasResult(sessionId, turnId)).toBe(false);
       }
       await done();
-    });
+      // Over 750 sequential round trips against a real Redis: on a loaded CI runner that's near the 5 s default.
+    }, 20_000);
 
     it('keeps the session index alive at least as long as the record it points at (§9.2)', async () => {
       const {
