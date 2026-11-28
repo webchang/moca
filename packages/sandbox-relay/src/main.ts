@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import type { Server as HttpServer } from 'node:http';
 import {
   Server,
   ServerCredentials,
@@ -73,6 +74,11 @@ import {
   makeSandboxCaller,
   type LeaseTimeoutsMs,
 } from './sandbox-caller.js';
+import {
+  buildControlServer,
+  listenControl,
+  makeReleaseTokenValidator,
+} from './control-listener.js';
 
 export { grpcError } from './exec-stream.js';
 export { SANDBOX_DRAIN_GRACE_S, armDeadline } from './sandbox-caller.js';
@@ -108,6 +114,11 @@ export interface RelayServerDeps extends RelayDeps {
   sandboxAuditCommands?: boolean;
   /** Direct clients (client-tokens.ts). Omitted: only the harness's exec token is accepted. */
   authenticateClient?: (presented: string | undefined) => ClientGrant | undefined;
+  /**
+   * The control listener's release-only bearer (#338, control-listener.ts), from
+   * makeReleaseTokenValidator. Required when the listener is on; unused otherwise.
+   */
+  releaseAuth?: { validate: (presented: string | undefined) => boolean };
 }
 
 /**
@@ -677,16 +688,19 @@ const SANDBOX_ID_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * Secret is admitted without a relay restart), then `SH_RELAY_TOKEN_<id>`, then `SH_RELAY_TOKEN`.
  * A missing file (or directory) falls through; any other read error, and an empty file, refuse the
  * attach without falling through. A directory token equal to MOCA_RELAY_EXEC_TOKEN is refused (MI1
- * R5: a sandbox credential must never be a caller credential). Only ids matching SANDBOX_ID_RE are
+ * R5: a sandbox credential must never be a caller credential), and so is one equal to the control
+ * listener's release bearer (`releaseToken`, #338), which the boot check cannot see in a file added
+ * later. Only ids matching SANDBOX_ID_RE are
  * looked up in the directory (no path traversal); any other id -- the container tier's dashed
  * moca-sandbox-N -- takes the env path exactly as before. Reserved names are refused outright with
  * no fallthrough. Constant-time, like the exec token's comparison. Logs name the id, never a value.
  */
 export function makeDefaultValidateToken(
   env: NodeJS.ProcessEnv,
-  deps: { readFile?: (path: string) => string } = {},
+  deps: { readFile?: (path: string) => string; releaseToken?: string } = {},
 ): (token: string | undefined, sandboxId: string) => boolean {
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
+  const releaseToken = deps.releaseToken;
   const dir = env.SH_RELAY_TOKEN_DIR;
   const execToken = env.MOCA_RELAY_EXEC_TOKEN;
   return (token, sandboxId) => {
@@ -715,6 +729,10 @@ export function makeDefaultValidateToken(
       console.error(`relay token for ${sandboxId} equals the exec token; refused`);
       return false;
     }
+    if (fromDir && releaseToken && expected === releaseToken) {
+      console.error(`relay token for ${sandboxId} equals the release token; refused`);
+      return false;
+    }
     const want = Buffer.from(expected);
     const got = Buffer.from(token);
     return got.length === want.length && timingSafeEqual(got, want);
@@ -740,10 +758,17 @@ export function detachMarks(records: RedisRecordStore, env: NodeJS.ProcessEnv): 
  * and only then do the servers finish. `tryShutdown` waits for open calls, and an Attach stream is
  * open for the worker's whole life, so without the drain ending them it never returns at all.
  */
-async function stopGracefully(servers: Server[], relay: Relay, close?: () => Promise<void>) {
-  const stopped = Promise.all(
-    servers.map((s) => new Promise<void>((r) => s.tryShutdown(() => r()))),
-  );
+async function stopGracefully(
+  servers: Server[],
+  relay: Relay,
+  close?: () => Promise<void>,
+  control?: HttpServer,
+) {
+  const stopped = Promise.all([
+    ...servers.map((s) => new Promise<void>((r) => s.tryShutdown(() => r()))),
+    // The control listener stops accepting too; a release in flight ends with the drain below.
+    ...(control ? [new Promise<void>((r) => control.close(() => r()))] : []),
+  ]);
   await relay.drain();
   await stopped;
   await close?.();
@@ -786,48 +811,88 @@ export async function startRelay(
   opts: {
     port?: number;
     execAddr?: string;
+    /** The control listener's address (#338); MOCA_RELAY_CONTROL_ADDR when absent. Unset: off. */
+    controlAddr?: string;
     deps?: RelayServerDeps;
     env?: NodeJS.ProcessEnv;
     keepalive?: Keepalive;
   } = {},
-): Promise<{ port: number; execPort?: number; shutdown: () => Promise<void> }> {
+): Promise<{
+  port: number;
+  execPort?: number;
+  controlPort?: number;
+  shutdown: () => Promise<void>;
+}> {
   const env = opts.env ?? process.env;
   // Before anything else, so a malformed value is a boot error.
   const keepalive = opts.keepalive ?? relayKeepalive(env);
+  // Off unless set: with no address there is no listener, no bearer read and no check at all.
+  const controlAddr = opts.controlAddr ?? (env.MOCA_RELAY_CONTROL_ADDR || undefined);
   // The store startRelay built itself, and so closes on shutdown; injected deps belong to the caller.
   let ownedRecords: RedisRecordStore | undefined;
   // The exec auth first: it throws on a missing credential before anything touches Redis.
-  const deps =
+  const deps: RelayServerDeps =
     opts.deps ??
     (() => {
       const auth = makeExecAuth(env);
       // Before Redis too: a malformed keyset is a boot error.
       const verifyAttach = makeAttachVerifier(env);
+      // And the release bearer: missing, short or equal to another bearer refuses the boot.
+      const release = controlAddr ? makeReleaseTokenValidator(env) : undefined;
       const records = new RedisRecordStore();
       ownedRecords = records;
       return {
         records,
         detach: detachMarks(records, env),
-        validateToken: makeDefaultValidateToken(env),
+        validateToken: makeDefaultValidateToken(env, {
+          ...(release ? { releaseToken: release.token } : {}),
+        }),
         ...auth,
         ...(verifyAttach ? { verifyAttach } : {}),
+        ...(release ? { releaseAuth: { validate: release.validate } } : {}),
       };
     })();
+  if (controlAddr && !deps.releaseAuth) {
+    throw new Error(
+      'MOCA_RELAY_CONTROL_ADDR needs the release bearer: the control listener refuses unauthenticated releases',
+    );
+  }
   const close = ownedRecords ? () => ownedRecords!.close() : undefined;
+  // The control listener (#338) over the same relay, so a release routes to a worker attached on
+  // the attach listener. Bound last, so a refused attach or exec bind leaves nothing open here.
+  const control = (relay: Relay) =>
+    controlAddr
+      ? buildControlServer(relay, {
+          validate: deps.releaseAuth!.validate,
+          ...(deps.releaseTimeoutMs !== undefined ? { timeoutMs: deps.releaseTimeoutMs } : {}),
+          ...(deps.log ? { log: deps.log } : {}),
+        })
+      : undefined;
   const attachAddr = `0.0.0.0:${opts.port ?? Number(env.SH_RELAY_PORT ?? 8443)}`;
   const execAddr = opts.execAddr ?? env.MOCA_RELAY_EXEC_ADDR;
   if (!execAddr) {
     const { server, relay } = buildServer(deps, keepalive);
     const port = await bind(server, attachAddr);
-    return { port, shutdown: () => stopGracefully([server], relay, close) };
+    const controlServer = control(relay);
+    const controlPort = controlServer
+      ? await listenControl(controlServer, controlAddr!)
+      : undefined;
+    return {
+      port,
+      ...(controlPort !== undefined ? { controlPort } : {}),
+      shutdown: () => stopGracefully([server], relay, close, controlServer),
+    };
   }
   const { attachServer, execServer, relay } = buildServers(deps, keepalive);
   const port = await bind(attachServer, attachAddr);
   const execPort = await bind(execServer, execAddr);
+  const controlServer = control(relay);
+  const controlPort = controlServer ? await listenControl(controlServer, controlAddr!) : undefined;
   return {
     port,
     execPort,
-    shutdown: () => stopGracefully([attachServer, execServer], relay, close),
+    ...(controlPort !== undefined ? { controlPort } : {}),
+    shutdown: () => stopGracefully([attachServer, execServer], relay, close, controlServer),
   };
 }
 
@@ -884,7 +949,7 @@ export function installShutdownSignals(
 // Bootstrap when run directly (tsx entrypoint), not when imported by tests.
 if (import.meta.url === `file://${process.argv[1]}`) {
   startRelay().then(
-    ({ port, execPort, shutdown }) => {
+    ({ port, execPort, controlPort, shutdown }) => {
       installShutdownSignals(shutdown);
       // The Redis schema version (#509): written if absent, and the relay exits on a newer one once
       // Redis answers. Its records store reads the same REDIS_URL (RedisRecordStore's default).
@@ -893,7 +958,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
       });
       console.log(
-        `sandbox-relay attach :${port}${execPort ? `, exec :${execPort}` : ' (exec on the same listener)'}`,
+        `sandbox-relay attach :${port}${execPort ? `, exec :${execPort}` : ' (exec on the same listener)'}` +
+          (controlPort ? `, control :${controlPort}` : ''),
       );
     },
     // Every boot refusal (a missing or clashing exec token, an unbindable address) lands here. Left

@@ -23,16 +23,18 @@ export interface CpRedisLike {
    */
   hGet(key: string, field: string): Promise<string | null | undefined>;
   zAdd(key: string, member: { score: number; value: string }): Promise<unknown>;
-  zRem(key: string, member: string): Promise<unknown>;
+  /** An array removes every named member at once and ignores the ones that were never there. */
+  zRem(key: string, member: string | string[]): Promise<unknown>;
   /**
    * NOTE the argument order: node-redis takes (key, min, max) normally but (key, MAX, MIN) when
-   * `REV` is set, which is the only way this index reads. Written max-first so the call site and the
-   * client agree; the test fake reproduces the same order deliberately.
+   * `REV` is set, which is how nearly every index here reads. So the two bounds are named by their
+   * POSITION, not by which is larger: with `REV` the first is the max, without it the first is the
+   * min. The test fake reproduces the same order deliberately.
    */
   zRange(
     key: string,
-    max: number | string,
-    min: number | string,
+    from: number | string,
+    to: number | string,
     opts?: { BY?: 'SCORE'; REV?: boolean; LIMIT?: { offset: number; count: number } },
   ): Promise<string[]>;
   /**
@@ -427,6 +429,8 @@ export class OwnershipIndex {
     sessionId?: string;
     /** The sandbox a decision is about (SBX0 §5). */
     sandboxId?: string;
+    /** The worker (relay sandbox id) a decision went to: a session's workspace release (#338). */
+    worker?: string;
     /** The async turn a decision is about (async fan-out spec §5.1). */
     turnId?: string;
     credential?: string;
@@ -447,6 +451,11 @@ export class OwnershipIndex {
      * allowed, downgraded at a token mint), `mode_not_allowed`.
      */
     reason?: string;
+    /**
+     * What the worker answered a workspace release (#338): released, kept_busy, unknown_key or
+     * unsupported; on a session's, also not_answered or no_worker.
+     */
+    outcome?: string;
     model?: string;
     fromModel?: string;
     /** A sandbox mode change (lease-mode spec §8.1): the old and new mode, and the new epoch. */
@@ -464,6 +473,7 @@ export class OwnershipIndex {
           decision: entry.decision,
           ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
           ...(entry.sandboxId ? { sandboxId: entry.sandboxId } : {}),
+          ...(entry.worker ? { worker: entry.worker } : {}),
           ...(entry.turnId ? { turnId: entry.turnId } : {}),
           // The credential NAME, never its value (spec §7.2).
           ...(entry.credential ? { credential: entry.credential } : {}),
@@ -475,6 +485,7 @@ export class OwnershipIndex {
           ...(entry.member ? { member: entry.member } : {}),
           ...(entry.rules ? { rules: entry.rules } : {}),
           ...(entry.reason ? { reason: entry.reason } : {}),
+          ...(entry.outcome ? { outcome: entry.outcome } : {}),
           ...(entry.model ? { model: entry.model } : {}),
           ...(entry.fromModel ? { fromModel: entry.fromModel } : {}),
           ...(entry.fromMode ? { fromMode: entry.fromMode } : {}),

@@ -8,12 +8,26 @@ import { MemoryEgressStore } from '../../src/egress-log.js';
 import { MemoryRefreshStore, type AuditFields } from '../../src/refresh-store.js';
 import { makeSigner, publicKeyFromBase64, type TokenClaims } from '../../src/token.js';
 import { MemoryTurnQueue } from '../../src/turn-queue.js';
+import { NotifyStore } from '../../src/notify-store.js';
 import { TurnStore } from '../../src/turn-store.js';
 import { fakeBundleRedis, fakeRedis } from './fake-redis.js';
 import { StubIdentity } from './stub-identity.js';
 
 /** Fixed epoch ms, so nothing in these suites depends on the wall clock. */
 export const NOW_MS = 1_757_000_000_000;
+
+/**
+ * A paused leaf result EXACTLY as the harness stores one: `toResultRecord`
+ * (`harness/src/leaf-result-store.ts`) nests the gate id under `gate`, and nothing writes a
+ * top-level `gateId`. One helper rather than a literal per suite, because a fixture that invented
+ * the top-level shape is what let `pausedGateId` read `null` for every real paused turn with every
+ * test green.
+ */
+export const pausedResult = (gateId: number, summary = 's', proposedAction = 'p'): string =>
+  JSON.stringify({
+    status: 'paused',
+    gate: { gateId, summary, proposed_action: proposedAction },
+  });
 
 export type TestDeps = CpDeps & {
   publicKeyBase64: string;
@@ -66,12 +80,18 @@ export function makeDeps(
     bundleSubjectBytes: 16 * 1024 * 1024,
     bundleTotalBytes: 64 * 1024 * 1024,
     asyncQueuedPerOwner: 50,
+    gateDeadlineS: 0,
     tenancy: 'single',
     turnRecordTtlSeconds: 86_400 + 3_600,
     turnSummaryBytes: 2048,
     grantTtlS: 300,
     turnMaxS: 1800,
+    // Empty allow = notifications off, which is what every suite that is not about them wants.
+    notify: { allow: [], minIntervalS: 5, perHour: 60, failMax: 10 },
     sandbox: {
+      // Off by default: the suites that want the test-user range enrolled say so (sandbox-config,
+      // combined-enrollment).
+      testUsersEnrolled: false,
       templates: [
         {
           id: 'default',
@@ -122,6 +142,7 @@ export function makeDeps(
     log: (line) => logLines.push(line),
     logLines,
     turns: new TurnStore(fake.redis, { resultTtlSeconds: 86_400, ttlMarginSeconds: 3_600 }),
+    notify: new NotifyStore(fake.redis),
     turnQueue: new MemoryTurnQueue(),
     leafResults: { get: async (k: string) => fake.strings.get(k) ?? null },
   };

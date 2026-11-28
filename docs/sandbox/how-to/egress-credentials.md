@@ -10,7 +10,7 @@ sidebar_position: 6
 The sandbox has no network of its own, but your operator may allow it to reach a few services
 (GitHub, say) through a proxy on the host. **Credential injection** lets those calls carry _your_
 token without the token ever entering the sandbox. You store the token once with `mocactl sbx
-credentials`; the host's proxy adds it to requests for the services you stored it for, and only
+credentials add`; the host's proxy adds it to requests for the services you stored it for, and only
 for your sandboxes. A second user's sandbox gets none of it.
 
 Inside the sandbox, tools see only the placeholder `moca-placeholder` (in `GH_TOKEN`, for
@@ -37,7 +37,7 @@ egress allowlist: the operator must add it, or the preset gets `403 destination_
 ## List and delete
 
 ```bash
-mocactl sbx credentials            # names and destinations, never the secret (--json for scripts)
+mocactl sbx credentials ls         # names and destinations, never the secret (--json for scripts)
 mocactl sbx credentials delete github
 ```
 
@@ -60,6 +60,49 @@ mocactl sbx credentials add docs-mcp --host mcp.corp.example/docs --kind bearer 
 A destination is `host[:port][/prefix]`: the port defaults to 443, and a prefix limits the token
 to that path (several MCP servers behind one gateway each get their own). Wildcard hosts are not
 supported. Two of your credentials cannot hold the identical destination (`409 destination_conflict`); nested prefixes such as `mcp.corp.example` and `mcp.corp.example/jira` are fine, and the longest matching prefix wins.
+
+## Kubernetes and OpenShift clusters
+
+A cluster API server is an internal service like any other, with two things special about it.
+Its certificate is signed by the cluster's own CA, so the operator must trust that CA upstream
+(`MOCA_EGRESS_UPSTREAM_CA`) — without it, every request dies as `502 upstream_unverified`
+_before_ credentials are considered. And `kubectl`/`oc` refuse to run without credentials of
+their own, so the sandbox needs a kubeconfig holding a placeholder: the proxy replaces it in
+flight, and the placeholder authenticates nothing by itself.
+
+`deploy/sbx/examples/ocp-cred-prepare.sh` in the moca repository does the whole sequence: a
+read-only service account and a 7-day token on the cluster (both overridable), the token stored
+as the egress credential, a placeholder kubeconfig in the sandbox, and an in-situ test. The
+kubeconfig it writes is the part worth understanding:
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+  - name: sandbox-egress
+    cluster:
+      server: https://api.cluster.example:6443
+users:
+  - name: via-egress
+    user:
+      token: moca-placeholder
+contexts:
+  - name: sandbox-egress
+    context:
+      cluster: sandbox-egress
+      user: via-egress
+current-context: sandbox-egress
+```
+
+No `certificate-authority-data` is needed: the sandbox already trusts the proxy's CA, which is
+what presents the server certificate. Then, in the sandbox:
+
+```bash
+KUBECONFIG=kubeconfig.yaml kubectl get nodes
+```
+
+For one-off commands the file can be skipped: `kubectl --server https://api.cluster.example:6443
+--token moca-placeholder get pods` works the same way.
 
 ## Things to know
 

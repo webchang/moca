@@ -23,8 +23,10 @@ import {
 import { DiscoveringHarness } from './api/discovery.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
 import { openCallRecord, RUN_LENGTH_FIELDS, type CallRecorder } from './sbx/call-record.js';
-import { sbxMain } from './sbx/cli.js';
+import { defaultSbxUrl, openSbxRuntime, sbxMain } from './sbx/cli.js';
 import {
+  cmdDecide,
+  cmdFollowUp,
   cmdGet,
   cmdSpawn,
   cmdSubagents,
@@ -40,15 +42,63 @@ import {
   cmdWorkloadList,
 } from './workloads.js';
 import { versionLine } from './version.js';
+import { versionReport, type VersionTarget } from './version-report.js';
 import { commandUsage, typedWords } from './core/usage.js';
 
+/**
+ * Bare `mocactl` and `mocactl --help`: what mocactl is, and its commands one line each. Each
+ * command's details are `mocactl COMMAND --help` (cut from USAGE) or `mocactl sbx --help`.
+ */
+export const SUMMARY = `mocactl provides a harness service and a sandbox service.
+
+The sandbox service (\`mocactl sbx\`) creates and manages remote VMs that hold a copy of your code
+repository, and patches Claude Code and other agents to work on that copy instead of your local
+machine. The harness service (\`mocactl harness\`) goes one step further, running the agent
+remotely.
+
+usage: mocactl COMMAND [ARGS...]
+
+the sandbox service:
+  sbx            remote VMs holding your repository, for your agent: login, up, pull, rm, ...
+
+the harness service:
+  harness        the interactive terminal UI: chat with an agent running remotely
+  run            run one turn and print its reply
+  sessions       list or delete your sessions
+  spawn          fork a detached subagent
+  subagents      list spawned subagents and their state
+  watch          follow subagents' state changes until they finish
+  get            write a subagent's result files
+  approve        let a subagent paused for approval go ahead
+  reject         tell a subagent paused for approval to take another route
+  follow-up      send a finished subagent a second turn on the same session
+  promote        upload a directory's Claude Code skills and commands as a config bundle
+  bundles        list or delete your promoted config bundles
+  workloads      create, list, get or delete workloads (contexts for subagents)
+  credentials    list, add or delete your credentials
+
+login and setup (the harness service; \`mocactl sbx login\` is the sandbox service's):
+  login          log in with the GitHub device flow
+  logout         end this login
+  auth token     print a valid API token
+  doctor         check the setup; one fix per failure
+
+  --version      print this build's version (CLI version: ...), and the control planes' versions
+                 and URLs
+
+Run \`mocactl COMMAND --help\` for a command's details (\`mocactl sbx --help\` for the sandbox
+service's commands).`;
+
 export const USAGE = `usage:
-  mocactl [--setup] [--no-animation]             interactive terminal UI (--setup: run the first-start
+  mocactl harness [--setup] [--no-animation]     interactive terminal UI (--setup: run the first-start
                                                  setup again: the server form, then login and
                                                  credential, each skipped when already done;
                                                  --no-animation: a still spinner)
-  mocactl --version                              print this build's version (a release tag, edge-<sha>,
-                                                 or dev-<sha> from a source checkout)
+  mocactl --version                              print this build's version as "CLI version: V" (a
+                                                 release tag, edge-<sha>, or dev-<sha> from a source
+                                                 checkout), then each configured control plane's
+                                                 (harness and sandbox service) version and URL, or
+                                                 unreachable
   mocactl login [--no-browser]                   log in with the GitHub device flow (in a local
                                                  terminal: copies the code, opens the browser;
                                                  --no-browser: only prints the URL and the code)
@@ -111,6 +161,9 @@ export const USAGE = `usage:
   mocactl spawn "prompt" --async [...]            dispatch as a cancellable async turn instead of a
                                                  local worker process (needs SH_ASYNC_DRAIN on the
                                                  deployment; not available with --workload)
+  mocactl spawn "prompt" --require-approval [...]  park the subagent before it acts: it proposes
+                                                 what it would do and waits for 'mocactl approve'
+                                                 or 'mocactl reject'
   mocactl spawn "prompt" --max-concurrent N [...]
                                                  refuse the dispatch when N of your subagents are
                                                  already running (default 4)
@@ -128,6 +181,22 @@ export const USAGE = `usage:
                                                  exit 1 and status 'queued' if the
                                                  budget runs out, 'unknown' if the run is over
                                                  without one)
+  mocactl approve SESSIONID [--gate N] [--feedback TEXT] [--json]
+                                                 let a subagent paused for approval go ahead; prints
+                                                 the turn it resumed as ('mocactl get SESSIONID'
+                                                 shows what it proposed and the number --gate takes,
+                                                 which is read off the paused run when the flag is
+                                                 left out; --feedback: a note that reaches the
+                                                 subagent)
+  mocactl reject SESSIONID [--gate N] [--feedback TEXT] [--json]
+                                                 refuse what the subagent proposed, and it carries
+                                                 on from there (--feedback says what to do instead,
+                                                 at most 4096 bytes; --gate as for approve)
+  mocactl follow-up SESSIONID "prompt" [--out DIR] [--json]
+                                                 send a second turn to a finished subagent, which
+                                                 keeps the first turn's context; the result is
+                                                 written to --out DIR (default: the current
+                                                 directory) first, because a new turn overwrites it
   mocactl workloads create --context FILE [--name NAME] [--json]
       [--sandboxes N [--mount read-only|writable]]
                                                  upload a context file (--context, made by
@@ -151,7 +220,7 @@ const CREDENTIAL_FLAGS = ['kind', 'consumer', 'host', 'endpoint'] as const;
  */
 export function usageFor(words: string[]): string {
   const own = commandUsage(USAGE, '  mocactl ', words);
-  if (own === undefined) return USAGE;
+  if (own === undefined) return SUMMARY;
   const notes = USAGE.slice(USAGE.lastIndexOf('\nflags for every command') + 1);
   // The --json note only for a command that takes --json, as `mocactl sbx COMMAND --help` does.
   const everyCommand = /--json\b/.test(own) ? notes : notes.replace(/\n--json:[^\n]*$/, '');
@@ -242,6 +311,9 @@ const OPTIONS = {
   workload: { type: 'string' },
   writable: { type: 'boolean' },
   async: { type: 'boolean' },
+  'require-approval': { type: 'boolean' },
+  gate: { type: 'string' },
+  feedback: { type: 'string' },
   context: { type: 'string' },
   name: { type: 'string' },
   sandboxes: { type: 'string' },
@@ -251,6 +323,9 @@ const OPTIONS = {
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } satisfies ParseArgsConfig['options'];
+
+/** The flags bare `mocactl` takes: help, version, and the URLs every command takes. */
+const BARE_FLAGS = new Set(['help', 'version', 'control-plane-url', 'harness-url']);
 
 async function mainWith(
   argv: string[],
@@ -287,12 +362,57 @@ async function mainWith(
   }
   const { values, positionals } = parsed;
   if (values.version) {
-    io.out(versionLine() + '\n');
+    io.out(`CLI version: ${versionLine()}\n`);
+    // Then each configured control plane's version (public discovery, no login needed): the
+    // harness service's, and the sandbox service's. Neither configured: the version alone.
+    const targets: VersionTarget[] = [];
+    const fetchImpl = deps.fetchImpl ?? fetch;
+    const rt = (deps.buildRuntime ?? buildRuntime)(
+      { controlPlaneUrl: values['control-plane-url'], harnessUrl: values['harness-url'] },
+      env,
+      undefined,
+      fetchImpl,
+    );
+    const cp = rt.cp;
+    if (rt.endpoints.controlPlaneUrl && cp) {
+      targets.push({
+        label: 'control plane',
+        url: rt.endpoints.controlPlaneUrl,
+        discovery: (o) => cp.discovery(o),
+      });
+    }
+    const sbxUrl = defaultSbxUrl(env);
+    if (sbxUrl) {
+      const { api } = openSbxRuntime(sbxUrl, env, { fetchImpl });
+      targets.push({
+        label: 'sandbox control plane',
+        url: sbxUrl,
+        discovery: (o) => api.discovery(o),
+      });
+    }
+    for (const line of await versionReport(targets)) io.out(line + '\n');
     return 0;
   }
   if (values.help) {
     // `mocactl COMMAND --help`: that command's syntax, not every command's.
     io.out(help + '\n');
+    return 0;
+  }
+  if (positionals.length === 0) {
+    // Bare `mocactl`: what it is and its commands. The interactive UI is `mocactl harness`.
+    const tuiFlag = (['setup', 'no-animation'] as const).find((f) => values[f] !== undefined);
+    if (tuiFlag) {
+      io.err(`--${tuiFlag} only applies to \`mocactl harness\`\n${usageFor(['harness'])}`);
+      return 2;
+    }
+    // Any other flag but the URLs every command takes belongs to a command that was not typed:
+    // refused, as it was before the summary, so a mistyped command is not silently accepted.
+    const stray = Object.keys(values).find((f) => !BARE_FLAGS.has(f));
+    if (stray) {
+      io.err(`--${stray} needs a command\n${SUMMARY}`);
+      return 2;
+    }
+    io.out(SUMMARY + '\n');
     return 0;
   }
 
@@ -345,6 +465,11 @@ async function mainWith(
     io.err(`--config only applies to \`mocactl run\` and \`mocactl spawn\`\n${help}`);
     return 2;
   }
+  const tuiFlag = (['setup', 'no-animation'] as const).find((f) => values[f] !== undefined);
+  if (tuiFlag && command !== 'harness') {
+    io.err(`--${tuiFlag} only applies to \`mocactl harness\`\n${help}`);
+    return 2;
+  }
   if (values.all !== undefined && command !== 'logout') {
     io.err(`--all only applies to \`mocactl logout\`\n${help}`);
     return 2;
@@ -375,8 +500,9 @@ async function mainWith(
     io.err(`--label only applies to \`mocactl spawn\`\n${help}`);
     return 2;
   }
-  if (values.out !== undefined && command !== 'get') {
-    io.err(`--out only applies to \`mocactl get\`\n${help}`);
+  // `follow-up` writes the result it is about to overwrite, so it takes `get`'s destination flag.
+  if (values.out !== undefined && command !== 'get' && command !== 'follow-up') {
+    io.err(`--out only applies to \`mocactl get\` and \`mocactl follow-up\`\n${help}`);
     return 2;
   }
   const getOnly = (['wait', 'timeout'] as const).find((f) => values[f] !== undefined);
@@ -404,6 +530,15 @@ async function mainWith(
   }
   if (values.writable !== undefined && command !== 'spawn') {
     io.err(`--writable only applies to \`mocactl spawn\`\n${help}`);
+    return 2;
+  }
+  if (values['require-approval'] !== undefined && command !== 'spawn') {
+    io.err(`--require-approval only applies to \`mocactl spawn\`\n${help}`);
+    return 2;
+  }
+  const decideOnly = (['gate', 'feedback'] as const).find((f) => values[f] !== undefined);
+  if (decideOnly && command !== 'approve' && command !== 'reject') {
+    io.err(`--${decideOnly} only applies to \`mocactl approve\` and \`mocactl reject\`\n${help}`);
     return 2;
   }
   if (values['prompt-file'] !== undefined && command !== 'spawn') {
@@ -633,6 +768,7 @@ async function mainWith(
         workloadId: values.workload,
         writable: values.writable === true,
         async: values.async === true,
+        requireApproval: values['require-approval'] === true,
         ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
         json,
       });
@@ -661,6 +797,39 @@ async function mainWith(
         outDir: values.out,
         wait: values.wait === true,
         ...(timeoutS !== undefined ? { timeoutS } : {}),
+        json,
+        signal,
+      });
+    }
+    case 'follow-up': {
+      const [sid, prompt, ...extra] = rest;
+      if (sid === undefined || prompt === undefined || extra.length > 0) return usage(io, help);
+      return cmdFollowUp(rt, io, {
+        sessionId: sid,
+        prompt,
+        outDir: values.out,
+        json,
+        signal,
+      });
+    }
+    case 'approve':
+    case 'reject': {
+      const [sid, ...extra] = rest;
+      if (sid === undefined || extra.length > 0) return usage(io, help);
+      let gateId: number | undefined;
+      if (values.gate !== undefined) {
+        // Gate ids start at 0 and count up within a session, so `0` is a legitimate one.
+        if (!/^(0|[1-9][0-9]{0,4})$/.test(values.gate)) {
+          io.err(`--gate must be a whole gate number, as \`mocactl get\` reports it\n${help}`);
+          return 2;
+        }
+        gateId = Number(values.gate);
+      }
+      return cmdDecide(rt, io, {
+        sessionId: sid,
+        action: command,
+        ...(gateId !== undefined ? { gateId } : {}),
+        ...(values.feedback !== undefined ? { feedback: values.feedback } : {}),
         json,
         signal,
       });
@@ -718,7 +887,8 @@ async function mainWith(
     case '__spawn-worker': {
       return runSpawnWorker(rt);
     }
-    case undefined:
+    case 'harness':
+      if (rest.length > 0) return usage(io, help);
       if (!deps.startInteractive) {
         io.err('interactive mode is not wired yet');
         return 2;

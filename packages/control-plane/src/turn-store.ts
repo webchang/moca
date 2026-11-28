@@ -2,9 +2,11 @@ import type { CpRedisLike } from './ownership.js';
 import { CpError } from './errors.js';
 import { sanitizeLimits } from './models.js';
 import {
+  asksForGate,
   decodeTurnEvent,
   encodeTurnEvent,
   EVENTS_MAXLEN,
+  gateIndexKey,
   idempotencyKeyKey,
   isTerminalState,
   ownerEventsKey,
@@ -147,6 +149,11 @@ export class TurnStore {
     return sessionTurnsKey(this.tag(sessionId));
   }
 
+  /** The one global gate index (#393 §3); tagged, because it has no id of its own to tag. */
+  private gateKey(): string {
+    return gateIndexKey(this.opts.keyTag);
+  }
+
   /** A terminal record's lifetime, and the session index's: one sum, one place (§5.1). */
   private ttlSeconds(): number {
     return this.opts.resultTtlSeconds + this.opts.ttlMarginSeconds;
@@ -165,6 +172,68 @@ export class TurnStore {
     // A hash that lost its field between the two calls is treated as unclaimed: answering with the
     // caller's own id is correct there, and it is the only reading that cannot wedge a session.
     return held.turnId ?? turnId;
+  }
+
+  /**
+   * When `held`'s claim on `key` started its age clock -- the stored instant, or `now` once this call
+   * stamps it -- and who holds the key as of that read. HSETNX for the stamp, so two readers stamping
+   * at once agree on one instant rather than one of them resetting the clock the other is about to
+   * measure.
+   *
+   * `held` is returned because the stamp alone cannot tell the caller WHOSE clock it just read. A
+   * stepover (`releaseIdempotencyKeyIf`) deletes the whole hash, stamp included, so a caller that
+   * lost a race to another submission would find its own holder's field missing, stamp a fresh one on
+   * the WINNER's hash and read an age of zero -- then answer with a turn id that was just released
+   * and will never have a record. Comparing the holder makes that caller fall through to the stepover
+   * instead, whose compare-and-reclaim converges on the winner's id. The extra read costs one round
+   * trip on the stamping path only, and only on the unreadable-holder branch.
+   *
+   * The READER stamps, not the claimant: this is read only by `claimKey`'s unreadable-holder branch
+   * (#989), so `claimIdempotencyKey` keeps its single round trip on the path every submission takes.
+   * The cost is that a claim orphaned by a crash starts its clock when the next submission first
+   * looks at it rather than when it was made, so the key frees a grace after the first duplicate
+   * attempt instead of a grace after the crash. It still frees, and it never frees EARLY, which is
+   * the side that would hand a live turn's key to a second submission -- within one replica's clock.
+   * ACROSS replicas it is the usual wall-clock assumption: whichever replica reads the claim first
+   * writes the stamp, and a later reader compares it against its own `now`, so a replica running more
+   * than the grace ahead of the stamping one does step over a live claim. The same assumption
+   * `gateDeadlineS` and `dueGates` already make, and skew that large breaks token validation first.
+   *
+   * The stamp is a field PER HOLDER, because a claim can change hands without the hash being deleted
+   * in between: a holder releasing the key (its `del`) between a caller's read of its record and this
+   * stamp leaves a holderless hash that the next submission's claim adopts. One shared `claimedAt`
+   * would then age the new holder from the old one's stamp, and a reader past the grace would step
+   * over a LIVE claim -- the exact duplicate fan-out this grace exists to prevent. A per-holder field
+   * cannot be misattributed; a stale one is a few dead bytes until the key's eventual release.
+   *
+   * A stamp-only hash -- what HSETNX leaves when the holder deleted the key just before it -- is not
+   * a leak: `held` then reads as null, which sends the caller into the stepover, and
+   * `releaseIdempotencyKeyIf` treats a hash with no `turnId` as already released and deletes it.
+   */
+  async claimedAtOr(
+    owner: string,
+    key: string,
+    held: string,
+    now: number,
+  ): Promise<{ at: number; heldBy: string | null }> {
+    const k = idempotencyKeyKey(this.tag(owner), key);
+    const field = `claimedAt:${held}`;
+    const stamped = await this.guard(() => this.redis.hSetNX(k, field, String(now)));
+    const fields = await this.guard(() => this.redis.hGetAll(k));
+    // A field that vanished between the two calls (the holder's release) reads as `now`. Harmless:
+    // `heldBy` has changed too, so the caller steps over rather than trusting the age.
+    const at = stamped ? now : Number(fields[field]);
+    return { at: Number.isFinite(at) ? at : now, heldBy: fields.turnId ?? null };
+  }
+
+  /**
+   * Who holds `key` right now, WITHOUT claiming it (#393). The decision route's replay check: the
+   * claim itself cannot answer it, because claiming an unheld key takes it.
+   */
+  async idempotencyHolder(owner: string, key: string): Promise<string | null> {
+    const k = idempotencyKeyKey(this.tag(owner), key);
+    const held = await this.guard(() => this.redis.hGetAll(k));
+    return held.turnId ?? null;
   }
 
   /**
@@ -210,6 +279,12 @@ export class TurnStore {
         state: rec.state,
         attempts: String(rec.attempts),
         createdAt: String(rec.createdAt),
+        // Only when set: an empty string here would read back as a resume of a turn named ''.
+        ...(rec.resumeOf ? { resumeOf: rec.resumeOf } : {}),
+        // Same rule: absent rather than '' or '0', because `get` reads the deadline with `Number()`
+        // and 0 is not a value `resolveGateDeadline` can ever produce.
+        ...(rec.gateDeadlineS ? { gateDeadlineS: String(rec.gateDeadlineS) } : {}),
+        ...(rec.onTimeout ? { onTimeout: rec.onTimeout } : {}),
       }),
     );
     // The OPEN set, written after the hash: a member whose hash is missing reads as "already gone"
@@ -291,7 +366,144 @@ export class TurnStore {
       createdAt: Number(h.createdAt ?? 0),
       ...(h.endedAt ? { endedAt: Number(h.endedAt) } : {}),
       ...(h.cancelRequested === '1' ? { cancelRequested: true } : {}),
+      ...(h.resumeOf ? { resumeOf: h.resumeOf } : {}),
+      ...(h.gateDeadlineS ? { gateDeadlineS: Number(h.gateDeadlineS) } : {}),
+      ...(h.onTimeout === 'abort' || h.onTimeout === 'reject' ? { onTimeout: h.onTimeout } : {}),
     };
+  }
+
+  /**
+   * This session's newest `paused` turn, and whether a later turn already resumed it (#393).
+   *
+   * Newest-first over the session index, stopping at the first paused record: a resume is created
+   * after the turn it resumes, so every candidate resume has been seen by then. Bounded by `scan`
+   * rather than walking a week of turns -- a session whose last 50 turns are all unpaused has no
+   * pending gate worth finding, and the alternative (a second index keyed by session) would have to
+   * be kept in step with every transition.
+   *
+   * shortcut: a gate stops being findable once `scan` NEWER turns exist on the session, which reads
+   * as `409 gate_not_pending` on the decision route and as a gate the sweep's `claimGate` has
+   * already dropped -- a refusal, never a decision landing on the wrong turn. Hard to reach now that
+   * `submitTurn` refuses a second GATED turn while one is open: it takes 50 ungated turns on the
+   * same session while a human thinks. Upgrade to a per-session paused marker written by
+   * `toTerminal` if a caller ever needs to hold a gate open across a long run of other turns.
+   */
+  async findPausedBySession(
+    sessionId: string,
+    scan = 50,
+  ): Promise<{ paused: TurnRecord; resumed: boolean } | null> {
+    const ids = await this.guard(() =>
+      this.redis.zRange(this.sessionKey(sessionId), '+inf', '-inf', {
+        BY: 'SCORE',
+        REV: true,
+        LIMIT: { offset: 0, count: scan },
+      }),
+    );
+    const resumed = new Set<string>();
+    for (const id of ids) {
+      const rec = await this.get(id);
+      if (!rec) continue;
+      // A `failed` resume does NOT answer the gate it links to. `submitResume` compensates a failed
+      // enqueue by finalizing the record it had already created, and that record still carries
+      // `resumeOf` -- counting it would leave the gate unanswerable by hand (409 `gate_not_pending`)
+      // and, on the sweep path, unanswerable by anyone. Safe for a resume that did run and then
+      // failed: re-sending the decision creates a retry, and the HARNESS is the authority on the
+      // gate's durable state, so it can never flip a decision that was already recorded there.
+      if (rec.resumeOf && rec.state !== 'failed') resumed.add(rec.resumeOf);
+      if (rec.state === 'paused') return { paused: rec, resumed: resumed.has(rec.turnId) };
+    }
+    return null;
+  }
+
+  /**
+   * The turn that holds this session's one gate, or is on its way to holding it (#393).
+   *
+   * Two kinds of holder, because a gate is SESSION state the harness derives from the session's own
+   * durable entries: a turn already `paused` and unresumed, and a GATED turn still `queued` or
+   * `running`, which has not reached its `request_approval` call yet but will park on that same
+   * session gate when it does. `findPausedBySession` cannot answer the second -- it reports only a
+   * record that is already `paused` -- and the second is the one that matters at admission time.
+   *
+   * Newest-first over the session index, as `findPausedBySession` walks it, and with the same
+   * `scan` bound and the same `resumed` rule: a `failed` resume did not answer the gate it links to.
+   * A resume is itself a gated non-terminal turn while it runs, so an answered gate still reports a
+   * holder until the resume lands -- correct, because that resume can pause at a gate of its own.
+   *
+   * shortcut: a read, so two gated submissions landing in genuine parallel can both see no holder
+   * and both be admitted -- the window is the two Redis round-trips between this call and
+   * `turns.create`. Narrowed from the `paused`-only read (which missed the whole of a first turn's
+   * run, seconds to minutes) to that. Closing it needs a per-session admission lock with a release
+   * on every terminal transition; upgrade to one if a caller ever submits gated turns concurrently
+   * on a single session, which no on-ramp in this repo does.
+   */
+  async findGateHolder(
+    sessionId: string,
+    scan = 50,
+  ): Promise<{ turn: TurnRecord; paused: boolean } | null> {
+    const ids = await this.guard(() =>
+      this.redis.zRange(this.sessionKey(sessionId), '+inf', '-inf', {
+        BY: 'SCORE',
+        REV: true,
+        LIMIT: { offset: 0, count: scan },
+      }),
+    );
+    const resumed = new Set<string>();
+    for (const id of ids) {
+      const rec = await this.get(id);
+      if (!rec) continue;
+      if (rec.state === 'queued' || rec.state === 'running') {
+        if (asksForGate(rec.envelope)) return { turn: rec, paused: false };
+        // An UNGATED turn in flight blocks nothing: it never calls `request_approval`, so it cannot
+        // park on the session's gate. This is what keeps ordinary traffic on a session unaffected.
+        continue;
+      }
+      if (rec.resumeOf && rec.state !== 'failed') resumed.add(rec.resumeOf);
+      if (rec.state === 'paused') {
+        return resumed.has(rec.turnId) ? null : { turn: rec, paused: true };
+      }
+    }
+    return null;
+  }
+
+  /** Turn ids whose gate deadline has passed, oldest first (#393 §3). */
+  async dueGates(now: number, limit = 100): Promise<string[]> {
+    // Forward, so a backlog longer than `limit` pages from the gates that have waited longest. The
+    // reverse read would take the newest `limit` and starve the rest for as long as the backlog
+    // lasted, which is the opposite of what a deadline is for.
+    return this.guard(() =>
+      this.redis.zRange(this.gateKey(), '-inf', now, {
+        BY: 'SCORE',
+        LIMIT: { offset: 0, count: limit },
+      }),
+    );
+  }
+
+  /**
+   * Take a turn out of the gate index, true only for the caller that removed it (#393 §3).
+   *
+   * The ZREM *is* the lock: N control-plane replicas sweep the same index, and the one whose ZREM
+   * returned 1 is the one that resumes. Cheaper than a lock key and self-releasing -- there is
+   * nothing to expire if the winner dies mid-resume. What that costs: a winner that dies between the
+   * ZREM and the submission loses the gate, which stays paused forever. Acceptable because the
+   * submission is the very next step and the gate is still answerable by hand; `submitResume`'s
+   * idempotency key is what makes a retry safe if we ever add one.
+   */
+  async claimGate(turnId: string): Promise<boolean> {
+    // An UNTAGGED member, as the session index holds: the key carries the tag, and `dueGates` hands
+    // these ids straight to `get`, which tags itself.
+    return Number(await this.guard(() => this.redis.zRem(this.gateKey(), turnId))) === 1;
+  }
+
+  /**
+   * Put a claimed gate back in the index, scored by the deadline it already had (#393 §3).
+   *
+   * The one caller is the sweep, when the resume it claimed the gate for failed to submit: the ZREM
+   * is the lock, so without this hand-back no later pass would ever look at that gate again and the
+   * deadline it promised would never fire. Re-adding at the ORIGINAL score keeps `dueGates`'
+   * oldest-first fairness, and `submitResume`'s gate-keyed idempotency key makes the retry safe.
+   */
+  async releaseGate(turnId: string, dueAt: number): Promise<void> {
+    await this.guard(() => this.redis.zAdd(this.gateKey(), { score: dueAt, value: turnId }));
   }
 
   /**
@@ -437,6 +649,14 @@ export class TurnStore {
     }
     for (let i = 0; i < keys.length; i += DELETE_CHUNK) {
       await this.guard(() => this.redis.del(keys.slice(i, i + DELETE_CHUNK)));
+    }
+    // The gate index too (#393). A paused turn is terminal, so it is always in the session index and
+    // never in the owner set -- the indexed set is the whole of it. One ZREM per chunk rather than
+    // one per turn: the command takes every member at once and ignores the ones that were never
+    // there, which is almost all of them.
+    const gated = [...indexed];
+    for (let i = 0; i < gated.length; i += DELETE_CHUNK) {
+      await this.guard(() => this.redis.zRem(this.gateKey(), gated.slice(i, i + DELETE_CHUNK)));
     }
     await this.guard(() => this.redis.del([this.sessionKey(sessionId)]));
   }
@@ -686,6 +906,22 @@ export class TurnStore {
         this.redis.zAdd(this.sessionKey(rec.sessionId), { score: now, value: rec.turnId }),
       );
       await this.guard(() => this.redis.expire(this.sessionKey(rec.sessionId), this.ttlSeconds()));
+    }
+    // #393 §3. Scored by the DEADLINE, so the sweep is one ZRANGEBYSCORE and never scans; added only
+    // on `paused`, which is the one terminal state that is waiting for something. Before the `emit`,
+    // because the index is state a reader may act on and the event is what tells anyone to look.
+    //
+    // No TTL on this key. Its members are bounded by the paused records that put them there, every
+    // removal path clears them (`submitResume`, `deleteSessionTurns`, `claimGate`), and a member
+    // whose record expired anyway is dropped on its first due pass -- an `expire` here would instead
+    // drop live gates whenever the deployment went a TTL without pausing anything.
+    if (state === 'paused' && rec.gateDeadlineS) {
+      await this.guard(() =>
+        this.redis.zAdd(this.gateKey(), {
+          score: now + rec.gateDeadlineS! * 1000,
+          value: rec.turnId,
+        }),
+      );
     }
     await this.emit(rec.owner, {
       ts: now,

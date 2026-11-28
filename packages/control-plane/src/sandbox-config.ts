@@ -1,7 +1,7 @@
 import { CpError } from './errors.js';
 import type { CpConfig } from './handlers.js';
 import type { RouteProfile } from './routes.js';
-import { SUBJECT_RE } from './identity.js';
+import { SUBJECT_RE, namesEnrolledTestUser } from './identity.js';
 import { DEFAULT_SANDBOX_ISSUER } from './sandbox-token.js';
 import { SANDBOX_MODE_NAMES, isSandboxModeName, type SandboxModeName } from './sandbox-store.js';
 import { egressConfigFromEnv, type EgressConfig } from './egress-config.js';
@@ -29,6 +29,14 @@ export interface SandboxConfig {
   templates: SandboxTemplate[];
   /** `SH_ALLOWED_SUBJECTS`: who may log in and use the profile, besides admins (spec §4.2). */
   allowedSubjects: string[];
+  /**
+   * `SH_SANDBOX_TEST_USERS_ENROLLED`: enrol `test:1..SH_TEST_USERS` for the sandbox routes without
+   * naming each one on the allow list (ADR-0045 range-checks test users rather than pre-minting
+   * them, and a thousand entries in SH_ALLOWED_SUBJECTS would undo that). A dev-stack switch: it
+   * hands every test user real sandboxes, so it is opt-in and `main.ts` refuses it without
+   * SH_TEST_USERS.
+   */
+  testUsersEnrolled: boolean;
   /**
    * `SH_SANDBOX_LIFETIME_SECONDS`: the default idle lifetime: a sandbox expires this long after its
    * last activity mint.
@@ -264,6 +272,9 @@ export function sandboxConfigFromEnv(
   return {
     templates,
     allowedSubjects,
+    // Exactly 'true', as SH_ALLOW_OPERATOR_FALLBACK (main.ts): a typo must not silently enrol a
+    // thousand subjects.
+    testUsersEnrolled: env.SH_SANDBOX_TEST_USERS_ENROLLED === 'true',
     lifetimeS,
     maxLifetimeS,
     slideOnActivity: (env.SH_SANDBOX_MAX_LIFETIME_SECONDS ?? '') !== '',
@@ -301,8 +312,20 @@ export function isEnrolled(
 /**
  * Who may use the sandbox routes and the template writes: the allow list, plus admins, plus a
  * subject the members store enrolls (`storeEnrolled`), on `sandbox` and on `combined` (combined
- * spec §3.2). A test user (`test:<n>`) is never on it: SH_ALLOWED_SUBJECTS admits only `github:`
- * subjects. Always true on `harness`, which mounts none of those routes.
+ * spec §3.2). Always true on `harness`, which mounts none of those routes.
+ *
+ * A test user (`test:<n>`) is not enrolled by default and cannot be enrolled through the API --
+ * `/v1/subjects` validates with MEMBER_SUBJECT_RE, which admits `github:`/`oidc:` only. But
+ * SH_ALLOWED_SUBJECTS validates with SUBJECT_RE (above), which DOES admit `test:<n>`, and
+ * SH_ADMIN_SUBJECTS is not format-checked at all, so on a `combined` dev stack an operator can
+ * deliberately put a test subject on either list and it passes here. That is what makes
+ * `mocactl sbx login --test-user N` useful on `combined`; on `sandbox` the same two lists do more
+ * than that -- enrollment is the login gate there, so they are what lets the login itself succeed
+ * (main.ts, ADR-0045).
+ *
+ * SH_SANDBOX_TEST_USERS_ENROLLED enrols the whole range instead, for a dev stack that wants all N
+ * of them (`enrolledTestUser`, through `onAllowList`). On the `sandbox` profile that is also what
+ * lets such a login succeed in the first place, since there enrollment IS the authentication.
  */
 export function isEnrolledForSandbox(
   subject: string,
@@ -323,8 +346,31 @@ function onAllowList(
   return (
     roles.includes('admin') ||
     storeEnrolled ||
-    (config.sandbox?.allowedSubjects ?? []).includes(subject)
+    (config.sandbox?.allowedSubjects ?? []).includes(subject) ||
+    enrolledTestUser(subject, config)
   );
+}
+
+/**
+ * A `test:<n>` subject within the configured range, when SH_SANDBOX_TEST_USERS_ENROLLED is on: the
+ * same bound `TestUserProvider.has` applies at login (`identity.ts`), checked against the count
+ * rather than a materialised list, so enrolling a thousand test users costs one setting instead of
+ * a thousand SH_ALLOWED_SUBJECTS entries (ADR-0045 range-checks test users rather than pre-minting
+ * them, and a thousand entries would undo that).
+ *
+ * It sits in `onAllowList`, so it answers both gates. On `combined` that only widens the sandbox
+ * routes, because login is open there anyway. On `sandbox` it widens LOGIN too -- which is the
+ * point: enrollment is that profile's only authentication, so a test user that is not enrolled
+ * cannot log in at all.
+ *
+ * `test:0` and an out-of-range index are refused, as they are at login: a subject the login
+ * endpoint will not issue must not be enrolled here either.
+ */
+function enrolledTestUser(subject: string, config: CpConfig): boolean {
+  if (!config.sandbox?.testUsersEnrolled) return false;
+  // The same helper main.ts's boot guard uses, so the range this admits and the range that guard
+  // accepts as enrolment cannot drift apart.
+  return namesEnrolledTestUser([subject], config.testUsers ?? 0);
 }
 
 /**

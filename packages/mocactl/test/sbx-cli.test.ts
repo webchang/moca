@@ -15,7 +15,14 @@ import {
 import { cmdLogin, devicePrompt } from '../src/headless.js';
 import { buildRuntime } from '../src/runtime.js';
 import { SandboxApiClient } from '../src/sbx/api.js';
-import { openSbxRuntime, sbxMain, sbxPaths } from '../src/sbx/cli.js';
+import {
+  openSbxRuntime,
+  SBX_COMMANDS,
+  SBX_OVERVIEW,
+  SBX_USAGE,
+  sbxMain,
+  sbxPaths,
+} from '../src/sbx/cli.js';
 import { createWaitingForActivation } from '../src/sbx/commands.js';
 import { readBoundSandbox } from '../src/sbx/state.js';
 import { LeaseControlError } from '@moca/sandbox-client';
@@ -30,6 +37,7 @@ import {
   TOKEN,
   URL_,
   type Handler,
+  MADE_UP_NAME,
 } from './helpers/sbx.js';
 
 const MOCA_URL = 'https://moca-api.example.invalid';
@@ -74,7 +82,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       const flat = about.replace(/\s+/g, ' ');
       // What the commands really do: copies made by up and push, the configuration up writes,
       // Bob's local tools left live, the agent's edits back by pull, how long a sandbox lasts,
-      // and not the sandbox a bare `mocactl` session's tools run in.
+      // and not the sandbox a `mocactl harness` session's tools run in.
       expect(flat).toContain(
         'In a git repository, `mocactl sbx up` creates or reuses one, copies the working tree',
       );
@@ -119,8 +127,50 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       ...['doctor', 'rm', 'logout'],
       // By hand, credentials, templates, then the admins' commands.
       ...['create', 'get', 'mode', 'reset', 'proc', 'token', 'env', 'egress', 'credentials'],
-      ...['templates', 'quota', 'policy', 'hosts', 'templates', 'admin'],
+      // (the admins' `templates transfer` and `quota` are in the one templates line).
+      ...['templates', 'quota', 'policy', 'hosts', 'admin'],
     ]);
+  });
+
+  it('lists every command on one line, with no flags, on --help and bare', async () => {
+    const help = setup();
+    expect(await sbxMain(['--help'], help.env, help.io, { home: help.home })).toBe(0);
+    const bare = setup();
+    expect(await sbxMain([], bare.env, bare.io, { home: bare.home })).toBe(2);
+    // Every command of the full usage, once, each with its one-line summary.
+    const all = new Set(
+      [...SBX_USAGE.matchAll(/^ {2}mocactl sbx ([a-z][a-z+|-]*)/gm)].map((m) => m[1]),
+    );
+    expect(new Set(SBX_COMMANDS())).toEqual(all);
+    expect(SBX_COMMANDS().length).toBe(all.size);
+    for (const line of SBX_OVERVIEW.split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(100);
+      if (line.startsWith('  mocactl sbx ')) expect(line).toMatch(/^ {2}mocactl sbx \S+ {2,}\S/);
+    }
+    for (const text of [help.io.outs.join(''), bare.io.errs.join('\n')]) {
+      expect(text).toContain(SBX_OVERVIEW);
+      expect(text).toMatch(/^ {2}mocactl sbx login {2,}log in$/m);
+      // No flag explanations, and no login code talk: those are `COMMAND --help`'s.
+      expect(SBX_OVERVIEW).not.toMatch(/--(?!help)[a-z]/);
+      expect(text).not.toContain('copies the code');
+      expect(text).toContain('admins only:');
+      expect(text).toContain('Run `mocactl sbx COMMAND --help`');
+    }
+  });
+
+  it("login --help: the sandbox service's URL, and no clipboard or browser talk", async () => {
+    const { env, io } = setup();
+    expect(await main(['sbx', 'login', '--help'], env, io)).toBe(0);
+    const out = io.outs.join('');
+    expect(out).toContain("--control-plane-url: the sandbox service's URL;");
+    expect(out).toContain('--no-browser: only print the sign-in URL and code');
+    expect(out).not.toMatch(/copies|clipboard|opens the browser/);
+    expect(out).toContain('The control plane comes from --control-plane-url, MOCACTL_SBX_URL');
+    // login takes no --record (it would record a secret); ls does.
+    expect(out).not.toContain('--record F');
+    const ls = setup();
+    expect(await main(['sbx', 'ls', '--help'], ls.env, ls.io)).toBe(0);
+    expect(ls.io.outs.join('')).toContain('--record F: append one NDJSON line');
   });
 
   describe('COMMAND --help shows that command, not every command', () => {
@@ -133,7 +183,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     it('credentials --help: every credentials form, and nothing else', async () => {
       const out = await help('credentials');
       for (const form of [
-        'credentials [list]',
+        'credentials ls|list',
         'credentials add NAME',
         'credentials presets',
         'credentials delete NAME',
@@ -154,7 +204,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       const logs = await help('proc', 'logs');
       expect(logs).toContain('mocactl sbx proc logs (NAME|ID)');
       expect(logs).not.toContain('mocactl sbx proc start');
-      expect(logs).toContain('.sbx/sandbox.json'); // its [ID] is the sandbox's
+      expect(logs).toContain('.sbx/sandbox.json'); // its [SANDBOX] is the sandbox's
     });
 
     it('two forms that share one description stay together (templates quota)', async () => {
@@ -165,39 +215,41 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       expect(out).not.toContain('mocactl sbx quota [--json]');
     });
 
-    it('an optional subcommand narrows too: credentials list is its own entry', async () => {
-      const list = await help('credentials', 'list');
-      expect(list).toContain('mocactl sbx credentials [list] [--json]');
-      expect(list).not.toContain('mocactl sbx credentials add');
-      expect(list).not.toContain('mocactl sbx credentials delete');
+    it('a subcommand narrows too, by either of its names: credentials ls and list', async () => {
+      for (const sub of ['ls', 'list']) {
+        const list = await help('credentials', sub);
+        expect(list).toContain('mocactl sbx credentials ls|list [--json]');
+        expect(list).not.toContain('mocactl sbx credentials add');
+        expect(list).not.toContain('mocactl sbx credentials delete');
+      }
     });
 
     it('a word that is not a subcommand is ignored: run -- CMD, an id', async () => {
-      expect(await help('rm', 'sbx-123')).toContain('mocactl sbx rm [ID]');
+      expect(await help('rm', 'sbx-123')).toContain('mocactl sbx rm [SANDBOX]');
       const { env, io } = setup();
       expect(await main(['sbx', 'run', '--help', '--', 'ls'], env, io)).toBe(0);
-      expect(io.outs.join('')).toContain('mocactl sbx run [--sandbox ID]');
+      expect(io.outs.join('')).toContain('mocactl sbx run [--sandbox SANDBOX]');
       expect(io.outs.join('')).not.toContain('mocactl sbx put');
     });
 
     it("a usage error shows the failed command's help, not every command's", async () => {
       const { env, io } = setup();
       // An unknown flag: the parse fails, yet the help is still the command's own.
-      expect(await main(['sbx', 'credentials', 'list', '--jsn'], env, io)).toBe(2);
+      expect(await main(['sbx', 'credentials', 'ls', '--jsn'], env, io)).toBe(2);
       const err = io.errs.join('\n');
       expect(err).toMatch(/--jsn/);
-      expect(err).toContain('mocactl sbx credentials [list] [--json]');
+      expect(err).toContain('mocactl sbx credentials ls|list [--json]');
       expect(err).not.toContain('mocactl sbx credentials add');
       expect(err).not.toContain('mocactl sbx up');
       // The error is the exit code: no list of the others, no Ctrl-C.
       expect(err).not.toMatch(/exit codes|Ctrl-C/);
       expect(err).toContain('Run `mocactl sbx --help` for the list of all commands.');
       // --help keeps them: there they are reference.
-      expect(await help('credentials', 'list')).toMatch(/exit codes: 0 ok/);
+      expect(await help('credentials', 'ls')).toMatch(/exit codes: 0 ok/);
       // A misused flag after a parse that succeeded, with a string flag's value before the word.
       const { io: io2 } = setup();
       expect(await main(['sbx', '--sandbox', SBX, 'ls', '--timeout', '5'], env, io2)).toBe(2);
-      expect(io2.errs.join('\n')).toContain('mocactl sbx ls [--all] [--json]');
+      expect(io2.errs.join('\n')).toContain('mocactl sbx ls [--all] [--include-deleted] [--json]');
       expect(io2.errs.join('\n')).not.toContain('mocactl sbx run');
       // No command, or an unknown one: the whole usage, as before.
       const { io: io3 } = setup();
@@ -276,6 +328,144 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(loadConfig(paths).config.sbxControlPlaneUrl).toBe(URL_);
     // Nothing was configured before, so there is no change to announce.
     expect(io.errs.join('\n')).not.toMatch(/is changing from/);
+  });
+
+  describe('sbx login --test-user N (ADR-0045)', () => {
+    const COMBINED = { profile: 'combined', execEndpoint: 'sbx-exec.example.invalid:443' };
+    const SECRET = 's'.repeat(32); // notsecret
+
+    it('logs in with no browser, stores it in sbx-auth.json, and remembers the URL', async () => {
+      const { home, paths, io } = setup({ loggedIn: false });
+      const cp = fakeCp({
+        'GET /v1/discovery': () => ({ status: 200, body: COMBINED }),
+        'POST /v1/auth/test-token': () => ({ status: 200, body: loginBody('api-t', 'test:7') }),
+      });
+      expect(
+        await sbxMain(
+          ['login', '--test-user', '7', '--control-plane-url', URL_],
+          { HOME: home, MOCA_TEST_USER_SECRET: SECRET },
+          io,
+          { home, fetchImpl: cp.fetchImpl },
+        ),
+      ).toBe(0);
+      expect(loadAuth(sbxPaths(paths), URL_)?.apiToken).toBe('api-t');
+      expect(existsSync(paths.authFile)).toBe(false); // MOCA's auth.json is not touched
+      expect(loadConfig(paths).config.sbxControlPlaneUrl).toBe(URL_);
+      // No device code was printed: that is the whole point of the flag.
+      expect(io.errs.join('\n')).not.toContain('ABCD-EFGH');
+      const token = cp.calls.find((c) => c.path === '/v1/auth/test-token');
+      expect(token?.body).toMatchObject({ index: 7, secret: SECRET });
+      // The secret travels in the body, never in a URL a proxy log would keep.
+      expect(cp.calls.every((c) => !c.path.includes(SECRET))).toBe(true);
+    });
+
+    // A sandbox-only stack is the configuration this flag exists for: the control plane mounts
+    // /v1/auth/test-token on `sandbox` too (ADR-0045), where enrollment is the login gate, so the
+    // client must send the secret rather than refuse the profile before asking anything.
+    it('logs in against a sandbox-profile control plane too', async () => {
+      const { home, paths, io } = setup({ loggedIn: false });
+      const cp = fakeCp({
+        'GET /v1/discovery': () => ({ status: 200, body: SBX_DISCOVERY }),
+        'POST /v1/auth/test-token': () => ({ status: 200, body: loginBody('api-t', 'test:3') }),
+      });
+      expect(
+        await sbxMain(
+          ['login', '--test-user', '3'],
+          { HOME: home, MOCACTL_SBX_URL: URL_, MOCA_TEST_USER_SECRET: SECRET },
+          io,
+          { home, fetchImpl: cp.fetchImpl },
+        ),
+      ).toBe(0);
+      expect(cp.calls.find((c) => c.path === '/v1/auth/test-token')?.body).toMatchObject({
+        index: 3,
+        secret: SECRET,
+      });
+      expect(loadAuth(sbxPaths(paths), URL_)?.apiToken).toBe('api-t');
+      expect(io.errs.join('\n')).not.toContain('serves no test users');
+    });
+
+    // Still refused: a MOCA control plane, whose discovery has no sandbox profile at all.
+    it('refuses a control plane that is not the sandbox service, before sending the secret', async () => {
+      const { home, paths, io } = setup({ loggedIn: false });
+      const cp = fakeCp({ 'GET /v1/discovery': () => ({ status: 404, body: {} }) });
+      expect(
+        await sbxMain(
+          ['login', '--test-user', '1'],
+          { HOME: home, MOCACTL_SBX_URL: URL_, MOCA_TEST_USER_SECRET: SECRET },
+          io,
+          { home, fetchImpl: cp.fetchImpl },
+        ),
+      ).toBe(2);
+      expect(io.errs.join('\n')).toContain('is not the sandbox service');
+      expect(cp.calls.some((c) => c.path === '/v1/auth/test-token')).toBe(false);
+      expect(loadAuth(sbxPaths(paths), URL_)).toBeNull();
+    });
+
+    it('needs the secret in the environment, and asks no control plane without it', async () => {
+      const { home, io } = setup({ loggedIn: false });
+      const cp = fakeCp({ 'GET /v1/discovery': () => ({ status: 200, body: COMBINED }) });
+      expect(
+        await sbxMain(['login', '--test-user', '1'], { HOME: home, MOCACTL_SBX_URL: URL_ }, io, {
+          home,
+          fetchImpl: cp.fetchImpl,
+        }),
+      ).toBe(2);
+      expect(io.errs.join('\n')).toContain('MOCA_TEST_USER_SECRET');
+      expect(cp.calls).toEqual([]);
+    });
+
+    it('names the two misconfigurations: test users off, and a secret that does not match', async () => {
+      for (const [reply, says] of [
+        [{ status: 404, body: { error: 'not_found' } }, 'has no test users'],
+        [{ status: 401, body: { error: 'unauthorized' } }, 'secret was refused'],
+      ] as const) {
+        const { home, io } = setup({ loggedIn: false });
+        const cp = fakeCp({
+          'GET /v1/discovery': () => ({ status: 200, body: COMBINED }),
+          'POST /v1/auth/test-token': () => reply,
+        });
+        expect(
+          await sbxMain(
+            ['login', '--test-user', '1'],
+            { HOME: home, MOCACTL_SBX_URL: URL_, MOCA_TEST_USER_SECRET: SECRET },
+            io,
+            { home, fetchImpl: cp.fetchImpl },
+          ),
+          says,
+        ).toBe(1);
+        expect(io.errs.join('\n'), says).toContain(says);
+      }
+    });
+
+    it('refuses an index that is not a whole number from 1, before any network call', async () => {
+      // `--test-user=<v>`, not two words: node's parseArgs rejects a leading dash itself, with its
+      // own message, so the `=` form is what puts every value in front of the check below.
+      for (const raw of ['0', 'abc', '-1', '1.5', '']) {
+        const { home, io } = setup({ loggedIn: false });
+        const cp = fakeCp({});
+        expect(
+          await sbxMain(
+            ['login', `--test-user=${raw}`],
+            { HOME: home, MOCACTL_SBX_URL: URL_, MOCA_TEST_USER_SECRET: SECRET },
+            io,
+            { home, fetchImpl: cp.fetchImpl },
+          ),
+          raw,
+        ).toBe(2);
+        expect(io.errs.join('\n'), raw).toContain('--test-user needs a whole number from 1');
+        expect(cp.calls, raw).toEqual([]);
+      }
+    });
+
+    it('applies to login only', async () => {
+      const { home, io } = setup();
+      expect(
+        await sbxMain(['ls', '--test-user', '1'], { HOME: home, MOCACTL_SBX_URL: URL_ }, io, {
+          home,
+        }),
+      ).toBe(2);
+      expect(io.errs.join('\n')).toContain('--test-user only applies to login');
+    });
   });
 
   describe('sbx login --control-plane-url remembers the URL even when the login fails', () => {
@@ -587,16 +777,44 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
         body: { templates: [{ id: 'node22', description: 'Node 22', tools: ['node'] }] },
       }),
     });
-    expect(await sbxMain(['templates'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    expect(io.outs.join('')).toMatch(/node22\s+Node 22/);
+    expect(await sbxMain(['templates', 'ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    // An older control plane sends no readiness or tags: those columns are left out.
+    expect(io.outs.join('')).toBe('ID      DESCRIPTION\nnode22  Node 22\n');
     expect(cp.calls[0]!.auth).toBe('Bearer api-1');
     io.outs.length = 0;
-    expect(await sbxMain(['templates', '--json'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(
-      0,
-    );
+    expect(
+      await sbxMain(['templates', 'ls', '--json'], env, io, { home, fetchImpl: cp.fetchImpl }),
+    ).toBe(0);
     expect(JSON.parse(io.outs.join(''))).toEqual([
       { id: 'node22', description: 'Node 22', tools: ['node'] },
     ]);
+  });
+
+  it('bare templates prints its subcommands, and makes no request', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({});
+    expect(await sbxMain(['templates'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(2);
+    const err = io.errs.join('');
+    // A pointer for an old script or habit first: bare `templates` once listed the templates.
+    expect(err).toMatch(
+      /^sbx: templates needs a subcommand; to list the templates, use 'mocactl sbx templates ls'\nusage:\n/,
+    );
+    expect(err).toContain('mocactl sbx templates ls [--json]');
+    expect(err).toContain('mocactl sbx templates create --spec F');
+    expect(err).not.toContain('mocactl sbx credentials');
+    expect(io.outs.join('')).toBe('');
+    expect(cp.calls).toEqual([]);
+    io.errs.length = 0;
+    expect(await sbxMain(['templates', '--json'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(
+      2,
+    );
+    expect(io.errs.join('')).toContain("use 'mocactl sbx templates ls'");
+    expect(io.outs.join('')).toBe('');
+    expect(cp.calls).toEqual([]);
+    expect(
+      await sbxMain(['templates', 'ls', 'x'], env, io, { home, fetchImpl: cp.fetchImpl }),
+    ).toBe(2);
+    expect(io.errs.join('')).toContain('sbx: templates ls takes no argument');
   });
 
   it('moves tags onto a build and removes one, saying what changed (lifecycle §5.1)', async () => {
@@ -853,11 +1071,54 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(cp.calls.length).toBe(1);
   });
 
+  const conflict = () => ({
+    status: 409,
+    body: { error: 'name_conflict', message: 'you already have a live sandbox named that' },
+  });
+
+  it('create without --name makes one up, and tries another on name_conflict', async () => {
+    const { home, env, io } = setup();
+    let posts = 0;
+    const cp = fakeCp({
+      'POST /v1/sandboxes': () => (++posts < 3 ? conflict() : { status: 201, body: sandbox() }),
+    });
+    // 0, then 0.5, then 0.999: the first and last of each list, then the middle, then the last.
+    const picks = [0, 0, 0.5, 0.5, 0.999, 0.999];
+    const random = () => picks.shift()!;
+    expect(await sbxMain(['create'], env, io, { home, fetchImpl: cp.fetchImpl, random })).toBe(0);
+    const names = cp.calls.map((c) => (c.body as { name: string }).name);
+    expect(names).toHaveLength(3);
+    expect(names[0]).toBe('admiring-agnesi');
+    for (const n of names) expect(n).toMatch(MADE_UP_NAME);
+    expect(new Set(names).size).toBe(3);
+    expect(io.errs.join('\n')).toContain(`created ${SBX} named web (node22)`);
+  });
+
+  it('create gives up on made-up names after 5 conflicts', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({ 'POST /v1/sandboxes': conflict });
+    expect(await sbxMain(['create'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(1);
+    expect(cp.calls).toHaveLength(5);
+    expect(io.errs.join('\n')).toContain('already have a live sandbox named');
+  });
+
+  it('create --name N sends N, and its name_conflict is not retried', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({ 'POST /v1/sandboxes': conflict });
+    expect(
+      await sbxMain(['create', '--name', 'mine'], env, io, { home, fetchImpl: cp.fetchImpl }),
+    ).toBe(1);
+    expect(cp.calls.map((c) => c.body)).toEqual([{ template: 'default', name: 'mine' }]);
+  });
+
   it('creates from the default template without --template (spec §6.1), and refuses a malformed --label', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({ 'POST /v1/sandboxes': () => ({ status: 201, body: sandbox() }) });
     expect(await sbxMain(['create'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    expect(cp.calls[0]!.body).toEqual({ template: 'default' });
+    expect(cp.calls[0]!.body).toEqual({
+      template: 'default',
+      name: expect.stringMatching(MADE_UP_NAME),
+    });
     expect(
       await sbxMain(['create', '--template', 'x', '--label', 'nope'], env, io, {
         home,
@@ -877,9 +1138,13 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(
       await sbxMain(['create', '--lifetime', '14d'], env, io, { home, fetchImpl: cp.fetchImpl }),
     ).toBe(0);
-    expect(cp.calls[0]!.body).toEqual({ template: 'default', idleLifetimeS: 1_209_600 });
+    expect(cp.calls[0]!.body).toEqual({
+      template: 'default',
+      name: expect.stringMatching(MADE_UP_NAME),
+      idleLifetimeS: 1_209_600,
+    });
     expect(io.errs.join('\n')).toContain(
-      `created ${SBX} (node22), expires ${new Date(1_800_604_800 * 1000).toISOString()}, after 7 d without use`,
+      `created ${SBX} named web (node22), expires ${new Date(1_800_604_800 * 1000).toISOString()}, after 7 d without use`,
     );
   });
 
@@ -967,7 +1232,54 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     expect(io.errs.join('\n')).toMatch(/no sandbox routes/);
   });
 
-  it('lists sandboxes with state and expiry; --all passes all=1', async () => {
+  // The fixture's sandbox is created at 1_800_000_000 and expires 7 days later; "now" is a day in.
+  const LS_NOW_MS = 1_800_086_400 * 1000;
+
+  it('lists sandboxes with state and a relative expiry; --all passes all=1', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({
+      'GET /v1/sandboxes': () => ({
+        status: 200,
+        body: {
+          sandboxes: [
+            sandbox({ idleLifetimeS: 604_800 }),
+            sandbox({
+              id: 'sbx-old',
+              name: null,
+              state: 'terminated',
+              reason: 'expired',
+              terminatedAt: 1_800_086_400 - 7200,
+            }),
+          ],
+        },
+      }),
+    });
+    const deps = { home, fetchImpl: cp.fetchImpl, now: () => LS_NOW_MS };
+    expect(await sbxMain(['ls'], env, io, deps)).toBe(0);
+    const lines = io.outs.join('').trimEnd().split('\n');
+    expect(lines[0]).toMatch(/^ID\s+NAME\s+TEMPLATE\s+MODE\s+STATE\s+EXPIRES$/);
+    expect(lines[1]).toMatch(
+      new RegExp(`^${SBX}\\s+web\\s+node22\\s+per-exec\\s+ready\\s+in 6 d$`),
+    );
+    expect(lines[2]).toMatch(
+      /^sbx-old\s+-\s+node22\s+per-exec\s+terminated \(expired\)\s+ended 2 h ago$/,
+    );
+    expect(lines[1]!.indexOf('web')).toBe(lines[0]!.indexOf('NAME'));
+    expect(lines[1]!.indexOf('in 6 d')).toBe(lines[0]!.indexOf('EXPIRES'));
+    // No ISO timestamp, and no idle lifetime: that is sbx get's.
+    expect(io.outs.join('')).not.toMatch(/\d{4}-\d\d-\d\dT|\(7 d\)/);
+    await sbxMain(['ls', '--all'], env, io, deps);
+    expect(cp.calls.at(-1)!.path).toBe('/v1/sandboxes?all=1');
+  });
+
+  it('ls prints no header for an empty list', async () => {
+    const { home, env, io } = setup();
+    const cp = fakeCp({ 'GET /v1/sandboxes': () => ({ status: 200, body: { sandboxes: [] } }) });
+    expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
+    expect(io.outs.join('')).toBe('');
+  });
+
+  it('ls leaves out deleted sandboxes unless --include-deleted, in --json too', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
       'GET /v1/sandboxes': () => ({
@@ -975,75 +1287,116 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
         body: {
           sandboxes: [
             sandbox(),
-            sandbox({ id: 'sbx-dead', name: null, state: 'terminated', reason: 'deleted' }),
+            sandbox({
+              id: 'sbx-gone',
+              state: 'terminated',
+              reason: 'deleted',
+              terminatedAt: 1_800_000_100,
+            }),
+            sandbox({
+              id: 'sbx-old',
+              state: 'terminated',
+              reason: 'expired',
+              terminatedAt: 1_800_000_100,
+            }),
           ],
         },
       }),
     });
-    expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    const out = io.outs.join('');
-    expect(out).toMatch(new RegExp(`${SBX}\\s+web\\s+node22\\s+per-exec\\s+ready`));
-    expect(out).toMatch(/sbx-dead\s+-\s+node22\s+per-exec\s+terminated \(deleted\)/);
-    expect(out).toContain(new Date(1_800_604_800 * 1000).toISOString());
-    await sbxMain(['ls', '--all'], env, io, { home, fetchImpl: cp.fetchImpl });
-    expect(cp.calls.at(-1)!.path).toBe('/v1/sandboxes?all=1');
+    const deps = { home, fetchImpl: cp.fetchImpl, now: () => LS_NOW_MS };
+    expect(await sbxMain(['ls'], env, io, deps)).toBe(0);
+    expect(io.outs.join('')).not.toContain('sbx-gone');
+    expect(io.outs.join('')).toContain('sbx-old');
+    io.outs.length = 0;
+    expect(await sbxMain(['ls', '--json'], env, io, deps)).toBe(0);
+    expect(JSON.parse(io.outs.join('')).map((s: { id: string }) => s.id)).toEqual([SBX, 'sbx-old']);
+    io.outs.length = 0;
+    expect(await sbxMain(['ls', '--include-deleted'], env, io, deps)).toBe(0);
+    expect(io.outs.join('')).toMatch(
+      /sbx-gone\s+web\s+node22\s+per-exec\s+terminated \(deleted\)\s+ended 23 h ago/,
+    );
+    io.outs.length = 0;
+    expect(await sbxMain(['ls', '--include-deleted', '--json'], env, io, deps)).toBe(0);
+    expect(JSON.parse(io.outs.join(''))).toHaveLength(3);
   });
 
-  it('ls prints no lifetime for a malformed idleLifetimeS (#770)', async () => {
+  it('refuses --include-deleted on any command but ls', async () => {
     const { home, env, io } = setup();
+    const cp = fakeCp({});
+    expect(
+      await sbxMain(['hosts', '--include-deleted'], env, io, { home, fetchImpl: cp.fetchImpl }),
+    ).toBe(2);
+    expect(io.errs.join('\n')).toContain('--include-deleted only applies to ls');
+    expect(cp.calls).toEqual([]);
+  });
+
+  it('ls widens a column for a long name or template id, so every column still lines up', async () => {
+    const { home, env, io } = setup();
+    const long = 'a-name-well-over-sixteen-characters';
     const cp = fakeCp({
       'GET /v1/sandboxes': () => ({
         status: 200,
         body: {
           sandboxes: [
-            sandbox({ idleLifetimeS: 0 }),
-            sandbox({ id: 'sbx-b', idleLifetimeS: '604800' as unknown as number }),
+            sandbox({ name: long, template: 'python312-slim-bookworm' }),
+            sandbox({ id: 'sbx-b' }),
           ],
         },
       }),
     });
-    await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl });
-    expect(io.outs.join('')).not.toMatch(/\(|undefined|NaN/);
-  });
-
-  it('ls --all aligns the owner column with and without the lifetime suffix (#770)', async () => {
-    const { home, env, io } = setup();
-    const cp = fakeCp({
-      'GET /v1/sandboxes': () => ({
-        status: 200,
-        body: {
-          sandboxes: [
-            sandbox({ owner: 'owner-a', idleLifetimeS: 604_800 }),
-            sandbox({ id: 'sbx-old', owner: 'owner-b' }),
-            sandbox({ id: 'sbx-odd', owner: 'owner-c', idleLifetimeS: 3601 }),
-          ],
-        },
-      }),
+    await sbxMain(['ls', '--all'], env, io, {
+      home,
+      fetchImpl: cp.fetchImpl,
+      now: () => LS_NOW_MS,
     });
-    await sbxMain(['ls', '--all'], env, io, { home, fetchImpl: cp.fetchImpl });
     const lines = io.outs.join('').trimEnd().split('\n');
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toContain('(7 d)');
-    expect(lines[2]).toContain('(3601 s)');
-    const col = lines.map((l, i) => l.indexOf(`owner-${'abc'[i]}`));
-    expect(col[0]).toBeGreaterThan(0);
-    expect(new Set(col).size).toBe(1);
+    for (const [col, cells] of [
+      ['NAME', [long, 'web']],
+      ['TEMPLATE', ['python312-slim-bookworm', 'node22']],
+      ['MODE', ['per-exec', 'per-exec']],
+      ['EXPIRES', ['in 6 d', 'in 6 d']],
+      ['OWNER', ['github:1', 'github:1']],
+    ] as const) {
+      const at = lines[0]!.indexOf(col);
+      expect(lines[1]!.indexOf(cells[0], 30)).toBe(at);
+      expect(lines[2]!.indexOf(cells[1], 30)).toBe(at);
+    }
+    for (const l of lines) expect(l).not.toMatch(/ $/);
   });
 
-  it('ls appends the idle lifetime to the expiry only when the record carries one (#770)', async () => {
+  it('ls --all aligns the owner column whatever the expiry text', async () => {
     const { home, env, io } = setup();
     const cp = fakeCp({
       'GET /v1/sandboxes': () => ({
         status: 200,
-        body: { sandboxes: [sandbox({ idleLifetimeS: 604_800 }), sandbox({ id: 'sbx-old' })] },
+        body: {
+          sandboxes: [
+            sandbox({ owner: 'owner-a' }),
+            sandbox({ id: 'sbx-soon', owner: 'owner-b', expiresAt: 1_800_086_400 + 30 }),
+            sandbox({
+              id: 'sbx-old',
+              owner: 'owner-c',
+              state: 'terminated',
+              reason: 'expired',
+              terminatedAt: 1_800_086_400 - 365 * 86_400,
+            }),
+          ],
+        },
       }),
     });
-    expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    const lines = io.outs.join('').trim().split('\n');
-    const iso = new Date(1_800_604_800 * 1000).toISOString();
-    expect(lines[0]!.endsWith(`${iso} (7 d)`)).toBe(true);
-    expect(lines[1]!.endsWith(iso)).toBe(true);
-    expect(lines[1]).not.toContain('undefined');
+    await sbxMain(['ls', '--all'], env, io, {
+      home,
+      fetchImpl: cp.fetchImpl,
+      now: () => LS_NOW_MS,
+    });
+    const [header, ...lines] = io.outs.join('').trimEnd().split('\n');
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toContain('in <1 min');
+    expect(lines[2]).toContain('ended 365 d ago');
+    const col = lines.map((l, i) => l.indexOf(`owner-${'abc'[i]}`));
+    expect(col[0]).toBeGreaterThan(0);
+    expect(new Set([...col, header!.indexOf('OWNER')]).size).toBe(1);
   });
 
   it('deletes a sandbox', async () => {
@@ -1466,7 +1819,7 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       }),
     });
     expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    const lines = io.outs.join('').split('\n');
+    const lines = io.outs.join('').split('\n').slice(1);
     expect(lines[0]).toMatch(new RegExp(`^${SBX}\\s+web\\s+node22\\s+per-exec\\s+ready\\s`));
     expect(lines[1]).toMatch(/^sbx-lease\s+l\s+node22\s+lease\+processes\s+ready\s/);
   });
@@ -1854,8 +2207,9 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
     });
     expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
     const out = io.outs.join('');
-    expect(out).toMatch(/node22\s+per-exec\s+terminated\s+\d{4}-/);
-    expect(out).not.toMatch(/expired|\(/);
+    // No terminatedAt and a deadline still ahead: it ended, but when is not known.
+    expect(out).toMatch(/node22\s+per-exec\s+terminated\s+ended\n/);
+    expect(out).not.toMatch(/expired|\(|ended in/);
   });
 
   it('sanitizes before padding, so the columns still line up', async () => {
@@ -1869,9 +2223,10 @@ describe('mocactl sbx (SBX0 §6.1, 1b subset)', () => {
       }),
     });
     expect(await sbxMain(['ls'], env, io, { home, fetchImpl: cp.fetchImpl })).toBe(0);
-    const [a, b] = io.outs.join('').trimEnd().split('\n');
+    const [h, a, b] = io.outs.join('').trimEnd().split('\n');
     expect(a).not.toContain('\u001b');
     expect(a!.indexOf('node22')).toBe(b!.indexOf('node22'));
+    expect(a!.indexOf('node22')).toBe(h!.indexOf('TEMPLATE'));
   });
 });
 

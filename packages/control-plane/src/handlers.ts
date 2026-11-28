@@ -79,6 +79,14 @@ import type { ProvenanceStore } from './provenance.js';
 import type { PresenceReader, TemplateBuild, TemplateCatalog } from './template-catalog.js';
 import type { PolicyStore } from './template-policy.js';
 import type { SandboxStore } from './sandbox-store.js';
+import {
+  RELEASE_BOUND_MS,
+  inBackground,
+  releaserOf,
+  withinBound,
+  type RelayReleaser,
+  type RelayReleaseTarget,
+} from './relay-release.js';
 import { SANDBOX_HANDLERS, requireActive, resolveForUse } from './sandbox-handlers.js';
 import type { TemplateHost } from './host-config.js';
 import { HOST_HANDLERS, type HostRegistry } from './host-handlers.js';
@@ -92,7 +100,9 @@ import type { ResultRedisLike } from './turn-result.js';
 import type { TurnStore } from './turn-store.js';
 import type { EgressHost } from './egress-config.js';
 import type { EgressStore } from './egress-log.js';
-import { formatDestination, parseDestination } from './egress-destination.js';
+import { formatDestination, parseDestination, type Destination } from './egress-destination.js';
+import { NOTIFY_HANDLERS } from './notify-handlers.js';
+import type { NotifyStore } from './notify-store.js';
 
 /** A stored destination in normalized form; a legacy or corrupt entry compares as written. */
 function normalizeStored(h: string): string {
@@ -113,6 +123,12 @@ export interface CpConfig {
   routeProfile?: RouteProfile;
   /** The template hosts (SH_TEMPLATE_HOSTS, template lifecycle spec §6.1); absent or empty: none. */
   templateHosts?: TemplateHost[];
+  /**
+   * The relay's control listener and its release-only bearer (#338, relay-release.ts), from
+   * SH_RELAY_CONTROL_URL and MOCA_RELAY_RELEASE_TOKEN. Absent, nothing is released and no record
+   * changes; idle reclaim on the worker frees the workspace, as before.
+   */
+  relayRelease?: RelayReleaseTarget;
   /**
    * How many reverse proxies in front of the control plane append to X-Forwarded-For
    * (`SH_TRUSTED_PROXY_HOPS`); absent or 0 means none, and the socket peer is the source.
@@ -185,6 +201,12 @@ export interface CpConfig {
    */
   asyncQueuedPerOwner: number;
   /**
+   * `MOCA_GATE_DEADLINE_S`, default 0 = never (#393 §3): the deployment ceiling on how long a turn
+   * may sit paused at a gate before the sweep answers it with the turn's `onTimeout`. Off by
+   * default because expiring a gate SPENDS the owner's decision for them -- a deployment opts in.
+   */
+  gateDeadlineS: number;
+  /**
    * `MOCA_TENANCY` (async spec §9). Async submission is refused by name under `multi` until M2:
    * M1 resolves the credential from the turn record at dequeue, which MI1 S2's interim allows under
    * `single` only.
@@ -218,6 +240,18 @@ export interface CpConfig {
    * `MOCA_TENANCY=multi` (`checkGrantRedemption`), absent in every single-tenant deployment.
    */
   inferenceUrl?: string;
+  /**
+   * #394. `allow` is the SSRF control and is fail-closed: empty means notifications are off, and
+   * `PUT /v1/notifications` says so by name. The rest are the per-subject rate limits.
+   */
+  notify: {
+    allow: Destination[];
+    /** Public base url for the approval deep link. Absent means the link is omitted. */
+    baseUrl?: string;
+    minIntervalS: number;
+    perHour: number;
+    failMax: number;
+  };
 }
 
 export interface CpDeps {
@@ -265,6 +299,13 @@ export interface CpDeps {
   close?: () => Promise<void>;
   /** The sandbox resource (SBX0 §5); present on the sandbox profile only. */
   sandboxes?: SandboxStore;
+  /**
+   * A releaser to use instead of the relay's control listener (`config.relayRelease`, #338): a
+   * test seam. Production leaves it absent and releaserOf builds the listener's from the config.
+   */
+  relayRelease?: RelayReleaser;
+  /** How long a release may hold up a DELETE or the sweep; RELEASE_BOUND_MS. A test seam. */
+  releaseBoundMs?: number;
   /** Per-sandbox egress logs, beside `sandboxes`; absent, the routes store nothing. */
   egress?: EgressStore;
   /**
@@ -297,6 +338,8 @@ export interface CpDeps {
   log?: AuditLog;
   /** The async turn record store (async spec §5.1); absent only in suites that never submit. */
   turns?: TurnStore;
+  /** #394's config store. Absent on a profile with no Redis, as `turns` is. */
+  notify?: NotifyStore;
   /** The leaf queue, holding turn ids and nothing else (§5.1). */
   turnQueue?: TurnQueue;
   /** Reads `leaf:result:<sid>:<turnId>` for the status route (§4.4); absent means no result. */
@@ -314,6 +357,58 @@ export interface CpDeps {
    * receive grants over the authenticated exchange and never verify them.
    */
   grantVerifyKeys?: Map<string, KeyObject>;
+}
+
+/**
+ * A deleted session's workspace released on its worker (#338), keyed by its session id. The worker
+ * is the session's `sandboxPod`, else the `sandboxId` its last leased turn ran on (both
+ * self-reported into the runtime hash, read before the cascade); with neither there is nothing to
+ * send, and the audit says so (`no_worker`).
+ *
+ * The session id is the key of every turn that writes those fields: the harness's `/turn` paths
+ * (server.ts, through runtimeFieldsForTurn) lease with `workspace_key` = the session id
+ * (select-sandbox.ts). One case runs under another key: an internal leaf run whose agent writes in
+ * its context view on a worker with the workspace-subdir capability leases with `workspace_key: ''`
+ * (run-leaf.ts `agentWritesInContext`), the worker's shared workspace. That path writes no runtime
+ * fields, and `''` is not releasable (both worker tiers refuse an empty key, and it is not the
+ * session's alone), so that workspace is not sent here and falls back to the worker's idle reclaim.
+ *
+ * One `session_workspace_release` audit line either way, its outcome the worker's answer or
+ * `not_answered`, the worker under `worker` (it is a worker id, not a sandbox record, so not
+ * `sandboxId`): the session record is gone, so nothing retries it, and the worker's idle reclaim is
+ * the backstop. Never throws; the DELETE does not wait for it.
+ */
+async function releaseSessionWorkspace(
+  deps: CpDeps,
+  rec: SessionRecord,
+  runtime: Record<string, string>,
+): Promise<void> {
+  const worker = runtime.sandboxPod || runtime.sandboxId || '';
+  const line = (outcome: string) =>
+    auditBestEffort(deps, 'session_workspace_release', rec.sessionId, {
+      subject: rec.owner,
+      sessionId: rec.sessionId,
+      decision: 'session_workspace_release',
+      outcome,
+      ...(worker ? { worker } : {}),
+    });
+  if (!worker) {
+    await line('no_worker');
+    return;
+  }
+  await withinBound(deps.releaseBoundMs ?? RELEASE_BOUND_MS, async (signal) => {
+    let outcome: string;
+    try {
+      outcome = await releaserOf(deps)!.release(worker, rec.sessionId, signal);
+    } catch (err) {
+      console.error(
+        `[control-plane] the release of session ${rec.sessionId}'s workspace on ${worker} was not ` +
+          `answered: ${(err as Error).message} -- idle reclaim on the worker frees it`,
+      );
+      outcome = 'not_answered';
+    }
+    await line(outcome);
+  });
 }
 
 /** `deps.log` with the production default; keeps the field optional on `CpDeps`. */
@@ -830,7 +925,10 @@ export const HANDLERS: Record<string, Handler> = {
       };
     }
     if (profile === 'sandbox') {
-      return { status: 200, body: { profile: 'sandbox', ...sandboxFields } };
+      return {
+        status: 200,
+        body: { profile: 'sandbox', ...sandboxFields, version: deps.config.version ?? null },
+      };
     }
     // harness, and combined (combined control plane spec §3.1): the harness fields, plus the
     // sandbox ones on combined.
@@ -927,8 +1025,10 @@ export const HANDLERS: Record<string, Handler> = {
     const fromProvider = provider.principalFor(index);
     const m = await membershipNow(deps, fromProvider.subject, fromProvider.roles);
     const principal = { ...fromProvider, roles: m.roles };
-    // SBX0 §4.2's enrolment gate still applies: main.ts refuses to boot test users on the sandbox
-    // profile, and this keeps the invariant even if that guard were ever relaxed.
+    // SBX0 §4.2's enrolment gate applies to a test login as to any other, and on the sandbox
+    // profile it IS the authentication: a test user that nothing enrols is refused HERE, at login,
+    // rather than later at the sandbox routes. main.ts refuses to boot a positive SH_TEST_USERS
+    // that nothing enrols, so this answers a stack whose enrolment changed under it.
     if (!isEnrolled(principal.subject, principal.roles, deps.config, m.enrolled)) {
       throw notEnrolled(principal.subject);
     }
@@ -1339,7 +1439,17 @@ export const HANDLERS: Record<string, Handler> = {
   deleteSession: async (ctx, deps) => {
     const rec = await assertOwner(ctx.params.id!, ctx.principal, deps);
     const inFlight = await turnInFlight(rec.sessionId, deps);
+    // #338: where the session's workspace lives, read BEFORE the cascade deletes the runtime hash.
+    const runtime = releaserOf(deps) ? await deps.index.getRuntime(rec.sessionId) : undefined;
     await deps.index.cascadeDelete(rec);
+    // Released only now that the delete has committed: a released key refuses new Execs, so a
+    // release before a delete that then failed would strand a live session. In the background,
+    // never awaited: it neither fails nor delays this DELETE, and has its own bound.
+    if (runtime) {
+      inBackground(`the release of session ${rec.sessionId}'s workspace`, () =>
+        releaseSessionWorkspace(deps, rec, runtime),
+      );
+    }
     // Reclaim this session's open async turns and their quota slots (F2): nothing else in the
     // design will ever move an orphaned queued/running turn to terminal, so without this a
     // submit-then-delete cycle burns a slot forever. `deps.turns` is absent on the sandbox profile,
@@ -1664,4 +1774,5 @@ export const HANDLERS: Record<string, Handler> = {
   ...MEMBER_HANDLERS,
   ...EGRESS_HANDLERS,
   ...TURN_HANDLERS,
+  ...NOTIFY_HANDLERS,
 };

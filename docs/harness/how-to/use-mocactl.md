@@ -14,8 +14,8 @@ streamed reply on the Docker Compose trial.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh
 export SH_CONTROL_PLANE_URL=https://moca.example.com   # your moca server; the only URL mocactl needs
-mocactl            # interactive; the first run walks you through setup
-mocactl --setup    # re-run setup on a configured machine
+mocactl harness           # interactive; the first run walks you through setup
+mocactl harness --setup   # re-run setup on a configured machine
 ```
 
 It installs `~/.local/bin/mocactl` (a symlink to `mocactl.mjs` beside it) from the latest release, after checking its SHA-256, and prints
@@ -90,10 +90,9 @@ printf %s "$KEY" | mocactl credentials add NAME --host HOST [--host HOST ...] \
 mocactl credentials delete NAME [--json]    # exit 1 if you own no credential of that name
 ```
 
-> **Preview.** `mocactl spawn`, `mocactl subagents`, `mocactl watch` and `mocactl get` are
-> implemented but not yet declared Stable; flags, ledger format, and output shapes may change.
-> One follow-up is still tracked under the subagent commands issue: `approve`/`reject` for a
-> subagent that stops at a gate.
+> **Preview.** `mocactl spawn`, `mocactl subagents`, `mocactl watch`, `mocactl get`,
+> `mocactl approve`, `mocactl reject` and `mocactl follow-up` are implemented but not yet declared
+> Stable; flags, ledger format, and output shapes may change.
 
 ```bash
 mocactl spawn "prompt" [--config sha256:…] --kind prompt|solve \
@@ -103,6 +102,10 @@ mocactl subagents [--tag T] [--json]        # list spawned subagents + current h
 mocactl watch [--tag T] [--json]            # one line per state change, until all are finished
 mocactl get SESSIONID [--out DIR] [--json]  # write result files + bounded summary
 mocactl spawn "prompt" --kind prompt --workload ID [--writable] [...]  # run it on a workload's context
+mocactl spawn "prompt" --require-approval [...]        # park it at a gate before it acts
+mocactl approve SESSIONID [--gate N] [--feedback TEXT] [--json]  # let it go ahead
+mocactl reject SESSIONID [--gate N] [--feedback TEXT] [--json]   # refuse, and say what to do instead
+mocactl follow-up SESSIONID "prompt" [--out DIR] [--json]  # a second turn on the same session; saves the result first
 ```
 
 ```bash
@@ -162,6 +165,57 @@ nothing has to be parsed twice. Ctrl-C ends the watch; the subagents keep runnin
 normalized so `git apply` does not reject it), and `<sid>.verdict.json` if the server returned a
 verdict. A session that has not finished yet exits `1` with a hint; a `failed` body exits `1`
 with the status, reason, and detail on stderr.
+
+`mocactl spawn --require-approval` makes the subagent ask before it acts: its first move is to
+propose what it would do, and the run parks `paused` at a numbered gate instead of carrying on.
+`mocactl get SESSIONID` prints the gate's number, its summary and the proposed action;
+`mocactl approve SESSIONID` lets it go ahead and `mocactl reject SESSIONID --feedback "…"` turns it
+down and sends the feedback back, so the subagent tries another route and may park at a second
+gate. Both print the handle the resumed run goes on under — a turn id for an `--async` row, a pid
+for a sync one — and both leave the ledger row `running`, so `subagents` and `watch` pick the
+resumed run up without being told. `--gate N` is rarely needed: at most one gate of a session is
+pending at a time, so the number is read off the paused result. It is there for an `--async`
+subagent whose result this machine cannot read — one spawned elsewhere, or one whose result has
+aged out — and the control plane checks the number itself. On a sync row `--gate N` is a
+cross-check rather than a short cut: the paused result is still read, because nothing behind this
+command would catch a stale number. `--feedback` goes to the model verbatim and is capped at 4096
+bytes. Answering a gate that is not pending — already answered, or answered by the deadline
+sweep — exits `1` and says which gate the session is at. A gate can only be answered while the
+subagent is parked at it: on a sync row a second decision taken once the first one's run has
+started is refused and names the pid, because that run holds the only answer the gate has. Two
+decisions started at the same instant (`mocactl approve S & mocactl approve S`) can both get
+through — the check reads the ledger row, which the first decision only marks `running` after it
+forks — so answer a gate once and wait for the command to return.
+
+A subagent spawned **without** `--async` is resumed from the machine that spawned it: the decision
+re-sends the stored envelope from a fresh detached worker, and only that machine's ledger holds it.
+An `--async` one is resumed through the control plane, so any logged-in machine can answer its gate.
+
+`mocactl follow-up SESSIONID "prompt"` sends a finished subagent a second turn on the same session,
+so it keeps the first turn's context — `get` the result, read it, then ask for the next thing
+without paying for the first turn again. It writes the current result to `--out DIR` (default: the
+current directory) **before** dispatching, because a sync subagent keeps one result record per
+session and the new turn overwrites it; the files are the same `SESSIONID.text`,
+`SESSIONID.verdict.json` and `SESSIONID.patch` that `get` writes, and `--json` lists them under
+`files`. A record that has already aged out of its 24 hours prints `no result to preserve` and the
+follow-up goes ahead; a result that could not be _read_ refuses the follow-up instead, so a
+transport problem never costs you the result. An `--async` subagent is copied nothing: each of its
+turns keeps its own artifacts for seven days, so the next turn overwrites none of them.
+
+The follow-up is always a prompt turn, including on a `--kind solve` subagent — the session already
+holds the repository workspace, so no `--repo`/`--ref` is needed — and it inherits the subagent's
+bundle, workload and `--require-approval`, so a subagent asked to park before it acts parks on its
+second turn too. (Rows written by a `mocactl` older than this command's release did not record
+`--require-approval`; a follow-up on one of those runs ungated. `mocactl subagents` is the way to
+tell: re-spawn rather than follow up if the gate matters.) It needs the subagent's ledger row on
+this machine, as a gate decision on a sync row does, and it is refused (exit `1`) while the
+subagent is still `running` (wait with `mocactl get --wait`) or parked at a gate (answer it with
+`mocactl approve`/`reject`; a follow-up prompt is not an answer to a gate). A sync subagent whose
+worker died without writing a result is _not_ refused once its process is gone and the 60-second
+grace has passed: the ledger still says `running`, but liveness decides, so the context survives a
+crashed first turn. After it returns, the ledger row describes the new turn: the
+same `tag` and `--label`, a new pid or turn id, and the follow-up's prompt as the envelope a later
+`approve` would re-send.
 
 `mocactl run` continues the session `--session` names, or starts a new one (`--new`, the default).
 An empty `--session ""` is refused (exit `2`), not taken as `--new`. When the harness has no
@@ -314,7 +368,8 @@ stable: fields may be added, but none is renamed or removed.
 | `spawn`              | `{"type":"session","sessionId","pid"}`                                                                                                              |
 | `subagents`          | `{"subagents":[{"sessionId","tag","kind","state","detail","bundle","workload","submittedAt"}]}`                                                     |
 | `watch`              | NDJSON, one event per line: `{"sessionId","tag","label"?,"kind","state","detail","at"}`                                                             |
-| `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?}`                                                                                  |
+| `get`                | `{"sessionId","status","files":["<path>",…],"reason"?,"message"?,"gate"?:{"gateId","summary","proposed_action"}}`                                   |
+| `approve` / `reject` | `{"sessionId","gateId","action"}` plus `"turnId"` for an async row or `"pid"` for a sync one                                                        |
 | `workloads create`   | `{"workloadId","status","contextType","revision","files","bytes","sandboxes"?,"mount"?}`                                                            |
 | `workloads list`     | `{"workloads":[{"workloadId","status","contextType","workspace","createdAt","revision","sandboxes","error"?}]}`, `null` unset, `createdAt` ISO 8601 |
 | `workloads get`      | `{"workloadId","status","contextType","workspace","revision","sandboxes","error"?}`, `null` unset                                                   |
@@ -328,7 +383,7 @@ local history (the control plane stores no titles).
 ## Sandboxes and templates
 
 `mocactl sbx` is the sandbox service's client: log in with `mocactl sbx login`, list templates with
-`mocactl sbx templates`, and create a sandbox of one with `mocactl sbx create --template ID` (or
+`mocactl sbx templates ls`, and create a sandbox of one with `mocactl sbx create --template ID` (or
 `sbx up --template ID` in a repository). On a deployment with the template store,
 `mocactl sbx templates` also creates, follows, activates and retires your own templates. The
 [sandbox service user guide](../../sandbox/user-guide.md) has every command; turning a container image into a

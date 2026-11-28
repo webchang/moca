@@ -26,8 +26,10 @@ import {
   setModeFailureText,
   type SetModeOutcome,
 } from './mode.js';
-import { afterText, lifetimeNotTakenText, lifetimeText, validLifetime } from './lifetime.js';
+import { sandboxName } from './names.js';
+import { afterText, lifetimeNotTakenText, relativeText } from './lifetime.js';
 import { forgetNotices } from './notices.js';
+import { SANDBOX_ID_RE } from './state.js';
 import { seedSandbox, type SeedResult } from './templates.js';
 
 /**
@@ -58,6 +60,8 @@ export interface SbxCtx {
    */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
+  /** The default sandbox name's pick, 0 to 1 (default Math.random); tests pass a fake. */
+  random?: () => number;
   /**
    * The control-plane URL when it came from `--control-plane-url` or MOCACTL_SBX_URL rather than
    * config.json: `SBX_TOKEN_CMD` then names it, since another shell may have neither.
@@ -249,16 +253,107 @@ export async function cmdLogin(
     rememberOnce();
     const end = deviceLoginEnd(c.io, err, { prefix: 'sbx', again: 'mocactl sbx login' });
     if (end !== undefined) return end;
-    // A refusal `fail` words for itself (not enrolled, a token code) keeps its words; any other
-    // failure, an API error or not (a proxy's 200 page that is not JSON), names the control plane
-    // tried and what came back (#700), at `fail`'s exit codes.
-    const ownWords =
-      err instanceof ApiError && (err.code === 'not_enrolled' || TOKEN_CODES.has(err.code));
-    if (!ownWords) {
-      c.io.err(`sbx: login failed: ${describeLoginError(err, c.url)}`);
-      return err instanceof ApiError && err.status === 0 ? SBX_EXIT.unreachable : SBX_EXIT.failed;
+    return loginFailed(c, err);
+  }
+}
+
+/**
+ * The exit for a login that failed for a reason not specific to the device flow, shared by both
+ * login paths. A refusal `fail` words for itself (not enrolled, a token code) keeps its words; any
+ * other failure, an API error or not (a proxy's 200 page that is not JSON), names the control plane
+ * tried and what came back (#700), at `fail`'s exit codes.
+ */
+function loginFailed(c: SbxCtx, err: unknown): number {
+  const ownWords =
+    err instanceof ApiError && (err.code === 'not_enrolled' || TOKEN_CODES.has(err.code));
+  if (!ownWords) {
+    c.io.err(`sbx: login failed: ${describeLoginError(err, c.url)}`);
+    return err instanceof ApiError && err.status === 0 ? SBX_EXIT.unreachable : SBX_EXIT.failed;
+  }
+  return failed(c, err);
+}
+
+/**
+ * `mocactl sbx login --test-user N` (ADR-0045): the sandbox service's half of
+ * `mocactl login --test-user`, so a multi-user `sbx` test needs no human at a browser. The secret
+ * comes from MOCA_TEST_USER_SECRET in the environment, never a flag, for the reason `headless.ts`
+ * gives: a flag would put it in the shell history and in every `ps` listing of the machine running
+ * the test.
+ *
+ * A SANDBOX SERVICE of either profile, which is a property of the server, not a policy chosen
+ * here: `POST /v1/auth/test-token` is declared for `sandbox` and `combined` alike (control-plane
+ * `routes.ts`, ADR-0045), so an sbx-only stack serves browser-free logins too. What is refused
+ * here is only a control plane whose `/v1/discovery` has no sandbox profile at all, where the
+ * login would be useless. A control plane that simply has the feature off is not refused here --
+ * it cannot be, since `/v1/discovery` does not advertise test users; its 404 is the answer, and
+ * the catch below turns that into "this control plane has no test users".
+ *
+ * A login is not yet a usable sandbox: on `combined` the sandbox routes check enrollment, so the
+ * operator must also have the subject in SH_ALLOWED_SUBJECTS (or SH_ADMIN_SUBJECTS); that refusal
+ * arrives later, from `sbx up`, as `not_enrolled` naming the subject. On `sandbox` enrollment is
+ * the login gate itself, so the same configuration is what makes THIS call succeed.
+ */
+export async function cmdLoginTestUser(
+  c: SbxCtx,
+  index: number,
+  env: NodeJS.ProcessEnv,
+  remember: boolean,
+): Promise<number> {
+  if (!c.rt.cp) return SBX_EXIT.usage;
+  // Checked before discovery: no reason to ask a control plane anything when the secret that the
+  // request needs is not here.
+  const secret = env.MOCA_TEST_USER_SECRET ?? '';
+  if (secret === '') {
+    c.io.err(
+      'sbx: --test-user needs the shared secret in MOCA_TEST_USER_SECRET ' +
+        "(the control plane's SH_TEST_USER_SECRET)",
+    );
+    return SBX_EXIT.usage;
+  }
+  let remembered = false;
+  const rememberOnce = (): void => {
+    if (!remember || remembered) return;
+    remembered = true;
+    rememberUrl(c);
+  };
+  try {
+    const d: SbxDiscovery = await c.api.sandboxDiscovery().catch((err: unknown) => {
+      if (err instanceof ApiError && err.status === 404) return {};
+      throw err;
+    });
+    if (d.profile !== 'sandbox' && d.profile !== 'combined') {
+      c.io.err(
+        `sbx: ${c.url} is not the sandbox service (its /v1/discovery has no sandbox profile)`,
+      );
+      return SBX_EXIT.usage;
     }
-    return failed(c, err);
+    rememberOnce();
+    const login = await c.api.testUserToken(index, secret);
+    setAuth(c.rt, toCachedAuth(login, c.url));
+    c.io.err(
+      `logged in to the sandbox service as ${sanitizeRemote(login.displayName ?? login.subject)}`,
+    );
+    return SBX_EXIT.ok;
+  } catch (err) {
+    rememberOnce();
+    // The two misconfigurations worth naming, as `cmdLoginTestUser` in headless.ts names them: say
+    // the fix, and name only settings. 404 is also the ONLY way to learn the feature is off --
+    // /v1/discovery does not advertise test users, so the profile gate above cannot tell.
+    if (err instanceof ApiError && err.status === 404) {
+      c.io.err(
+        'sbx: login failed: this control plane has no test users ' +
+          '(set SH_TEST_USERS on it to enable them)',
+      );
+      return SBX_EXIT.failed;
+    }
+    if (err instanceof ApiError && err.code === 'unauthorized') {
+      c.io.err(
+        'sbx: login failed: the test-user secret was refused ' +
+          "(MOCA_TEST_USER_SECRET must match the control plane's SH_TEST_USER_SECRET)",
+      );
+      return SBX_EXIT.failed;
+    }
+    return loginFailed(c, err);
   }
 }
 
@@ -302,23 +397,52 @@ export async function cmdLogout(c: SbxCtx): Promise<number> {
 
 const when = (epochS: number) => new Date(epochS * 1000).toISOString();
 
+/**
+ * A table: the header, then the rows (cells already sanitized), each column as wide as its widest
+ * cell so a long value cannot shift the columns after it, two spaces apart; the last column is not
+ * padded, so no line ends in spaces.
+ */
+export function columns(header: string[], rows: string[][]): string {
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
+  const line = (cells: string[]) =>
+    cells.map((v, i) => (i < cells.length - 1 ? v.padEnd(widths[i]!) : v)).join('  ') + '\n';
+  return [header, ...rows].map(line).join('');
+}
+
 export async function cmdTemplates(c: SbxCtx): Promise<number> {
   try {
     const ts = await c.api.listTemplates();
-    if (c.json) c.io.out(JSON.stringify(ts) + '\n');
-    else {
-      for (const t of ts) {
-        // Readiness and tags (template lifecycle spec §4) when the control plane sends them; an
-        // older one sends neither, and the line is as before.
-        const ready =
-          typeof t.readiness === 'string' ? `${sanitizeRemote(t.readiness).padEnd(9)} ` : '';
-        const tags = t.tags ? Object.keys(t.tags).sort().map(sanitizeRemote) : [];
-        c.io.out(
-          `${sanitizeRemote(t.id).padEnd(16)} ${ready}${sanitizeRemote(t.description)}` +
-            `${tags.length ? `  tags ${tags.join(',')}` : ''}\n`,
-        );
-      }
+    if (c.json) {
+      c.io.out(JSON.stringify(ts) + '\n');
+      return SBX_EXIT.ok;
     }
+    // No header for an empty list, so "nothing" stays empty output.
+    if (ts.length === 0) return SBX_EXIT.ok;
+    // READINESS and TAGS (template lifecycle spec §4) when the control plane sends them; an older
+    // one sends neither, and the table is ID and DESCRIPTION. DESCRIPTION, free text, comes last.
+    const withReadiness = ts.some((t) => typeof t.readiness === 'string');
+    const withTags = ts.some((t) => t.tags !== undefined);
+    const header = [
+      'ID',
+      ...(withReadiness ? ['READINESS'] : []),
+      ...(withTags ? ['TAGS'] : []),
+      'DESCRIPTION',
+    ];
+    const rows = ts.map((t) =>
+      [
+        t.id,
+        ...(withReadiness ? [typeof t.readiness === 'string' ? t.readiness : '-'] : []),
+        ...(withTags
+          ? [
+              Object.keys(t.tags ?? {})
+                .sort()
+                .join(',') || '-',
+            ]
+          : []),
+        t.description,
+      ].map(sanitizeRemote),
+    );
+    c.io.out(columns(header, rows));
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);
@@ -404,21 +528,45 @@ export async function cmdTransferTemplate(c: SbxCtx, id: string, owner: string):
 /** How long `sbx create` and `sbx up` wait for a template to become active (§6.4) before giving up. */
 const ACTIVATION_WAIT_MS = 10 * 60_000;
 
+/** ` named eager-hopper`, or nothing for a record with no name (a control plane that dropped it). */
+export const namedText = (s: { name?: string | null }): string =>
+  s.name ? ` named ${sanitizeRemote(s.name)}` : '';
+
+/** Tries at a default name before a `name_conflict` is the user's to see. */
+const NAME_TRIES = 5;
+
 /**
  * Creates a sandbox, waiting while its template activates (template lifecycle spec §6.4): a
  * `409 template_not_active` means the control plane has started the activation (or, with no lease
  * to take, is waiting for a host), so the create is retried after its Retry-After, saying why, until
- * ACTIVATION_WAIT_MS. Any other refusal is thrown.
+ * ACTIVATION_WAIT_MS. With no name given, one is made up (`adjective-surname`), and a
+ * `409 name_conflict` on it is retried with another, up to NAME_TRIES: the user did not pick it, so
+ * a clash is not theirs to fix. A name the user gave stays theirs: its clash is thrown. Any other
+ * refusal is thrown.
  */
 export async function createWaitingForActivation(
   c: SbxCtx,
-  body: { template: string; name?: string; labels?: Record<string, string> },
+  given: { template: string; name?: string; labels?: Record<string, string> },
 ): Promise<SbxSandbox & { buildId?: string | null; templateManifestHash?: string | null }> {
   const start = c.rt.now();
+  const madeUp = given.name === undefined;
+  const named = () => (madeUp ? { ...given, name: sandboxName(c.random) } : given);
+  let body = named();
+  let nameTries = 1;
   for (;;) {
     try {
       return await c.api.createSandbox(body);
     } catch (err) {
+      if (
+        madeUp &&
+        err instanceof ApiError &&
+        err.code === 'name_conflict' &&
+        nameTries < NAME_TRIES
+      ) {
+        nameTries += 1;
+        body = named();
+        continue;
+      }
       if (!(err instanceof ApiError && err.status === 409 && err.code === 'template_not_active'))
         throw err;
       const left = ACTIVATION_WAIT_MS - (c.rt.now() - start);
@@ -449,7 +597,7 @@ export async function cmdCreate(
     const s = await createWaitingForActivation(c, body);
     const id = sanitizeRemote(s.id);
     c.io.err(
-      `created ${id} (${sanitizeRemote(s.template)}), expires ${when(s.expiresAt)}${afterText(s)}`,
+      `created ${id}${namedText(s)} (${sanitizeRemote(s.template)}), expires ${when(s.expiresAt)}${afterText(s)}`,
     );
     // A control plane from before modes ignores the body's mode: say so, never a silent per-exec.
     if (body.mode !== undefined && s.mode !== body.mode) {
@@ -543,31 +691,105 @@ function stateText(s: SbxSandbox): string {
   return s.reason ? `terminated (${s.reason})` : 'terminated';
 }
 
-export async function cmdLs(c: SbxCtx, all: boolean): Promise<number> {
+/**
+ * A sandbox name as the control plane accepts one at create (`sandbox-handlers.ts` NAME_RE).
+ * Checked before the name is looked up, so an argument that is neither an id nor a name (a path,
+ * say) is a usage error with no request made.
+ */
+export const SANDBOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * The id of the caller's live sandbox named `name` (`create --name`/`up --name`), or the exit
+ * code after saying why there is none. The control plane keeps names unique among one owner's
+ * live sandboxes, so one match is the answer; a terminated one of the name is not (it takes no
+ * more commands, and a new one may reuse its name). The match's id is checked as an id typed
+ * would be: it goes into URLs, the flight recorder's file name and Codex's TOML override.
+ */
+export async function resolveSandboxName(c: SbxCtx, name: string): Promise<string | number> {
+  let ss: SbxSandbox[];
   try {
-    const ss = await c.api.listSandboxes({ all });
+    ss = await c.api.listSandboxes();
+  } catch (err) {
+    return failed(c, err);
+  }
+  const live = ss.filter((s) => s.name === name && s.state === 'ready');
+  if (live.length === 1) {
+    const found = live[0]!.id;
+    if (SANDBOX_ID_RE.test(found)) return found;
+    c.io.err(
+      `sbx: the control plane answered '${sanitizeRemote(name)}' with '${sanitizeRemote(found)}', which is not a sandbox id (sbx-…)`,
+    );
+    return SBX_EXIT.failed;
+  }
+  if (live.length === 0) {
+    c.io.err(`sbx: you have no live sandbox named '${sanitizeRemote(name)}' (see mocactl sbx ls)`);
+  } else {
+    const ids = live.map((s) => sanitizeRemote(s.id)).join(', ');
+    c.io.err(
+      `sbx: more than one live sandbox is named '${sanitizeRemote(name)}': ${ids}; use its id`,
+    );
+  }
+  return SBX_EXIT.failed;
+}
+
+/**
+ * EXPIRES: a live sandbox's deadline, `in 6 d`; an ended one's end, `ended 2 h ago`, or just
+ * `ended` when the record says no end time and its deadline is still ahead (a control plane that
+ * leaves terminatedAt null), rather than a time it cannot know.
+ */
+function expiryText(s: SbxSandbox, nowS: number): string {
+  if (s.state !== 'terminated') {
+    // A live record past its deadline is clock skew: the control plane's state wins.
+    return relativeText(Math.max(s.expiresAt, nowS), nowS);
+  }
+  const end = s.terminatedAt ?? (s.expiresAt <= nowS ? s.expiresAt : undefined);
+  return end === undefined ? 'ended' : `ended ${relativeText(Math.min(end, nowS), nowS)}`;
+}
+
+/**
+ * `sbx ls`. A deleted sandbox is left out, in the table and in --json alike, unless
+ * `includeDeleted`: it was ended on purpose, so it is noise in a list of what one has. An expired
+ * one stays, since nobody chose to end it. EXPIRES is relative: a live sandbox's deadline, an
+ * ended one's end. The idle lifetime is `sbx get`'s.
+ */
+export async function cmdLs(
+  c: SbxCtx,
+  all: boolean,
+  o: { includeDeleted?: boolean } = {},
+): Promise<number> {
+  try {
+    const ss = (await c.api.listSandboxes({ all })).filter(
+      (s) => o.includeDeleted || !(s.state === 'terminated' && s.reason === 'deleted'),
+    );
     if (c.json) {
       c.io.out(JSON.stringify(ss) + '\n');
       return SBX_EXIT.ok;
     }
-    for (const s of ss) {
-      // Sanitized before padding, so stripped control characters cannot skew the columns.
-      const cell = (v: string, width = 0) => sanitizeRemote(v).padEnd(width);
-      const expiry =
-        when(s.expiresAt) +
-        (validLifetime(s.idleLifetimeS) ? ` (${lifetimeText(s.idleLifetimeS)})` : '');
-      const row = [
-        cell(s.id, 30),
-        cell(s.name ?? '-', 16),
-        cell(s.template, 12),
-        cell(s.mode, 15),
-        cell(stateText(s), 22),
-        // Padded (24-character date, 12 for the longest ` (2591999 s)`) only to align the owner.
-        all ? cell(expiry, 36) : expiry,
-        ...(all ? [cell(s.owner)] : []),
-      ].join(' ');
-      c.io.out(row + '\n');
-    }
+    const nowS = Math.floor((c.now ?? c.rt.now)() / 1000);
+    // No header for an empty list, so "nothing" stays empty output.
+    if (ss.length === 0) return SBX_EXIT.ok;
+    const header = [
+      'ID',
+      'NAME',
+      'TEMPLATE',
+      'MODE',
+      'STATE',
+      'EXPIRES',
+      ...(all ? ['OWNER'] : []),
+    ];
+    // Sanitized before measuring, so stripped control characters cannot skew the columns.
+    const rows = ss.map((s) =>
+      [
+        s.id,
+        s.name ?? '-',
+        s.template,
+        s.mode,
+        stateText(s),
+        expiryText(s, nowS),
+        ...(all ? [s.owner] : []),
+      ].map(sanitizeRemote),
+    );
+    c.io.out(columns(header, rows));
     return SBX_EXIT.ok;
   } catch (err) {
     return failed(c, err);

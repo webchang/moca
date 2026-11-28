@@ -38,6 +38,12 @@ Other messages:
 
 - **"not enrolled"**: your GitHub account is not on the service's list, or was removed. Send your
   operator the `github:<id>` in the message.
+- **A stored-credential service answers `401` or `403`**: the credential the proxy injects is
+  stale — a token past its expiry or revoked at the service (a service-account token past its
+  `--duration`, say). The injection itself worked: the request reached the service carrying your
+  token and the service refused it. Mint a fresh token and store it again under the same name; if
+  the answer is `502 upstream_unverified` instead, that is your operator's to fix (the service's
+  CA is not trusted upstream). See [Use credentials](egress-credentials.md).
 - **"sandbox failure: … no live worker for sandbox …"** (this is what "template unavailable" looks
   like today): the template's worker is not attached, usually because the KVM host is down or being
   maintained. Nothing you can fix; tell your operator, and wait.
@@ -87,7 +93,7 @@ Other messages:
   `--trust`. Prefer the former: `--trust` takes the default grant without showing you what it is.
 - **Bob reports a missing compiler** (`go: command not found` and the like): the templates carry
   only the Pi toolchain, and anything more installs only on a template with egress, from a host on
-  the allowlist. See `mocactl sbx templates`, and [IBM Bob](connect-agents.md#ibm-bob).
+  the allowlist. See `mocactl sbx templates ls`, and [IBM Bob](connect-agents.md#ibm-bob).
 - **Codex edits files on your laptop instead of in the sandbox**: check you started it with
   `mocactl sbx codex` (or the `-c mcp_servers.sandbox=…` line), and that `/mcp` in the TUI lists
   the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code,

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
-import { USAGE, main } from '../src/cli.js';
+import { SUMMARY, USAGE, main } from '../src/cli.js';
 import type { Io } from '../src/headless.js';
 import type { Runtime } from '../src/runtime.js';
 import { ApiError } from '../src/api/errors.js';
@@ -28,10 +28,59 @@ const fakeBuild = (..._args: unknown[]) =>
   ({ endpoints: {}, config: {}, auth: null }) as unknown as Runtime;
 
 describe('main', () => {
-  it('prints usage for --help', async () => {
+  it('prints the summary for --help and for bare mocactl, reading no config', async () => {
+    for (const argv of [['--help'], []]) {
+      const o = io();
+      const build = vi.fn(fakeBuild);
+      const start = vi.fn((..._args: unknown[]) => Promise.resolve(0));
+      expect(await main(argv, {}, o, { buildRuntime: build, startInteractive: start })).toBe(0);
+      const out = o.outs.join('');
+      expect(out).toContain(SUMMARY);
+      expect(out).toMatch(/^mocactl provides a harness service and a sandbox service/);
+      expect(out).not.toContain('--endpoint URL'); // one line per command, not every flag
+      expect(build).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    }
+  });
+
+  it('lists every top-level command of USAGE in the summary', () => {
+    const commands = new Set(
+      [...USAGE.matchAll(/^ {2}mocactl ([a-z][a-z-]*)/gm)].map((m) => m[1]!),
+    );
+    for (const c of commands) expect(SUMMARY).toMatch(new RegExp(`^ {2}${c} `, 'm'));
+  });
+
+  it('refuses a command-only flag on bare mocactl, as before the summary', async () => {
+    for (const argv of [
+      ['--all'],
+      ['--json'],
+      ['--record', 'F'],
+      ['--config', 'd'],
+      ['--tag', 't'],
+    ]) {
+      const o = io();
+      const build = vi.fn(fakeBuild);
+      expect(await main(argv, {}, o, { buildRuntime: build })).toBe(2);
+      expect(o.errs.join('\n')).toContain(`${argv[0]} needs a command`);
+      expect(o.outs).toEqual([]);
+      expect(build).not.toHaveBeenCalled();
+    }
+    // The URLs every command takes are not refused: bare mocactl still prints the summary.
     const o = io();
-    expect(await main(['--help'], {}, o, { buildRuntime: fakeBuild })).toBe(0);
-    expect(o.outs.join('')).toContain(USAGE);
+    expect(
+      await main(['--control-plane-url', 'http://cp'], {}, o, { buildRuntime: fakeBuild }),
+    ).toBe(0);
+    expect(o.outs.join('')).toContain(SUMMARY);
+  });
+
+  it('points --setup and --no-animation without harness at mocactl harness', async () => {
+    for (const argv of [['--setup'], ['--no-animation'], ['sessions', '--setup']]) {
+      const o = io();
+      const start = vi.fn((..._args: unknown[]) => Promise.resolve(0));
+      expect(await main(argv, {}, o, { buildRuntime: fakeBuild, startInteractive: start })).toBe(2);
+      expect(o.errs.join('\n')).toContain('only applies to `mocactl harness`');
+      expect(start).not.toHaveBeenCalled();
+    }
   });
 
   it('COMMAND --help prints only that command, with the flags every command takes', async () => {
@@ -56,8 +105,9 @@ describe('main', () => {
     const run = await help('run', 'hello');
     expect(run).toContain('mocactl run "prompt" --record F');
     expect(run).not.toContain('mocactl spawn');
-    // Nothing named: the whole usage.
-    expect(await help('nonsense')).toContain(USAGE);
+    // Nothing named: the summary.
+    expect(await help('nonsense')).toContain(SUMMARY);
+    expect(await help('harness')).toContain('mocactl harness [--setup] [--no-animation]');
   });
 
   it("a usage error shows the failed command's help, not every command's", async () => {
@@ -73,17 +123,59 @@ describe('main', () => {
     expect(o2.errs.join('\n')).not.toContain('mocactl credentials');
   });
 
-  it('prints the version for --version and -V, reading no config and no network', async () => {
+  it('prints only the version for --version and -V when no control plane is configured', async () => {
+    const env = { XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'mocactl-version-')) };
     for (const flag of ['--version', '-V']) {
       const o = io();
-      const build = vi.fn(fakeBuild);
-      expect(await main([flag], {}, o, { buildRuntime: build })).toBe(0);
+      const fetchImpl = vi.fn(() => Promise.reject(new Error('no network expected')));
+      expect(await main([flag], env, o, { fetchImpl: fetchImpl as typeof fetch })).toBe(0);
       // Under vitest (as under tsx) no build defined MOCACTL_VERSION: a source checkout names its
       // commit, and plain `dev` is left where git can't say (a source tarball).
-      expect(o.outs.join('')).toMatch(/^dev(-[0-9a-f]{8}(-dirty)?)?\n$/);
+      expect(o.outs.join('')).toMatch(/^CLI version: dev(-[0-9a-f]{8}(-dirty)?)?\n$/);
       expect(o.errs).toEqual([]);
-      expect(build).not.toHaveBeenCalled();
+      expect(fetchImpl).not.toHaveBeenCalled();
     }
+  });
+
+  it("adds each configured control plane's version and URL, or unreachable", async () => {
+    const env = {
+      XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'mocactl-version-')),
+      SH_CONTROL_PLANE_URL: 'http://cp.example.invalid',
+      MOCACTL_SBX_URL: 'http://sbx.example.invalid',
+    };
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url === 'http://cp.example.invalid/v1/discovery') {
+        return Response.json({ harnessUrl: null, sandboxTiers: null, version: 'v1.2.3' });
+      }
+      throw new TypeError('fetch failed');
+    });
+    const o = io();
+    expect(await main(['--version'], env, o, { fetchImpl: fetchImpl as typeof fetch })).toBe(0);
+    const lines = o.outs.join('').split('\n');
+    expect(lines[0]).toMatch(/^CLI version: dev(-[0-9a-f]{8}(-dirty)?)?$/);
+    expect(lines.slice(1)).toEqual([
+      'control plane:         v1.2.3 (http://cp.example.invalid)',
+      'sandbox control plane: unreachable (http://sbx.example.invalid)',
+      '',
+    ]);
+    expect(o.errs).toEqual([]);
+  });
+
+  it('says so when a control plane answers without a version', async () => {
+    const env = {
+      XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'mocactl-version-')),
+      MOCACTL_SBX_URL: 'http://sbx.example.invalid',
+    };
+    const fetchImpl = vi.fn(async () =>
+      Response.json({ profile: 'sandbox', execEndpoint: 'x:443' }),
+    );
+    const o = io();
+    expect(await main(['-V'], env, o, { fetchImpl: fetchImpl as typeof fetch })).toBe(0);
+    expect(o.outs.join('').split('\n').slice(1)).toEqual([
+      'sandbox control plane: version unknown (http://sbx.example.invalid)',
+      '',
+    ]);
   });
 
   it('lists --version in the usage', () => {
@@ -170,19 +262,29 @@ describe('main', () => {
     });
   });
 
-  it('hands the no-command case to startInteractive', async () => {
+  it('hands mocactl harness to startInteractive', async () => {
     const start = vi.fn((..._args: unknown[]) => Promise.resolve(0));
     expect(
-      await main(['--setup'], {}, io(), { buildRuntime: fakeBuild, startInteractive: start }),
+      await main(['harness', '--setup'], {}, io(), {
+        buildRuntime: fakeBuild,
+        startInteractive: start,
+      }),
     ).toBe(0);
     expect(start.mock.calls[0][1]).toEqual({ setup: true, noAnimation: false });
+    expect(
+      await main(['harness', 'extra'], {}, io(), {
+        buildRuntime: fakeBuild,
+        startInteractive: start,
+      }),
+    ).toBe(2);
+    expect(start).toHaveBeenCalledTimes(1);
   });
 
   it('refuses the interactive UI without a terminal, pointing at run', async () => {
     const start = vi.fn((..._args: unknown[]) => Promise.resolve(0));
     const o = io();
     expect(
-      await main([], {}, o, {
+      await main(['harness'], {}, o, {
         buildRuntime: fakeBuild,
         startInteractive: start,
         stdinIsTTY: false,
@@ -513,6 +615,101 @@ describe('spawn / subagents / get', () => {
       ref: 'main',
       tag: 'parent-1',
     });
+  });
+
+  it('approve / reject route the sessionId, --gate and --feedback through to cmdDecide', async () => {
+    const stub = vi.fn(async (..._a: unknown[]) => 0);
+    const mod = await import('../src/subagent.js');
+    const spy = vi.spyOn(mod, 'cmdDecide').mockImplementation(stub);
+    onTestFinished(() => spy.mockRestore());
+    expect(
+      await main(['approve', 'sess-1', '--gate', '0'], {}, io(), { buildRuntime: fakeBuild }),
+    ).toBe(0);
+    // Gate ids count from 0, so `--gate 0` must survive the parse.
+    expect(stub.mock.calls[0][2]).toMatchObject({
+      sessionId: 'sess-1',
+      action: 'approve',
+      gateId: 0,
+    });
+    expect(
+      await main(['reject', 'sess-1', '--feedback', 'use git log'], {}, io(), {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(0);
+    expect(stub.mock.calls[1][2]).toMatchObject({
+      sessionId: 'sess-1',
+      action: 'reject',
+      feedback: 'use git log',
+    });
+    expect(stub.mock.calls[1][2]).not.toHaveProperty('gateId');
+  });
+
+  it('refuses a non-numeric --gate, a missing sessionId, and --gate outside approve/reject', async () => {
+    const mod = await import('../src/subagent.js');
+    const spy = vi.spyOn(mod, 'cmdDecide');
+    onTestFinished(() => spy.mockRestore());
+    const o = io();
+    expect(
+      await main(['approve', 'sess-1', '--gate', 'first'], {}, o, {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(2);
+    expect(o.errs.join('\n')).toContain('--gate must be a whole gate number');
+    expect(await main(['approve'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
+    expect(await main(['approve', 'a', 'b'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
+    const o2 = io();
+    expect(await main(['get', 's', '--gate', '1'], {}, o2, { buildRuntime: fakeBuild })).toBe(2);
+    expect(o2.errs.join('\n')).toContain('--gate only applies to');
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('follow-up routes both positionals and --out through to cmdFollowUp', async () => {
+    const stub = vi.fn(async (..._a: unknown[]) => 0);
+    const mod = await import('../src/subagent.js');
+    const spy = vi.spyOn(mod, 'cmdFollowUp').mockImplementation(stub);
+    onTestFinished(() => spy.mockRestore());
+    expect(
+      await main(['follow-up', 'sess-1', 'and now this', '--out', '/tmp/x'], {}, io(), {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(0);
+    expect(stub.mock.calls[0][2]).toMatchObject({
+      sessionId: 'sess-1',
+      prompt: 'and now this',
+      outDir: '/tmp/x',
+    });
+    // The prompt is the second positional, so a missing one is usage, not an empty follow-up.
+    expect(await main(['follow-up', 'sess-1'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
+    expect(await main(['follow-up', 'a', 'b', 'c'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
+    expect(stub).toHaveBeenCalledTimes(1);
+  });
+
+  it('--out applies to get and follow-up, and nothing else', async () => {
+    const o = io();
+    expect(await main(['subagents', '--out', '/tmp/x'], {}, o, { buildRuntime: fakeBuild })).toBe(
+      2,
+    );
+    expect(o.errs.join('\n')).toContain(
+      '--out only applies to `mocactl get` and `mocactl follow-up`',
+    );
+  });
+
+  it('--require-approval reaches cmdSpawn, and only on spawn', async () => {
+    const stub = vi.fn(async (..._a: unknown[]) => 0);
+    const mod = await import('../src/subagent.js');
+    const spy = vi.spyOn(mod, 'cmdSpawn').mockImplementation(stub);
+    onTestFinished(() => spy.mockRestore());
+    expect(
+      await main(['spawn', 'p', '--kind', 'prompt', '--require-approval'], {}, io(), {
+        buildRuntime: fakeBuild,
+      }),
+    ).toBe(0);
+    expect(stub.mock.calls[0][2]).toMatchObject({ requireApproval: true });
+    const o = io();
+    expect(await main(['run', 'p', '--require-approval'], {}, o, { buildRuntime: fakeBuild })).toBe(
+      2,
+    );
+    expect(o.errs.join('\n')).toContain('--require-approval only applies to');
   });
 
   it('spawn refuses an invalid --kind at the CLI level (never reaches cmdSpawn)', async () => {

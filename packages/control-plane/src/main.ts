@@ -30,6 +30,7 @@ import {
   adminSubjectsFromEnv,
   INSTALLER_SUBJECT,
   GithubOAuthProvider,
+  namesEnrolledTestUser,
   TestUserProvider,
   testUsersFromEnv,
   testUserSecretFromEnv,
@@ -46,6 +47,7 @@ import { keyIdFor, makeSigner, parseKeyset, publicKeyFromBase64 } from './token.
 import { resolveVersion } from './version.js';
 import { VaultCredentialStore, vaultTokenSource } from './vault-store.js';
 import { withCredentials } from './systemd-credentials.js';
+import { relayReleaseFromEnv } from './relay-release.js';
 import { parseSandboxTiers } from './sandbox-tiers.js';
 import {
   routeProfileFromEnv,
@@ -59,8 +61,12 @@ import { refuseMisnamedIdentityProvider } from './identity-switch.js';
 import { TurnStore } from './turn-store.js';
 import { resultTtlSeconds, TURN_RECORD_TTL_MARGIN_SECONDS } from './turn-record.js';
 import { RedisTurnQueue } from './turn-queue.js';
+import { startGateSweep } from './gate-sweep.js';
 import { guardSchemaVersion } from './schema-version.js';
 import type { ResultRedisLike } from './turn-result.js';
+import { parseDestination } from './egress-destination.js';
+import { NotifyStore } from './notify-store.js';
+import { startNotifySweep } from './notify-sweep.js';
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const v = env[name];
@@ -81,17 +87,22 @@ function intEnv(env: NodeJS.ProcessEnv, name: string, def: number): number {
  * An optional absolute http(s) URL, trailing slashes dropped. A malformed value fails STARTUP: a
  * control plane advertising a harness URL no client can use would fail every user's first turn.
  */
-function urlEnv(env: NodeJS.ProcessEnv, name: string): string | undefined {
+function urlEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  protocols: readonly string[] = ['http:', 'https:'],
+): string | undefined {
   const v = env[name];
   if (!v) return undefined;
+  const label = protocols.length === 1 ? protocols[0]!.replace(':', '') : 'http(s)';
   let u: URL;
   try {
     u = new URL(v);
   } catch {
-    throw new Error(`${name} must be an absolute http(s) URL, got "${v}"`);
+    throw new Error(`${name} must be an absolute ${label} URL, got "${v}"`);
   }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:')
-    throw new Error(`${name} must be an absolute http(s) URL, got "${v}"`);
+  if (!protocols.includes(u.protocol))
+    throw new Error(`${name} must be an absolute ${label} URL, got "${v}"`);
   let end = v.length;
   // A loop, not /\/+$/: that regex is quadratic on a long run of slashes (CodeQL js/polynomial-redos).
   while (end > 0 && v.charCodeAt(end - 1) === 0x2f) end--;
@@ -118,6 +129,17 @@ function countEnv(env: NodeJS.ProcessEnv, name: string, def: number): number {
   if (!/^(0|[1-9][0-9]*)$/.test(v))
     throw new Error(`${name} must be a non-negative integer, got "${v}"`);
   return Number(v);
+}
+
+/**
+ * Like countEnv, but 0 refuses to boot: unlike the async quota, 0 reads as "unlimited" to an
+ * operator for these two notification settings, and taking it literally would silently mute every
+ * owner forever.
+ */
+function positiveCountEnv(env: NodeJS.ProcessEnv, name: string, def: number): number {
+  const n = countEnv(env, name, def);
+  if (n === 0) throw new Error(`${name} must not be 0: 0 would mute every subject permanently`);
+  return n;
 }
 
 function turnRecordTtlFromEnv(env: NodeJS.ProcessEnv): number {
@@ -194,6 +216,41 @@ function catalogHostsEnv(env: NodeJS.ProcessEnv): string[] {
     out.push(h);
   }
   return out;
+}
+
+/**
+ * `MOCA_NOTIFY_ALLOW`: the destinations a subject's notification sink may point at (#394).
+ * Comma-separated `host[:port][/prefix]`, parsed by the same `parseDestination` the egress
+ * allowlist uses. UNSET MEANS NOTIFICATIONS ARE OFF, and `PUT /v1/notifications` says so by name:
+ * this is the only SSRF control on a user-supplied URL the control plane fetches, so it is
+ * fail-closed. A malformed entry refuses to boot.
+ */
+function notifyFromEnv(env: NodeJS.ProcessEnv): CpConfig['notify'] {
+  const allow = (env.MOCA_NOTIFY_ALLOW ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+    .map((entry) => {
+      try {
+        return parseDestination(entry);
+      } catch (err) {
+        throw new Error(
+          `MOCA_NOTIFY_ALLOW entries must be host[:port][/prefix], got "${entry}": ${String(err)}`,
+        );
+      }
+    });
+  // https: only, and validated rather than merely trimmed: a scheme-less typo would otherwise ship
+  // as a non-navigable link inside every notification. Unset = no link, which is correct for a
+  // deployment the phone cannot reach.
+  const baseUrl = urlEnv(env, 'MOCA_NOTIFY_BASE_URL', ['https:']);
+  return {
+    allow,
+    ...(baseUrl ? { baseUrl } : {}),
+    // 0 is meaningful here: no minimum spacing between deliveries.
+    minIntervalS: countEnv(env, 'MOCA_NOTIFY_MIN_INTERVAL_S', 5),
+    perHour: positiveCountEnv(env, 'MOCA_NOTIFY_PER_HOUR', 60),
+    failMax: positiveCountEnv(env, 'MOCA_NOTIFY_FAIL_MAX', 10),
+  };
 }
 
 export function portFromEnv(env: NodeJS.ProcessEnv): number {
@@ -294,7 +351,7 @@ export function checkGrantRedemption(
  * (`LoadCredential=`, MI1 §6.7) rather than an env line; everywhere else, as today, from the env.
  */
 // prettier-ignore
-export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN', 'SH_INSTALLER_TOKEN', 'SH_TEST_USER_SECRET', 'SH_OIDC_CLIENT_SECRET', 'MOCA_GRANT_SIGNING_KEY'] as const;
+export const CONTROL_PLANE_SECRETS = ['SH_SESSION_TOKEN_PRIVATE_KEY', 'SH_CREDENTIAL_KEK', 'SH_EXCHANGE_TOKEN', 'SH_OPERATOR_INFERENCE_TOKEN', 'SH_JANITOR_TOKEN', 'SH_INSTALLER_TOKEN', 'SH_TEST_USER_SECRET', 'SH_OIDC_CLIENT_SECRET', 'MOCA_GRANT_SIGNING_KEY', 'MOCA_RELAY_RELEASE_TOKEN'] as const;
 
 /** The API, session and refresh token lifetimes, shared by both route profiles. */
 function tokenTtlsFromEnv(
@@ -335,6 +392,11 @@ function grantTtlsFromEnv(env: NodeJS.ProcessEnv): Pick<CpConfig, 'grantTtlS' | 
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
+  // #338: the relay's control listener, on every profile; checked here, at boot, like the rest.
+  return withRelayRelease(env, profileConfigFromEnv(env));
+}
+
+function profileConfigFromEnv(env: NodeJS.ProcessEnv): CpConfig {
   required(env, 'SH_SESSION_TOKEN_PRIVATE_KEY');
   // Before SH_IDENTITY_PROVIDER is read here or in identityProviderFromEnv: a misspelled name
   // would otherwise leave it unset and serve github (#723).
@@ -374,6 +436,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     // Async fan-out: the only containment against unbounded fan-out in M1 (spec §4.3). Counts
     // NON-TERMINAL turns per owner, enforced before the enqueue.
     asyncQueuedPerOwner: countEnv(env, 'MOCA_ASYNC_QUEUED_PER_OWNER', 50),
+    // 0 = no deadline (#393 §3). A gate that expires decides for the owner, so opting in is the
+    // deployment's call; a submission may ask for a tighter one but never a longer.
+    gateDeadlineS: countEnv(env, 'MOCA_GATE_DEADLINE_S', 0),
     // The control plane reads MOCA_TENANCY for the first time here. readTenancy throws on a
     // near-miss NAME, so a control-plane env with a misspelled switch now fails to boot -- the same
     // contract the worker has had, and the point of the check.
@@ -383,6 +448,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
     // Where a worker spends an inference grant (MI1 §6.3). Only the harness profile reads it: the
     // sandbox profile returns above and serves no turns.
     inferenceUrl: inferenceUrlFromEnv(env),
+    // #394: notifications stay off (fail-closed) until MOCA_NOTIFY_ALLOW is set.
+    notify: notifyFromEnv(env),
   };
   // Validated at startup even though only the provider uses it: a deployment with
   // SH_TEST_USERS set and no secret must fail to boot, not serve an unguarded login path.
@@ -395,10 +462,17 @@ export function configFromEnv(env: NodeJS.ProcessEnv): CpConfig {
 /**
  * Combined control plane spec §3.5: everything the harness profile requires (above) AND the sandbox
  * profile's own settings, each refusal naming what is missing. Test users may stay (they log in and
- * use sessions; the sandbox routes refuse them, §3.2). The template list is the one list both read.
+ * use sessions; the sandbox routes refuse them unless SH_SANDBOX_TEST_USERS_ENROLLED enrols the
+ * range, §3.2). The template list is the one list both read.
  */
 function combinedProfileConfig(env: NodeJS.ProcessEnv, harness: CpConfig): CpConfig {
   const sandbox = sandboxConfigFromEnv(env, { kekIsShared: true });
+  // Enrolling a range nobody can log in as would be a silently dead setting: the sandbox routes
+  // would admit test:1..N while /v1/auth/test-user refuses every one of them (ADR-0045). Name both
+  // variables, neither value.
+  if (sandbox.testUsersEnrolled && harness.testUsers <= 0) {
+    throw new Error('SH_SANDBOX_TEST_USERS_ENROLLED needs SH_TEST_USERS: no test user can log in');
+  }
   // The members routes are served on this profile too, so the installer's bearer is read as on
   // the sandbox profile (#938).
   const installerToken = installerTokenFromEnv(env);
@@ -458,16 +532,16 @@ function testUserProvider(
  * settings, so none is required; the harness-only fields take inert values that no mounted route reads.
  */
 function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
-  // ADR-0045: the sandbox profile admits only ENROLLED subjects (SBX0 §4.2, SH_ALLOWED_SUBJECTS,
-  // whose entries match SUBJECT_RE -- github: or oidc:). A synthetic `test:N` subject can never be
-  // enrolled there, so rather than serve a route that always refuses, refuse to boot and say which
-  // two settings conflict.
-  if (testUsersFromEnv(env.SH_TEST_USERS) > 0) {
-    throw new Error(
-      'SH_TEST_USERS cannot be used on the sandbox profile: it admits only enrolled ' +
-        'github:/oidc: subjects (SH_ALLOWED_SUBJECTS)',
-    );
-  }
+  // ADR-0045 originally refused test users here, on the grounds that this profile admits only
+  // ENROLLED subjects and a synthetic test:<n> could never be one. That second half is what
+  // changed: SH_ALLOWED_SUBJECTS validates with SUBJECT_RE, which admits test:<n>, and
+  // SH_SANDBOX_TEST_USERS_ENROLLED enrols the whole range, so a test user CAN be enrolled here --
+  // and an sbx-only stack is exactly where browser-free multi-user testing is wanted.
+  //
+  // What did not change is the gate: enrollment is this profile's only authentication, so a test
+  // login that is not enrolled is refused at login, not merely at the sandbox routes
+  // (isEnrolled, sandbox-config.ts). Turning the range on therefore hands every holder of
+  // SH_TEST_USER_SECRET a working account, which is why it stays opt-in and dev/test only.
   const sandbox = sandboxConfigFromEnv(env);
   const installerToken = installerTokenFromEnv(env);
   const config: CpConfig = {
@@ -491,12 +565,57 @@ function sandboxProfileConfig(env: NodeJS.ProcessEnv): CpConfig {
     bundleSubjectBytes: 0,
     bundleTotalBytes: 0,
     version: resolveVersion(env),
-    testUsers: 0,
+    // ADR-0045 on this profile too: the count mounts the login route (routes.ts `feature`) and
+    // bounds which test:<n> subjects exist. The secret is required once the count is positive --
+    // testUserProvider throws without it, at boot.
+    testUsers: testUsersFromEnv(env.SH_TEST_USERS),
     asyncQueuedPerOwner: 0,
+    // The sandbox profile serves no turns, so it gates nothing and sweeps nothing.
+    gateDeadlineS: 0,
     tenancy: 'single',
     turnRecordTtlSeconds: turnRecordTtlFromEnv(env),
     turnSummaryBytes: countEnv(env, 'MOCA_TURN_SUMMARY_BYTES', 2048),
+    // #394: the sandbox profile mounts no notification routes, but still reads the env so a
+    // misconfigured allowlist fails the boot rather than being silently ignored.
+    notify: notifyFromEnv(env),
   };
+  // As on the combined profile (above): a flag that enrols test:1..N means nothing without a
+  // positive count, and silently doing nothing is the failure mode ADR-0045's opt-in exists to
+  // avoid. Named here too rather than only there, because this profile reaches it by another path.
+  if (sandbox.testUsersEnrolled && config.testUsers <= 0) {
+    throw new Error('SH_SANDBOX_TEST_USERS_ENROLLED needs SH_TEST_USERS: no test user can log in');
+  }
+  // And the converse, which is what ADR-0045 refused this pairing OUTRIGHT to avoid: enrollment is
+  // this profile's only authentication, so test users that nothing enrols cannot log in at all --
+  // the route would mount and answer not_enrolled to every call. Carrying test users here is the
+  // change; serving a login path that always refuses is not, and it is the failure that reads as a
+  // broken stack rather than a misconfigured one. Every way out is named, no value is.
+  //
+  // It must ask about enrollment exactly as isEnrolled does, or it refuses a stack that works:
+  // onAllowList admits the allow list OR an admin (sandbox-config.ts), and a test user's roles come
+  // from SH_ADMIN_SUBJECTS (TestUserProvider.principalFor -> rolesFor), so SH_ADMIN_SUBJECTS=test:1
+  // is a third enrolment path -- one users-and-roles.md documents. Hence namesEnrolledTestUser over
+  // both lists, which also bounds the index to 1..N rather than matching the `test:` prefix: a
+  // `test:0` entry enrols nothing, so taking it as enrolment would boot a stack whose every test
+  // login is refused -- the state this guard exists to prevent.
+  const adminSubjects = adminSubjectsFromEnv(env.SH_ADMIN_SUBJECTS);
+  if (
+    config.testUsers > 0 &&
+    !sandbox.testUsersEnrolled &&
+    !namesEnrolledTestUser(sandbox.allowedSubjects, config.testUsers) &&
+    !namesEnrolledTestUser(adminSubjects, config.testUsers)
+  ) {
+    throw new Error(
+      'SH_TEST_USERS on the sandbox profile needs its subjects enrolled, since enrollment is ' +
+        "this profile's login gate: set SH_SANDBOX_TEST_USERS_ENROLLED=true for the whole " +
+        'range, or name test:<n> subjects within the count in SH_ALLOWED_SUBJECTS or ' +
+        'SH_ADMIN_SUBJECTS',
+    );
+  }
+  // Validated here as on the harness profile (configFromEnv above), even though only the provider
+  // reads it: a stack with SH_TEST_USERS and no secret must fail at the same point on both
+  // profiles, not later and elsewhere when testUserProvider is constructed.
+  testUserSecretFromEnv(env.SH_TEST_USER_SECRET, config.testUsers);
   checkRefreshConfig(config);
   return config;
 }
@@ -821,6 +940,7 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
       ttlMarginSeconds: TURN_RECORD_TTL_MARGIN_SECONDS,
     }),
     turnQueue: new RedisTurnQueue(client as unknown as CpRedisLike),
+    notify: new NotifyStore(client as unknown as CpRedisLike),
     // The leaf result store's reader (§4.4). The same client, narrowed to one method: the control
     // plane reads this key and never writes it -- the worker writes it, the cascade deletes it.
     leafResults: client as unknown as ResultRedisLike,
@@ -880,12 +1000,36 @@ export function depsFromEnv(env: NodeJS.ProcessEnv): CpDeps {
   };
 }
 
+/**
+ * The relay control listener's settings (#338), into the config beside the other secrets, on every
+ * profile; absent without SH_RELAY_CONTROL_URL. Its bearer must differ from every other secret this
+ * control plane holds: each of CONTROL_PLANE_SECRETS but itself (so a secret added there is covered
+ * without a change here), and every egress and template host bearer from the config.
+ */
+function withRelayRelease(env: NodeJS.ProcessEnv, config: CpConfig): CpConfig {
+  const relayRelease = relayReleaseFromEnv(env, [
+    ...CONTROL_PLANE_SECRETS.filter((n) => n !== 'MOCA_RELAY_RELEASE_TOKEN')
+      .map((n) => env[n])
+      .filter((v): v is string => !!v),
+    ...(config.sandbox?.egress?.hosts.map((h) => h.token) ?? []),
+    ...(config.templateHosts?.map((h) => h.token) ?? []),
+  ]);
+  return relayRelease ? { ...config, relayRelease } : config;
+}
+
 const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
 if (isMainModule) {
   // Resolved once, into a copy: the secrets never enter process.env, which every kubectl child inherits.
   const env = withCredentials(process.env, CONTROL_PLANE_SECRETS);
   const deps = depsFromEnv(env);
   startControlPlane(deps, portFromEnv(env), hostFromEnv(env));
+  // #393 §3: answers gates nobody answered. Unconditional -- a per-submission `gateDeadlineS` works
+  // with MOCA_GATE_DEADLINE_S unset, so the sweep cannot be gated on the config value. Costs one
+  // ZRANGEBYSCORE per 30 s when no gate is open.
+  startGateSweep(deps);
+  // #394: pushes paused and finished turns to the owner's sinks. With MOCA_NOTIFY_ALLOW unset the
+  // pass returns before it reads the owner index, so an un-opted deployment pays nothing per tick.
+  startNotifySweep(deps);
   // The Redis schema version (#509): written if absent, and the process exits on a newer one once
   // Redis answers. In the background, because this server starts before Redis and waits for it.
   void guardSchemaVersion({

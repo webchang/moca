@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deploy/k8s/setup.sh -- bring up P6 on Kubernetes (docs/specs/2026-10-02-p6-on-kubernetes-slice1-design.md §4).
 #
-#   deploy/k8s/setup.sh --target kind|kind-ci|ocp|ocp-single [--image IMG] [--sandbox-image IMG]
+#   deploy/k8s/setup.sh --target kind|kind-ci|ocp|ocp-single [--profile harness|combined|sandbox]
+#                       [--image IMG] [--sandbox-image IMG]
 #                       [--build|--skip-build] [--tls-cert FILE --tls-key FILE]
 #                       [--relay-tls-cert FILE --relay-tls-key FILE] [--tls-secret NAME]
 #                       [--delete-workload-sandboxes]
@@ -49,13 +50,23 @@
 # sandbox keeps a session's workspace after its last command, as hours, minutes and seconds in that
 # order, e.g. 8h or 1h30m; empty means 8h, as deploy/microvm writes; also mirrored to ConfigMap
 # moca-sandbox-settings in the sandbox namespace, and a change restarts the sandbox pods; #338),
+# SH_RELAY_RELEASE_CONTROL=1 (kind, kind-ci and ocp: the relay's control listener, through which
+# the control plane releases a deleted session's workspace on its worker at once instead of leaving
+# it to the worker's idle reclaim; its release-only bearer, MOCA_RELAY_RELEASE_TOKEN, is generated
+# once into a Secret of its own, moca-relay-release, and its digest rolls the relay and the control
+# plane when it changes; off when unset or empty, and then the relay, its Services and
+# NetworkPolicies render as before, though the control plane's credentials volume names
+# moca-relay-release as an optional source whatever the switch (a one-time change that rolls the
+# control plane with the release that brings it);
+# turning it off leaves the Secret, the sandbox-relay-control Service and its two NetworkPolicies,
+# inert, in place; #338),
 # SH_SOURCE_ONLY=1 (define the functions and stop, for tests).
 #
 # Idempotent: a re-run converges and never rotates a secret. Inputs are sticky: a re-run keeps every
 # setting, --image, --sandbox-image (ocp), SH_SANDBOX_COUNT, SH_P4_SANDBOX_IDS,
 # SH_SANDBOX_DEFAULT_TIER (not kind), SH_SANDBOX_EGRESS_EXCEPT, SH_MODEL_CATALOG_HOSTS,
-# SH_WORKLOAD_SANDBOXES, SH_WORKLOAD_STORAGE_CLASSES, SH_ASYNC_DRAIN, LEAF_RESULT_TTL_SECONDS
-# and, on ocp-single, SH_ROUTE_DOMAIN and
+# SH_WORKLOAD_SANDBOXES, SH_WORKLOAD_STORAGE_CLASSES, SH_ASYNC_DRAIN, LEAF_RESULT_TTL_SECONDS,
+# SH_RELAY_RELEASE_CONTROL and, on ocp-single, SH_ROUTE_DOMAIN and
 # --tls-secret it is not given; an
 # explicitly empty variable (SH_ADMIN_SUBJECTS=) clears it. No secret value is ever put on
 # a command line -- values travel through pipes and through the environment of the one jq that
@@ -110,6 +121,8 @@ ROUTE_DOMAIN=''
 # load_setup_inputs. EGRESS_EXCEPT_GIVEN: the variable was set (even to empty) -- set in parse_args.
 EGRESS_EXCEPT=''
 EGRESS_EXCEPT_GIVEN=''
+# SH_SANDBOX_COUNT was given on this run (not read back from moca-setup) -- set in parse_args.
+SANDBOX_COUNT_GIVEN=''
 # --tls-secret: a preinstalled kubernetes.io/tls Secret to serve the supervisor's Route with,
 # instead of --tls-cert or a generated self-signed one. ocp-single only, and only with Routes.
 TLS_SECRET=''
@@ -117,6 +130,47 @@ TLS_SECRET=''
 # load_setup_inputs; WORKLOAD_SANDBOXES_GIVEN: the variable was set (even to empty).
 WORKLOAD_SANDBOXES=''
 WORKLOAD_SANDBOXES_GIVEN=''
+# SH_RELAY_RELEASE_CONTROL (#338): 1 lists base/relay-release-control, '' does not. Sticky, resolved
+# in load_setup_inputs; RELEASE_CONTROL_GIVEN: the variable was set (even to empty).
+# RELEASE_TOKEN_HASH: a digest of moca-relay-release's data, set by ensure_release_secret.
+RELEASE_CONTROL=''
+RELEASE_CONTROL_GIVEN=''
+RELEASE_TOKEN_HASH=''
+# --profile combined (combined control plane spec §3) and --profile sandbox: the two profiles that
+# serve the sandbox service's routes, so `sbx` works against them -- combined serves the harness's
+# session routes as well, sandbox serves only the sandbox service (SBX0 §4.1). ocp-single only, and
+# both need Routes (SH_ROUTE_DOMAIN) because an sbx client reaches the exec path from outside the
+# cluster. Ask serves_sbx rather than naming a profile. Sticky, resolved in load_setup_inputs;
+# PROFILE_GIVEN: --profile was passed on this run.
+PROFILE=''
+PROFILE_GIVEN=''
+# On a profile that serves sandboxes: the exec Route's host (moca-exec-<ns>.<SH_ROUTE_DOMAIN> --
+# namespace-qualified, because an apps domain is shared and an unqualified host can already be
+# claimed), the PEM of its
+# certificate when that is self-signed (SH_SANDBOX_EXEC_CA, so an sbx client trusts it), and the
+# sbx-settings ConfigMap as JSON, which joins the settings hash so a change rolls the pods.
+SBX_EXEC_HOST=''
+# What the relay reads at container start and cannot pick up later: the sandbox token keyset, an
+# env var it loads once. Its digest joins SBX_RELAY_HASH, which write_overlay stamps on the relay's
+# pod template, so rotating the signing key rolls the relay instead of leaving it verifying against
+# a keyset the control plane no longer signs with.
+SBX_TOKEN_KEYS_DIGEST=''
+SBX_RELAY_HASH=''
+# The id of the one worker the sbx-service component installs: the template's `worker`, the
+# Deployment's literal SANDBOX_ID, and the field wait_sbx_attached looks for in the relay's
+# presence hash. WORKER_RE (sandbox-config.ts) forbids dashes, hence the underscore.
+SBX_WORKER_ID=sbx_default
+SBX_EXEC_CA=''
+SBX_SETTINGS_JSON=''
+# SH_ALLOWED_SUBJECTS on a profile that serves sandboxes: who may use those routes besides admins (SBX0
+# §4.2). Sticky, like every other input, so a re-run keeps the list.
+ALLOWED_SUBJECTS=''
+# SH_SANDBOX_TEST_USERS_ENROLLED: 'true' enrols test:1..SH_TEST_USERS for the sandbox routes, so
+# `sbx login --test-user N` reaches a sandbox without each of N subjects being named in
+# SH_ALLOWED_SUBJECTS (ADR-0045 range-checks test users rather than pre-minting them). Sticky.
+# Spelled exactly 'true', as the control plane parses it: a typo must not enrol a thousand subjects.
+SBX_TEST_USERS_ENROLLED=''
+SBX_TEST_USERS_ENROLLED_GIVEN=''
 # --delete-workload-sandboxes: turning SH_WORKLOAD_SANDBOXES off also deletes the workloads'
 # sandboxes, instead of refusing while any exist.
 DELETE_WORKLOAD_SANDBOXES=''
@@ -143,6 +197,24 @@ REDIS_PROVISIONER_ACL='~sh:wl:* resetchannels +get'
 # adding, changing or dropping the user must roll it.
 REDIS_ACL_HASH=''
 
+# The profile that serves the sandbox service: `combined`, beside the harness's own routes.
+# Everything the sandbox half needs -- the exec certificate, the relay's keyset, sbx-settings, the
+# component -- is conditioned on this predicate rather than spelled out at each site.
+#
+# Note what no profile changes: a control plane always needs an identity provider to boot
+# (configFromEnv -> required SH_GITHUB_CLIENT_ID, or SH_OIDC_ISSUER under
+# SH_IDENTITY_PROVIDER=oidc). Test users are an extra login path beside one (ADR-0045), never a
+# replacement -- a stack with test users and no provider crash-loops instead of serving them,
+# measured on a real cluster.
+serves_sbx() { [[ "$PROFILE" == combined || "$PROFILE" == sandbox ]]; }
+
+# The profile the stack was LAST deployed with (moca-setup, read in load_setup_inputs), so the
+# sandbox half can be cleaned up when it is turned off -- and, just as important, so a harness stack
+# that never had it issues no deletes at all: a plain harness run must make exactly the API calls it
+# made before this feature existed.
+WAS_PROFILE=''
+served_sbx_before() { [[ "$WAS_PROFILE" == combined || "$WAS_PROFILE" == sandbox ]]; }
+
 log() { printf '==> %s\n' "$*" >&2; }
 die() {
   printf 'setup.sh: %s\n' "$*" >&2
@@ -158,6 +230,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --target) need_value "$1" $# "${2-}"; TARGET="$2"; shift 2 ;;
+    --profile) need_value "$1" $# "${2-}"; PROFILE="$2"; PROFILE_GIVEN=x; shift 2 ;;
     --image) need_value "$1" $# "${2-}"; IMAGE="$2"; shift 2 ;;
     --sandbox-image) need_value "$1" $# "${2-}"; SANDBOX_IMAGE="$2"; shift 2 ;;
     --build) BUILD=always; shift ;;
@@ -240,6 +313,9 @@ parse_args() {
   # from the earlier run's value (load_setup_inputs). At most 4 digits: $((10#...)) overflows
   # silently on a longer one, and could come out negative ("not 0", so tiered; negative replicas).
   SH_SANDBOX_COUNT="${SH_SANDBOX_COUNT:-}"
+  # Whether the count came from THIS run, which only the profile-switch warning below needs: after
+  # load_setup_inputs reads the stored value into the same variable, the two are indistinguishable.
+  SANDBOX_COUNT_GIVEN="${SH_SANDBOX_COUNT:+x}"
   [[ -z "$SH_SANDBOX_COUNT" || "$SH_SANDBOX_COUNT" =~ ^[0-9]{1,4}$ ]] ||
     die "SH_SANDBOX_COUNT='$SH_SANDBOX_COUNT' must be a whole number of at most 4 digits (0 runs no container sandboxes)"
   # SH_PUBLIC_HARNESS_URL overrides the derived URL on port-forward-reached targets. Only the shape
@@ -281,6 +357,26 @@ parse_args() {
   # positive Go duration, so a typo is refused here; a stored one is checked in write_settings.
   valid_workspace_idle "${SH_WORKSPACE_IDLE-}" ||
     die "SH_WORKSPACE_IDLE='${SH_WORKSPACE_IDLE}' must be a positive duration in hours, minutes and seconds, in that order, e.g. 8h or 1h30m (empty: the default, $DEFAULT_WORKSPACE_IDLE)"
+  case "$PROFILE" in
+  '' | harness | combined | sandbox) ;;
+  *) die "unknown --profile '$PROFILE': harness (the default), combined or sandbox" ;;
+  esac
+  SBX_TEST_USERS_ENROLLED_GIVEN="${SH_SANDBOX_TEST_USERS_ENROLLED+x}"
+  case "${SH_SANDBOX_TEST_USERS_ENROLLED-}" in
+  '' | true) SBX_TEST_USERS_ENROLLED="${SH_SANDBOX_TEST_USERS_ENROLLED-}" ;;
+  *) die "SH_SANDBOX_TEST_USERS_ENROLLED='$SH_SANDBOX_TEST_USERS_ENROLLED' must be the word true (on) or empty (off), spelled exactly as the control plane reads it" ;;
+  esac
+  # ocp-single only, for now: the sandbox routes need a worker whose id a template can name, and
+  # this adds exactly one, in the one namespace. On --target ocp the sandboxes live in their own
+  # namespace and the component's objects would land in the wrong one.
+  { ! serves_sbx || [[ "$TARGET" == ocp-single ]]; } ||
+    die "--profile $PROFILE needs --target ocp-single (got ${TARGET:-none}): it adds the sandbox service to a single-namespace stack"
+  # SH_ROUTE_PROFILE is the control plane's own variable name, so an operator may reasonably export
+  # it and expect this script to read it. It does not: the profile shapes which manifests are
+  # rendered, so it is an argument. Refuse rather than ignore -- a silently dropped export would
+  # look like a stack that simply did not come up as a combined one.
+  [[ -z "${SH_ROUTE_PROFILE-}" ]] ||
+    die "SH_ROUTE_PROFILE is not read here: pass --profile ${SH_ROUTE_PROFILE} instead (it selects the manifests, not just the pod's environment)"
   WORKLOAD_SANDBOXES_GIVEN="${SH_WORKLOAD_SANDBOXES+x}"
   case "${SH_WORKLOAD_SANDBOXES-}" in
   '' | 1) WORKLOAD_SANDBOXES="${SH_WORKLOAD_SANDBOXES-}" ;;
@@ -292,6 +388,15 @@ parse_args() {
   # share it with the supervisor's Secrets: the provisioner's isolation needs the sandbox namespace.
   [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp-single ]] ||
     die 'SH_WORKLOAD_SANDBOXES=1 needs a separate sandbox namespace: use --target kind, kind-ci or ocp'
+  RELEASE_CONTROL_GIVEN="${SH_RELAY_RELEASE_CONTROL+x}"
+  case "${SH_RELAY_RELEASE_CONTROL-}" in
+  '' | 1) RELEASE_CONTROL="${SH_RELAY_RELEASE_CONTROL-}" ;;
+  *) die "SH_RELAY_RELEASE_CONTROL='$SH_RELAY_RELEASE_CONTROL' must be 1 (on) or empty (off)" ;;
+  esac
+  # The component's objects name the base namespace, which ocp-single renames beneath the generated
+  # overlay, out of the component's reach.
+  [[ "$RELEASE_CONTROL" != 1 || "$TARGET" != ocp-single ]] ||
+    die 'SH_RELAY_RELEASE_CONTROL=1 is not supported on --target ocp-single: use --target kind, kind-ci or ocp'
   SH_WAIT_SECONDS="${SH_WAIT_SECONDS:-120}"
 }
 
@@ -601,7 +706,15 @@ load_setup_inputs() {
     fi
   fi
   [[ -n "$SH_SANDBOX_COUNT" ]] || SH_SANDBOX_COUNT="$(cm_value "$json" SH_SANDBOX_COUNT)"
-  [[ -n "$SH_SANDBOX_COUNT" ]] || SH_SANDBOX_COUNT=2
+  # The default is 2 container sandboxes, EXCEPT on the sandbox-only profile: there the supervisor
+  # is scaled to 0, so the shared pool has no harness to answer and two pods would sit Ready and
+  # unreachable -- on the 2-core namespace this target is for, that is the difference between
+  # fitting and not. An explicit SH_SANDBOX_COUNT still stands, and after the first run the stored
+  # value is sticky like every other input, so this decides a first install only. PROFILE here is
+  # the one given on THIS run (parse_args); a sticky sandbox stack already carries its stored 0.
+  if [[ -z "$SH_SANDBOX_COUNT" ]]; then
+    if [[ "$PROFILE" == sandbox ]]; then SH_SANDBOX_COUNT=0; else SH_SANDBOX_COUNT=2; fi
+  fi
   [[ "$SH_SANDBOX_COUNT" =~ ^[0-9]{1,4}$ ]] ||
     die "moca-setup holds SH_SANDBOX_COUNT='$SH_SANDBOX_COUNT': re-run with SH_SANDBOX_COUNT set to a whole number of at most 4 digits"
   # Normalised once, so every later comparison may be a string one: 00 is 0 (no container
@@ -632,6 +745,14 @@ load_setup_inputs() {
   [[ "$WORKLOAD_SANDBOXES" != 1 ]] || workload_storage_classes
   data="$(jq -nc --argjson d "$data" --arg w "$WORKLOAD_SANDBOXES" --arg c "${WORKLOAD_CLASSES_INPUT// /,}" \
     '($d + {SH_WORKLOAD_SANDBOXES: $w, SH_WORKLOAD_STORAGE_CLASSES: $c}) | with_entries(select(.value != ""))')"
+  # The relay's control listener (#338), sticky as the workload switch is; '' stores nothing.
+  [[ -n "$RELEASE_CONTROL_GIVEN" ]] || RELEASE_CONTROL="$(cm_value "$json" SH_RELAY_RELEASE_CONTROL)"
+  [[ "$RELEASE_CONTROL" == '' || "$RELEASE_CONTROL" == 1 ]] ||
+    die "moca-setup holds SH_RELAY_RELEASE_CONTROL='$RELEASE_CONTROL': re-run with it set to 1 or empty"
+  [[ "$RELEASE_CONTROL" != 1 || "$TARGET" != ocp-single ]] ||
+    die 'moca-setup holds SH_RELAY_RELEASE_CONTROL=1, which --target ocp-single cannot run: re-run with SH_RELAY_RELEASE_CONTROL='
+  data="$(jq -nc --argjson d "$data" --arg r "$RELEASE_CONTROL" \
+    '($d + {SH_RELAY_RELEASE_CONTROL: $r}) | with_entries(select(.value != ""))')"
   # The extra sandbox egress exceptions apply on every target, Kind too (#446).
   [[ -n "$EGRESS_EXCEPT_GIVEN" ]] || EGRESS_EXCEPT="$(normalize_egress_except "$(cm_value "$json" SH_SANDBOX_EGRESS_EXCEPT)")"
   data="$(jq -nc --argjson d "$data" --arg e "${EGRESS_EXCEPT// /,}" \
@@ -650,6 +771,83 @@ load_setup_inputs() {
       die "SH_PUBLIC_HARNESS_URL is meaningless when Routes are on (SH_ROUTE_DOMAIN='$ROUTE_DOMAIN'): the Route host is the harness URL. Unset SH_PUBLIC_HARNESS_URL, or set SH_ROUTE_DOMAIN='' to turn Routes off."
     fi
     data="$(jq -nc --argjson d "$data" --arg dom "$ROUTE_DOMAIN" '($d + {SH_ROUTE_DOMAIN: $dom}) | with_entries(select(.value != ""))')"
+    # The profile is sticky like every other input: --profile unset keeps the stored one (a
+    # combined stack stays combined across re-runs), --profile harness turns the sandbox service
+    # off again. Resolved here, after ROUTE_DOMAIN, because combined needs Routes.
+    WAS_PROFILE="$(cm_value "$json" SH_ROUTE_PROFILE)"
+    [[ -n "$PROFILE_GIVEN" ]] || PROFILE="$WAS_PROFILE"
+    case "$PROFILE" in
+    '' | harness | combined | sandbox) ;;
+    *) die "moca-setup holds SH_ROUTE_PROFILE='$PROFILE': re-run with --profile harness, combined or sandbox" ;;
+    esac
+    # A profile SWITCH is the one case the pool count's default (above) cannot see: that default
+    # decides a first install only, because a stored value wins -- so a stack installed as combined
+    # re-runs as sandbox keeping its stored 2, two pool pods Ready and answering a supervisor this
+    # profile holds at 0 replicas; and the reverse keeps a stored 0, leaving a combined stack with
+    # no shared pool at all. The stored value is NOT changed here: it may be the operator's own
+    # choice, and silently re-defaulting it on a switch would be the worse surprise of the two. So
+    # say it, with the value, the profile's default and the consequence.
+    # EFFECTIVE profiles, not a stored key: a stack installed without --profile stores no
+    # SH_ROUTE_PROFILE at all (write_settings drops an empty value), so requiring a stored one would
+    # stay silent on the likeliest migration of all -- an existing harness stack, stored
+    # SH_SANDBOX_COUNT=2, re-run as --profile sandbox. A first install stays quiet because both
+    # sides are then harness, and so does a sticky re-run, where PROFILE was just read from
+    # WAS_PROFILE above.
+    local was="${WAS_PROFILE:-harness}" now="${PROFILE:-harness}"
+    if [[ "$now" != "$was" ]]; then
+      # One consequence per direction, and only for a count that is actually WRONG on the new
+      # profile -- not merely different from its default. A pool of 3 on combined is an operator's
+      # own sizing and needs no warning; what does is a pool this profile cannot serve (any pool at
+      # all on sandbox, whose supervisor is held at 0 replicas) or a stack left with no pool (a 0
+      # carried onto a profile that serves sessions). A switch to harness gets the second one too:
+      # it is the same wrong state, reached from --profile sandbox's stored 0.
+      local want=2 consequence=''
+      if [[ "$now" == sandbox ]]; then
+        want=0
+        ((SH_SANDBOX_COUNT == 0)) ||
+          consequence="a pool of $SH_SANDBOX_COUNT sits Ready answering a supervisor this profile holds at 0 replicas"
+      elif ((SH_SANDBOX_COUNT == 0)); then
+        consequence="a pool of 0 leaves a --profile $now stack with no container sandboxes"
+      fi
+      if [[ -n "$consequence" ]]; then
+        # "stored" only when it is: with SH_SANDBOX_COUNT given on this run, nothing is being kept,
+        # and telling the operator the installer kept a value they just typed reads as an accusation
+        # about state they did not set.
+        local kept="keeps its stored SH_SANDBOX_COUNT=$SH_SANDBOX_COUNT"
+        [[ -z "$SANDBOX_COUNT_GIVEN" ]] || kept="runs with the SH_SANDBOX_COUNT=$SH_SANDBOX_COUNT you passed"
+        log "WARNING: --profile $now on a stack deployed as --profile $was $kept, not this profile's default of $want: $consequence. Re-run with SH_SANDBOX_COUNT=$want if that is not what you want."
+      fi
+    fi
+    if serves_sbx; then
+      # An sbx client reaches the exec path over its own Route, so there is no combined stack
+      # without a domain to put it on. Refused before moca-setup records the profile.
+      [[ -n "$ROUTE_DOMAIN" ]] ||
+        die "--profile $PROFILE needs SH_ROUTE_DOMAIN: an sbx client reaches the sandbox exec path over its own Route (docs/operate/harness/kubernetes.md §12.6)"
+      # Namespace-qualified, as route_hosts does for --target ocp ("moca-$NS.$domain"): the apps
+      # domain of a shared cluster is shared, so an unqualified host can be claimed by another
+      # project already -- and the symptom is an obscure HostAlreadyClaimed in the Route's status
+      # rather than a refusal here.
+      SBX_EXEC_HOST="moca-exec-$NS.$ROUTE_DOMAIN"
+      if [[ -n "${SH_ALLOWED_SUBJECTS+x}" ]]; then ALLOWED_SUBJECTS="$SH_ALLOWED_SUBJECTS"; else ALLOWED_SUBJECTS="$(cm_value "$json" SH_ALLOWED_SUBJECTS)"; fi
+      # The control plane refuses to boot without it (SBX0 §4.2: a stack with no allow list would
+      # admit every account that can log in), so refuse here, where the message can say what to
+      # pass, instead of after the apply with a crash-looping pod.
+      [[ -n "$ALLOWED_SUBJECTS" ]] ||
+        die "--profile $PROFILE needs SH_ALLOWED_SUBJECTS: the subjects that may use the sandbox routes, e.g. SH_ALLOWED_SUBJECTS=github:1234 (admins always may; SH_SANDBOX_TEST_USERS_ENROLLED=true adds test:1..SH_TEST_USERS)"
+      data="$(jq -nc --argjson d "$data" --arg a "$ALLOWED_SUBJECTS" '$d + {SH_ALLOWED_SUBJECTS: $a}')"
+      [[ -n "$SBX_TEST_USERS_ENROLLED_GIVEN" ]] || SBX_TEST_USERS_ENROLLED="$(cm_value "$json" SH_SANDBOX_TEST_USERS_ENROLLED)"
+      [[ -z "$SBX_TEST_USERS_ENROLLED" || "$SBX_TEST_USERS_ENROLLED" == true ]] ||
+        die "moca-setup holds SH_SANDBOX_TEST_USERS_ENROLLED='$SBX_TEST_USERS_ENROLLED': re-run with it set to true or empty"
+      if [[ "$SBX_TEST_USERS_ENROLLED" == true ]]; then
+        # The control plane refuses this combination at boot (no test user could log in), so refuse
+        # it here, where the message can name the setting to add.
+        ((TEST_USERS > 0)) ||
+          die 'SH_SANDBOX_TEST_USERS_ENROLLED=true needs SH_TEST_USERS: no test user could log in to use the sandboxes it enrols'
+        log "WARNING: SH_SANDBOX_TEST_USERS_ENROLLED=true: test:1..test:$TEST_USERS may create and exec into sandboxes (dev/test only, ADR-0045)"
+      fi
+    fi
+    data="$(jq -nc --argjson d "$data" --arg p "$PROFILE" --arg e "$SBX_TEST_USERS_ENROLLED" \
+      '($d + {SH_ROUTE_PROFILE: $p, SH_SANDBOX_TEST_USERS_ENROLLED: $e}) | with_entries(select(.value != ""))')"
     # --tls-secret is sticky too: with Routes kept on (SH_ROUTE_DOMAIN unset), a re-run without
     # the flag must not fall back to a self-signed certificate over the operator's Secret.
     # --tls-cert/--tls-key, given on this run, replaces the source: the saved name is not loaded,
@@ -669,6 +867,14 @@ load_setup_inputs() {
     if [[ -n "$TLS_SECRET" ]]; then
       data="$(jq -nc --argjson d "$data" --arg s "$TLS_SECRET" '$d + {SH_TLS_SECRET: $s}')"
     fi
+  fi
+  # PROFILE is final here (the block above resolves it for ocp-single; no other target has one), so
+  # this is where a flag that only a sandbox-serving profile reads can be refused rather than
+  # ignored. A harness profile has no sandbox routes to enrol anyone for, so the setting would do
+  # nothing. The message names BOTH profiles that take it: this refusal is only reachable on
+  # harness, so naming one of them would leave a reader thinking the other does not enrol.
+  if [[ -n "$SBX_TEST_USERS_ENROLLED" ]] && ! serves_sbx; then
+    die 'SH_SANDBOX_TEST_USERS_ENROLLED needs --profile combined or --profile sandbox: a harness stack has no sandbox routes to enrol test users for'
   fi
   jq -n --arg ns "$NS" --argjson data "$data" \
     '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "moca-setup", namespace: $ns}, data: $data}' |
@@ -1049,7 +1255,77 @@ ensure_secrets() {
   ensure_redis_secret
   ensure_mu1_secret
   ensure_test_user_secret
+  ensure_sandbox_token_keys
   ensure_provisioner_secret
+  ensure_release_secret
+}
+
+# The relay control listener's bearer (SH_RELAY_RELEASE_CONTROL=1 only, #338): MOCA_RELAY_RELEASE_TOKEN
+# in moca-relay-release, a Secret of its own so it never touches moca-mu1 or moca-relay. Generated
+# once and kept, like every Secret here; to rotate it, delete the key and re-run, and its digest
+# (RELEASE_TOKEN_HASH, on both pod templates) rolls the relay and the control plane, which read it
+# only at boot. It must differ from every other bearer either pod holds -- the relay refuses to boot
+# on one equal to its attach, exec or P4 tokens, the control plane on one equal to its exchange token
+# -- so a fresh one is drawn again on a clash and a kept one that clashes is refused, naming keys only.
+# in_lines VALUE LINES: VALUE is one of LINES. A builtin loop, so no value reaches an argv (a grep
+# would carry it in its pattern).
+in_lines() {
+  local l
+  while IFS= read -r l; do [[ "$l" != "$1" ]] || return 0; done <<<"$2"
+  return 1
+}
+ensure_release_secret() {
+  [[ "$RELEASE_CONTROL" == 1 ]] || return 0
+  local json tok others
+  json="$(secret_json moca-relay-release "$NS")"
+  tok="$(json_value "$json" MOCA_RELAY_RELEASE_TOKEN)"
+  others="$(
+    secret_json moca-relay "$NS" | jq -r '.data // {} | .[] | @base64d'
+    secret_json "$P4_TOKENS_SECRET" "$NS" | jq -r '.data // {} | .[] | @base64d'
+    secret_json moca-mu1 "$NS" | jq -r '.data // {} | (.SH_EXCHANGE_TOKEN // empty) | @base64d'
+  )"
+  if [[ -n "$tok" ]]; then
+    printf '%s' "$tok" | grep -qE '^[[:graph:]]{32,}$' ||
+      die 'moca-relay-release MOCA_RELAY_RELEASE_TOKEN is not 32+ printable characters: delete the key and re-run (this rotates it)'
+    ! in_lines "$tok" "$others" ||
+      die 'moca-relay-release MOCA_RELAY_RELEASE_TOKEN equals another bearer of the relay or the control plane: delete the key and re-run (this rotates it)'
+  else
+    log 'generating MOCA_RELAY_RELEASE_TOKEN'
+    tok="$(rand_hex)"
+    while in_lines "$tok" "$others"; do tok="$(rand_hex)"; done
+  fi
+  (
+    export S_0="$tok"
+    apply_secret moca-relay-release "$NS" MOCA_RELAY_RELEASE_TOKEN
+  )
+  RELEASE_TOKEN_HASH="$(printf '%s' "$tok" | sha256 | cut -c1-16)"
+}
+
+# combined and sandbox: the relay verifies sandbox tokens, so it needs the signer's PUBLIC keyset.
+# That is the session signer: the control plane mints sandbox tokens with the same key as API
+# tokens and keeps them apart by type, audience and issuer (spec §3.3). So this is a COPY of
+# moca-mu1's SH_SESSION_TOKEN_PUBLIC_KEYS under the name the relay's env reads, not a new keypair --
+# a second keypair would verify nothing the control plane signs.
+#
+# A copy and not a projected volume because the relay reads it as an env var, and the public half
+# is not secret. It is rewritten on every run, so rotating the signing key cannot leave the relay
+# verifying against a stale keyset.
+ensure_sandbox_token_keys() {
+  if ! serves_sbx; then
+    # Only when there is something to remove: see served_sbx_before.
+    ! served_sbx_before || kc delete secret sbx-token-keys -n "$NS" --ignore-not-found >/dev/null
+    return 0
+  fi
+  local json pub
+  json="$(secret_json moca-mu1 "$NS")"
+  pub="$(json_value "$json" SH_SESSION_TOKEN_PUBLIC_KEYS)"
+  json=''
+  [[ -n "$pub" ]] || die 'moca-mu1 holds no SH_SESSION_TOKEN_PUBLIC_KEYS, which the relay needs to verify sandbox tokens: delete both key halves and re-run to generate a matching pair'
+  SBX_TOKEN_KEYS_DIGEST="$(printf '%s' "$pub" | sha256)"
+  (
+    export S_0="$pub"
+    apply_secret sbx-token-keys "$NS" PUBLIC_KEYS
+  )
 }
 
 # --- Settings, TLS, SCC, the generated overlay, apply, wait (spec §4.1 steps 5-7) -----------------
@@ -1057,6 +1333,12 @@ SUP_HOST=''
 CP_HOST=''
 RELAY_HOST=''
 SETTINGS_HASH=''
+# The same hash WITHOUT the sandbox half: what a pod that reads only moca-settings should roll on.
+# The supervisor is the one such pod (it reads the tiers), and on a combined stack the full hash
+# would restart it for a changed template or quota it never looks at. Equal to SETTINGS_HASH on a
+# harness stack, by construction -- the same two fields -- so nothing about a harness rollout
+# depends on which of the two a caller picks.
+CORE_SETTINGS_HASH=''
 # ADR-0045: sha256 of the test-user secret ('' when test users are off), set by
 # ensure_test_user_secret and folded into SETTINGS_HASH so a changed secret rolls the pods.
 TEST_USER_SECRET_DIGEST=''
@@ -1295,10 +1577,94 @@ write_settings() {
   jq -n --arg ns "$SBX_NS" --arg idle "$idle" \
     '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "moca-sandbox-settings", namespace: $ns}, data: {SH_WORKSPACE_IDLE: $idle}}' |
     kc apply --server-side --force-conflicts --field-manager=moca-setup -f - >/dev/null
+  write_sbx_settings
   # The digest joins the HASH INPUT only -- never the ConfigMap, which holds nothing secret. The
   # sandboxes' key does not: neither the control plane nor the supervisor reads it, and write_overlay
   # stamps it on the sandbox pod template instead, so a change rolls only the sandboxes.
-  SETTINGS_HASH="$(printf '%s\n%s' "$(printf '%s' "$after" | jq -cS 'del(.SH_WORKSPACE_IDLE)')" "$TEST_USER_SECRET_DIGEST" | sha256)"
+  # sbx-settings joins it so that changing a template, the exec host or the enrolment flag rolls
+  # the control plane and the relay -- and only those two: the supervisor stamps CORE_SETTINGS_HASH
+  # (below), since it reads none of those keys. APPENDED ONLY WHEN IT EXISTS. A harness stack has to hash
+  # the same two fields it always hashed: `printf '%s\n%s\n%s' A B ''` is "A\nB\n", not "A\nB", so
+  # a third field that is always present moves EVERY deployed harness stack's hash and rolls both
+  # pod templates carrying moca.dev/settings-hash once on the first run after upgrading -- which is
+  # precisely the rollout this feature was designed not to cause.
+  # TWO printfs rather than one with a conditional suffix: `$(printf ...)` strips trailing
+  # newlines, so assembling the input in a variable first would ALSO change a harness stack's hash
+  # (it drops the newline the two-field form ends with). The pinned harness case in setup.test.sh
+  # caught exactly that, which is why it compares the value and not the number of keys.
+  local settings_json
+  settings_json="$(printf '%s' "$after" | jq -cS 'del(.SH_WORKSPACE_IDLE)')"
+  CORE_SETTINGS_HASH="$(printf '%s\n%s' "$settings_json" "$TEST_USER_SECRET_DIGEST" | sha256)"
+  if [[ -z "$SBX_SETTINGS_JSON" ]]; then
+    SETTINGS_HASH="$CORE_SETTINGS_HASH"
+  else
+    SETTINGS_HASH="$(printf '%s\n%s\n%s' "$settings_json" "$TEST_USER_SECRET_DIGEST" "$SBX_SETTINGS_JSON" | sha256)"
+  fi
+  # The relay's own stamp: the settings hash plus the two things it reads at start which the hash
+  # cannot see. Empty on a harness stack, where write_overlay stamps nothing on the relay at all.
+  SBX_RELAY_HASH=''
+  ! serves_sbx ||
+    SBX_RELAY_HASH="$(printf '%s\n%s' "$SETTINGS_HASH" "$SBX_TOKEN_KEYS_DIGEST" | sha256)"
+}
+
+# combined and sandbox: the sandbox half's settings, in a ConfigMap OF ITS OWN (sbx-settings), which
+# the patches of overlays/ocp-single/<profile> read. Not keys in moca-settings, for two reasons: a harness
+# stack's moca-settings keeps exactly the keys it had, so nothing about its rollout changes because
+# this feature exists; and deploy/sbx/setup.sh's ocp-combined overlay already reads this same name,
+# so the two installers share one contract for the sandbox settings.
+#
+# Only the REQUIRED four are always written -- SH_ALLOWED_SUBJECTS, SH_SANDBOX_TEMPLATES,
+# SH_SANDBOX_EXEC_ENDPOINT and SH_SANDBOX_TOKEN_ISSUER. The jq object below names six: the exec CA
+# and the enrolment flag are dropped when empty (`with_entries(select(.value != ""))`), so a stack
+# with an operator certificate and no test users emits four, a self-signed one five, and both of
+# those plus enrolled test users six. The rest of what the overlay reads is `optional` there, so the
+# control plane's own defaults apply (sandbox-config.ts) and an operator who wants a different
+# lifetime or quota edits this ConfigMap -- which is also what the next run's settings hash sees.
+write_sbx_settings() {
+  if ! serves_sbx; then
+    # Removed when the profile goes back to harness, so a later combined run cannot inherit a
+    # stale exec host or template list from a stack that has been reshaped since -- and only then,
+    # so a harness stack that never served sandboxes issues no delete at all.
+    #
+    # Every object has to be named: `kubectl apply -k` does NOT prune, so dropping the component
+    # from the render leaves them running -- measured on a real cluster, where a switch back to
+    # harness left the worker Deployment burning quota and the exec Route answering for a backend
+    # whose sidecar the same run had just removed. The relay's own objects (its sidecar container)
+    # do go with the apply, because that Deployment stays in the render and loses the patch.
+    #
+    # sbx-exec-tls is deliberately kept, as moca-supervisor-tls is kept when Routes are turned
+    # off: it may hold an operator certificate this installer did not mint and cannot re-create.
+    if served_sbx_before; then
+      log "the stack was deployed with --profile $WAS_PROFILE and is now harness: removing the sandbox service's objects (sbx-exec-tls is kept, in case it holds your own certificate)"
+      kc delete configmap sbx-settings -n "$NS" --ignore-not-found >/dev/null
+      kc delete deployment sbx-worker -n "$NS" --ignore-not-found >/dev/null
+      kc delete service sbx-relay-exec-tls -n "$NS" --ignore-not-found >/dev/null
+      kc delete route sbx-exec -n "$NS" --ignore-not-found >/dev/null
+      kc delete networkpolicy sbx-worker sbx-worker-dns sbx-relay-exec-from-router \
+        sbx-relay-attach-from-worker -n "$NS" --ignore-not-found >/dev/null
+    fi
+    SBX_SETTINGS_JSON=''
+    return 0
+  fi
+  # The one template, backed by the one worker overlays/ocp-single/<profile> installs -- the
+  # sandbox component on --profile sandbox, the combined one on --profile combined. Its worker id
+  # must match WORKER_RE (sandbox-config.ts) -- letters, digits and underscores, no dashes -- which
+  # is why the worker is a Deployment with a literal SANDBOX_ID rather than a StatefulSet pod.
+  local templates
+  templates="$(jq -nc --arg w "$SBX_WORKER_ID" '[{id: "default", worker: $w, description: "Container sandbox (bash)", tools: ["bash"]}]')"
+  # The port is 443: the exec Route is passthrough, so the router hands the TLS connection to the
+  # sidecar unchanged. A DNS NAME, never an IP -- a gRPC client derives the TLS servername from the
+  # host and Node refuses to set it to an IP address, which fails at the first `sbx run`, long
+  # after the sandbox was created.
+  SBX_SETTINGS_JSON="$(jq -ncS --arg subjects "$ALLOWED_SUBJECTS" --argjson templates "$templates" \
+    --arg endpoint "$SBX_EXEC_HOST:443" --arg ca "$SBX_EXEC_CA" --arg enrolled "$SBX_TEST_USERS_ENROLLED" \
+    '{SH_ALLOWED_SUBJECTS: $subjects, SH_SANDBOX_TEMPLATES: ($templates | tojson),
+      SH_SANDBOX_EXEC_ENDPOINT: $endpoint, SH_SANDBOX_TOKEN_ISSUER: "sbx-control-plane",
+      SH_SANDBOX_EXEC_CA: $ca, SH_SANDBOX_TEST_USERS_ENROLLED: $enrolled}
+      | with_entries(select(.value != ""))')"
+  jq -n --arg ns "$NS" --argjson data "$SBX_SETTINGS_JSON" \
+    '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "sbx-settings", namespace: $ns}, data: $data}' |
+    kc apply --server-side --force-conflicts --field-manager=moca-setup -f - >/dev/null
 }
 
 # kind-ci's mock model, from the file itself: no kustomization reads outside its root.
@@ -1335,8 +1701,15 @@ route_cert() {
   (
     trap 'rm -rf "$dir"' EXIT
     chmod 700 "$dir"
+    # The CN is the host's FIRST LABEL, not the whole host: a CN is an X.509 DirectoryString
+    # capped at 64 bytes, and a Route host can exceed that on its own -- a ROKS-style
+    # moca-relay-<ns>.<cluster>-<hash>-0000.<region>.containers.appdomain.cloud is 77 characters,
+    # which makes openssl refuse the certificate outright ("string too long", maxsize=64) and so
+    # makes Routes impossible on such a cluster. The authoritative name is the SAN below, which has
+    # no such limit and is what every current client verifies against (RFC 6125: the CN is legacy
+    # and ignored when a subjectAltName is present).
     # openssl's stderr is progress noise on success; on failure it is the reason, so show it.
-    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=$host" \
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=${host%%.*}" \
       -addext "subjectAltName=DNS:$host" -keyout "$dir/tls.key" -out "$ca" 2>"$dir/openssl.err"; then
       cat "$dir/openssl.err" >&2
       die "openssl could not create the self-signed certificate for $host"
@@ -1345,6 +1718,40 @@ route_cert() {
       kc apply --server-side --force-conflicts --field-manager=moca-setup -f - >/dev/null
   )
   ROUTE_CERT_MADE=self-signed
+}
+
+# combined and sandbox: the exec Route's certificate, for the relay's TLS sidecar. Its own Secret and
+# its own CA file, because it serves a DIFFERENT host from the supervisor's Route and a certificate
+# is valid for the name in it -- a gRPC client checks the host it dialled against the SAN, and
+# reuses nothing from moca-supervisor-tls.
+#
+# Self-signed by default, as the supervisor's. When it is, the PEM travels to the control plane as
+# SH_SANDBOX_EXEC_CA and from there to every `sbx` client in its bundle: without that an sbx client
+# cannot verify the Route and every exec fails the handshake.
+ensure_exec_tls() {
+  serves_sbx || return 0
+  local ca="$K8S_DIR/.generated/ocp-single/sbx-exec-ca.crt"
+  # Self-signed, and kept across runs: route_cert leaves an existing Secret alone, so an operator
+  # can replace sbx-exec-tls by hand with their own pair. Supplying one as an argument, and rolling
+  # the relay when it changes, is a follow-up.
+  route_cert sbx-exec-tls "$SBX_EXEC_HOST" '' '' "$ca"
+  [[ "$ROUTE_CERT_MADE" != self-signed ]] ||
+    log "the exec Route for $SBX_EXEC_HOST uses a SELF-SIGNED certificate, which every sbx client receives as its CA"
+  # route_cert writes the PEM only when it generated a self-signed certificate this run; on a
+  # re-run the Secret is kept and nothing is written, so read it back from the Secret instead --
+  # otherwise SH_SANDBOX_EXEC_CA would go empty on the second run and clients would stop trusting
+  # a Route that had not changed. self_issued_crt returns nothing for a CA-issued certificate,
+  # which is exactly when the setting should be absent.
+  local json
+  json="$(secret_json sbx-exec-tls "$NS")"
+  SBX_EXEC_CA="$(self_issued_crt "$json" sbx-exec-tls)"
+  json=''
+  if [[ -n "$SBX_EXEC_CA" ]]; then
+    mkdir -p "$(dirname "$ca")"
+    printf '%s\n' "$SBX_EXEC_CA" >"$ca"
+  else
+    rm -f "$ca"
+  fi
 }
 
 # check_tls_secret: the --tls-secret (or saved SH_TLS_SECRET) must exist and be kubernetes.io/tls.
@@ -1367,6 +1774,14 @@ ensure_tls() {
     # the sticky domain, and refuses before moca-setup records anything); by here Routes are on.
     # Without them nothing serves a certificate, so an earlier run's CA file is stale.
     [[ -n "$ROUTE_DOMAIN" ]] || { rm -f "$SUP_CA"; return 0; }
+    # The exec Route's certificate comes FIRST, before the supervisor's three certificate sources
+    # and in particular before --tls-secret's `return 0`: it depends on the exec host alone, not on
+    # the supervisor's, and the relay's tls-exec sidecar mounts sbx-exec-tls non-optionally
+    # (overlays/ocp-sbx/exec-tls). A path that skipped it left deployment/sandbox-relay in
+    # ContainerCreating and wait_ready failing on a 300s timeout that named nothing; on a re-run
+    # whose Secret already existed it passed with SH_SANDBOX_EXEC_CA empty, so every client exec
+    # failed the handshake instead. It returns at once unless the profile serves sandboxes.
+    ensure_exec_tls
     # --tls-secret: a preinstalled certificate the sidecar references by name; no copy is made, so
     # an operator's Secret is never duplicated (and never rotated by a later self-signed default).
     if [[ -n "$TLS_SECRET" ]]; then
@@ -1410,7 +1825,7 @@ self_issued_crt() {
     [[ "$subject" != "$issuer" ]] || printf '%s\n' "$crt"
     return 0
   fi
-  log "WARNING: Secret $2 holds no readable certificate (tls.crt), so no trust file carries the supervisor's: fix or delete the Secret and re-run"
+  log "WARNING: Secret $2 holds no readable certificate (tls.crt), so nothing carries it to the clients that must trust it: fix or delete the Secret and re-run"
 }
 
 # refresh_supervisor_ca SECRET: SUP_CA holds SECRET's certificate when it is self-issued, and is
@@ -1589,8 +2004,13 @@ write_overlay() {
     local components=()
     [[ -z "$P4_IDS" ]] || components+=(../../overlays/ocp/p4-relay)
     [[ "$TARGET" != ocp-single || -z "$ROUTE_DOMAIN" ]] || components+=(../../overlays/ocp-single/routes)
+    # The sandbox service on top of ocp-single (combined control plane spec §3): its own Route and
+    # TLS sidecar for the exec path, the worker a template can name, and that worker's policies.
+    ! serves_sbx || components+=("../../overlays/ocp-single/$PROFILE")
     [[ "$WORKLOAD_SANDBOXES" != 1 ]] || components+=(../../base/workload-sandboxes)
     [[ "$WORKLOAD_SANDBOXES" != 1 || "$TARGET" != ocp ]] || components+=(../../overlays/ocp/workload-sandboxes)
+    # The relay's control listener (#338), only with SH_RELAY_RELEASE_CONTROL=1.
+    [[ "$RELEASE_CONTROL" != 1 ]] || components+=(../../base/relay-release-control)
     if [[ ${#components[@]} -gt 0 ]]; then
       printf 'components:\n'
       printf '  - %s\n' "${components[@]}"
@@ -1599,11 +2019,20 @@ write_overlay() {
     # base/control-plane.yaml's pod template has no annotations, so "add" creates the map.
     printf '  - target: { kind: Deployment, name: moca-control-plane }\n    patch: |-\n      - { op: replace, path: /spec/replicas, value: %s }\n' "$cp_replicas"
     printf '      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/settings-hash: "%s"%s } }\n' "$SETTINGS_HASH" "$harness_ann"
-    # The supervisor reads the tiers from moca-settings too (base/supervisor.yaml); roll it on a change.
+    # The supervisor reads the tiers from moca-settings too (base/supervisor.yaml); roll it on a
+    # change -- but on the CORE hash, which is moca-settings alone. It reads none of sbx-settings,
+    # so the full hash would restart it whenever a template, quota or exec host changed: harmless,
+    # but one rollout more than the change calls for, and the kind of churn an operator reads as
+    # something having gone wrong. On a harness stack the two hashes are identical.
     # Its pod template has no annotations in any overlay either, ocp-single's supervisor entry below
     # patches only env, and ocp-single's routes component (and the --tls-secret volume patch) touch
     # only the containers and volumes, so this stays the one "add" of the map.
-    printf '  - target: { kind: Deployment, name: moca-supervisor }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/settings-hash: "%s"%s } }\n' "$SETTINGS_HASH" "$harness_ann"
+    printf '  - target: { kind: Deployment, name: moca-supervisor }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/settings-hash: "%s"%s } }\n' "$CORE_SETTINGS_HASH" "$harness_ann"
+    # The relay reads the sbx settings and the token keyset at start, so a change in either has to
+    # roll it (SBX_RELAY_HASH). Only on a profile that serves sandboxes: a harness stack renders no
+    # patch here, exactly as before this feature existed.
+    ! serves_sbx ||
+      printf '  - target: { kind: Deployment, name: sandbox-relay }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/settings-hash: "%s" } }\n' "$SBX_RELAY_HASH"
     printf '  - target: { kind: StatefulSet, name: moca-sandbox }\n    patch: |-\n      - { op: replace, path: /spec/replicas, value: %s }\n' "$SH_SANDBOX_COUNT"
     # The sandboxes read SH_WORKSPACE_IDLE from moca-sandbox-settings at start (#338), so its value
     # on the pod template rolls them when it changes, as the settings hash does the control plane.
@@ -1611,9 +2040,25 @@ write_overlay() {
     # the map; on kind the loaded image's ID joins it.
     printf '      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/workspace-idle: "%s"%s } }\n' \
       "$WORKSPACE_IDLE" "${sandbox_ann:+, $sandbox_ann}"
+    # The sbx worker reads SH_WORKSPACE_IDLE from the same ConfigMap (sbx-service/sbx-worker.yaml,
+    # optional: true), so it needs the same stamp: otherwise a changed value rolls the shared pool
+    # and leaves this Deployment on the old timeout until something else restarts it. Its template
+    # carries no annotations either, so "add" creates the map; no image id, which is kind-only.
+    ! serves_sbx ||
+      printf '  - target: { kind: Deployment, name: sbx-worker }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/workspace-idle: "%s" } }\n' "$WORKSPACE_IDLE"
     if is_kind; then
       # The relay's pod template carries no annotations on kind (its only one is ocp's p4-relay).
       printf '  - target: { kind: Deployment, name: sandbox-relay }\n    patch: |-\n      - { op: add, path: /spec/template/metadata/annotations, value: { moca.dev/image-id: "%s" } }\n' "$HARNESS_IMAGE_ID"
+    fi
+    # The release bearer's digest (#338) on the two pods that read it at boot, so a rotated one rolls
+    # both. A strategic merge, so it joins whatever annotations each template already has; after the
+    # JSON patches above that create those maps, which would otherwise replace it.
+    if [[ "$RELEASE_CONTROL" == 1 ]]; then
+      local d
+      for d in sandbox-relay moca-control-plane; do
+        printf '  - patch: |-\n      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: %s, namespace: moca }\n' "$d"
+        printf '      spec: { template: { metadata: { annotations: { moca.dev/release-token-hash: "%s" } } } }\n' "$RELEASE_TOKEN_HASH"
+      done
     fi
     # Workload sandboxes (the component's objects, which no base or target transformer reaches):
     # the namespace's pod quota, the shared pool plus 32 workload sandboxes so it never refuses the
@@ -1660,6 +2105,11 @@ write_overlay() {
     if [[ -n "$EGRESS_EXCEPT" ]]; then
       local cidr policy policies=moca-sandbox
       [[ "$WORKLOAD_SANDBOXES" != 1 ]] || policies="$policies moca-workload-sandbox"
+      # And the sbx worker, whose own policy carries the same egress[1] rule by design
+      # (overlays/ocp-single/sbx-service/network-policy.yaml says so). An operator who blocks a
+      # range means every sandbox: without this the shared pool is blocked and every sbx sandbox
+      # reaches it, which is the inconsistency the workload-sandbox line above exists to prevent.
+      ! serves_sbx || policies="$policies sbx-worker"
       for policy in $policies; do
         printf '  - target: { kind: NetworkPolicy, name: %s }\n    patch: |-\n' "$policy"
         printf '      - { op: test, path: /spec/egress/1/to/0/ipBlock/cidr, value: 0.0.0.0/0 }\n'
@@ -1702,6 +2152,15 @@ write_overlay() {
         printf '      apiVersion: apps/v1\n      kind: StatefulSet\n      metadata: { name: moca-sandbox }\n'
         printf '      spec:\n        template:\n          spec:\n            containers:\n              - name: sandbox\n                env:\n'
         printf '                  - { name: RELAY_ADDR, value: "sandbox-relay-attach.%s.svc:9443" }\n' "$NS"
+        # The combined profile's worker carries the same hard-coded address, and for the same
+        # reason: the component is buildable on its own against the moca-single placeholder.
+        if serves_sbx; then
+          printf '  - target: { kind: Deployment, name: sbx-worker }\n'
+          printf '    patch: |-\n'
+          printf '      apiVersion: apps/v1\n      kind: Deployment\n      metadata: { name: sbx-worker }\n'
+          printf '      spec:\n        template:\n          spec:\n            containers:\n              - name: sandbox\n                env:\n'
+          printf '                  - { name: RELAY_ADDR, value: "sandbox-relay-attach.%s.svc:9443" }\n' "$NS"
+        fi
       fi
       # ocp-single's Routes (docs/operate/harness/kubernetes.md §12.5): the component's placeholder hosts, replaced with the
       # domain SH_ROUTE_DOMAIN gave; and with --tls-secret, the sidecar's volume points at the
@@ -1711,6 +2170,9 @@ write_overlay() {
       if [[ -n "$ROUTE_DOMAIN" ]]; then
         printf '  - target: { kind: Route, name: moca }\n    patch: |-\n      - { op: replace, path: /spec/host, value: moca.%s }\n' "$ROUTE_DOMAIN"
         printf '  - target: { kind: Route, name: moca-control-plane }\n    patch: |-\n      - { op: replace, path: /spec/host, value: moca-control-plane.%s }\n' "$ROUTE_DOMAIN"
+        # The exec Route's host, as the two above (the component ships a placeholder).
+        ! serves_sbx ||
+          printf '  - target: { kind: Route, name: sbx-exec }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_EXEC_HOST"
         if [[ -n "$TLS_SECRET" && "$TLS_SECRET" != moca-supervisor-tls ]]; then
           printf '  - target: { kind: Deployment, name: moca-supervisor }\n'
           printf '    patch: |-\n'
@@ -1784,6 +2246,7 @@ wait_ready() {
     kc rollout status "$w" -n "$NS" --timeout=300s
   done
   { [[ -z "$(client_id)" ]] && [[ -z "$(oidc_issuer)" ]]; } || kc rollout status deployment/moca-control-plane -n "$NS" --timeout=300s
+  ! serves_sbx || kc rollout status deployment/sbx-worker -n "$NS" --timeout=300s
   [[ "$SH_SANDBOX_COUNT" == 0 ]] || kc rollout status statefulset/moca-sandbox -n "$SBX_NS" --timeout=300s
   [[ "$WORKLOAD_SANDBOXES" != 1 ]] || kc rollout status deployment/moca-provisioner -n "$NS" --timeout=300s
 }
@@ -1807,6 +2270,24 @@ wait_records() {
   log "$n sandbox(es) attached to the relay"
 }
 
+# The sandbox service is not usable until the worker has ATTACHED to the relay: a Ready pod has
+# only started dialing. Until the record lands, `sbx run` fails with `no live worker for sandbox
+# '$SBX_WORKER_ID'` -- which reads as a broken stack, so the install waits for it here rather than
+# reporting success a few seconds early. wait_records does the same for the shared pool.
+wait_sbx_attached() {
+  serves_sbx || return 0
+  local n waited=0
+  while :; do
+    n="$(kc exec -n "$NS" redis-0 -- sh -c "redis-cli HEXISTS sh:sandbox:records $SBX_WORKER_ID" 2>/dev/null | tr -dc '0-9' || true)"
+    [[ "${n:-0}" != 1 ]] || break
+    [[ "$waited" -lt "$SH_WAIT_SECONDS" ]] ||
+      die "the sandbox worker did not attach to the relay within ${SH_WAIT_SECONDS}s: see 'kubectl -n $NS logs deployment/sbx-worker' (a repeated 'dial tcp ...:9443: i/o timeout' there is a NetworkPolicy denying the attach) and 'kubectl -n $NS logs deployment/sandbox-relay'"
+    sleep 2
+    waited=$((waited + 2))
+  done
+  log "the sandbox worker $SBX_WORKER_ID attached to the relay"
+}
+
 print_access() {
   # The local port of the supervisor's port-forward: honor SH_PUBLIC_HARNESS_URL's port when given.
   local sup_port=8080
@@ -1820,12 +2301,26 @@ then:  mocactl --control-plane-url http://127.0.0.1:8090 login
 EOF
   elif [[ "$TARGET" == ocp-single ]]; then
     if [[ -n "$ROUTE_DOMAIN" ]]; then
-      cat >&2 <<EOF
-P6 is up on OpenShift, namespace $NS (single-namespace dev/test target), served by Routes:
-  harness:        https://moca.$ROUTE_DOMAIN   (TLS passthrough to the supervisor's L4 sidecar)
-  control plane:  https://moca-control-plane.$ROUTE_DOMAIN
-then:  mocactl --control-plane-url https://moca-control-plane.$ROUTE_DOMAIN login
-EOF
+      printf 'P6 is up on OpenShift, namespace %s (single-namespace dev/test target), served by Routes:\n' "$NS" >&2
+      # The sandbox profile holds the supervisor at 0 replicas, so naming its Route here would send
+      # the operator at a host nothing answers on.
+      [[ "$PROFILE" == sandbox ]] ||
+        printf '  harness:        https://moca.%s   (TLS passthrough to the supervisor'"'"'s L4 sidecar)\n' "$ROUTE_DOMAIN" >&2
+      printf '  control plane:  https://moca-control-plane.%s\n' "$ROUTE_DOMAIN" >&2
+      if serves_sbx; then
+        printf '  sandbox exec:   https://%s   (TLS passthrough to the relay'"'"'s exec sidecar; sbx clients get it from the control plane)\n' "$SBX_EXEC_HOST" >&2
+        # The PEM on disk is for everything that is NOT an sbx client -- curl --cacert, a browser,
+        # NODE_EXTRA_CA_CERTS -- since those have no bundle to read it from.
+        [[ -z "$SBX_EXEC_CA" ]] ||
+          printf '                  self-signed: its PEM is %s (curl --cacert, NODE_EXTRA_CA_CERTS)\n' \
+            "$K8S_DIR/.generated/ocp-single/sbx-exec-ca.crt" >&2
+      fi
+      printf 'then:  mocactl --control-plane-url https://moca-control-plane.%s login\n' "$ROUTE_DOMAIN" >&2
+      if serves_sbx; then
+        printf '  sbx:   mocactl sbx login --control-plane-url https://moca-control-plane.%s' "$ROUTE_DOMAIN" >&2
+        [[ "$SBX_TEST_USERS_ENROLLED" != true ]] || printf ' --test-user 1' >&2
+        printf '\n         mocactl sbx up --template default --name s1 && mocactl sbx run --sandbox s1 -- uname -a\n' >&2
+      fi
       trust_line >&2
     else
       cat >&2 <<EOF
@@ -1878,6 +2373,7 @@ main() {
   apply_stack
   wait_ready
   wait_records
+  wait_sbx_attached
   print_access
 }
 

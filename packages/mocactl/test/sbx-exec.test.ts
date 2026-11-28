@@ -525,7 +525,7 @@ describe('mocactl sbx run (SBX0 §6.1, §6.5)', () => {
   it('needs a sandbox: --sandbox or a .sbx/sandbox.json (exit 2)', async () => {
     const { home, env, io } = setup();
     expect(await sbxMain(['run', '--', 'ls'], env, io, { home, cwd: tmpdir() })).toBe(2);
-    expect(io.errs.join('\n')).toMatch(/--sandbox ID/);
+    expect(io.errs.join('\n')).toMatch(/--sandbox SANDBOX/);
   });
 
   it('reports a terminated sandbox through the control-plane path, naming why', async () => {
@@ -1920,6 +1920,11 @@ describe('the flight recorder, format 2 (TRAJECTORY-JOINER §9)', () => {
       req_id: relay.seen[0]!.req.exec!.reqId,
       exit: 3,
       outcome: 'ok',
+      // 'SECRET-OUTPUT\n': its byte count, never its bytes.
+      out_bytes: 14,
+      err_bytes: 0,
+      grpc_status: null,
+      wire_code: null,
       run: 'rep-7',
     });
     expect(line!.start).toMatch(/^\d{4}-\d\d-\d\dT.*Z$/);

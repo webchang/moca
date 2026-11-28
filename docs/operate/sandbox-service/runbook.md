@@ -107,6 +107,12 @@ running, and reattach when the relay comes back; Execs running through the old r
 setting (templates, subjects, quotas, lifetimes) rolls the control plane alone, and running Execs
 carry on.
 
+**The release listener's optional source.** From the release that adds `SBX_RELEASE_CONTROL`, the
+control plane's credentials volume names `moca-relay-release` as an optional source (mounted only
+when the Secret exists), with the switch on or off. The first `setup.sh` run of that release
+therefore rolls the control plane once, even with nothing else changed; the relay, its Services and
+NetworkPolicies are unchanged while the switch is off ([the release listener](#the-release-listener)).
+
 **Moving to idle lifetimes (#770).** The first run of this `setup.sh` on an existing deployment
 changes every worker's idle from 216 h to 768 h at the defaults, and starts idle lifetimes: the control plane counts
 idle time only when `SH_SANDBOX_MAX_LIFETIME_SECONDS` is set, and keeps the old absolute lifetime
@@ -660,6 +666,42 @@ certificate is not publicly trusted).
 Uninstalling the last worker leaves the janitor. Remove it with
 `sudo <checkout>/deploy/sbx/install-host.sh --uninstall-janitor`.
 
+### The release listener
+
+With `SBX_RELEASE_CONTROL=1` the control plane does not leave an ended sandbox's workspace to the
+janitor's wait or the worker's idle reclaim: it asks the worker to release it, through the relay's
+control listener (`sandbox-relay-control`, port 9445, which a NetworkPolicy opens to the control
+plane alone). The worker frees the workspace's standby VMs and disk at once, or when its running
+Exec ends, and refuses new Execs on it. The control plane sends the release
+
+- at `DELETE /v1/sandboxes/{id}`, after the record is marked deleted;
+- from the janitor's `GET /v1/janitor/sandboxes`, for every ended sandbox the worker has not yet
+  answered: an expired sandbox is first noticed there, so its release waits for the next janitor
+  run (every 15 minutes), and a delete whose release went unanswered is retried there too;
+- on the combined profile, at a session's delete, to the worker the session last ran on.
+
+Each is best-effort and bounded (5 s). A DELETE does not wait for it at all (it runs after the
+delete commits); the janitor's read waits at most the bound. Neither ever fails for it, and a
+release is sent once even when a DELETE and a janitor run race (an atomic claim). The worker's answer (`released`, `kept_busy`, `unknown_key`, or `unsupported` for a
+worker that predates release) is written to the sandbox record and audited as
+`sandbox_workspace_release`; anything else (the relay down, the worker detached) is logged and
+retried by the next janitor run while the record is retained. A session's is audited as
+`session_workspace_release`, with the worker under `worker`, `no_worker` when it never ran on one. The janitor keeps removing what
+is left after its wait, and idle reclaim stays the backstop everywhere.
+
+The listener's bearer, `MOCA_RELAY_RELEASE_TOKEN`, is in the Secret `moca-relay-release`, apart
+from `moca-mu1`, and both pods' settings hashes cover it. To rotate it, delete the key and re-run;
+the relay and the control plane roll, and nothing on the hosts changes:
+
+```bash
+kubectl patch secret moca-relay-release -n <namespace> --type=merge \
+  -p '{"data":{"MOCA_RELAY_RELEASE_TOKEN":null}}'
+deploy/sbx/setup.sh --env-file <env file>
+```
+
+Turning `SBX_RELEASE_CONTROL` off again leaves `moca-relay-release`, the `sandbox-relay-control`
+Service and its two NetworkPolicies in place, inert: nothing listens on 9445.
+
 ## 8. Status and the audit lines
 
 `deploy/sbx/status.sh` is read-only. It reads the audit lines of the relay's current pod only, so
@@ -760,7 +802,13 @@ adds each command's first 200 bytes as `cmd`.
   each with a command and a standby being promoted). The static clients (`remote-worker/cmd/sbx`,
   `docs/api/examples/sbx.py`) retry such a refusal and exit 75 if every try is refused. The
   worker's start-up warning (slots × per-VM size against the budget) is expected at any budget below
-  its slot count.
+  its slot count. Each such refusal also writes one `vmpool: memory-budget refusal` line to the
+  worker's journal, with the workspace key and `why`: `futile` (the idle standbys and idle leases
+  together could not cover `short_by`; the line gives each one's bytes), `reclaim-queue-full`
+  (reclamation is behind), `gates-taken` (every idle lease started an Exec before it could be
+  taken), `evicted` (victims were queued and it was still short) or `closed` (the worker is
+  shutting down, as during a restart: benign). `gate_held` counts idle leases
+  whose gate an Exec held, which an admission never takes.
 
 ## Reproducing a member's issue
 
@@ -775,7 +823,7 @@ machine (status.sh needs `jq` too); the host's commands run over ssh as in §8.
 
 ```bash
 SBX=sbx-…                   # the sandbox id
-mocactl sbx ls --all --json | jq --arg id "$SBX" '.[] | select(.id == $id)
+mocactl sbx ls --all --include-deleted --json | jq --arg id "$SBX" '.[] | select(.id == $id)
   | {id, owner, template, state, created: (.createdAt | todate),
      ended: (if .terminatedAt then (.terminatedAt | todate) else null end)}'
 SUB=github:…                # its owner
@@ -1119,6 +1167,14 @@ same applies to a CA rotation.
 The default allowlist (`MOCA_EGRESS_ALLOW`) does not include `api.githubcopilot.com`. Add it to
 `/etc/sbx/moca-egress.env` for the `github-mcp` preset, which otherwise gets `403 destination_denied`.
 
+For sandboxes to drive a Kubernetes or OpenShift cluster's API, two operator-side facts matter: the
+destination must be allowlisted, and the cluster API's CA must be trusted upstream
+(`MOCA_EGRESS_UPSTREAM_CA`), or every request dies as `502 upstream_unverified` before credentials
+are considered. The user-facing procedure — service-account token as a stored credential, plus the
+placeholder kubeconfig that carries it — is in [the credentials
+how-to](../../sandbox/how-to/egress-credentials.md#kubernetes-and-openshift-clusters), with a
+runnable example at `deploy/sbx/examples/ocp-cred-prepare.sh`.
+
 **Turning credential injection off.** Run `install-host.sh --uninstall-egress` on every KVM host
 first, then run `setup.sh` with `SBX_EGRESS_CREDENTIALS=0`. With the cluster off, the lookup route is
 unmounted (404); a host that still has the drop-in treats the 404 as an error and answers
@@ -1346,13 +1402,13 @@ In the cluster, delete what `setup.sh` applied, then its Secrets and ConfigMaps:
 kubectl delete -k deploy/sbx/.generated
 kubectl delete secret -n <namespace> moca-redis moca-relay moca-relay-attach \
   moca-relay-sandbox-tokens moca-mu1 sbx-token-keys sbx-egress sbx-template-hosts \
-  moca-relay-tls sbx-exec-tls --ignore-not-found
+  moca-relay-release moca-relay-tls sbx-exec-tls --ignore-not-found
 kubectl delete configmap -n <namespace> moca-settings sbx-settings --ignore-not-found
 rm -rf deploy/sbx/.generated
 ```
 
-`--ignore-not-found` covers the Secrets a stack without egress credentials (`sbx-egress`) or the
-template store (`sbx-template-hosts`) never had. With `SBX_PROFILE=combined`, the generated folder
+`--ignore-not-found` covers the Secrets a stack without egress credentials (`sbx-egress`), the
+template store (`sbx-template-hosts`) or the release listener (`moca-relay-release`) never had. With `SBX_PROFILE=combined`, the generated folder
 is `deploy/sbx/.generated-<namespace>/`, and `moca-supervisor-tls` is one more Secret to delete.
 
 **`kubectl delete -k` deletes the template store's and the egress credentials' volumes.** They are

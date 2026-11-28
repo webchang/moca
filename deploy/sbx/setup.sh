@@ -71,6 +71,9 @@
 #                           may set, in seconds. Also every worker bundle's SH_LEASE_IDLE_CEILING_S, so
 #                           the control plane and the workers clamp alike; at least 300, the worker's
 #                           default idle timeout, which it refuses to start above its ceiling
+#   SBX_LEASE_CACHE_DROP_S  optional; 0-86400, default 30: how long a lease stays idle before its guest
+#                           drops its clean page cache (#974), in seconds; 0 turns the drop off. Every
+#                           worker bundle's SH_LEASE_CACHE_DROP_S; the control plane does not read it
 #   SBX_EGRESS_CREDENTIALS  optional; unset, 0 or 1 (SBX0.2b, spec §4.3). 1 turns on user-scoped egress
 #                           credentials: the control plane's file store (a PVC) and credential routes,
 #                           a KEK and one bearer per KVM host in the Secret sbx-egress, and an egress
@@ -136,6 +139,19 @@
 #                           (template lifecycle spec §6.1); one bearer each in the Secret
 #                           sbx-template-hosts, and a host-agent bundle each
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
+#   SBX_RELEASE_CONTROL     optional; unset, 0 or 1 (#338). 1 turns on the relay's control listener
+#                           (deploy/k8s/base/relay-release-control): the control plane releases an
+#                           ended sandbox's workspace on its worker at its delete and when the janitor's
+#                           sweep first sees it expired, and a deleted session's on combined, instead of
+#                           leaving it to the worker's idle reclaim. Its release-only bearer,
+#                           MOCA_RELAY_RELEASE_TOKEN, is generated once and kept in the Secret
+#                           moca-relay-release, apart from every other Secret, and is in both pods'
+#                           hashes. Unset or 0: no Secret and no listener, and the relay, its hash,
+#                           Services and NetworkPolicies are as before. The control plane's
+#                           credentials volume names moca-relay-release as an optional source
+#                           (mounted only when the Secret exists) whatever the switch, a one-time
+#                           change that rolls the control plane with the release that brings it.
+#                           Turning it off later leaves moca-relay-release in place
 #   SBX_PROFILE             optional; sandbox (default) or combined. combined renders
 #                           deploy/k8s/overlays/ocp-combined instead of ocp-sbx: one control plane on
 #                           the combined route profile serving Moca Pi sessions (the supervisor and its
@@ -196,7 +212,7 @@ OVERLAY_REL=../../k8s/overlays/ocp-sbx # from $GEN; ocp-combined with SBX_PROFIL
 # GEN is .generated-<namespace> with SBX_PROFILE=combined (validate), at the same depth, so OVERLAY_REL holds.
 API_ROUTE='sbx-api'
 HOSTS_TO_REINSTALL='' # workers whose SH_WORKSPACE_IDLE or SH_LEASE_IDLE_CEILING_S this run changes
-REINSTALL_SETTINGS='' # which of the two changed, for write_bundles' last warning (check_host_*)
+REINSTALL_SETTINGS='' # which of them changed, for write_bundles' last warning (check_host_*)
 IDLE_LOWERED_FROM_DAYS='' # set when this run lowers SH_WORKSPACE_IDLE: the old maximum, in days (check_host_idle)
 IDLE_LOWERED_BY='the run that lowered SBX_MAX_LIFETIME_DAYS' # since when the old maximum must have passed
 IDLE_KEPT='' # set when this run keeps SH_WORKSPACE_IDLE above what its maximum gives (check_host_idle)
@@ -300,7 +316,7 @@ validate() {
 
   : "${SBX_LIFETIME_DAYS:=7}" "${SBX_MAX_LIFETIME_DAYS:=30}" "${SBX_MAX_PER_SUBJECT:=3}" "${SBX_MAX_TOTAL:=40}" "${SBX_MAX_INFLIGHT:=2}"
   : "${SBX_WORKSPACE_IMAGE_MB:=2048}" "${SBX_TOKEN_TTL_MINUTES:=15}" "${SBX_RETENTION_DAYS:=14}"
-  : "${SBX_MODES_ALLOWED:=per-exec}" "${SBX_IDLE_CEILING_S:=1800}"
+  : "${SBX_MODES_ALLOWED:=per-exec}" "${SBX_IDLE_CEILING_S:=1800}" "${SBX_LEASE_CACHE_DROP_S:=30}"
   [[ "$SBX_LIFETIME_DAYS" =~ ^([1-9]|[12][0-9]|30)$ ]] || die 'SBX_LIFETIME_DAYS must be a whole number of days, 1-30'
   [[ "$SBX_MAX_LIFETIME_DAYS" =~ ^([1-9]|[12][0-9]|30|off)$ ]] ||
     die 'SBX_MAX_LIFETIME_DAYS must be a whole number of days, 1-30, or off'
@@ -334,6 +350,10 @@ validate() {
   # At most a day: the janitor's wait must outlast it when a lease mode is allowed (below).
   [[ "$SBX_IDLE_CEILING_S" =~ $COUNT6_RE ]] && ((SBX_IDLE_CEILING_S >= 300 && SBX_IDLE_CEILING_S <= 86400)) ||
     die "SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400 (a worker's ceiling must be at least its default idle timeout, 300 s)"
+  # microvm-worker's own bounds (vmpool.MaxLeaseCacheDrop); no leading zero, so the bundle compares
+  # as a string in check_host_cache_drop.
+  [[ "$SBX_LEASE_CACHE_DROP_S" =~ ^(0|[1-9][0-9]{0,4})$ ]] && ((SBX_LEASE_CACHE_DROP_S <= 86400)) ||
+    die 'SBX_LEASE_CACHE_DROP_S must be a whole number of seconds, 0 (off) to 86400'
   # A token minted just before a delete reaches the sandbox for its lifetime plus the relay's 30 s
   # leeway, and each Exec it sends restarts the lease's idle clock, so a lease can stay live that long
   # plus the idle timeout. The janitor must not free the workspace (and its lease state file) under
@@ -367,12 +387,13 @@ validate() {
   fi
   WORKSPACE_IDLE_H=$((longest_days * 24 + 48))
   ((WORKSPACE_IDLE_H * 3600 > longest_days * 86400)) || die 'SH_WORKSPACE_IDLE must exceed the longest sandbox lifetime'
-  # check_host_idle and check_host_ceiling run in preflight, once the live maximum is read.
+  # check_host_idle, check_host_ceiling and check_host_cache_drop run in preflight, once the live maximum is read.
 
   validate_templates
   validate_egress
   validate_profile
   validate_store
+  validate_release
 
   local pair
   for pair in ATTACH EXEC API MOCA; do
@@ -436,6 +457,16 @@ validate_store() {
   done
   # shellcheck disable=SC2086 # one argument per host; ids hold no whitespace
   STORE_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | {id: .}]' --args $STORE_HOSTS)"
+}
+
+# SBX_RELEASE_CONTROL (#338). Sets RELEASE_ON.
+RELEASE_ON=''
+validate_release() {
+  case "${SBX_RELEASE_CONTROL:-}" in
+    '' | 0) ;;
+    1) RELEASE_ON=1 ;;
+    *) die 'SBX_RELEASE_CONTROL must be unset, 0 or 1' ;;
+  esac
 }
 
 # SBX_EGRESS_CREDENTIALS and what it takes (spec §4.3). Sets EGRESS_ON, EGRESS_IDS (host ids, in
@@ -632,6 +663,27 @@ check_host_ceiling() {
   log "WARNING: SH_LEASE_IDLE_CEILING_S changes from${olds} to ${SBX_IDLE_CEILING_S} for worker(s)${changed}, and a running worker keeps its old ceiling until deploy/sbx/install-host.sh is re-run on its host with the new bundle"
 }
 
+# And the SH_LEASE_CACHE_DROP_S it was installed with (#1011): a stale value only changes when an idle
+# lease's guest drops its page cache, so a change is a warning, as for the ceiling. A bundle from
+# before the setting carries none, and install-host.sh gives such a worker 30 s, the worker's default.
+check_host_cache_drop() {
+  local env id old changed='' olds=''
+  for env in "$GEN"/workers/*/worker.env; do
+    [[ -f "$env" ]] || continue
+    id="$(basename "$(dirname "$env")")"
+    [[ " $SBX_WORKERS " == *" $id "* ]] || continue
+    old="$( (grep -E '^SH_LEASE_CACHE_DROP_S=' "$env" || true) | tail -1 | cut -d= -f2-)"
+    old="${old:-30}"
+    [[ "$old" != "$SBX_LEASE_CACHE_DROP_S" ]] || continue
+    changed+=" $id"
+    [[ " $olds " == *" $old "* ]] || olds+=" $old"
+    [[ " $HOSTS_TO_REINSTALL " == *" $id "* ]] || HOSTS_TO_REINSTALL+="${HOSTS_TO_REINSTALL:+ }$id"
+  done
+  [[ -n "$changed" ]] || return 0
+  REINSTALL_SETTINGS+="${REINSTALL_SETTINGS:+ and }SH_LEASE_CACHE_DROP_S"
+  log "WARNING: SH_LEASE_CACHE_DROP_S changes from${olds} to ${SBX_LEASE_CACHE_DROP_S} for worker(s)${changed}, and a running worker keeps its old value until deploy/sbx/install-host.sh is re-run on its host with the new bundle"
+}
+
 # The rules of the control plane's parseTemplates (packages/control-plane/src/sandbox-config.ts),
 # checked here so a bad file is refused before anything is applied rather than as a pod that never
 # boots; plus SBX0 §8.1's: every template's worker is in SBX_WORKERS, one template per worker.
@@ -674,6 +726,7 @@ preflight() {
   read_live_max
   check_host_idle
   check_host_ceiling
+  check_host_cache_drop
   check_unknown_bundles
 }
 
@@ -1172,6 +1225,47 @@ apply_configmap() {
     --args "$@" | kc apply --server-side --force-conflicts --field-manager=sbx-setup -f - >/dev/null
 }
 
+# The relay control listener's bearer, moca-relay-release (SBX_RELEASE_CONTROL=1 only, #338):
+# MOCA_RELAY_RELEASE_TOKEN (rand_hex), generated once and kept, in a Secret of its own so it can
+# rotate (delete the key and re-run) without moving moca-mu1: it can only release, and only the
+# relay and the control plane mount it. It must differ from every other bearer either pod holds --
+# the relay refuses to boot on one equal to its attach or exec tokens, the control plane on one equal
+# to its janitor, installer, exchange, egress or host tokens -- so a fresh one is drawn again on a
+# clash and a kept one that clashes is refused, naming keys only. Runs after every other Secret's.
+# in_lines VALUE LINES: VALUE is one of LINES. A builtin loop, so no value reaches an argv (a grep
+# would carry it in its pattern).
+in_lines() {
+  local l
+  while IFS= read -r l; do [[ "$l" != "$1" ]] || return 0; done <<<"$2"
+  return 1
+}
+ensure_release_secret() {
+  [[ -n "$RELEASE_ON" ]] || return 0
+  local json tok others s
+  json="$(secret_json moca-relay-release)"
+  tok="$(json_value "$json" MOCA_RELAY_RELEASE_TOKEN)"
+  # Every other bearer's value, one per line, from the Secrets that hold them (never logged).
+  others="$(for s in moca-relay moca-relay-sandbox-tokens moca-mu1 sbx-egress sbx-template-hosts; do
+    secret_json "$s" | jq -r '.data // {} | to_entries[] |
+      select(.key | test("^(SH_RELAY_TOKEN|MOCA_RELAY_EXEC_TOKEN|SH_JANITOR_TOKEN|SH_INSTALLER_TOKEN|SH_EXCHANGE_TOKEN|SH_EGRESS_TOKEN_.*|SH_HOST_TOKEN_.*)$") or ($s == "moca-relay-sandbox-tokens")) |
+      .value | @base64d' --arg s "$s"
+  done)"
+  if [[ -n "$tok" ]]; then
+    [[ "$tok" =~ ^[[:graph:]]{32,}$ ]] ||
+      die 'moca-relay-release MOCA_RELAY_RELEASE_TOKEN is not 32+ printable characters: delete the key and re-run (this rotates it)'
+    ! in_lines "$tok" "$others" ||
+      die 'moca-relay-release MOCA_RELAY_RELEASE_TOKEN equals another bearer of the relay or the control plane: delete the key and re-run (this rotates it)'
+  else
+    log 'generating the relay release token (MOCA_RELAY_RELEASE_TOKEN)'
+    tok="$(rand_hex)"
+    while in_lines "$tok" "$others"; do tok="$(rand_hex)"; done
+  fi
+  (
+    export S_0="$tok"
+    apply_secret moca-relay-release MOCA_RELAY_RELEASE_TOKEN
+  )
+}
+
 # moca-settings (the keys base/control-plane.yaml reads) and sbx-settings (the sandbox profile's and
 # the relay's), then two hashes of what each pod reads at boot (write_overlay stamps them, so a change
 # rolls the pod that reads it): SETTINGS_HASH, the control plane's, covers every setting, the public
@@ -1180,7 +1274,7 @@ apply_configmap() {
 # change rolls the control plane alone and leaves running Execs be (docs/operate/sandbox-service/runbook.md §5). Runs after
 # route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx relay keys attach_crt exec_crt moca_crt mu1 egress hosts
+  local ca='' moca sbx relay keys attach_crt exec_crt moca_crt mu1 egress hosts release
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   # The identity block follows the provider: github writes only the client id (an empty
@@ -1254,10 +1348,14 @@ ensure_settings() {
   # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
   # token or KEK changes the pod template, so the control plane rolls and rereads its files.
   # With the store on, the host tokens' Secret likewise: a new or revoked host token rolls it.
+  # With the release listener on (#338), moca-relay-release goes into BOTH hashes, as both pods read
+  # its token at boot: a rotated one rolls each, and moca-mu1's data (and so its line here) is
+  # untouched. Off, neither hash has the line, so both are exactly as before.
   mu1="$(secret_json moca-mu1 | jq -cS '.data // {}')"
-  egress='' hosts=''
+  egress='' hosts='' release=''
   [[ -z "$EGRESS_ON" ]] || egress="$(secret_json sbx-egress | jq -cS '.data // {}')"
   [[ -z "$STORE_ON" ]] || hosts="$(secret_json sbx-template-hosts | jq -cS '.data // {}')"
+  [[ -z "$RELEASE_ON" ]] || release="$(secret_json moca-relay-release | jq -cS '.data // {}')"
   SETTINGS_HASH="$({
     printf '%s\n' "${moca[@]}" "${sbx[@]}"
     json_value "$keys" PUBLIC_KEYS
@@ -1267,6 +1365,7 @@ ensure_settings() {
     printf '%s\n' "$mu1"
     [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
     [[ -z "$STORE_ON" ]] || printf '%s\n' "$hosts"
+    [[ -z "$RELEASE_ON" ]] || printf '%s\n' "$release"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
   [[ "$SETTINGS_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the settings (openssl dgst)'
   # The relay's env from sbx-settings, by key, as patch-relay.yaml names them.
@@ -1276,6 +1375,7 @@ ensure_settings() {
     json_value "$keys" PUBLIC_KEYS
     json_value "$attach_crt" tls.crt
     json_value "$exec_crt" tls.crt
+    [[ -z "$RELEASE_ON" ]] || printf '%s\n' "$release"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
   [[ "$RELAY_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the relay settings (openssl dgst)'
 }
@@ -1343,8 +1443,10 @@ write_overlay() {
     printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n'
     printf 'namespace: %s\nresources:\n  - %s\n' "$NS" "$OVERLAY_REL"
     # The combined overlay already holds the template store (and refuses egress, validate_profile).
-    if [[ -z "$COMBINED" ]] && [[ -n "$EGRESS_ON" || -n "$STORE_ON" ]]; then
+    if [[ -z "$COMBINED" && ( -n "$EGRESS_ON" || -n "$STORE_ON" ) ]] || [[ -n "$RELEASE_ON" ]]; then
       printf 'components:\n'
+    fi
+    if [[ -z "$COMBINED" ]] && [[ -n "$EGRESS_ON" || -n "$STORE_ON" ]]; then
       # Exactly one credential-store Component: both set SH_CREDENTIAL_STORE, so listing the two
       # would leave the later one deciding (moca#823). EGRESS_STORE is file unless asked otherwise.
       if [[ -n "$EGRESS_ON" ]]; then
@@ -1356,6 +1458,9 @@ write_overlay() {
       fi
       [[ -z "$STORE_ON" ]] || printf '  - %s/template-store\n' "$OVERLAY_REL"
     fi
+    # The relay's control listener (#338), on either profile. It patches no projected source (every
+    # overlay's credentials volume names moca-relay-release already), so its place in the list is free.
+    [[ -z "$RELEASE_ON" ]] || printf '  - ../../k8s/base/relay-release-control\n'
     printf 'patches:\n'
     printf '  - target: { kind: Route, name: moca-relay }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_ATTACH_HOST"
     printf '  - target: { kind: Route, name: sbx-exec }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_EXEC_HOST"
@@ -1479,8 +1584,9 @@ write_bundles() {
       mkdir -p "$d"
       # SH_WORKSPACE_IDLE: the maximum lifetime plus two days (idle-lifetime spec §6.2); install-host.sh takes it from here.
       # SH_LEASE_IDLE_CEILING_S: the control plane's SH_SANDBOX_IDLE_CEILING_S, so both clamp alike.
-      printf 'RELAY_ADDR=%s:443\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\nSH_WORKSPACE_IDLE=%sh\nSH_WORKSPACE_IMAGE_MB=%s\nSH_LEASE_IDLE_CEILING_S=%s\n' \
-        "$SBX_ATTACH_HOST" "$id" "$tok" "$WORKSPACE_IDLE_H" "$SBX_WORKSPACE_IMAGE_MB" "$SBX_IDLE_CEILING_S" >"$d/worker.env"
+      # SH_LEASE_CACHE_DROP_S: SBX_LEASE_CACHE_DROP_S, the workers' alone (#1011).
+      printf 'RELAY_ADDR=%s:443\nRELAY_TLS=true\nSANDBOX_ID=%s\nSANDBOX_TOKEN=%s\nSH_WORKSPACE_IDLE=%sh\nSH_WORKSPACE_IMAGE_MB=%s\nSH_LEASE_IDLE_CEILING_S=%s\nSH_LEASE_CACHE_DROP_S=%s\n' \
+        "$SBX_ATTACH_HOST" "$id" "$tok" "$WORKSPACE_IDLE_H" "$SBX_WORKSPACE_IMAGE_MB" "$SBX_IDLE_CEILING_S" "$SBX_LEASE_CACHE_DROP_S" >"$d/worker.env"
       if [[ -f "$GEN/attach-ca.crt" ]]; then cp "$GEN/attach-ca.crt" "$d/relay-ca.crt"; else rm -f "$d/relay-ca.crt"; fi
     done
     chmod 700 "$GEN" "$GEN"/workers "$GEN"/workers/* 2>/dev/null || true
@@ -1603,6 +1709,7 @@ main() {
   ensure_signing_key
   ensure_egress_secrets
   ensure_store_secrets
+  ensure_release_secret
   route_cert moca-relay-tls "$SBX_ATTACH_HOST" "${SBX_ATTACH_TLS_CERT:-}" "${SBX_ATTACH_TLS_KEY:-}" "$GEN/attach-ca.crt"
   route_cert sbx-exec-tls "$SBX_EXEC_HOST" "${SBX_EXEC_TLS_CERT:-}" "${SBX_EXEC_TLS_KEY:-}" "$GEN/exec-ca.crt"
   # Combined: the supervisor's passthrough Route (Moca Pi turns) terminates TLS in its sidecar.

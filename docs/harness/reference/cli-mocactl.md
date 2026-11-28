@@ -8,9 +8,10 @@
 
 ## Usage
 
-The block below is `mocactl --help`, generated from `USAGE` in `packages/mocactl/src/cli.ts`; a
-test fails when the two disagree. `mocactl COMMAND --help` prints only that command's syntax. To
-update the block after changing the help text:
+`mocactl` and `mocactl --help` print a summary: what mocactl is and its commands, one line each.
+The block below is every command's syntax, generated from `USAGE` in
+`packages/mocactl/src/cli.ts`; a test fails when the two disagree. `mocactl COMMAND --help` prints
+only that command's part of it. To update the block after changing the help text:
 
 ```bash
 UPDATE_MOCACTL_REFERENCE=1 pnpm -C packages/mocactl exec vitest run test/mocactl-reference.test.ts
@@ -20,12 +21,15 @@ UPDATE_MOCACTL_REFERENCE=1 pnpm -C packages/mocactl exec vitest run test/mocactl
 
 ```text
 usage:
-  mocactl [--setup] [--no-animation]             interactive terminal UI (--setup: run the first-start
+  mocactl harness [--setup] [--no-animation]     interactive terminal UI (--setup: run the first-start
                                                  setup again: the server form, then login and
                                                  credential, each skipped when already done;
                                                  --no-animation: a still spinner)
-  mocactl --version                              print this build's version (a release tag, edge-<sha>,
-                                                 or dev-<sha> from a source checkout)
+  mocactl --version                              print this build's version as "CLI version: V" (a
+                                                 release tag, edge-<sha>, or dev-<sha> from a source
+                                                 checkout), then each configured control plane's
+                                                 (harness and sandbox service) version and URL, or
+                                                 unreachable
   mocactl login [--no-browser]                   log in with the GitHub device flow (in a local
                                                  terminal: copies the code, opens the browser;
                                                  --no-browser: only prints the URL and the code)
@@ -88,6 +92,9 @@ usage:
   mocactl spawn "prompt" --async [...]            dispatch as a cancellable async turn instead of a
                                                  local worker process (needs SH_ASYNC_DRAIN on the
                                                  deployment; not available with --workload)
+  mocactl spawn "prompt" --require-approval [...]  park the subagent before it acts: it proposes
+                                                 what it would do and waits for 'mocactl approve'
+                                                 or 'mocactl reject'
   mocactl spawn "prompt" --max-concurrent N [...]
                                                  refuse the dispatch when N of your subagents are
                                                  already running (default 4)
@@ -105,6 +112,22 @@ usage:
                                                  exit 1 and status 'queued' if the
                                                  budget runs out, 'unknown' if the run is over
                                                  without one)
+  mocactl approve SESSIONID [--gate N] [--feedback TEXT] [--json]
+                                                 let a subagent paused for approval go ahead; prints
+                                                 the turn it resumed as ('mocactl get SESSIONID'
+                                                 shows what it proposed and the number --gate takes,
+                                                 which is read off the paused run when the flag is
+                                                 left out; --feedback: a note that reaches the
+                                                 subagent)
+  mocactl reject SESSIONID [--gate N] [--feedback TEXT] [--json]
+                                                 refuse what the subagent proposed, and it carries
+                                                 on from there (--feedback says what to do instead,
+                                                 at most 4096 bytes; --gate as for approve)
+  mocactl follow-up SESSIONID "prompt" [--out DIR] [--json]
+                                                 send a second turn to a finished subagent, which
+                                                 keeps the first turn's context; the result is
+                                                 written to --out DIR (default: the current
+                                                 directory) first, because a new turn overwrites it
   mocactl workloads create --context FILE [--name NAME] [--json]
       [--sandboxes N [--mount read-only|writable]]
                                                  upload a context file (--context, made by
@@ -177,7 +200,7 @@ reachable?` instead; `auth token` exits 3 (login required) or 4; `logout` while 
 
 | Command                                                                                                                           | What it does and calls                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `mocactl [--setup] [--no-animation]`                                                                                              | The interactive UI. `--setup` re-runs onboarding. Exits 2 when stdin is not a terminal                                                                                                                                                                                                                                                                                                                                   |
+| `mocactl harness [--setup] [--no-animation]`                                                                                      | The interactive UI. `--setup` re-runs onboarding. Exits 2 when stdin is not a terminal                                                                                                                                                                                                                                                                                                                                   |
 | `mocactl login`                                                                                                                   | GitHub device-flow login (`POST /v1/auth/device`, then polls `/v1/auth/device/token`). Prints the code to stderr                                                                                                                                                                                                                                                                                                         |
 | `mocactl logout [--all]`                                                                                                          | Ends this login on the server (`POST /v1/auth/revoke`); `--all` ends all of yours (`/v1/auth/revoke-all`). The local file is cleared anyway                                                                                                                                                                                                                                                                              |
 | `mocactl auth token [--json]`                                                                                                     | Prints a valid API token for scripts, refreshing if needed. `--json`: `{"token","expiresAt","subject"}`                                                                                                                                                                                                                                                                                                                  |

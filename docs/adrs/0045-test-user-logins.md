@@ -81,11 +81,29 @@ server, because the seam already exists and `identity.ts` already anticipates a 
   `SH_TEST_USERS_ACK=i-know-this-is-not-for-production`, so a stale export or a sticky ConfigMap
   value cannot quietly keep that path alive where other people work. The mitigations are structural rather than advisory — 404 when unset (indistinguishable
   from an unrouted path), a required secret of at least 16 characters compared in constant time,
-  `N` capped at 1000, the route not mounted on the sandbox profile at all, a boot refusal if
-  combined with that profile, and a warning line at boot naming the count.
+  `N` capped at 1000, and a warning line at boot naming the count. On the `sandbox` profile the
+  route is mounted but enrollment gates it: a boot refusal if the count is set and nothing enrols
+  those subjects -- neither `SH_SANDBOX_TEST_USERS_ENROLLED` nor a `test:<n>` within the count in
+  `SH_ALLOWED_SUBJECTS` or `SH_ADMIN_SUBJECTS` -- so the path is never served in a state where it
+  can only refuse.
 - Negative / accepted cost: `test:N` subjects can be named in `SH_ADMIN_SUBJECTS`, so a
   misconfigured test cluster can hand admin to a synthetic subject. Deliberate — it is what makes
   the admin path testable — but it is one more reason the secret is not optional.
+- Later addition: the sandbox service takes a test-user login too, as
+  `mocactl sbx login --test-user N`, on the `combined` profile and -- since the change that
+  implements #1022, which carries the client half with it -- on the `sandbox` profile too: `POST /v1/auth/test-token` is declared for BOTH, so an sbx-only stack
+  can serve browser-free logins. There enrollment is the login gate rather than an extra check
+  on the sandbox routes, so an unenrolled test user is refused at login. The boundary above is unchanged; what is new is
+  that `mocactl` can now fill `sbx-auth.json` without a browser. A login is not a sandbox: on
+  `combined` the sandbox routes check enrollment, so the operator must also put the subject in
+  `SH_ALLOWED_SUBJECTS` (which admits `test:<n>`, unlike `/v1/subjects`) or `SH_ADMIN_SUBJECTS` --
+  or cover the whole range with `SH_SANDBOX_TEST_USERS_ENROLLED=true`, which enrols
+  `test:1..SH_TEST_USERS` as a RANGE CHECK rather than a list. That is the decision this addition
+  turns on: naming a thousand subjects in `SH_ALLOWED_SUBJECTS` would re-materialise exactly the
+  identities this ADR chose not to pre-mint, so the range is checked the same way
+  `TestUserProvider.has` checks it at login. The control plane refuses the flag without
+  `SH_TEST_USERS`, since it would enrol a range nobody could log in as, and reads it as exactly
+  `true` so a typo cannot enrol a thousand subjects.
 - Follow-up owed: migrate `smoke.sh` off the in-pod mint; decide whether `mocactl` should grow a
   `--profile` flag, since today a second login in one `XDG_CONFIG_HOME` overwrites the first and the
   driver script works around it with a directory per user.

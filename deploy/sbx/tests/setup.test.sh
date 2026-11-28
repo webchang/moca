@@ -250,6 +250,11 @@ refusals=(
   'export SBX_IDLE_CEILING_S=30m => SBX_IDLE_CEILING_S must be'
   'export SBX_IDLE_CEILING_S=1000000 => SBX_IDLE_CEILING_S must be'
   'export SBX_IDLE_CEILING_S=86401 => SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400'
+  'export SBX_LEASE_CACHE_DROP_S=-1 => SBX_LEASE_CACHE_DROP_S must be a whole number of seconds, 0 \(off\) to 86400'
+  'export SBX_LEASE_CACHE_DROP_S=30s => SBX_LEASE_CACHE_DROP_S must be'
+  'export SBX_LEASE_CACHE_DROP_S=1.5 => SBX_LEASE_CACHE_DROP_S must be'
+  'export SBX_LEASE_CACHE_DROP_S=030 => SBX_LEASE_CACHE_DROP_S must be'
+  'export SBX_LEASE_CACHE_DROP_S=86401 => SBX_LEASE_CACHE_DROP_S must be a whole number of seconds, 0 \(off\) to 86400'
   'export SBX_MODES_ALLOWED=per-exec,lease SBX_IDLE_CEILING_S=3600 => SBX_JANITOR_WAIT_MINUTES \(3600 s\) must exceed the token lifetime plus the 30 s leeway plus SBX_IDLE_CEILING_S \(4530 s\) when a lease mode is allowed'
   'export SBX_MODES_ALLOWED=lease+processes SBX_IDLE_CEILING_S=2700 SBX_JANITOR_WAIT_MINUTES=60 => SBX_JANITOR_WAIT_MINUTES \(3600 s\) must exceed .* \(3630 s\)'
   'export SBX_MODES_ALLOWED=per-exec,lease SBX_TOKEN_TTL_MINUTES=60 => SBX_JANITOR_WAIT_MINUTES \(3900 s\) must exceed .* \(5430 s\)'
@@ -428,6 +433,7 @@ grep -qx "SANDBOX_TOKEN=$(secret_val moca-relay-sandbox-tokens sbx_py312)" "$W/w
 grep -qx 'SH_WORKSPACE_IDLE=768h' "$W/worker.env" || fail 'worker bundle idle is not the maximum lifetime + 2 days'
 grep -qx 'SH_WORKSPACE_IMAGE_MB=2048' "$W/worker.env" || fail 'worker bundle image size'
 grep -qx 'SH_LEASE_IDLE_CEILING_S=1800' "$W/worker.env" || fail 'worker bundle idle ceiling is not the default 1800'
+grep -qx 'SH_LEASE_CACHE_DROP_S=30' "$W/worker.env" || fail 'worker bundle cache drop is not the default 30'
 [[ -f "$W/relay-ca.crt" ]] || fail 'self-signed attach certificate not shipped in the worker bundle'
 [[ "$(stat -c %a "$W/worker.env" 2>/dev/null || stat -f %Lp "$W/worker.env")" == 600 ]] || fail 'worker.env is not 0600'
 pass 'writes 0600 worker bundles in the P6.2 format, with the idle derived from the lifetime and the image size'
@@ -829,6 +835,28 @@ grep -qx 'SH_LEASE_IDLE_CEILING_S=1800' "$GEN/workers/sbx_default/worker.env" ||
 render
 [[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the hash did not return with the defaults'
 pass 'SBX_MODES_ALLOWED and SBX_IDLE_CEILING_S reach sbx-settings and move the hash; the ceiling reaches every worker bundle'
+
+# 4c'''. SBX_LEASE_CACHE_DROP_S (#1011) reaches every worker bundle as SH_LEASE_CACHE_DROP_S, 0
+# included (the drop off). It is the workers' alone: the control plane's settings and hash do not
+# move. A running worker keeps its old value until install-host.sh is re-run, so a change warns and
+# names the hosts, as a ceiling change does.
+run_setup export SBX_LEASE_CACHE_DROP_S=0 || fail 'a run with the cache drop off failed'
+for w in sbx_default sbx_py312; do
+  grep -qx 'SH_LEASE_CACHE_DROP_S=0' "$GEN/workers/$w/worker.env" || fail "the $w bundle's cache drop is not 0"
+  [[ "$(grep -c '^SH_LEASE_CACHE_DROP_S=' "$GEN/workers/$w/worker.env")" == 1 ]] || fail "the $w bundle has the cache drop twice"
+done
+grep -q 'WARNING: SH_LEASE_CACHE_DROP_S changes from 30 to 0' "$TMP/out" ||
+  fail 'a cache drop change does not warn, naming SH_LEASE_CACHE_DROP_S and both values'
+grep -q 'WARNING: SH_LEASE_CACHE_DROP_S changed: re-run deploy/sbx/install-host.sh now on the host of each of: sbx_default sbx_py312' "$TMP/out" ||
+  fail 'a cache drop change does not end by naming the hosts to reinstall'
+render
+[[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the cache drop moved the control plane hash'
+run_setup export SBX_LEASE_CACHE_DROP_S=0 || fail 'a re-run with the same cache drop failed'
+! grep -q 'SH_LEASE_CACHE_DROP_S' "$TMP/out" || fail 'an unchanged cache drop still warns'
+run_setup true || fail 'the run back to the default cache drop failed'
+grep -qx 'SH_LEASE_CACHE_DROP_S=30' "$GEN/workers/sbx_default/worker.env" || fail 'the bundle cache drop did not return to 30'
+grep -q 'WARNING: SH_LEASE_CACHE_DROP_S changes from 0 to 30' "$TMP/out" || fail 'the cache drop back to 30 does not warn'
+pass 'SBX_LEASE_CACHE_DROP_S reaches every worker bundle, 0 included, and a change names the hosts to reinstall'
 
 # 4c''. A running worker keeps the SH_LEASE_IDLE_CEILING_S it was installed with until install-host.sh
 # is re-run on its host, so a ceiling change names the hosts to reinstall. A warning, not a refusal:
@@ -1790,3 +1818,108 @@ redis_sts "$VK"
 ! run_setup export MOCK_FAIL_GET=redis || fail 'carried on past a failing kubectl get of the redis StatefulSet'
 ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something after a failing kubectl get of the redis StatefulSet'
 pass 'refuses to switch an existing non-Valkey redis StatefulSet to Valkey without SBX_REDIS_IMAGE, naming its image; Valkey, a fresh namespace or SBX_REDIS_IMAGE proceed'
+
+# 19. The relay's control listener (#338) behind SBX_RELEASE_CONTROL=1: the release bearer in a
+#     Secret of its own (moca-relay-release), both pods' hashes over it, the component last, and with
+#     the switch off nothing at all changes -- the relay's hash, its Services and NetworkPolicies and
+#     the generated kustomization are today's (14a holds the golden copy; this compares the renders).
+# The rendered objects as one JSON array (kubectl label --local is only a YAML-to-JSON converter).
+render_json() { KUBECONFIG=/dev/null "$REAL_KUBECTL" label --local -f "$TMP/render.yaml" sbx-render- -o json | jq -s . >"$TMP/render.json"; }
+robj() { jq -c --arg k "$1" --arg n "$2" '.[] | select(.kind == $k and .metadata.name == $n)' "$TMP/render.json"; }
+# The relay's own objects: its Deployment, every Service selecting it, every NetworkPolicy on it.
+relay_objects() {
+  jq -cS '[.[] | select((.kind == "Deployment" and .metadata.name == "sandbox-relay") or
+    (.kind == "Service" and .spec.selector.app == "sandbox-relay") or
+    (.kind == "NetworkPolicy" and .spec.podSelector.matchLabels.app == "sandbox-relay"))]' "$TMP/render.json"
+}
+reset_state
+run_setup true || fail 'release off (unset) failed'
+cp "$K" "$TMP/release-unset.yaml"
+render; render_json; relay_objects >"$TMP/relay-unset.json"
+relay_off="$(pod_hash sandbox-relay)" cp_off="$(pod_hash moca-control-plane)"
+run_setup export SBX_RELEASE_CONTROL=0 || fail 'SBX_RELEASE_CONTROL=0 failed'
+cmp -s "$TMP/release-unset.yaml" "$K" || fail 'SBX_RELEASE_CONTROL=0 differs from unset'
+render; render_json
+diff <(relay_objects) "$TMP/relay-unset.json" >/dev/null || fail 'SBX_RELEASE_CONTROL=0 changed the relay, its Services or NetworkPolicies'
+[[ ! -e "$MOCK_STATE/secret-moca-relay-release.json" ]] || fail 'release off generated moca-relay-release'
+! grep -q 'moca-relay-release\|relay-release-control' "$K" "$MOCK_LOG" || fail 'release off touched the release Secret or component'
+! grep -q 'MOCA_RELAY_CONTROL_ADDR\|SH_RELAY_CONTROL_URL\|sandbox-relay-control\|9445' "$TMP/render.yaml" || fail 'release off renders the control listener'
+[[ "$(pod_hash sandbox-relay)" == "$relay_off" && "$(pod_hash moca-control-plane)" == "$cp_off" ]] || fail 'release off moved a hash'
+pass 'release off (unset or 0): no Secret, no component, the relay, its Services and NetworkPolicies and both hashes as before'
+
+mu1_before="$(jq -cS '.data' "$MOCK_STATE/secret-moca-mu1.json")"
+run_setup export SBX_RELEASE_CONTROL=1 || fail "release on failed: $(cat "$TMP/out")"
+rt="$(secret_val moca-relay-release MOCA_RELAY_RELEASE_TOKEN)"
+[[ "$rt" =~ ^[0-9a-f]{64}$ ]] || fail 'the release token is not 64 hex'
+jq -e '.metadata.labels["sbx.moca.dev/setup"] == "true"' "$MOCK_STATE/secret-moca-relay-release.json" >/dev/null || fail 'moca-relay-release is not labelled'
+jq -e '.data | keys == ["MOCA_RELAY_RELEASE_TOKEN"]' "$MOCK_STATE/secret-moca-relay-release.json" >/dev/null || fail 'moca-relay-release holds more than its token'
+for s in moca-relay moca-relay-sandbox-tokens moca-mu1; do
+  ! jq -r '.data[] | @base64d' "$MOCK_STATE/secret-$s.json" | grep -qxF -- "$rt" || fail "the release token equals a bearer in $s"
+done
+! grep -qF -- "$rt" "$MOCK_LOG" "$TMP/out" || fail 'the release token reached argv or the output'
+[[ "$(jq -cS '.data' "$MOCK_STATE/secret-moca-mu1.json")" == "$mu1_before" ]] || fail 'turning release on changed moca-mu1'
+[[ "$(grep -A1 '^components:' "$K" | tail -1)" == '  - ../../k8s/base/relay-release-control' ]] || fail "the component is not listed: $(cat "$K")"
+render; render_json
+relay_on="$(pod_hash sandbox-relay)" cp_on="$(pod_hash moca-control-plane)"
+[[ "$relay_on" != "$relay_off" && "$cp_on" != "$cp_off" ]] || fail 'turning release on did not roll both pods'
+R="$(robj Deployment sandbox-relay)" CPD="$(robj Deployment moca-control-plane)"
+[[ "$(jq -r '.spec.template.spec.containers[] | select(.name == "sandbox-relay") | .env[] | select(.name == "MOCA_RELAY_CONTROL_ADDR") | .value' <<<"$R")" == 0.0.0.0:9445 ]] || fail 'the relay has no MOCA_RELAY_CONTROL_ADDR'
+[[ "$(jq -r '.spec.template.spec.volumes[] | select(.name == "release-token") | .secret | "\(.secretName)/\(.items[0].key)/\(.defaultMode)"' <<<"$R")" == moca-relay-release/MOCA_RELAY_RELEASE_TOKEN/256 ]] || fail 'the relay does not mount the release token 0400'
+! jq -e '[.spec.template.spec.containers[].env[]? | select(.name == "MOCA_RELAY_RELEASE_TOKEN")] | length > 0' <<<"$R" >/dev/null || fail 'the release token is an env value on the relay'
+[[ "$(jq -r '.spec.template.spec.containers[] | select(.name == "control-plane") | .env[] | select(.name == "SH_RELAY_CONTROL_URL") | .value' <<<"$CPD")" == http://sandbox-relay-control:9445 ]] || fail 'the control plane has no SH_RELAY_CONTROL_URL'
+[[ "$(robj Service sandbox-relay-control | jq -c '[.metadata.namespace, .spec.selector.app, .spec.ports[0].port]')" == '["moca-sbx-test","sandbox-relay",9445]' ]] || fail 'the control Service'
+[[ "$(robj NetworkPolicy sandbox-relay-control | jq -c '[.spec.ingress[] | [.from[].podSelector.matchLabels.app, .ports[].port]]')" == '[["moca-control-plane",9445]]' ]] || fail 'the control listener admits more than the control plane'
+[[ "$(robj NetworkPolicy moca-control-plane-to-relay-control | jq -c '[.spec.egress[] | [.to[].podSelector.matchLabels.app, .ports[].port]]')" == '[["sandbox-relay",9445]]' ]] || fail "the control plane's egress to the listener"
+pass 'release on: a kept 64-hex token in moca-relay-release alone (labelled, never in argv), the component, the listener, its Service and NetworkPolicies, both pods rolled, moca-mu1 untouched'
+
+run_setup export SBX_RELEASE_CONTROL=1 || fail 'release re-run failed'
+render
+[[ "$(secret_val moca-relay-release MOCA_RELAY_RELEASE_TOKEN)" == "$rt" ]] || fail 'a re-run rotated the release token'
+[[ "$(pod_hash sandbox-relay)" == "$relay_on" && "$(pod_hash moca-control-plane)" == "$cp_on" ]] || fail 'a re-run moved a hash'
+# Rotating it (delete the key, re-run) rolls the relay and the control plane, and leaves moca-mu1.
+kubectl patch secret moca-relay-release -n moca-sbx-test --type=merge -p '{"data":{"MOCA_RELAY_RELEASE_TOKEN":null}}' >/dev/null
+mu1_before="$(jq -cS '.data' "$MOCK_STATE/secret-moca-mu1.json")"
+run_setup export SBX_RELEASE_CONTROL=1 || fail 'the rotating run failed'
+render
+[[ "$(secret_val moca-relay-release MOCA_RELAY_RELEASE_TOKEN)" =~ ^[0-9a-f]{64}$ && "$(secret_val moca-relay-release MOCA_RELAY_RELEASE_TOKEN)" != "$rt" ]] || fail 'the rotating run did not draw a new token'
+[[ "$(pod_hash sandbox-relay)" != "$relay_on" && "$(pod_hash moca-control-plane)" != "$cp_on" ]] || fail 'a rotated release token did not roll both pods'
+[[ "$(jq -cS '.data' "$MOCK_STATE/secret-moca-mu1.json")" == "$mu1_before" ]] || fail 'rotating the release token changed moca-mu1'
+pass 'a re-run keeps the token and both hashes; rotating it rolls the relay and the control plane, and moca-mu1 does not move'
+
+# Turning it off drops the component and leaves the Secret; the relay goes back to today's objects.
+run_setup true || fail 'release off again failed'
+render; render_json
+[[ -f "$MOCK_STATE/secret-moca-relay-release.json" ]] || fail 'turning release off deleted moca-relay-release'
+! grep -q 'relay-release-control' "$K" || fail 'the overlay still names the component after turning it off'
+diff <(relay_objects) "$TMP/relay-unset.json" >/dev/null || fail 'after turning release off, the relay objects are not the unset ones'
+[[ "$(pod_hash sandbox-relay)" == "$relay_off" ]] || fail 'after turning release off, the relay hash is not the unset one'
+pass 'turning release off drops the component, keeps moca-relay-release, and the relay renders as before'
+
+# A kept token that clashes with another bearer, or is malformed, is refused before the stack is applied.
+reset_state
+run_setup export SBX_RELEASE_CONTROL=1 || fail 'release on (for the clash) failed'
+jt="$(secret_val moca-mu1 SH_JANITOR_TOKEN)"
+jq --arg v "$(printf '%s' "$jt" | base64 | tr -d '\n')" '.data.MOCA_RELAY_RELEASE_TOKEN = $v' \
+  "$MOCK_STATE/secret-moca-relay-release.json" >"$TMP/x" && mv "$TMP/x" "$MOCK_STATE/secret-moca-relay-release.json"
+: >"$MOCK_LOG"; rm -f "$K"
+! run_setup export SBX_RELEASE_CONTROL=1 || fail 'a release token equal to the janitor token was accepted'
+grep -q 'MOCA_RELAY_RELEASE_TOKEN equals another bearer' "$TMP/out" || fail "the clash refusal: $(tail -2 "$TMP/out")"
+! grep -qF -- "$jt" "$TMP/out" "$MOCK_LOG" || fail 'the clash refusal printed the token'
+[[ ! -f "$K" ]] || fail 'the stack was applied despite the clash'
+jq '.data.MOCA_RELAY_RELEASE_TOKEN = ("short" | @base64)' "$MOCK_STATE/secret-moca-relay-release.json" >"$TMP/x" && mv "$TMP/x" "$MOCK_STATE/secret-moca-relay-release.json"
+! run_setup export SBX_RELEASE_CONTROL=1 || fail 'a short release token was accepted'
+grep -q 'is not 32+ printable characters' "$TMP/out" || fail "the short-token refusal: $(tail -2 "$TMP/out")"
+refuse_each reset_state '' 'export SBX_RELEASE_CONTROL=2 => SBX_RELEASE_CONTROL must be unset, 0 or 1' \
+  'export SBX_RELEASE_CONTROL=yes => SBX_RELEASE_CONTROL must be unset, 0 or 1'
+pass 'a kept release token equal to another bearer, or under 32 characters, is refused naming the key, before the stack is applied; a bad switch is refused'
+
+# On combined too: the sessions' releases need the listener there, and its render holds.
+reset_state
+GEN0="$GEN"; GEN="$REPO/deploy/sbx/.generated-moca-sbx-combined-test"
+run_setup eval "${C[1]} SBX_RELEASE_CONTROL=1" || fail "combined with release failed: $(cat "$TMP/out")"
+grep -q -- '- ../../k8s/base/relay-release-control' "$K" || fail 'combined with release does not list the component'
+render; render_json
+[[ "$(robj Service sandbox-relay-control | jq -r .metadata.namespace)" == moca-sbx-combined-test ]] || fail 'the control Service is not in the combined namespace'
+[[ "$(robj Deployment moca-control-plane | jq -r '.spec.template.spec.volumes[] | select(.name == "credentials") | .projected.sources[] | select(.secret.name == "moca-relay-release") | .secret.optional')" == true ]] || fail "combined's control plane does not mount the release token"
+GEN="$GEN0"
+pass 'SBX_PROFILE=combined with SBX_RELEASE_CONTROL=1 renders the listener in its namespace and mounts the token in the control plane'

@@ -26,7 +26,8 @@ import {
 } from '../src/main.js';
 import { keyIdFor, makeSigner, parseKeyset, publicKeyToBase64, verifyToken } from '../src/token.js';
 import { VaultCredentialStore } from '../src/vault-store.js';
-import { testUserSecretFromEnv, testUsersFromEnv } from '../src/identity.js';
+import { rolesFor, testUserSecretFromEnv, testUsersFromEnv } from '../src/identity.js';
+import { isEnrolled } from '../src/sandbox-config.js';
 import { withCredentials } from '../src/systemd-credentials.js';
 import { codeOf, ctx } from './helpers/deps.js';
 
@@ -218,6 +219,76 @@ describe('configFromEnv', () => {
         /SH_MODEL_CATALOG_HOSTS/,
       );
     }
+  });
+
+  // #394: the notification allowlist is the ONLY SSRF control on a URL the control plane fetches
+  // for a user, so its boot contract is tested like SH_MODEL_CATALOG_HOSTS above: off unless the
+  // operator opts in, and a refusal to start rather than a surprise at first delivery.
+  it('leaves MOCA_NOTIFY_ALLOW empty when unset, so notifications are off by default', () => {
+    expect(configFromEnv(baseEnv).notify.allow).toEqual([]);
+    expect(configFromEnv({ ...baseEnv, MOCA_NOTIFY_ALLOW: '' }).notify.allow).toEqual([]);
+    expect(configFromEnv({ ...baseEnv, MOCA_NOTIFY_ALLOW: ' , ' }).notify.allow).toEqual([]);
+  });
+
+  it('parses MOCA_NOTIFY_ALLOW with the egress destination parser', () => {
+    expect(
+      configFromEnv({ ...baseEnv, MOCA_NOTIFY_ALLOW: ' ntfy.sh , Hooks.example:8443/moca ' }).notify
+        .allow,
+    ).toEqual([
+      { host: 'ntfy.sh', port: 443, pathPrefix: '/' },
+      { host: 'hooks.example', port: 8443, pathPrefix: '/moca' },
+    ]);
+  });
+
+  it('refuses to boot on a MOCA_NOTIFY_ALLOW entry that is not host[:port][/prefix]', () => {
+    for (const bad of ['https://ntfy.sh', 'ntfy.sh:0', 'ntfy sh', 'a:1:2', 'ntfy.sh/a/../b']) {
+      expect(() => configFromEnv({ ...baseEnv, MOCA_NOTIFY_ALLOW: bad }), bad).toThrow(
+        /MOCA_NOTIFY_ALLOW/,
+      );
+    }
+  });
+
+  it('trims trailing slashes off MOCA_NOTIFY_BASE_URL, and omits it when unset', () => {
+    expect(configFromEnv(baseEnv).notify.baseUrl).toBeUndefined();
+    expect(
+      configFromEnv({ ...baseEnv, MOCA_NOTIFY_BASE_URL: 'https://moca.example//' }).notify.baseUrl,
+    ).toBe('https://moca.example');
+  });
+
+  it('refuses to boot on a MOCA_NOTIFY_BASE_URL that is not an absolute https URL', () => {
+    for (const bad of ['moca.example.com', 'http://moca.example.com', 'ftp://moca.example.com']) {
+      expect(() => configFromEnv({ ...baseEnv, MOCA_NOTIFY_BASE_URL: bad }), bad).toThrow(
+        /MOCA_NOTIFY_BASE_URL must be an absolute https URL/,
+      );
+    }
+  });
+
+  it('defaults the notification rate limits to 5s / 60 per hour / 10 failures', () => {
+    expect(configFromEnv(baseEnv).notify).toMatchObject({
+      minIntervalS: 5,
+      perHour: 60,
+      failMax: 10,
+    });
+    expect(
+      configFromEnv({
+        ...baseEnv,
+        MOCA_NOTIFY_MIN_INTERVAL_S: '30',
+        MOCA_NOTIFY_PER_HOUR: '12',
+        MOCA_NOTIFY_FAIL_MAX: '3',
+      }).notify,
+    ).toMatchObject({ minIntervalS: 30, perHour: 12, failMax: 3 });
+  });
+
+  it('allows MOCA_NOTIFY_MIN_INTERVAL_S of 0 (no minimum spacing), but refuses 0 for the other two', () => {
+    expect(configFromEnv({ ...baseEnv, MOCA_NOTIFY_MIN_INTERVAL_S: '0' }).notify.minIntervalS).toBe(
+      0,
+    );
+    expect(() => configFromEnv({ ...baseEnv, MOCA_NOTIFY_PER_HOUR: '0' })).toThrow(
+      /MOCA_NOTIFY_PER_HOUR must not be 0/,
+    );
+    expect(() => configFromEnv({ ...baseEnv, MOCA_NOTIFY_FAIL_MAX: '0' })).toThrow(
+      /MOCA_NOTIFY_FAIL_MAX must not be 0/,
+    );
   });
 
   it('reads SH_SANDBOX_TIERS, and refuses to boot on a tier list it cannot serve', () => {
@@ -509,6 +580,8 @@ describe('the control plane`s secrets as systemd credentials (deploy/vm)', () =>
       // MI1 §6.1's grant ring, a SEPARATE private key from the session signer below -- and a file
       // like every other secret from S2 on (§6.7), never an env line.
       'MOCA_GRANT_SIGNING_KEY',
+      // The relay control listener's release-only bearer (#338), a file like the rest.
+      'MOCA_RELAY_RELEASE_TOKEN',
       'SH_CREDENTIAL_KEK',
       'SH_EXCHANGE_TOKEN',
       'SH_INSTALLER_TOKEN',
@@ -554,6 +627,70 @@ async function freePort(): Promise<number> {
   await new Promise<void>((resolve) => s.close(() => resolve()));
   return port;
 }
+
+describe('depsFromEnv: the relay release (#338)', () => {
+  const RELEASE = 'r'.repeat(64); // notsecret
+  const URL_ = 'http://sandbox-relay-control:9445';
+  it('configures the release only with SH_RELAY_CONTROL_URL', async () => {
+    const off = depsFromEnv({ ...baseEnv, MOCA_RELAY_RELEASE_TOKEN: RELEASE });
+    const on = depsFromEnv({
+      ...baseEnv,
+      SH_RELAY_CONTROL_URL: URL_,
+      MOCA_RELAY_RELEASE_TOKEN: RELEASE,
+    });
+    try {
+      expect('relayRelease' in off.config).toBe(false);
+      expect(on.config.relayRelease).toEqual({ url: URL_, token: RELEASE });
+    } finally {
+      await off.close?.();
+      await on.close?.();
+    }
+  });
+
+  it.each([
+    ['SH_EXCHANGE_TOKEN', { SH_EXCHANGE_TOKEN: RELEASE }],
+    ['SH_OPERATOR_INFERENCE_TOKEN', { SH_OPERATOR_INFERENCE_TOKEN: RELEASE }],
+    ['SH_TEST_USER_SECRET', { SH_TEST_USERS: '1', SH_TEST_USER_SECRET: RELEASE }],
+  ])('refuses to boot with a release bearer equal to %s', (_name, over) => {
+    let msg = '';
+    try {
+      depsFromEnv({
+        ...baseEnv,
+        ...over,
+        SH_RELAY_CONTROL_URL: URL_,
+        MOCA_RELAY_RELEASE_TOKEN: RELEASE,
+      });
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toMatch(
+      /MOCA_RELAY_RELEASE_TOKEN must differ from every other control-plane secret/,
+    );
+    expect(msg).not.toContain(RELEASE);
+  });
+
+  it('compares against every one of CONTROL_PLANE_SECRETS but itself', async () => {
+    // Each secret in turn equal to the release bearer, through the same env depsFromEnv reads.
+    for (const name of CONTROL_PLANE_SECRETS.filter((n) => n !== 'MOCA_RELAY_RELEASE_TOKEN')) {
+      const env: NodeJS.ProcessEnv = {
+        ...baseEnv,
+        SH_RELAY_CONTROL_URL: URL_,
+        MOCA_RELAY_RELEASE_TOKEN: RELEASE,
+      };
+      env[name] = RELEASE;
+      let msg = '';
+      let deps: ReturnType<typeof depsFromEnv> | undefined;
+      try {
+        deps = depsFromEnv(env);
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      await deps?.close?.();
+      // A secret whose own boot check refuses the value first refuses the boot all the same.
+      expect(msg, name).not.toBe('');
+    }
+  });
+});
 
 describe('depsFromEnv against a Redis that starts AFTER the control plane (#423, spike finding F2)', () => {
   it('fails readyz fast, keeps reconnecting, and never logs the Redis password', async () => {
@@ -655,18 +792,129 @@ describe('SH_TEST_USERS (ADR-0045)', () => {
     );
   });
 
-  // SBX0 §4.2 admits only enrolled github: subjects, which a test:N subject can never be. Refuse at
-  // boot rather than serve a route that would always 403.
-  it('cannot be combined with the sandbox profile', () => {
+  // ADR-0045 refused this pairing while a test:N subject could never be enrolled. That half
+  // changed: SUBJECT_RE admits test:<n> and SH_SANDBOX_TEST_USERS_ENROLLED enrols the range, so
+  // the profile can serve browser-free logins -- which is what an sbx-only dev stack wants.
+  it('is carried on the sandbox profile, where enrollment is the login gate', () => {
+    const sandboxEnv = {
+      ...baseEnv,
+      SH_CREDENTIAL_KEK: undefined,
+      SH_ROUTE_PROFILE: 'sandbox',
+      SH_ALLOWED_SUBJECTS: 'github:1',
+      SH_SANDBOX_TEMPLATES: JSON.stringify([
+        { id: 'default', worker: 'sbx_default', description: 'bash', tools: ['bash'] },
+      ]),
+      SH_SANDBOX_EXEC_ENDPOINT: 'sbx-exec.apps.example.invalid:443',
+    };
+    const enrolled = {
+      ...sandboxEnv,
+      SH_TEST_USERS: '10',
+      SH_TEST_USER_SECRET: SECRET,
+      SH_SANDBOX_TEST_USERS_ENROLLED: 'true',
+    };
+    const c = configFromEnv(enrolled);
+    expect(c.routeProfile).toBe('sandbox');
+    expect(c.testUsers).toBe(10);
+    // Naming the subjects by hand is the other way in, and it must work for exactly the subjects
+    // named: a count is not enrollment.
+    const named = configFromEnv({
+      ...sandboxEnv,
+      SH_ALLOWED_SUBJECTS: 'github:1,test:1',
+      SH_TEST_USERS: '10',
+      SH_TEST_USER_SECRET: SECRET,
+    });
+    expect(named.testUsers).toBe(10);
+    // The flag must not be silently inert here either: no count, no boot.
+    expect(() => configFromEnv({ ...sandboxEnv, SH_SANDBOX_TEST_USERS_ENROLLED: 'true' })).toThrow(
+      /needs SH_TEST_USERS/,
+    );
+  });
+
+  // The converse of the flag check, and the reason ADR-0045 refused the pairing outright: on this
+  // profile enrollment IS the login gate, so a count with nothing enrolling it mounts a route that
+  // answers not_enrolled to every call. Refuse at boot instead, as the old rule did.
+  it('refuses a count on the sandbox profile that nothing enrols', () => {
+    const sandboxEnv = {
+      ...baseEnv,
+      SH_CREDENTIAL_KEK: undefined,
+      SH_ROUTE_PROFILE: 'sandbox',
+      SH_ALLOWED_SUBJECTS: 'github:1',
+      SH_SANDBOX_TEMPLATES: JSON.stringify([
+        { id: 'default', worker: 'sbx_default', description: 'bash', tools: ['bash'] },
+      ]),
+      SH_SANDBOX_EXEC_ENDPOINT: 'sbx-exec.apps.example.invalid:443',
+    };
+    expect(() =>
+      configFromEnv({ ...sandboxEnv, SH_TEST_USERS: '10', SH_TEST_USER_SECRET: SECRET }),
+    ).toThrow(/needs its subjects enrolled/);
+    // Validated on this profile as on the harness one, rather than later in testUserProvider.
     expect(() =>
       configFromEnv({
-        ...baseEnv,
-        SH_ROUTE_PROFILE: 'sandbox',
-        SH_ALLOWED_SUBJECTS: 'github:1',
+        ...sandboxEnv,
         SH_TEST_USERS: '10',
-        SH_TEST_USER_SECRET: SECRET,
+        SH_TEST_USER_SECRET: undefined,
+        SH_SANDBOX_TEST_USERS_ENROLLED: 'true',
       }),
-    ).toThrow(/cannot be used on the sandbox profile/);
+    ).toThrow(/SH_TEST_USER_SECRET/);
+    // An entry outside 1..N is not enrollment, because the login refuses it too: taking the `test:`
+    // prefix for enrollment would boot a stack whose every test login answers not_enrolled, which
+    // is the state this guard exists to prevent.
+    // (`test:abc` is not one of these cases: SUBJECT_RE refuses it when the list is parsed, long
+    // before this guard, with its own message.)
+    // `test:01` is the same class and the one the regex lets through: Number('01') is 1, but
+    // principalFor mints `test:1` and enrollment compares the list entry verbatim, so a stack
+    // accepted on it would refuse every test login. Both lists are checked, since both enrol.
+    for (const subjects of [
+      'github:1,test:0',
+      'github:1,test:11',
+      'github:1,test:01',
+      'github:1,test:007',
+    ]) {
+      expect(() =>
+        configFromEnv({
+          ...sandboxEnv,
+          SH_ALLOWED_SUBJECTS: subjects,
+          SH_TEST_USERS: '10',
+          SH_TEST_USER_SECRET: SECRET,
+        }),
+      ).toThrow(/needs its subjects enrolled/);
+    }
+  });
+
+  // The guard must ask about enrollment exactly as the login gate does, or it refuses a stack that
+  // works. onAllowList admits the allow list OR an admin, and a test user's roles come from
+  // SH_ADMIN_SUBJECTS -- a path users-and-roles.md documents -- so this pairing logs in today and
+  // must still boot. Asserted against isEnrolled itself, not just the absence of a throw, so the
+  // two cannot drift apart.
+  it('accepts a sandbox-profile count enrolled only by SH_ADMIN_SUBJECTS', () => {
+    const sandboxEnv = {
+      ...baseEnv,
+      SH_CREDENTIAL_KEK: undefined,
+      SH_ROUTE_PROFILE: 'sandbox',
+      SH_ALLOWED_SUBJECTS: 'github:1',
+      SH_SANDBOX_TEMPLATES: JSON.stringify([
+        { id: 'default', worker: 'sbx_default', description: 'bash', tools: ['bash'] },
+      ]),
+      SH_SANDBOX_EXEC_ENDPOINT: 'sbx-exec.apps.example.invalid:443',
+      SH_TEST_USERS: '10',
+      SH_TEST_USER_SECRET: SECRET,
+    };
+    const admin = { ...sandboxEnv, SH_ADMIN_SUBJECTS: 'test:1' };
+    const c = configFromEnv(admin);
+    expect(c.testUsers).toBe(10);
+    // The login this boot now allows: roles come from SH_ADMIN_SUBJECTS, and isEnrolled says yes.
+    const roles = rolesFor('test:1', ['test:1']);
+    expect(roles).toEqual(['admin']);
+    expect(isEnrolled('test:1', roles, c, false)).toBe(true);
+    // Negative control: the same stack without the admin entry is refused, so the case above is
+    // the admin path passing the guard and not the guard having stopped refusing.
+    expect(() => configFromEnv(sandboxEnv)).toThrow(/needs its subjects enrolled/);
+    // And an admin entry outside the count enrols nothing, as in the allow list.
+    expect(() => configFromEnv({ ...sandboxEnv, SH_ADMIN_SUBJECTS: 'test:11' })).toThrow(
+      /needs its subjects enrolled/,
+    );
+    // The refusal names the third way out, or an operator on this path cannot find it.
+    expect(() => configFromEnv(sandboxEnv)).toThrow(/SH_ADMIN_SUBJECTS/);
   });
 });
 

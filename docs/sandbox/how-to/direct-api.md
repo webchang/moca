@@ -77,7 +77,7 @@ ExecRequest { sandbox_id, exec: Exec { req_id, command, stdin, timeout_s, stream
 
 ```bash
 mocactl sbx login --control-plane-url https://<api host>   # GitHub device flow, once
-mocactl sbx templates                                      # what a sandbox can be created from
+mocactl sbx templates ls                                   # what a sandbox can be created from
 mocactl sbx create --template <id>                         # prints the sandbox id and its expiry
 eval "$(mocactl sbx env <sandbox id>)"
 ```
@@ -386,6 +386,11 @@ sandbox token, and the relay sends the token's own workspace key, never one you 
 a `ReleaseOutcome`: `RELEASED` (freed), `KEPT_BUSY` (an `Exec` or a live lease is using it: the
 standbys go now, the workspace when it is free) or `UNKNOWN_KEY` (the worker holds no workspace for
 it).
+
+On a deployment with the relay's control listener on, the control plane also releases the
+workspace after your `DELETE`, and when the janitor first sees a sandbox expired, so a client that
+skips its own `Release` loses nothing; sending it first still frees the workspace before the delete
+returns.
 
 | Code                  | Cause                                                                                                           |
 | --------------------- | --------------------------------------------------------------------------------------------------------------- |
