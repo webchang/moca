@@ -83,6 +83,14 @@ export function makeReleaseTokenValidator(
         env[k] === token,
     )
     .sort();
+  // Fork only (webchang): the fork's direct-client tokens are bearers too, so the release token must
+  // differ from each (`<sandbox_id>:<prefix>:<token>`, the token everything after the second colon).
+  (env.MOCA_RELAY_CLIENT_TOKENS ?? '')
+    .split(',')
+    .map((part) => part.trim().split(':').slice(2).join(':'))
+    .forEach((v, i) => {
+      if (v && v === token) clashes.push(`MOCA_RELAY_CLIENT_TOKENS entry ${i + 1}`);
+    });
   const dir = env.SH_RELAY_TOKEN_DIR;
   if (dir) {
     const readDir = deps.readDir ?? ((p: string) => readdirSync(p));

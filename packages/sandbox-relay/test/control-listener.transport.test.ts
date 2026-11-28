@@ -330,6 +330,13 @@ describe('the release bearer at boot (#338)', () => {
     ['MOCA_RELAY_EXEC_TOKEN', { MOCA_RELAY_EXEC_TOKEN: RELEASE }],
     ['SH_RELAY_TOKEN', { SH_RELAY_TOKEN: RELEASE }],
     ['SH_RELAY_TOKEN_sbx_default', { SH_RELAY_TOKEN_sbx_default: RELEASE }],
+    // Fork only (webchang): a direct-client token is a bearer too.
+    [
+      'MOCA_RELAY_CLIENT_TOKENS entry 2',
+      {
+        MOCA_RELAY_CLIENT_TOKENS: `w1:ws-:${'c'.repeat(40)}, w1:ws-:${RELEASE}`,
+      },
+    ],
   ])('refuses to boot when it equals %s, naming the variable and never the value', (name, env) => {
     let msg = '';
     try {
